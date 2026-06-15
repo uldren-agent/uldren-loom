@@ -4,6 +4,7 @@ description = "Uldren Loom command-line tool (installs as the `loom` binary)."
 edition.workspace = true
 license.workspace = true
 name = "uldren-loom-cli"
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

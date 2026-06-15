@@ -4,6 +4,7 @@ description = "C ABI for Uldren Loom (cdylib + staticlib); the contract every la
 edition.workspace = true
 license.workspace = true
 name = "uldren-loom-ffi"
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

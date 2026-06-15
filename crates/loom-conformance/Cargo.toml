@@ -4,6 +4,7 @@ description = "Shared conformance vectors and a generic runner that any Uldren L
 edition.workspace = true
 license.workspace = true
 name = "uldren-loom-conformance"
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

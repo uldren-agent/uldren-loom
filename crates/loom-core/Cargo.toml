@@ -4,6 +4,7 @@ description = "Uldren Loom core engine: content-addressed object model and provi
 edition.workspace = true
 license.workspace = true
 name = "uldren-loom-core"
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
