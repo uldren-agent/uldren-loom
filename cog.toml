@@ -1,0 +1,14 @@
+# Cocogitto configuration - enforces Conventional Commits.
+# Versioning and changelog are handled by release-plz; cocogitto verifies commit messages and
+# installs the local git hooks. Install the hooks once with: cog install-hook --all
+ignore_merge_commits = true
+
+[git_hooks.commit-msg]
+script = """#!/bin/sh
+cog verify --file "$1"
+"""
+
+[git_hooks.pre-commit]
+script = """#!/bin/sh
+cargo fmt --all --check
+"""

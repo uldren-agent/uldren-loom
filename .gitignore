@@ -1,0 +1,30 @@
+# Rust
+/target
+**/target
+*.rs.bk
+
+# Native artifacts
+*.node
+*.so
+*.dylib
+*.dll
+*.a
+
+# Binding build outputs
+node_modules/
+bindings/*/build/
+bindings/*/dist/
+bindings/wasm/pkg/
+bindings/jvm/.gradle/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local scratch
+/TODO.*
+/tmp/
+
+# NOTE: Cargo.lock IS committed (this workspace produces binaries).

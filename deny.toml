@@ -1,0 +1,39 @@
+# cargo-deny policy. Run with `just deny` / `cargo deny check`.
+# Every dependency must be permissively licensed (no copyleft); the project's own crates are
+# source-available (BUSL-1.1) and exempted below.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+version = 2
+allow = [
+    "Apache-2.0 WITH LLVM-exception",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT-0",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = [
+    { name = "loom-cli", allow = ["BUSL-1.1"] },
+    { name = "loom-conformance", allow = ["BUSL-1.1"] },
+    { name = "loom-core", allow = ["BUSL-1.1"] },
+    { name = "loom-ffi", allow = ["BUSL-1.1"] },
+]
+
+[bans]
+allow-wildcard-paths = true
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-git = "deny"
+unknown-registry = "deny"

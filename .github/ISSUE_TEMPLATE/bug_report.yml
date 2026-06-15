@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a problem with Uldren Loom
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, commands, or code.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Crate/package version or git SHA.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - core engine
+        - CLI
+        - C ABI
+        - Node binding
+        - WASM binding
+        - JVM binding
+        - C/C++ binding
+        - build / CI
+        - docs
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, architecture, and toolchain versions.
