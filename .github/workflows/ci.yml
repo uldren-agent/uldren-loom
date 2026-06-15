@@ -103,7 +103,7 @@ jobs:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --workspace --no-report
       - run: cargo llvm-cov report --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@v7
         with:
           use_oidc: true
           files: lcov.info
