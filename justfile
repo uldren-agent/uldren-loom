@@ -37,6 +37,15 @@ build:
 build-release:
     cargo build --workspace --release
 
+# Remove all build artifacts: workspace target, each standalone binding crate's target, and the
+# per-toolchain outputs (node_modules, native addons, wasm pkg/, cmake build/, gradle build/).
+clean:
+    cargo clean
+    cargo clean --manifest-path bindings/node/Cargo.toml
+    cargo clean --manifest-path bindings/wasm/Cargo.toml
+    rm -rf bindings/node/node_modules bindings/node/*.node bindings/wasm/pkg bindings/cpp/build bindings/jvm/build bindings/jvm/.gradle
+    @echo "clean: workspace + node/wasm/cpp/jvm artifacts removed"
+
 # Dependency license/advisory/source policy.
 deny:
     cargo deny check
@@ -92,5 +101,5 @@ all: fmt-fix header sync-versions lint build-release test deny audit
     @echo "all: format + header + sync-versions + lint + release build + test + deny + audit  ✔"
 
 # Build every language binding (each needs its own toolchain; see bindings/*/README.md).
-bindings-all: node wasm cpp jvm
+bindings: node wasm cpp jvm
     @echo "bindings: node + wasm + cpp + jvm built"

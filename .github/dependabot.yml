@@ -4,11 +4,25 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    ignore:
+      # The tag selects the Rust toolchain version (the MSRV pin in ci.yml), not the action version, so Dependabot must not bump it.
+      - dependency-name: "dtolnay/rust-toolchain"
+
   - package-ecosystem: npm
     directory: "/bindings/node"
     schedule:
       interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]

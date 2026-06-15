@@ -11,7 +11,7 @@ use std::ffi::CString;
 use loom_core::Object;
 
 /// Return the library version as a newly-allocated C string. Free with [`loom_string_free`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn loom_version() -> *mut c_char {
     to_c_string(loom_core::VERSION)
 }
@@ -21,7 +21,7 @@ pub extern "C" fn loom_version() -> *mut c_char {
 ///
 /// # Safety
 /// `data` must point to at least `len` readable bytes, or be null when `len == 0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn loom_blob_digest(data: *const c_uchar, len: usize) -> *mut c_char {
     let bytes: &[u8] = if len == 0 {
         &[]
@@ -38,7 +38,7 @@ pub unsafe extern "C" fn loom_blob_digest(data: *const c_uchar, len: usize) -> *
 ///
 /// # Safety
 /// `s` must be a pointer returned by this library and not previously freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn loom_string_free(s: *mut c_char) {
     if !s.is_null() {
         // SAFETY: `s` came from `CString::into_raw` in this library (see fn docs).

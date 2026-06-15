@@ -1,7 +1,9 @@
 name: CLA
 
 # Requires a CLA before merging contributions (see CONTRIBUTING.md).
-# Signatures are recorded in a separate private repo; set CLA_SIGNATURES_TOKEN as a secret.
+# Signatures are committed by the default GITHUB_TOKEN to the `cla-signatures` branch of this repo.
+# That branch must exist and must NOT be covered by branch protection or a ruleset, otherwise the
+# action cannot push to it and fails with "Resource not accessible by integration".
 
 on:
   issue_comment:
@@ -11,7 +13,7 @@ on:
 
 permissions:
   actions: write
-  contents: read
+  contents: write
   pull-requests: write
   statuses: write
 
@@ -22,9 +24,8 @@ jobs:
       - uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
         with:
           path-to-signatures: "signatures/version1/cla.json"
           path-to-document: "https://github.com/uldrenai/uldren-loom/blob/main/CONTRIBUTING.md#contributor-license-agreement"
-          branch: main
+          branch: cla-signatures
           allowlist: dependabot[bot]

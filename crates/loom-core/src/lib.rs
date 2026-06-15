@@ -13,8 +13,8 @@ pub mod provider;
 pub use digest::{Algo, Digest};
 pub use error::{Code, LoomError, Result};
 pub use object::{Object, ObjectType};
-pub use provider::memory::MemoryStore;
 pub use provider::ObjectStore;
+pub use provider::memory::MemoryStore;
 
 /// The crate version (from Cargo).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

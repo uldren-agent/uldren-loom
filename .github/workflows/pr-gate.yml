@@ -1,0 +1,47 @@
+name: PR gate
+
+# Until the CLA process is live, only owners, members, and collaborators may open pull requests.
+# Pull requests from anyone else are closed with an explanatory comment. Remove this workflow once
+# CLA Assistant is configured (the CLA status check then gates merges instead).
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const association = pr.author_association;
+            const actor = pr.user.login;
+            const allowedAssociations = ["OWNER", "MEMBER", "COLLABORATOR"];
+            const allowedActors = ["dependabot[bot]"];
+            if (allowedAssociations.includes(association) || allowedActors.includes(actor)) {
+              core.info(`Allowed PR from ${actor} (${association}).`);
+              return;
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: [
+                "Thanks for your interest in Uldren Loom.",
+                "",
+                "External pull requests are paused until our Contributor License Agreement (CLA)",
+                "process is in place. Please open an issue to discuss your change, or check back soon.",
+              ].join("\n"),
+            });
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              state: "closed",
+            });
+            core.notice(`Closed PR #${pr.number} from ${actor} (${association}); PRs paused pending CLA.`);

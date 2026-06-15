@@ -20,7 +20,7 @@ exclude = [
 [workspace.package]
 authors = ["Uldren Technologies LLC"]
 description = "Uldren Loom - a universal, content-addressed, versioned filesystem."
-edition = "2021"
+edition = "2024"
 homepage = "https://uldren.com"
 license = "BUSL-1.1"
 repository = "https://github.com/uldrenai/uldren-loom"

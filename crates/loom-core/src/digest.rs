@@ -71,7 +71,7 @@ impl Digest {
                 return Err(LoomError::new(
                     Code::Unsupported,
                     format!("unknown digest algo '{other}'"),
-                ))
+                ));
             }
         };
         let raw =

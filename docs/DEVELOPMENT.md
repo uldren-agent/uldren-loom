@@ -60,7 +60,9 @@ Key recipes (run `just` to list all):
 - Granular: `just build`, `just build-release`, `just check`, `just test`, `just lint`,
   `just fmt-fix`, `just deny`, `just audit`, `just semver`, `just ffi`, `just header`,
   `just header-check`, `just sync-versions`.
-- Bindings: `just node`, `just wasm`, `just jvm`, `just cpp`, or `just bindings-all`.
+- Bindings: `just node`, `just wasm`, `just jvm`, `just cpp`, or `just bindings`.
+- Cleanup: `just clean` - remove all build artifacts: the workspace target plus every binding's
+  toolchain output (`node_modules`, native addons, `wasm/pkg`, `cpp/build`, `jvm/build`).
 
 ## 4. Cross-compilation of the Rust workspace (`loom-core`, `loom-cli`, `loom-ffi`)
 
@@ -95,7 +97,7 @@ Notes:
 ## 5. Language bindings
 
 Each binding is built and cross-compiled by its own toolchain, not by `cargo zigbuild` or
-`cargo xwin`. `just bindings-all` builds every binding for your host platform; per-target prebuilds
+`cargo xwin`. `just bindings` builds every binding for your host platform; per-target prebuilds
 are produced in CI (for example, napi-rs builds one `.node` per platform).
 
 ### Node - `@uldrenai/loom` (napi-rs)

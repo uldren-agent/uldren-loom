@@ -5,7 +5,7 @@ back to the WASM build (`@uldrenai/loom-wasm`) where no prebuilt exists.
 
 Licensed under **BUSL-1.1** - the binding embeds the engine (see the repo `LICENSE`).
 
-## Build (Node ≥ 18)
+## Build (Node ≥ 20)
 
 ```bash
 pnpm install

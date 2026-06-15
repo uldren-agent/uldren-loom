@@ -66,9 +66,10 @@ Requires the Rust toolchain (`rustup`) and [`just`](https://github.com/casey/jus
 [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) for full setup, cross-compilation, and bindings.
 
 ```bash
-just all          # full local pass: format, header, sync-versions, lint, build, test, deny, audit
-just bindings-all # build the Node, WASM, JVM, and C++ bindings (each needs its own toolchain)
-just ci           # format check + clippy + tests + dependency policy
+just all      # full local pass: format, header, sync-versions, lint, build, test, deny, audit
+just bindings # build the Node, WASM, JVM, and C++ bindings (each needs its own toolchain)
+just ci       # format check + clippy + tests + dependency policy
+just clean    # remove all build artifacts (workspace + every binding)
 ```
 
 Packages: crate `uldren-loom`, Node `@uldrenai/loom`, Maven `ai.uldren:loom`.
