@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "uldren-loom-cli"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "clap",
  "uldren-loom-core",
@@ -262,14 +262,14 @@ dependencies = [
 
 [[package]]
 name = "uldren-loom-conformance"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "uldren-loom-core",
 ]
 
 [[package]]
 name = "uldren-loom-core"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "hex",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "uldren-loom-ffi"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "uldren-loom-core",
 ]
