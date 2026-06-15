@@ -25,14 +25,14 @@ homepage = "https://uldren.com"
 license = "BUSL-1.1"
 repository = "https://github.com/uldrenai/uldren-loom"
 rust-version = "1.85"
-version = "0.0.0"
+version = "0.0.1"
 
 [workspace.dependencies]
 # Core engine deps (all permissive; enforced by deny.toml).
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
-loom-core = { package = "uldren-loom-core", path = "crates/loom-core", version = "0.0.0" }
+loom-core = { package = "uldren-loom-core", path = "crates/loom-core", version = "0.0.1" }
 thiserror = "2"
 
 # Pin lints once, share across crates.
