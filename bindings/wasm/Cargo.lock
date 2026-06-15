@@ -84,19 +84,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "loom-core"
-version = "0.0.0"
-dependencies = [
- "blake3",
- "hex",
- "thiserror",
-]
-
-[[package]]
 name = "loom-wasm"
 version = "0.0.0"
 dependencies = [
- "loom-core",
+ "uldren-loom-core",
  "wasm-bindgen",
 ]
 
@@ -165,6 +156,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "uldren-loom-core"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "thiserror",
 ]
 
 [[package]]

@@ -197,22 +197,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "loom-core"
-version = "0.0.0"
-dependencies = [
- "blake3",
- "hex",
- "thiserror",
-]
-
-[[package]]
 name = "loom-node"
 version = "0.0.0"
 dependencies = [
- "loom-core",
  "napi",
  "napi-build",
  "napi-derive",
+ "uldren-loom-core",
 ]
 
 [[package]]
@@ -361,6 +352,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "uldren-loom-core"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "thiserror",
 ]
 
 [[package]]

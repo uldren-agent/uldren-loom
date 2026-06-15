@@ -1,5 +1,5 @@
 # Sample CMake build for the Uldren Loom C++ example.
-# Assumes libuldren_loom has been built (cargo build -p loom-ffi) and the C header is at
+# Assumes libuldren_loom has been built (cargo build -p uldren-loom-ffi) and the C header is at
 # ../../include/loom.h. Licensed under BUSL-1.1.
 cmake_minimum_required(VERSION 3.16)
 project(uldren_loom_cpp CXX)

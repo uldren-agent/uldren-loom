@@ -32,7 +32,7 @@ version = "0.0.0"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
-loom-core = { path = "crates/loom-core", version = "0.0.0" }
+loom-core = { package = "uldren-loom-core", path = "crates/loom-core", version = "0.0.0" }
 thiserror = "2"
 
 # Pin lints once, share across crates.

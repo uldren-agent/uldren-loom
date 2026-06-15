@@ -22,8 +22,8 @@ jobs:
             const association = pr.author_association;
             const actor = pr.user.login;
             const allowedAssociations = ["OWNER", "MEMBER", "COLLABORATOR"];
-            const allowedActors = ["dependabot[bot]"];
-            if (allowedAssociations.includes(association) || allowedActors.includes(actor)) {
+            const isBot = pr.user.type === "Bot";
+            if (allowedAssociations.includes(association) || isBot) {
               core.info(`Allowed PR from ${actor} (${association}).`);
               return;
             }

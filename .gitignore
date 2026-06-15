@@ -12,10 +12,16 @@
 
 # Binding build outputs
 node_modules/
+bindings/**/.cxx/
+bindings/**/jniLibs/
+bindings/*/.gradle/
 bindings/*/build/
 bindings/*/dist/
+bindings/swift/.build/
 bindings/wasm/pkg/
-bindings/jvm/.gradle/
+
+# Coverage
+lcov.info
 
 # Editor / OS
 .DS_Store

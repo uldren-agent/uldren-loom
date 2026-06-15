@@ -1,0 +1,27 @@
+{
+  "name": "@uldrenai/loom-react-native",
+  "version": "0.0.0",
+  "description": "React Native binding for Uldren Loom - a TurboModule over the C ABI.",
+  "license": "BUSL-1.1",
+  "author": "Uldren Technologies LLC",
+  "repository": "https://github.com/uldrenai/uldren-loom",
+  "main": "src/index.ts",
+  "files": [
+    "src",
+    "ios",
+    "android",
+    "UldrenLoom.podspec"
+  ],
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*"
+  },
+  "codegenConfig": {
+    "name": "RNUldrenLoomSpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "ai.uldren.loom.rn"
+    }
+  }
+}

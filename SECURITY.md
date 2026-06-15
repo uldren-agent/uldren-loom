@@ -12,7 +12,7 @@ Coordinated disclosure is appreciated; we will credit reporters who wish to be n
 
 ## Scope
 
-The Rust core (`crates/loom-core`, `loom-ffi`), the CLI (`loom-cli`), and the language bindings (`bindings/*`).
+The Rust core (`uldren-loom-core`, `uldren-loom-ffi`), the CLI (`uldren-loom-cli`), and the language bindings (`bindings/*`).
 Integrity of the content-addressed object model and the `.loom` container format are treated as high-severity areas.
 
 ## Supported versions

@@ -64,7 +64,7 @@ Key recipes (run `just` to list all):
 - Cleanup: `just clean` - remove all build artifacts: the workspace target plus every binding's
   toolchain output (`node_modules`, native addons, `wasm/pkg`, `cpp/build`, `jvm/build`).
 
-## 4. Cross-compilation of the Rust workspace (`loom-core`, `loom-cli`, `loom-ffi`)
+## 4. Cross-compilation of the Rust workspace (`uldren-loom-core`, `uldren-loom-cli`, `uldren-loom-ffi`)
 
 Run these from the repository root; they cross-compile the core engine, the `loom` CLI, and the
 C ABI. (Cross-compiling the language bindings is different - see section 5.) Add the target first,
@@ -136,7 +136,7 @@ resolver downloads JDK 22 for the build, so you do not need to install version 2
 
 ```bash
 # build the native library first
-cargo build -p loom-ffi --release
+cargo build -p uldren-loom-ffi --release
 cd bindings/jvm
 # macOS shown; on Linux use LD_LIBRARY_PATH instead of DYLD_LIBRARY_PATH
 DYLD_LIBRARY_PATH="$PWD/../../target/release" ./gradlew build
@@ -146,9 +146,62 @@ DYLD_LIBRARY_PATH="$PWD/../../target/release" ./gradlew build
 
 ```bash
 brew install cmake
-cargo build -p loom-ffi --release
+cargo build -p uldren-loom-ffi --release
 cmake -S bindings/cpp -B bindings/cpp/build
 cmake --build bindings/cpp/build
 # prints version + the "abc" digest
 ./bindings/cpp/build/loom_example
 ```
+
+### Prerequisites for the mobile bindings
+
+- **Swift / iOS:** Xcode or the Swift toolchain (`xcode-select --install`).
+- **Android (Kotlin + React Native):** the Android SDK and **NDK** - install via Android Studio,
+  Settings -> Languages & Frameworks -> Android SDK -> SDK Tools, tick **NDK (Side by side)** and
+  **CMake**. Then export `ANDROID_HOME` and `ANDROID_NDK_HOME`, install `cargo install cargo-ndk`,
+  and add the Rust Android targets:
+
+  ```bash
+  rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+  ```
+
+The `kotlin/` Gradle wrapper (`gradlew`) is committed, so no separate Gradle install is needed.
+Run every command in this section from the repository root.
+
+### Swift / iOS - `UldrenLoom` (SwiftPM)
+
+The C header is vendored at `bindings/swift/Sources/CUldrenLoom/include/loom.h` and kept in sync by
+`just header`. Pass the library path at run time so the test binary can load `libuldren_loom`:
+
+```bash
+cargo build -p uldren-loom-ffi --release
+cd bindings/swift && DYLD_LIBRARY_PATH="$PWD/../../target/release" swift test # Linux: LD_LIBRARY_PATH
+```
+
+For iOS, build `libuldren_loom.a` for the iOS targets and package an `.xcframework` (see `bindings/swift/README.md`).
+
+### Kotlin / Android - Kotlin Multiplatform over JNI
+
+JVM (off Android) - build the native lib, then compile the Kotlin jvm target:
+
+```bash
+cargo build -p uldren-loom-ffi --release
+cd bindings/kotlin && ./gradlew :compileKotlinJvm
+```
+
+Android - build the per-ABI Rust static lib (CMake links it from `target/<triple>/release`), then assemble the AAR:
+
+```bash
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build -p uldren-loom-ffi --release
+cd bindings/kotlin && ./gradlew :assembleRelease
+```
+
+### React Native - `@uldrenai/loom-react-native` (TurboModule)
+
+```bash
+# iOS calls the C ABI directly; Android uses a JNI bridge (CMake links the static lib from target/).
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build -p uldren-loom-ffi --release
+```
+
+Standard React Native cannot load the Node `.node` addon, so this binding targets `libuldren_loom`
+via a TurboModule rather than the napi binding.

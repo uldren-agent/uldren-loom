@@ -3,10 +3,15 @@ authors.workspace = true
 description = "Uldren Loom core engine: content-addressed object model and provider contract."
 edition.workspace = true
 license.workspace = true
-name = "loom-core"
+name = "uldren-loom-core"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+
+# Package is `uldren-loom-core` (crates.io), but the Rust crate stays `loom_core` so imports
+# (`use loom_core::...`) and the dependency key are unchanged across the workspace and bindings.
+[lib]
+name = "loom_core"
 
 [lints]
 workspace = true

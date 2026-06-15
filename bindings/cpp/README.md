@@ -9,7 +9,7 @@ Licensed under **BUSL-1.1** (see the repo `LICENSE`).
 
 ```bash
 # produces target/release/libuldren_loom.{a,so,dylib}
-cargo build -p loom-ffi --release
+cargo build -p uldren-loom-ffi --release
 cmake -S bindings/cpp -B bindings/cpp/build
 cmake --build bindings/cpp/build
 # prints version + the "abc" digest

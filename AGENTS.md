@@ -13,18 +13,20 @@ through a stable C ABI.
 
 A Cargo workspace of four crates, plus language bindings built with their own toolchains.
 
-- `loom-core` (`crates/loom-core`) - the engine: digests, the canonical object model, and the
-  `ObjectStore` provider trait with an in-memory implementation. No `unsafe`.
-- `loom-cli` (`crates/loom-cli`) - the `loom` binary (the crate is `loom-cli`; the installed binary is `loom`).
-- `loom-ffi` (`crates/loom-ffi`) - the C ABI (`cdylib` + `staticlib`, `libuldren_loom`). The only crate permitted to use `unsafe`.
-- `loom-conformance` (`crates/loom-conformance`) - canonical test vectors and a generic runner that every backend must pass.
+- `uldren-loom-core` (`crates/loom-core`) - the engine: digests, the canonical object model, and the
+  `ObjectStore` provider trait with an in-memory implementation. No `unsafe`. Rust import name stays `loom_core`.
+- `uldren-loom-cli` (`crates/loom-cli`) - the `loom` binary (the crate is `uldren-loom-cli`; the installed binary is `loom`).
+- `uldren-loom-ffi` (`crates/loom-ffi`) - the C ABI (`cdylib` + `staticlib`, `libuldren_loom`). The only crate permitted to use `unsafe`.
+- `uldren-loom-conformance` (`crates/loom-conformance`) - canonical test vectors and a generic runner that every backend must pass.
 
 ## Repo map
 
 - `crates/` - the workspace crates listed above.
 - `bindings/` - language bindings, each with its own toolchain, excluded from the cargo workspace:
   `node/` (napi-rs → `@uldrenai/loom`), `wasm/` (wasm-bindgen → `@uldrenai/loom-wasm`),
-  `jvm/` (FFM/Panama, JDK 22+ → `ai.uldren:loom`), `cpp/` (header + CMake sample).
+  `jvm/` (FFM/Panama, JDK 22+ → `ai.uldren:loom`), `cpp/` (header + CMake sample),
+  `swift/` (SwiftPM, iOS + macOS), `kotlin/` (KMP over JNI, Android + JVM), and
+  `react-native/` (TurboModule → `@uldrenai/loom-react-native`). All wrap the same C ABI.
 - `include/loom.h` - the public C header; regenerate with `just header` (cbindgen).
 - `idl/loom.idl` - the language-neutral interface definition.
 - `docs/DEVELOPMENT.md` - toolchain setup, cross-compilation, and per-binding build steps.
@@ -45,9 +47,9 @@ Bindings build with their own toolchains - see each `bindings/*/README.md` and `
 
 Rules the tooling can't fully enforce. Breaking them lands a regression.
 
-- **Edition 2021, MSRV 1.85.** `rust-toolchain.toml` pins the toolchain (stable + rustfmt + clippy);
+- **Edition 2024, MSRV 1.85.** `rust-toolchain.toml` pins the toolchain (stable + rustfmt + clippy);
   `clippy.toml` pins the MSRV. Keep both in sync with `rust-version` in `Cargo.toml`.
-- **No `unsafe` outside `loom-ffi`.** The workspace forbids `unsafe_code`; `loom-ffi` is the sole
+- **No `unsafe` outside `uldren-loom-ffi`.** The workspace forbids `unsafe_code`; `uldren-loom-ffi` is the sole
   exception because the C ABI requires it. Every `unsafe` block carries a `// SAFETY:` comment that
   states the invariant being upheld.
 - **The error `Code` enum is a stable contract.** Bindings and wire protocols preserve it verbatim.

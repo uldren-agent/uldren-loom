@@ -4,6 +4,7 @@
 [![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](./LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-fe5196.svg)](https://www.conventionalcommits.org)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/uldrenai/uldren-loom/badge)](https://scorecard.dev/viewer/?uri=github.com/uldrenai/uldren-loom)
 
 > A universal, content-addressed, versioned store - one interface that is a filesystem, a git-style
 > version history, and a queryable database (SQL + vectors), packable into a single portable file.
@@ -54,7 +55,7 @@ clean backbone for GitOps-style config promotion and audit.
 - **AI-native** - an MCP server surface so agents use Loom as tools and memory.
 - **Backends** - an entire store in one `.loom` file, in a SQL/KV database, or behind a remote.
 - **Filesystem** - directories, files, byte-range and streaming I/O, move/copy, symlinks.
-- **Polyglot** - a Rust core with bindings for Node, the JVM, C/C++, and WASM, behind a stable C ABI.
+- **Polyglot** - a Rust core with bindings for Node, WASM, the JVM, C/C++, Swift (iOS + macOS), Kotlin (Android + JVM), and React Native, behind a stable C ABI.
 - **Security** - content integrity by construction, plus encryption at rest and compression.
 - **Structured data** - versioned SQL tables and vector search over the same store.
 - **Synchronization** - `push`/`pull`/`clone` between any two backends, online or via a bundle file.
