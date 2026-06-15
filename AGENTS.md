@@ -62,6 +62,11 @@ Rules the tooling can't fully enforce. Breaking them lands a regression.
 - **Output and ABI shapes are part of the contract.** The C ABI (`include/loom.h`), the interface
   definition (`idl/loom.idl`), and the canonical vectors define observable behavior. Don't drift a
   shape without updating the definition and the conformance vectors together.
+- **No thematic names in code.** Internal design notes use loom-themed terms (Warp, Weft, Heddle,
+  Bobbin, Selvedge, Shuttle); production code, public APIs, and the C ABI must not. Use plain,
+  descriptive names: Warp -> object store (`ObjectStore`), Weft -> working tree / staging, Heddle ->
+  reference store, Bobbin -> pack / segment, Selvedge -> journal (write-ahead log), Shuttle ->
+  sync engine.
 - **No emoji** in code, commits, or PR descriptions unless the request explicitly calls for them.
 - **No em-dashes or en-dashes.** Use a plain hyphen `-`, or rewrite the sentence. This applies to
   every file: code, comments, docs, commits, and PR descriptions.

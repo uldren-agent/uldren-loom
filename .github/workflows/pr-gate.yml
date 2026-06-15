@@ -1,8 +1,9 @@
 name: PR gate
 
-# Until the CLA process is live, only owners, members, and collaborators may open pull requests.
-# Pull requests from anyone else are closed with an explanatory comment. Remove this workflow once
-# CLA Assistant is configured (the CLA status check then gates merges instead).
+# We are not accepting external contributions yet (the contribution + CLA guidance is still being
+# finalized). Until then, only maintainers (write/admin on this repo) and internal bots may open
+# pull requests; everyone else's PR is closed with an explanatory comment.
+# Remove this workflow when external contributions open up - the CLA status check then gates merges.
 
 on:
   pull_request_target:
@@ -19,14 +20,32 @@ jobs:
         with:
           script: |
             const pr = context.payload.pull_request;
-            const association = pr.author_association;
             const actor = pr.user.login;
-            const allowedAssociations = ["OWNER", "MEMBER", "COLLABORATOR"];
-            const isBot = pr.user.type === "Bot";
-            if (allowedAssociations.includes(association) || isBot) {
-              core.info(`Allowed PR from ${actor} (${association}).`);
+
+            // Internal automation (the release-plz GitHub App, Dependabot, etc.).
+            if (pr.user.type === "Bot") {
+              core.info(`Allowed bot ${actor}.`);
               return;
             }
+
+            // Identify maintainers by repository permission - reliable even when org membership is
+            // private (author_association is reported as NONE/CONTRIBUTOR in that case).
+            let permission = "none";
+            try {
+              const res = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: actor,
+              });
+              permission = res.data.permission;
+            } catch (err) {
+              permission = "none";
+            }
+            if (permission === "admin" || permission === "write") {
+              core.info(`Allowed ${actor} (permission: ${permission}).`);
+              return;
+            }
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -34,8 +53,8 @@ jobs:
               body: [
                 "Thanks for your interest in Uldren Loom.",
                 "",
-                "External pull requests are paused until our Contributor License Agreement (CLA)",
-                "process is in place. Please open an issue to discuss your change, or check back soon.",
+                "We are not accepting external pull requests yet - the contribution and CLA process",
+                "is still being set up. Please open an issue to discuss your change, or check back soon.",
               ].join("\n"),
             });
             await github.rest.pulls.update({
@@ -44,4 +63,4 @@ jobs:
               pull_number: pr.number,
               state: "closed",
             });
-            core.notice(`Closed PR #${pr.number} from ${actor} (${association}); PRs paused pending CLA.`);
+            core.notice(`Closed PR #${pr.number} from ${actor} (permission: ${permission}).`);

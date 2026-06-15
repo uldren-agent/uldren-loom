@@ -28,4 +28,4 @@ jobs:
           path-to-signatures: "signatures/version1/cla.json"
           path-to-document: "https://github.com/uldrenai/uldren-loom/blob/main/CONTRIBUTING.md#contributor-license-agreement"
           branch: cla-signatures
-          allowlist: dependabot[bot],uldren-loom[bot]
+          allowlist: dependabot[bot],uldren-loom[bot],uldren-agent
