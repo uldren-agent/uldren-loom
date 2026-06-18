@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+description = "Loom Canonical CBOR v1: the deterministic, content-addressed codec for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-codec"
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_codec"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

@@ -1,0 +1,16 @@
+[package]
+authors.workspace = true
+description = "Code generator that emits the Loom Remote Protocol method registry from idl/loom.idl."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-remote-codegen"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "loom-remote-codegen"
+path = "src/main.rs"
+
+[lints]
+workspace = true

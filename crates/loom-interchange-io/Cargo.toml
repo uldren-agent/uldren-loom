@@ -1,0 +1,39 @@
+[package]
+authors.workspace = true
+description = "Filesystem import and export execution over Loom interchange contracts."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-interchange-io"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_interchange_io"
+
+[lints]
+workspace = true
+
+[features]
+default = ["zstd"]
+zstd = ["dep:zstd"]
+
+[dependencies]
+blake3.workspace = true
+flate2.workspace = true
+loom-codec.workspace = true
+loom-chat.workspace = true
+loom-core.workspace = true
+loom-drive.workspace = true
+loom-interchange.workspace = true
+loom-pages.workspace = true
+loom-store.workspace = true
+loom-substrate = { workspace = true, features = ["studio-meetings"] }
+loom-tickets.workspace = true
+loom-types.workspace = true
+quick-xml = "0.41"
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+zip.workspace = true
+zstd = { workspace = true, optional = true }

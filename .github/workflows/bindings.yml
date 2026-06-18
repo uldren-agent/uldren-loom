@@ -41,7 +41,7 @@ jobs:
       - run: pnpm test
 
   wasm:
-    name: wasm-pack
+    name: wasm-pack + browser runtime
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -55,6 +55,67 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: jetli/wasm-pack-action@v0.4.0
       - run: wasm-pack build --target web --release
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Locate Chrome
+        run: |
+          chrome="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium-browser || command -v chromium)"
+          echo "CHROME=$chrome" >> "$GITHUB_ENV"
+      - run: node browser-test/run.mjs
+
+  python:
+    name: python (${{ matrix.settings.target }})
+    runs-on: ${{ matrix.settings.os }}
+    defaults:
+      run:
+        working-directory: bindings/python
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v6
+      - name: Sync binding version
+        run: ./scripts/sync-binding-versions.sh
+        shell: bash
+        working-directory: ${{ github.workspace }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: pip install maturin pytest
+      - run: maturin build --release --target ${{ matrix.settings.target }} --out dist
+      - name: Install the built wheel
+        run: pip install --no-index --find-links dist uldrenai-loom
+        shell: bash
+      - run: python -m pytest
+
+  cross-binding-interop:
+    name: cross-binding interop (Node / Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Sync binding version
+        run: ./scripts/sync-binding-versions.sh
+        shell: bash
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - run: corepack enable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install just --locked
+      - run: just binding-cross-interop
 
   jvm:
     name: jvm (FFM, JDK 22)
@@ -75,8 +136,8 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
 
-  swift:
-    name: swift (SwiftPM)
+  ios:
+    name: ios (Swift / SwiftPM)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -86,19 +147,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build -p uldren-loom-ffi --release
       - run: swift test
-        working-directory: bindings/swift
+        working-directory: bindings/ios
         env:
           LIBRARY_PATH: ${{ github.workspace }}/target/release
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/target/release
 
-  kotlin:
-    name: kotlin (jvm compile)
+  android:
+    name: android (Kotlin / JVM runtime)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Sync binding version
         run: ./scripts/sync-binding-versions.sh
         shell: bash
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -107,19 +169,65 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: "8.10"
-      - run: gradle :compileKotlinJvm
-        working-directory: bindings/kotlin
+      - run: cargo build -p uldren-loom-ffi --release
+      - run: gradle :compileKotlinJvm :jvmTest
+        working-directory: bindings/android
 
   react-native:
-    name: react-native (install)
+    name: react-native (Android connected runtime)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Sync binding version
         run: ./scripts/sync-binding-versions.sh
         shell: bash
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+      - run: cargo install just --locked
+      - run: cargo install cargo-ndk --locked
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "22"
+      - uses: android-actions/setup-android@v4
+      - uses: gradle/actions/setup-gradle@v6
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-      - run: npm install
-        working-directory: bindings/react-native
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          script: just release-test-binding react-native-android
+
+  publication-gate:
+    name: publication gate dry-run
+    runs-on: ubuntu-latest
+    needs:
+      - node
+      - wasm
+      - python
+      - cross-binding-interop
+      - jvm
+      - ios
+      - android
+      - react-native
+    environment: binding-release
+    steps:
+      - uses: actions/checkout@v6
+      - name: Sync binding version
+        run: ./scripts/sync-binding-versions.sh
+        shell: bash
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install just --locked
+      - run: just binding-publication-dry-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binding-publication-dry-run
+          path: target/release-materials/standard/bindings/

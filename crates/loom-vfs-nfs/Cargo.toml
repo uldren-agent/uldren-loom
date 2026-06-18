@@ -1,0 +1,34 @@
+# NFSv3 backend for the Uldren Loom filesystem projection (0003c). A thin `nfsserve` adapter over the
+# portable `loom-vfs` layer; runs an in-process NFSv3/MOUNT server over TCP so macOS and Linux can mount
+# driverless (`mount_nfs -o vers=3`). Pure Rust (no native NFS dependency); kept out of
+# `loom-core`/`loom-vfs` per the 0032 parity rule. tokio is confined to this crate.
+# Licensed under BUSL-1.1 (see ../../LICENSE). (c) Uldren Technologies LLC.
+[package]
+name = "uldren-loom-vfs-nfs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "NFSv3 backend that serves an Uldren Loom namespace working tree for driverless mounts."
+
+[dependencies]
+loom-core = { workspace = true }
+loom-store = { workspace = true }
+loom-vfs = { package = "uldren-loom-vfs", path = "../loom-vfs", version = "0.1.0-alpha.1" }
+# The NFSv3 + MOUNT + ONC RPC server. Default features only (no `demo`), so the heavy `tracing-subscriber`
+# and `intaglio` deps and `tokio/rt-multi-thread` stay out; `nfsserve` pins tokio to a lean set
+# (net, io-util, sync, fs, rt, macros) which fixes the tokio surface for this crate.
+nfsserve = "0.11"
+# Async runtime for the server. `nfsserve` is built on tokio; we only need the runtime builder to host
+# it on a single thread, so we take the minimal `rt` feature (a subset of what `nfsserve` already
+# requires, so it adds nothing to the unified tokio build).
+tokio = { version = "1", default-features = false, features = ["rt"] }
+async-trait = "0.1"
+
+[lints]
+workspace = true
+
+[lib]
+name = "loom_vfs_nfs"

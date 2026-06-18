@@ -1,0 +1,21 @@
+[package]
+name = "uldren-loom-lanes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Source-backed Lane coordination model for Uldren Loom."
+
+[dependencies]
+loom-codec.workspace = true
+loom-core.workspace = true
+loom-store.workspace = true
+loom-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+loom-store.workspace = true

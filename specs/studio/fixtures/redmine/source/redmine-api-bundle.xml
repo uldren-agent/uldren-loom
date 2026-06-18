@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<redmine source_scope="redmine://fixture.example">
+  <projects type="array">
+    <project>
+      <id>1</id>
+      <identifier>core</identifier>
+      <key_prefix>CORE</key_prefix>
+      <name>Core</name>
+      <description>Core product project</description>
+      <homepage>https://redmine.example/projects/core</homepage>
+      <status>1</status>
+      <is_public>true</is_public>
+      <parent id="99" name="Platform"/>
+      <default_version id="3" name="7.0"/>
+      <default_assignee id="4" name="Bob Example"/>
+      <created_on>2026-06-01T08:00:00Z</created_on>
+      <updated_on>2026-07-01T09:00:00Z</updated_on>
+      <trackers type="array">
+        <tracker id="1" name="Bug">
+          <default_status id="1" name="New"/>
+          <description>Defect tracker</description>
+          <enabled_standard_fields type="array">
+            <field>assigned_to_id</field>
+            <field>category_id</field>
+            <field>fixed_version_id</field>
+            <field>parent_issue_id</field>
+          </enabled_standard_fields>
+        </tracker>
+      </trackers>
+      <issue_categories type="array">
+        <issue_category id="2" name="Authentication"/>
+      </issue_categories>
+      <enabled_modules type="array">
+        <enabled_module name="issue_tracking"/>
+        <enabled_module name="wiki"/>
+      </enabled_modules>
+      <time_entry_activities type="array">
+        <time_entry_activity id="9" name="Development" is_default="true"/>
+      </time_entry_activities>
+      <issue_custom_fields type="array">
+        <custom_field id="2" name="Resolution"/>
+      </issue_custom_fields>
+    </project>
+  </projects>
+  <issues type="array">
+    <issue>
+      <id>42</id>
+      <project id="1" identifier="core" name="Core"/>
+      <tracker id="1" name="Bug"/>
+      <status id="1" name="New"/>
+      <priority id="5" name="High"/>
+      <category id="2" name="Authentication"/>
+      <author id="3" name="Alice Example"/>
+      <assigned_to id="4" name="Bob Example"/>
+      <subject>Login fails</subject>
+      <description>Fails on Safari</description>
+      <start_date>2026-07-01</start_date>
+      <due_date>2026-07-15</due_date>
+      <closed_on>2026-07-03T10:00:00Z</closed_on>
+      <done_ratio>0</done_ratio>
+      <estimated_hours>3.5</estimated_hours>
+      <fixed_version id="3" name="7.0"/>
+      <affected_version id="4" name="6.9"/>
+      <parent id="41"/>
+      <is_private>false</is_private>
+      <url>https://redmine.example/issues/42</url>
+      <affected_versions type="array">
+        <version id="4" name="6.9"/>
+        <version id="5" name="6.8"/>
+      </affected_versions>
+      <created_on>2026-07-01T10:00:00Z</created_on>
+      <updated_on>2026-07-02T12:00:00Z</updated_on>
+      <custom_fields type="array">
+        <custom_field id="2" name="Resolution">
+          <value>Investigating</value>
+        </custom_field>
+        <custom_field id="3" name="Browsers" multiple="true">
+          <value>Safari</value>
+          <value>Firefox</value>
+        </custom_field>
+      </custom_fields>
+      <children type="array">
+        <issue id="4201" subject="Collect Safari console logs"/>
+      </children>
+      <changesets type="array">
+        <changeset revision="abc123">
+          <comments>Fix login form cookie handling</comments>
+        </changeset>
+      </changesets>
+      <allowed_statuses type="array">
+        <status id="1" name="New"/>
+        <status id="2" name="In Progress"/>
+      </allowed_statuses>
+      <journals type="array">
+        <journal id="7">
+          <user id="3" name="Alice Example"/>
+          <notes>Status changed</notes>
+          <created_on>2026-07-02T11:00:00Z</created_on>
+          <details type="array">
+            <detail property="attr" name="status_id" old_value="1" new_value="2"/>
+          </details>
+        </journal>
+      </journals>
+      <comments type="array">
+        <comment id="8">
+          <author id="5" name="Carol Commenter"/>
+          <text>Needs server logs before closing.</text>
+          <created_on>2026-07-02T12:30:00Z</created_on>
+        </comment>
+      </comments>
+      <watchers type="array">
+        <watcher id="6" name="Dana Watcher"/>
+        <watcher id="7" name="Eli Watcher"/>
+      </watchers>
+      <attachments type="array">
+        <attachment id="9">
+          <filename>error.txt</filename>
+          <filesize>12</filesize>
+          <content_type>text/plain</content_type>
+          <description>Server error excerpt</description>
+          <content_url>https://redmine.example/attachments/download/9/error.txt</content_url>
+          <author id="4" name="Bob Example"/>
+          <created_on>2026-07-02T12:45:00Z</created_on>
+        </attachment>
+      </attachments>
+      <relations type="array">
+        <relation id="11">
+          <issue_id>42</issue_id>
+          <issue_to_id>43</issue_to_id>
+          <relation_type>blocks</relation_type>
+          <delay>2</delay>
+        </relation>
+        <relation id="12">
+          <issue_id>42</issue_id>
+          <issue_to_id>44</issue_to_id>
+          <relation_type>precedes</relation_type>
+          <delay>1</delay>
+        </relation>
+        <relation id="13">
+          <issue_id>42</issue_id>
+          <issue_to_id>45</issue_to_id>
+          <relation_type>duplicates</relation_type>
+        </relation>
+        <relation id="14">
+          <issue_id>42</issue_id>
+          <issue_to_id>46</issue_to_id>
+          <relation_type>relates</relation_type>
+        </relation>
+      </relations>
+    </issue>
+  </issues>
+  <time_entries type="array">
+    <time_entry>
+      <id>10</id>
+      <project id="1" name="Core"/>
+      <issue id="42"/>
+      <user id="4" name="Bob Example"/>
+      <activity id="9" name="Development"/>
+      <hours>1.5</hours>
+      <comments>Debugging Safari login</comments>
+      <spent_on>2026-07-02</spent_on>
+      <created_on>2026-07-02T14:00:00Z</created_on>
+      <updated_on>2026-07-02T15:00:00Z</updated_on>
+    </time_entry>
+  </time_entries>
+  <wiki_pages type="array">
+    <wiki_page>
+      <title>Manuals</title>
+      <project_identifier>core</project_identifier>
+      <page_id>manuals</page_id>
+      <text>h1. Manuals</text>
+      <version>3</version>
+      <author id="3" name="Alice Example"/>
+      <created_on>2026-06-25T09:00:00Z</created_on>
+      <updated_on>2026-06-26T10:00:00Z</updated_on>
+    </wiki_page>
+    <wiki_page>
+      <title>Home</title>
+      <project_identifier>core</project_identifier>
+      <page_id>home</page_id>
+      <parent title="Manuals"/>
+      <text>h1. Home
+
+Redmine wiki body</text>
+      <version>22</version>
+      <author id="3" name="Alice Example"/>
+      <comments>Imported fixture</comments>
+      <created_on>2026-07-01T09:00:00Z</created_on>
+      <updated_on>2026-07-02T13:00:00Z</updated_on>
+      <attachments type="array">
+        <attachment id="15">
+          <filename>manual.pdf</filename>
+          <filesize>1000</filesize>
+          <content_type>application/pdf</content_type>
+          <content_url>https://redmine.example/attachments/download/15/manual.pdf</content_url>
+        </attachment>
+      </attachments>
+    </wiki_page>
+  </wiki_pages>
+</redmine>

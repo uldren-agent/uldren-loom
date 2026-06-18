@@ -1,0 +1,77 @@
+{
+  "source_scope": "redmine://fixture.example",
+  "project": {
+    "id": "core",
+    "key_prefix": "CORE",
+    "name": "Core",
+    "classification": "1:1 imported"
+  },
+  "issue": {
+    "external_identity": {
+      "source": "redmine",
+      "id": "issue:42"
+    },
+    "project_id": "core",
+    "subject": "Login fails",
+    "description": "Fails on Safari",
+    "status": "New",
+    "priority": "High",
+    "category": "Authentication",
+    "assigned_to": "Bob Example",
+    "author": "Alice Example",
+    "tracker": "Bug",
+    "created_at": "2026-07-01T10:00:00Z",
+    "updated_at": "2026-07-02T12:00:00Z",
+    "start_date": "2026-07-01",
+    "due_date": "2026-07-15",
+    "closed_on": "2026-07-03T10:00:00Z",
+    "done_ratio": 0,
+    "estimated_hours": 3.5,
+    "fixed_version": "7.0",
+    "affected_version": "6.9",
+    "parent_issue_id": "41",
+    "is_private": false,
+    "url": "https://redmine.example/issues/42",
+    "classification": "1:1 imported for mapped fields; retained for Redmine extras"
+  },
+  "retained_fields": {
+    "redmine_journals": "Status changed",
+    "redmine_journal_user": "Alice Example",
+    "redmine_journal_detail": "status_id",
+    "redmine_comments": "Needs server logs before closing.",
+    "redmine_comment_author": "Carol Commenter",
+    "redmine_watchers": ["Dana Watcher", "Eli Watcher"],
+    "redmine_affected_versions": ["6.9", "6.8"],
+    "redmine_attachments": "error.txt",
+    "redmine_attachment_content_type": "text/plain",
+    "redmine_attachment_url": "https://redmine.example/attachments/download/9/error.txt",
+    "redmine_attachment_description": "Server error excerpt",
+    "redmine_attachment_author": "Bob Example",
+    "redmine_time_entries": "Debugging Safari login",
+    "redmine_time_entry_activity": "Development",
+    "redmine_time_entry_hours": 1.5,
+    "redmine_time_entry_created_on": "2026-07-02T14:00:00Z",
+    "redmine_relations": ["blocks", "precedes", "duplicates", "relates"],
+    "redmine_children": "Collect Safari console logs",
+    "redmine_changesets": "abc123",
+    "redmine_allowed_statuses": ["New", "In Progress"]
+  },
+  "wiki_page": {
+    "page_id": "home",
+    "parent_page_id": "manuals",
+    "title": "Home",
+    "body_contains": "Redmine wiki body",
+    "metadata_gap": "version, author, comments, created_on, updated_on, and attachments are represented in source fixture and not currently stored by the Pages profile",
+    "classification": "1:1 imported for title/body; source wiki revision metadata retained by fixture comparison only"
+  },
+  "unsupported_fields": [
+    "enabled_modules",
+    "issue_categories",
+    "issue_custom_fields",
+    "project_metadata",
+    "time_entry_activities",
+    "trackers",
+    "attachments",
+    "wiki_revision_metadata"
+  ]
+}

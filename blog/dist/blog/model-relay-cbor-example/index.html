@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Model Relay In Practice: Choosing Canonical CBOR | Uldren Engineering Blog</title>
+  <meta name="description" content="A step-by-step example of Model Relay using a serialization decision: bespoke bytes, CBOR, transport formats, ABI shape, and proof gates.">
+  <link rel="canonical" href="/blog/model-relay-cbor-example/">
+  <link rel="stylesheet" href="/blog/assets/blog.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script defer src="/blog/assets/blog.js"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "neutral",
+      securityLevel: "strict",
+      flowchart: {
+        htmlLabels: true,
+        wrappingWidth: 180,
+      },
+    });
+  </script>
+</head>
+<body class="post">
+  <header class="site-bar">
+    <a class="site-mark" href="/blog/">Uldren</a>
+    <nav aria-label="Primary">
+      <a href="/blog/">Blog</a>
+      <a href="/">Home</a>
+    </nav>
+  </header>
+  <main>
+<article class="markdown-page">
+  <header class="article-head">
+    <h1>Model Relay In Practice: Choosing Canonical CBOR</h1>
+    <div class="article-meta">
+      <time datetime="2026-06-25">June 25, 2026</time>
+      <span>Uldren</span>
+    </div>
+    <p>A step-by-step example of Model Relay using a serialization decision: bespoke bytes, CBOR, transport formats, ABI shape, and proof gates.</p>
+  </header>
+  <div class="markdown-body">
+<p>A relay is clearest when it changes the decision, not just the wording.</p>
+<p>The Model Relay Pattern is easiest to understand when the decision has real architecture cost.</p>
+<p>This example reconstructs an architecture decision from a content-addressed storage system. The details are intentionally generalized, but the pattern is real: one model was deep in the implementation, another model had the wider field, and the human moved the decision between them.</p>
+<p>The question was whether the system should keep its existing bespoke canonical byte codec or move to deterministic CBOR while the design was still being shaped.</p>
+<p>Claude was on the ground. It had the active implementation task, local code changes, and the immediate pressure to close the issue.</p>
+<p>Codex had the wider repository view. It could read the architecture notes, current object codec, ABI notes, conformance vectors, agent guidance, and the already-started code. It could also challenge the premise that the cheapest patch was the right long-term design.</p>
+<p>That is exactly where Model Relay helps.</p>
+<h2 id="the-relay-shape">The Relay Shape</h2>
+<pre class="mermaid">flowchart TD
+  A[&quot;`Codec decision`&quot;] --&gt; B[&quot;`Claude&lt;br/&gt;local implementation view`&quot;]
+  B --&gt; C{&quot;`Human notices&lt;br/&gt;architecture risk`&quot;}
+  C --&gt;|needs wider review| D[&quot;`Codex&lt;br/&gt;contract and proof review`&quot;]
+  D --&gt; E{&quot;`Cheapest patch&lt;br/&gt;or durable design?`&quot;}
+  E --&gt;|cheap patch| B
+  E --&gt;|durable design| F[&quot;`Decision:&lt;br/&gt;Canonical CBOR profile`&quot;]
+  F --&gt; G[&quot;`Claude&lt;br/&gt;implementation questions`&quot;]
+  G --&gt; H[&quot;`Codex&lt;br/&gt;verification criteria`&quot;]
+  H --&gt; I{&quot;`Proof bar met?`&quot;}
+  I --&gt;|tighten tests| G
+  I --&gt;|yes| J[&quot;`Accepted direction&lt;br/&gt;with vectors and gates`&quot;]</pre>
+<p>The value is not the model choice by itself. The value is that each role has a different job.</p>
+<p>Claude proposes from inside the work. Codex critiques from outside the trench. The human keeps control of the handoff.</p>
+<h2 id="step-1-the-implementation-model-frames-the-local-choice">Step 1: The Implementation Model Frames The Local Choice</h2>
+<p>Claude&#39;s local frame was reasonable:</p>
+<pre><code class="language-text">We already have a deterministic length-prefixed object codec in loom-core.
+It drives object digests.
+ABI result payloads still cross as interim JSON.
+The shortest path is to extend the existing codec to IDL result types.</code></pre>
+<p>That is a good implementation-local observation. It sees the current system clearly.</p>
+<p>The local recommendation looked like this:</p>
+<ul>
+<li>Codec: extend the existing bespoke length-prefixed codec.</li>
+<li>Reason: one deterministic codec already drives digests.</li>
+<li>Risk of CBOR: it creates a second canonical form or forces a digest repin.</li>
+<li>Async: defer. Keep sync now and make async additive later.</li>
+</ul>
+<p>For a normal issue close, that might be enough.</p>
+<p>But this was not only an issue close. It was an architecture decision being made while the design was still flexible.</p>
+<h2 id="step-2-the-human-spots-a-decision-smell">Step 2: The Human Spots A Decision Smell</h2>
+<p>The human noticed the pressure in the recommendation.</p>
+<p>The project was still in a design phase. The implementation existed, but it was not yet the only thing that mattered. So the right question was not:</p>
+<pre><code class="language-text">What is cheapest to finish this task?</code></pre>
+<p>The right question was:</p>
+<pre><code class="language-text">While the design is still flexible, what should the long-term codec be?</code></pre>
+<p>That is the moment to relay.</p>
+<p>The human brought Claude&#39;s local recommendation to Codex and asked for an independent review.</p>
+<h2 id="step-3-the-field-model-checks-the-contract">Step 3: The Field Model Checks The Contract</h2>
+<p>Codex did not answer only from the pasted summary. It inspected the repo.</p>
+<p>It checked:</p>
+<ul>
+<li>The binding contract, where complex payloads cross language boundaries</li>
+<li>The core interface, where async behavior affects every binding</li>
+<li>The wire protocol notes, where JSON and RPC formats are projections rather than identity</li>
+<li>The object model, where identity was already defined by canonical bytes plus a digest</li>
+<li>The digest layer, where the current hash choice was separable from the encoding choice</li>
+<li>The conformance tests, where existing vectors pinned current behavior</li>
+<li>The agent guidance, where minimal-diff defaults could bias agents toward short-term work</li>
+</ul>
+<p>The key finding was that the implementation already leaned toward bespoke bytes, but the design was still movable.</p>
+<p>That changed the answer.</p>
+<h2 id="step-4-the-critique-separates-patch-cost-from-v1-design">Step 4: The Critique Separates Patch Cost From V1 Design</h2>
+<p>Codex split the decision in two:</p>
+<ul>
+<li>Cheapest patch: extend the bespoke codec.</li>
+<li>Right design while in a design phase: adopt a strict Loom Canonical CBOR profile for identity and ABI payloads.</li>
+</ul>
+<p>That distinction was the whole point.</p>
+<p>Bespoke bytes were cheap because they already existed. CBOR was better because the system needed a durable, cross-language, readable canonical format. The right answer was allowed to challenge existing work because the design was still being formed.</p>
+<p>Codex also rejected two common shortcuts:</p>
+<ul>
+<li>Protobuf is good for gRPC, but not for content-addressed identity because serialized bytes are not a stable cross-language canonical form.</li>
+<li>JSON is good for debug and admin surfaces, but not for compact deterministic identity.</li>
+</ul>
+<p>The recommended decision became:</p>
+<ul>
+<li>Use Loom Canonical CBOR v1.</li>
+<li>Make it a strict profile of RFC 8949.</li>
+<li>Use it for object identity and ABI result payloads.</li>
+<li>Keep protobuf as the gRPC transport.</li>
+<li>Keep JSON as debug/admin output.</li>
+<li>Pin canonical bytes separately from digest vectors.</li>
+</ul>
+<h2 id="step-5-the-relay-improves-the-agent-instructions">Step 5: The Relay Improves The Agent Instructions</h2>
+<p>The review also found a process bug.</p>
+<p>AGENTS.md told agents to follow existing patterns, keep minimal diffs, and avoid dependency changes unless the task demanded them. Those are good default engineering rules. But they can make an implementation model short-sighted during architecture decisions.</p>
+<p>So the human asked Codex to edit AGENTS.md.</p>
+<p>The new rule was an architecture decision mode:</p>
+<ul>
+<li>When asked for the right long-term, strategic, or standard-setting path, the current implementation is evidence, not precedent.</li>
+<li>Separate the cheapest patch from the intended product design.</li>
+<li>Prefer durable standards with strict profiles over bespoke formats unless the bespoke choice has a measured durable advantage.</li>
+<li>Treat design-phase contracts and conformance vectors as movable while decisions are still being formed.</li>
+<li>Demand canonical proof before calling identity-affecting formats settled.</li>
+</ul>
+<p>That is Model Relay becoming executable process.</p>
+<p>The workflow did not just produce an answer. It changed the instructions for future agents so they would be less likely to make the same short-term mistake.</p>
+<h2 id="step-6-the-implementation-model-asks-better-questions">Step 6: The Implementation Model Asks Better Questions</h2>
+<p>Once the direction moved back to Claude, the questions got sharper.</p>
+<p>Instead of asking &quot;bespoke or CBOR,&quot; Claude asked implementation questions:</p>
+<ul>
+<li>Which CBOR library?</li>
+<li>Where should the codec live?</li>
+<li>What object shape should it use?</li>
+<li>How should async work at the ABI?</li>
+<li>How should hash vectors be split from canonical-byte vectors?</li>
+<li>What proof bar makes the codec settled?</li>
+</ul>
+<p>That is what a good relay does. It turns a vague architecture disagreement into smaller decisions that can be accepted or rejected.</p>
+<p>The reconciled answers were:</p>
+<ul>
+<li>Use an owned <code>loom-codec</code> crate, not a hidden helper inside <code>loom-core</code>.</li>
+<li>Use positional arrays for fixed-shape identity objects: <code>[epoch, type, ...fields]</code>.</li>
+<li>Use integer-key maps only for sparse or genuinely evolvable structures.</li>
+<li>Keep BLAKE3-256 for v1, but split canonical-byte vectors from digest vectors.</li>
+<li>Build the <code>LoomTask*</code> poll form as the ABI async primitive, with callbacks and Promise/Future wrappers layered above it.</li>
+<li>Require pinned vectors, negative decode tests, round-trip tests, and fuzzing before the codec is considered settled.</li>
+</ul>
+<h2 id="step-7-the-verifier-catches-a-subtle-float-edge">Step 7: The Verifier Catches A Subtle Float Edge</h2>
+<p>Later, Claude found a real codec edge case.</p>
+<p>SQL values include <code>Float</code>, <code>F32</code>, and <code>Point</code>. Those can hold NaN, positive infinity, negative infinity, and negative zero. But Loom Canonical CBOR rejects those CBOR float bit patterns. That rejection is correct for ordinary CBOR floats because otherwise the same logical value could have multiple byte forms.</p>
+<p>The implementation-local proposal was:</p>
+<pre><code class="language-text">Do not encode SQL Float/F32/Point as CBOR floats.
+Encode their raw IEEE-754 bits as canonical CBOR unsigned integers.
+
+Float(f64) -&gt; [3, Uint(f.to_bits())]
+F32(f32) -&gt; [15, Uint(f.to_bits())]
+Point{x,y} -&gt; [23, Uint(x.to_bits()), Uint(y.to_bits())]</code></pre>
+<p>Codex reviewed that against the current code.</p>
+<p>The answer was mostly yes, with a correction:</p>
+<ul>
+<li>This is the right rule for the CBOR migration of SQL row values.</li>
+<li>But the latest code still stores tabular row values in bespoke binary.</li>
+<li>So phrase it as a migration rule, not as a description of current behavior.</li>
+</ul>
+<p>The review also added proof requirements:</p>
+<ul>
+<li>Decode must range-check <code>F32</code> bit payloads to <code>u32</code>.</li>
+<li>Add vectors for <code>+0.0</code>, <code>-0.0</code>, <code>+Inf</code>, <code>-Inf</code>, quiet NaN, signaling NaN, and distinct NaN payloads.</li>
+<li>Keep the separate order-preserving prolly key codec untouched because CBOR does not preserve Loom&#39;s byte-lexicographic index ordering.</li>
+</ul>
+<p>That is the Verifier role working. It did not just say &quot;looks good.&quot; It checked the proposal against current code and tightened the acceptance criteria.</p>
+<h2 id="why-this-was-a-model-relay-not-a-chat">Why This Was A Model Relay, Not A Chat</h2>
+<p>Each phase had a different job.</p>
+<p>The implementation model saw the immediate shape: &quot;We have a codec. Extend it.&quot;</p>
+<p>The field model saw the architectural shape: &quot;The design is still flexible. Do not let current code become accidental law.&quot;</p>
+<p>The human saw the meta-problem: &quot;The implementation agent is probably optimizing for task closure. I need a second role before approving the direction.&quot;</p>
+<p>The result was better than any one response:</p>
+<ul>
+<li>A strategic codec decision</li>
+<li>A concrete implementation plan</li>
+<li>A stricter proof bar</li>
+<li>A process update in AGENTS.md</li>
+<li>A later correction for float edge cases</li>
+</ul>
+<p>That is the pattern.</p>
+<h2 id="the-handoff-packet">The Handoff Packet</h2>
+<p>The useful artifact was not the transcript. It was the handoff packet.</p>
+<p>A compact version would look like:</p>
+<pre><code class="language-text">Decision:
+Adopt Loom Canonical CBOR v1 as the identity and ABI codec.
+
+Rejected:
+Do not keep bespoke bytes as the v1 identity format.
+Do not use protobuf as canonical identity.
+Do not keep JSON as the normative ABI payload format.
+
+Implementation:
+Create loom-codec.
+Encode objects as [epoch, type, ...fields].
+Use canonical-byte vectors plus digest vectors.
+Build strict decode tests and fuzzing.
+Keep order-preserving key codecs separate.
+
+Special case:
+SQL Float/F32/Point encode raw IEEE bits as CBOR Uint payloads, not CBOR Float.
+
+Proof:
+Pinned bytes, negative decode tests, round-trip tests, no-panic fuzz target, cross-language vectors with first non-Rust binding.</code></pre>
+<p>That packet can move between models, tools, PR descriptions, or issue comments. It survives better than a chat summary because it names the decisions and the evidence.</p>
+<h2 id="what-the-pattern-teaches">What The Pattern Teaches</h2>
+<p>A model close to implementation is valuable because it knows the ground truth of the active work.</p>
+<p>A model with wider context is valuable because it can challenge accidental commitments.</p>
+<p>The human is valuable because they can notice when the mode changed from &quot;finish the task&quot; to &quot;set the architecture.&quot;</p>
+<p>Model Relay makes those differences explicit. It is not more process for its own sake. It is a way to stop one model response from doing five jobs badly.</p>
+<p>The best relay runs are not long. They are structured:</p>
+<ul>
+<li>Propose locally.</li>
+<li>Critique globally.</li>
+<li>Reconcile explicitly.</li>
+<li>Execute narrowly.</li>
+<li>Verify against proof.</li>
+</ul>
+<p>That is how a codec decision became more than &quot;CBOR or bespoke.&quot; It became an architecture decision with a migration plan and a testable proof bar.</p>
+<h2 id="related-pattern">Related Pattern</h2>
+<p>Read the general pattern: <a href="/blog/model-relay-pattern/">The Model Relay Pattern</a>.</p>
+  </div>
+</article>
+  </main>
+  <footer class="site-footer">
+    <a href="/blog/">Index</a>
+    <span>Uldren Engineering</span>
+  </footer>
+</body>
+</html>

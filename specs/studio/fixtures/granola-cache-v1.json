@@ -1,0 +1,31 @@
+{
+  "cache": {
+    "state": {
+      "documents": {
+        "not_1": {
+          "id": "not_1",
+          "title": "Architecture review",
+          "ownerEmail": "alice@example.com",
+          "attendees": [
+            {
+              "email": "bob@example.com"
+            }
+          ],
+          "folderId": "fld_design",
+          "summary": "Discussed normalized meeting imports.",
+          "createdAt": 1000,
+          "updatedAt": 2000
+        }
+      },
+      "transcripts": {
+        "not_1": [
+          {
+            "speaker": "Alice",
+            "text": "Use the official loom meetings import command.",
+            "language": "en"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "source_scope": "drive://workspace/example",
+  "rows_imported": 6,
+  "folders": {
+    "root_count": 2,
+    "engineering_count": 3,
+    "sharepoint_count": 1
+  },
+  "files": {
+    "readme": "Drive README body",
+    "binary": "000102ff",
+    "sidecar": "Drive content loaded from a sidecar path.\n",
+    "shortcut": "Shortcut target: file-readme"
+  },
+  "unsupported_fields": [
+    "capabilities",
+    "comments",
+    "content_restrictions",
+    "created_time",
+    "download_url",
+    "drive_id",
+    "labels",
+    "last_modifying_user",
+    "link_share_metadata",
+    "list_item",
+    "md5_checksum",
+    "metadata",
+    "mime_type",
+    "modified_time",
+    "owners",
+    "parents",
+    "permissions",
+    "remote_item",
+    "retention_label",
+    "revisions",
+    "sha1_checksum",
+    "sha256_checksum",
+    "sharepoint_ids",
+    "shortcut_target",
+    "size",
+    "source_system",
+    "thumbnails",
+    "trashed",
+    "web_content_link",
+    "web_view_link"
+  ]
+}

@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat</title>
+  <style>
+    {{ loom.app_shell.css }}
+
+    main {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr) 320px;
+      min-height: 100vh;
+    }
+
+    aside,
+    section {
+      min-width: 0;
+      padding: 18px;
+    }
+
+    aside {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .right {
+      border-left: 1px solid var(--line);
+      border-right: 0;
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 20px;
+    }
+
+    h2 {
+      font-size: 16px;
+      margin-top: 18px;
+    }
+
+    h3 {
+      font-size: 14px;
+    }
+
+    .meta,
+    .empty,
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .list {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .channel,
+    .message,
+    .task,
+    .handoff,
+    .presence,
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 11px;
+    }
+
+    aside .channel {
+      background: var(--bg);
+    }
+
+    .message {
+      display: grid;
+      gap: 6px;
+    }
+
+    .message.redacted {
+      border-color: var(--danger);
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+    }
+
+    .key {
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .body {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0 9px;
+      background: var(--accent-soft);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin: 14px 0;
+    }
+
+    input {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--ink);
+      padding: 0 10px;
+      font: inherit;
+    }
+
+    input[type="text"] {
+      min-width: min(100%, 280px);
+      flex: 1;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 10px;
+      margin: 14px 0;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 22px;
+    }
+
+    @media (max-width: 980px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+
+      aside,
+      .right {
+        border: 0;
+        border-bottom: 1px solid var(--line);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <aside>
+      <h1 id="title">Chat</h1>
+      <div class="meta" id="subtitle"></div>
+      <h2>Channels</h2>
+      <div class="list" id="channels"></div>
+    </aside>
+    <section>
+      <div class="row">
+        <div>
+          <h1 id="channel-title">Channel</h1>
+          <div class="meta" id="channel-meta"></div>
+        </div>
+        <span class="pill" id="cursor"></span>
+      </div>
+      <div class="toolbar">
+        <input id="message" type="text" placeholder="Write a message">
+        <button type="button" id="post">Post</button>
+        <button type="button" id="presence">Set presence</button>
+        <span class="small" id="action-status"></span>
+      </div>
+      <div class="metrics" id="metrics"></div>
+      <h2>Messages</h2>
+      <div class="list" id="messages"></div>
+    </section>
+    <aside class="right">
+      <h2>Threads</h2>
+      <div class="list" id="threads"></div>
+      <h2>Tasks</h2>
+      <div class="list" id="tasks"></div>
+      <h2>Presence</h2>
+      <div class="list" id="presence-list"></div>
+      <h2>Handoffs</h2>
+      <div class="list" id="handoffs"></div>
+    </aside>
+  </main>
+  <script>
+    (() => {
+      const data = {{ loom.chat | tojson }};
+      const appId = data.definition?.app_id ?? "chat-channel";
+      const channels = Array.isArray(data.channels) ? data.channels : [];
+      const channel = data.channel ?? null;
+      const messages = Array.isArray(channel?.messages) ? channel.messages : [];
+      const threads = Array.isArray(channel?.threads) ? channel.threads : [];
+      const tasks = Array.isArray(channel?.tasks) ? channel.tasks : [];
+      const agentInvocations = Array.isArray(channel?.agent_invocations) ? channel.agent_invocations : [];
+      const handoffs = Array.isArray(channel?.handoffs) ? channel.handoffs : [];
+      const presence = Array.isArray(data.presence) ? data.presence : [];
+      const cursor = data.cursor ?? null;
+      const appUri = data.app_uri ?? data.definition?.resource_uri ?? "";
+      const selectedThread = data.selected_thread ?? null;
+
+      function textBody(body) {
+        if (body == null) return "";
+        if (typeof body === "string") return body;
+        if (Array.isArray(body)) {
+          return new TextDecoder().decode(new Uint8Array(body));
+        }
+        if (body?.String) return body.String;
+        return String(body);
+      }
+
+      function postHost(message) {
+        const host = window.parent;
+        if (!host || host === window) return;
+        try {
+          host.postMessage(Object.assign({ jsonrpc: "2.0" }, message), "*");
+        } catch (_) {
+        }
+      }
+
+      function renderEmpty(root, label) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = label;
+        root.append(empty);
+      }
+
+      document.getElementById("title").textContent = data.definition?.display_name ?? "Chat";
+      document.getElementById("subtitle").textContent = `${data.workspace?.name ?? data.profile_id ?? "workspace"} - ${appUri}`;
+      document.getElementById("channel-title").textContent = channel?.channel_id ?? "No channel selected";
+      document.getElementById("channel-meta").textContent = appId;
+      document.getElementById("cursor").textContent = cursor
+        ? `${cursor.unread_count} unread`
+        : "no cursor";
+
+      const channelRoot = document.getElementById("channels");
+      if (channels.length === 0) {
+        renderEmpty(channelRoot, "No channels");
+      } else {
+        for (const item of channels) {
+          const row = document.createElement("div");
+          row.className = "channel";
+          row.innerHTML = `<div class="key"></div><div class="small"></div>`;
+          row.querySelector(".key").textContent = `#${item.handle}`;
+          row.querySelector(".small").textContent = item.name || item.channel_id;
+          channelRoot.append(row);
+        }
+      }
+
+      const metrics = [
+        ["Messages", messages.length],
+        ["Threads", threads.length],
+        ["Tasks", tasks.length],
+        ["Handoffs", handoffs.length]
+      ];
+      const metricRoot = document.getElementById("metrics");
+      for (const [label, value] of metrics) {
+        const item = document.createElement("div");
+        item.className = "metric";
+        item.innerHTML = `<strong></strong><span></span>`;
+        item.querySelector("strong").textContent = String(value);
+        item.querySelector("span").textContent = label;
+        metricRoot.append(item);
+      }
+
+      const messagesRoot = document.getElementById("messages");
+      const visibleMessages = selectedThread
+        ? messages.filter(message => message.thread_id === selectedThread.thread_id || message.message_id === selectedThread.parent_message_id)
+        : messages;
+      if (visibleMessages.length === 0) {
+        renderEmpty(messagesRoot, "No messages");
+      } else {
+        for (const message of visibleMessages) {
+          const item = document.createElement("article");
+          item.className = "message" + (message.redacted ? " redacted" : "");
+          const reactions = Array.isArray(message.reactions) ? message.reactions : [];
+          item.innerHTML = `<div class="row"><span class="key"></span><span class="pill"></span></div><div class="body"></div><div class="small"></div>`;
+          item.querySelector(".key").textContent = message.message_id;
+          item.querySelector(".pill").textContent = message.thread_id ? `thread ${message.thread_id}` : "channel";
+          item.querySelector(".body").textContent = message.redacted ? "Message redacted" : textBody(message.body);
+          item.querySelector(".small").textContent = `${message.author_principal ?? "principal"} - reactions ${reactions.length}`;
+          messagesRoot.append(item);
+        }
+      }
+
+      const threadRoot = document.getElementById("threads");
+      if (threads.length === 0) {
+        renderEmpty(threadRoot, "No threads");
+      } else {
+        for (const thread of threads) {
+          const item = document.createElement("div");
+          item.className = "message";
+          item.innerHTML = `<div class="key"></div><div class="small"></div>`;
+          item.querySelector(".key").textContent = thread.thread_id;
+          item.querySelector(".small").textContent = `parent ${thread.parent_message_id}`;
+          threadRoot.append(item);
+        }
+      }
+
+      const taskRoot = document.getElementById("tasks");
+      if (tasks.length === 0) {
+        renderEmpty(taskRoot, "No tasks");
+      } else {
+        for (const task of tasks) {
+          const item = document.createElement("div");
+          item.className = "task";
+          item.innerHTML = `<div class="row"><span class="key"></span><span class="pill"></span></div><div class="small"></div>`;
+          item.querySelector(".key").textContent = task.title;
+          item.querySelector(".pill").textContent = task.state?.kind ?? "Open";
+          item.querySelector(".small").textContent = task.task_id;
+          taskRoot.append(item);
+        }
+      }
+
+      const presenceRoot = document.getElementById("presence-list");
+      if (presence.length === 0) {
+        renderEmpty(presenceRoot, "No presence");
+      } else {
+        for (const entry of presence) {
+          const item = document.createElement("div");
+          item.className = "presence";
+          item.textContent = `${entry.principal}: ${entry.status}`;
+          presenceRoot.append(item);
+        }
+      }
+
+      const handoffRoot = document.getElementById("handoffs");
+      if (handoffs.length === 0 && agentInvocations.length === 0) {
+        renderEmpty(handoffRoot, "No handoffs");
+      } else {
+        for (const handoff of handoffs) {
+          const item = document.createElement("div");
+          item.className = "handoff";
+          item.textContent = `${handoff.handoff_id}: ${handoff.reason ?? "handoff requested"}`;
+          handoffRoot.append(item);
+        }
+        for (const invocation of agentInvocations) {
+          const item = document.createElement("div");
+          item.className = "handoff";
+          item.textContent = `${invocation.invocation_id}: ${invocation.agent_principal}`;
+          handoffRoot.append(item);
+        }
+      }
+
+      const selectedChannel = channel?.channel_id ?? channels[0]?.channel_id ?? channels[0]?.handle ?? "";
+      const actionStatus = document.getElementById("action-status");
+      document.getElementById("post").disabled = !selectedChannel;
+      document.getElementById("presence").disabled = !selectedChannel;
+      document.getElementById("post").addEventListener("click", () => {
+        const input = document.getElementById("message");
+        const body = input.value.trim();
+        if (!body || !selectedChannel) return;
+        postHost({
+          id: "chat-post-" + Date.now(),
+          method: "tools/call",
+          params: {
+            name: "chat_post_message",
+            arguments: {
+              workspace: data.workspace?.name ?? data.profile_id,
+              channel_id: selectedChannel,
+              message_id: "msg-" + Date.now(),
+              body: Array.from(new TextEncoder().encode(body))
+            }
+          }
+        });
+        actionStatus.textContent = "Post requested";
+      });
+      document.getElementById("presence").addEventListener("click", () => {
+        if (!selectedChannel) return;
+        postHost({
+          id: "chat-presence-" + Date.now(),
+          method: "tools/call",
+          params: {
+            name: "chat_set_presence",
+            arguments: {
+              workspace: data.workspace?.name ?? data.profile_id,
+              channel_id: selectedChannel,
+              status: "active",
+              ttl_ms: 30000
+            }
+          }
+        });
+        actionStatus.textContent = "Presence requested";
+      });
+    })();
+  </script>
+</body>
+</html>

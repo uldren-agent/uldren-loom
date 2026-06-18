@@ -5,14 +5,53 @@ edition = "2024"
 license = "BUSL-1.1"
 name = "loom-wasm"
 publish = false
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 loom-core = { package = "uldren-loom-core", path = "../../crates/loom-core" }
+loom-codec = { package = "uldren-loom-codec", path = "../../crates/loom-codec" }
+loom-compute = { package = "uldren-loom-compute", path = "../../crates/loom-compute", features = ["guards", "sql-state-access"] }
+loom-chat = { package = "uldren-loom-chat", path = "../../crates/loom-chat" }
+loom-drive = { package = "uldren-loom-drive", path = "../../crates/loom-drive" }
+loom-interchange = { package = "uldren-loom-interchange", path = "../../crates/loom-interchange" }
+loom-interchange-io = { package = "uldren-loom-interchange-io", path = "../../crates/loom-interchange-io", default-features = false }
+loom-lanes = { package = "uldren-loom-lanes", path = "../../crates/loom-lanes" }
+loom-pages = { package = "uldren-loom-pages", path = "../../crates/loom-pages" }
+loom-result = { package = "uldren-loom-result", path = "../../crates/loom-result" }
+loom-sql = { package = "uldren-loom-sql", path = "../../crates/loom-sql" }
+loom-store = { package = "uldren-loom-store", path = "../../crates/loom-store" }
+loom-substrate = { package = "uldren-loom-substrate", path = "../../crates/loom-substrate", features = ["studio-surfaces"] }
+loom-tickets = { package = "uldren-loom-tickets", path = "../../crates/loom-tickets" }
+loom-wire = { package = "uldren-loom-wire", path = "../../crates/loom-wire" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 wasm-bindgen = "0.2"
+
+# Browser-only deps for the OPFS-backed SQL session.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+# rand 0.8 uses getrandom 0.2, which needs the "js" feature for wasm32-unknown-unknown.
+getrandom = { version = "0.2", features = ["js"] }
+web-sys = { version = "0.3", features = [
+    "WorkerGlobalScope",
+    "WorkerNavigator",
+    "StorageManager",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemGetFileOptions",
+    "FileSystemSyncAccessHandle",
+    "FileSystemReadWriteOptions",
+] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+
+[features]
+default = []
+fips = ["loom-core/fips"]
+# Opt-in remote Loom locators. Off by default, the browser binding is local-only over OPFS.
+remote = []

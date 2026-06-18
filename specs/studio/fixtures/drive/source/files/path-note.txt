@@ -1,0 +1,1 @@
+Drive content loaded from a sidecar path.

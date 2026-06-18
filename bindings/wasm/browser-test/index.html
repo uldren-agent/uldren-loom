@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Uldren Loom WASM browser runtime</title>
+<script type="module">
+  const worker = new Worker('./worker.js', { type: 'module' });
+  const finish = async (payload) => {
+    document.body.textContent = payload.ok ? 'PASS' : `FAIL: ${payload.error}`;
+    await fetch('/__loom_done__', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  };
+  worker.onmessage = (event) => finish(event.data);
+  worker.onerror = (event) => finish({ ok: false, error: event.message || 'worker error' });
+</script>

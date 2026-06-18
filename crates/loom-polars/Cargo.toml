@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+description = "Optional native Polars dataframe executor for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-polars"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_polars"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-dataframe.workspace = true
+loom-types.workspace = true
+polars.workspace = true

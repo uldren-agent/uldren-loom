@@ -1,0 +1,22 @@
+[package]
+authors.workspace = true
+description = "Native dynamic-library loading boundary for optional Uldren Loom runtimes."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-native"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_native"
+
+# This crate intentionally does NOT inherit the workspace `unsafe_code = forbid` lint because it is
+# the approved boundary for optional native dynamic-library loading. It restates the clippy config so
+# the rest of the workspace policy holds.
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+libloading.workspace = true
+loom-types.workspace = true

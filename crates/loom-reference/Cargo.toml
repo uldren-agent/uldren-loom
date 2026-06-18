@@ -1,0 +1,23 @@
+[package]
+authors.workspace = true
+description = "Reusable reference reconciliation persistence and scheduling for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-reference"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_reference"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-core.workspace = true
+loom-store.workspace = true
+loom-substrate.workspace = true
+serde.workspace = true
+hex.workspace = true
+sha2.workspace = true

@@ -1,0 +1,62 @@
+# Model Context Protocol host for Uldren Loom. A native tokio server over the `rmcp` SDK that projects
+# the engine as agent-facing MCP tools, resources, and prompts. Not a language binding and not
+# wasm-embedded; it is a host process. The default build is the transport-agnostic engine surface
+# (StoreAccess + facade); the `server` feature pulls `rmcp`/`tokio` for the wire host.
+# Licensed under BUSL-1.1 (see ../../LICENSE). (c) Uldren Technologies LLC.
+[package]
+name = "uldren-loom-mcp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Model Context Protocol host that projects an Uldren Loom as MCP tools, resources, and prompts."
+
+[dependencies]
+loom-core = { workspace = true }
+loom-codec = { workspace = true }
+loom-coordination = { workspace = true }
+loom-wire = { workspace = true }
+loom-store = { workspace = true }
+loom-substrate = { workspace = true, features = ["studio-lifecycle", "studio-meetings", "studio-pages", "studio-surfaces"] }
+loom-interchange.workspace = true
+loom-interchange-io.workspace = true
+loom-inference.workspace = true
+loom-lanes.workspace = true
+loom-lifecycle.workspace = true
+loom-reference.workspace = true
+loom-pages.workspace = true
+loom-tickets.workspace = true
+loom-templates = { workspace = true }
+loom-types.workspace = true
+hex = { workspace = true }
+getrandom.workspace = true
+# The SQL-facet direct readers (sql.read_table/index_scan/diff/blame) return Loom Canonical CBOR built
+# by loom-sql's result_cbor; the index-scan prefix is parsed by its lookup_cbor. Same crate the C ABI
+# uses for these. BUSL-1.1 (deny.toml-allowed for the uldren-loom-* crates).
+loom-sql = { workspace = true }
+# Wire host dependencies are confined to the `server` feature so the default workspace build stays
+# transport-agnostic.
+rmcp = { version = "1.4", default-features = false, features = ["server", "macros", "transport-io", "schemars", "elicitation"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "io-std", "macros", "sync", "time"], optional = true }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"], optional = true }
+# Streamable HTTP transport (owner mode): rmcp's tower `StreamableHttpService` hosted by axum. MIT.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
+# Serde is used for the small wire summary types (always) and the rmcp tool parameter structs (server).
+serde = { version = "1", features = ["derive"] }
+# Read facades and tool registration use serde_json for structured predicates and results.
+serde_json.workspace = true
+schemars = { version = "1", optional = true }
+
+[features]
+# Off by default: the engine surface (StoreAccess + facade) builds with no async runtime. Enable to
+# build the rmcp stdio host.
+default = []
+server = ["dep:rmcp", "dep:tokio", "dep:schemars"]
+integration-tests = ["server"]
+# Streamable HTTP transport (owner mode) on top of the stdio host.
+http = ["server", "dep:axum", "dep:tokio-util", "rmcp/transport-streamable-http-server", "tokio/net", "tokio/rt-multi-thread"]
+
+[lints]
+workspace = true

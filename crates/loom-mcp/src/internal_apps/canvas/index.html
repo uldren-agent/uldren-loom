@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Canvas</title>
+  <style>
+    {{ loom.app_shell.css }}
+
+    main {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto auto minmax(420px, 1fr);
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--line);
+      background: var(--bg);
+    }
+
+    form {
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 12px;
+    }
+
+    form strong {
+      font-size: 13px;
+    }
+
+    input {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--ink);
+      padding: 7px 9px;
+      font: inherit;
+    }
+
+    button {
+      min-height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--accent);
+      color: var(--accent-ink);
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .action-status {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 0 20px 12px;
+    }
+
+    .board {
+      position: relative;
+      min-height: 420px;
+      overflow: hidden;
+      background:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 40px 40px;
+    }
+
+    .tile {
+      position: absolute;
+      width: 170px;
+      min-height: 72px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: var(--panel);
+      box-shadow: 0 8px 22px rgba(0, 0, 0, 0.08);
+    }
+
+    .tile strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .tile span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .empty {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+    }
+
+    @media (max-width: 860px) {
+      .controls {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Canvas</h1>
+        <div class="meta" id="summary">Loading canvas</div>
+      </div>
+    </header>
+    <section class="controls" aria-label="Structure actions">
+      <form id="add-node">
+        <strong>Add node</strong>
+        <input name="node_id" placeholder="node id" required>
+        <input name="label" placeholder="label" required>
+        <input name="kind" placeholder="kind" value="topic" required>
+        <input name="entity_ref" placeholder="entity ref">
+        <button type="submit">Add</button>
+      </form>
+      <form id="move-node">
+        <strong>Move node</strong>
+        <input name="node_id" placeholder="node id" required>
+        <input name="parent_node_id" placeholder="parent node id">
+        <input name="label" placeholder="label override">
+        <button type="submit">Move</button>
+      </form>
+      <form id="link-node">
+        <strong>Link nodes</strong>
+        <input name="edge_id" placeholder="edge id" required>
+        <input name="src_node_id" placeholder="source node id" required>
+        <input name="dst_node_id" placeholder="destination node id" required>
+        <input name="label" placeholder="label" value="relates" required>
+        <button type="submit">Link</button>
+      </form>
+    </section>
+    <div class="action-status" id="action-status"></div>
+    <section class="board" id="board" aria-label="Canvas board">
+      <div class="empty" id="empty">No structure nodes.</div>
+    </section>
+  </main>
+  <script>
+    const data = {{ loom.pages | tojson }};
+    const structure = data.structure ?? { nodes: [], structure: {} };
+    const nodes = Array.isArray(structure.nodes) ? structure.nodes : [];
+    const workspace = data.workspace?.name ?? data.profile_id ?? "workspace";
+    const appUri = data.app_uri ?? data.definition?.resource_uri ?? "";
+    const board = document.getElementById("board");
+    document.getElementById("summary").textContent = structure.structure?.title ?? "Workspace canvas";
+    document.getElementById("empty").hidden = nodes.length > 0;
+    nodes.forEach((node, index) => {
+      const tile = document.createElement("div");
+      tile.className = "tile";
+      tile.style.left = `${40 + (index % 3) * 210}px`;
+      tile.style.top = `${36 + Math.floor(index / 3) * 120}px`;
+      const title = document.createElement("strong");
+      title.textContent = node.label ?? node.node_id;
+      const kind = document.createElement("span");
+      kind.textContent = node.entity_ref ?? node.kind ?? "node";
+      tile.append(title, kind);
+      board.append(tile);
+    });
+    const actionStatus = document.getElementById("action-status");
+
+    function postHost(message) {
+      const host = window.parent;
+      if (!host || host === window) return;
+      try {
+        host.postMessage(Object.assign({ jsonrpc: "2.0" }, message), "*");
+      } catch (_) {
+      }
+    }
+
+    let requestId = 0;
+    const pending = new Map();
+    function request(method, params) {
+      return new Promise((resolve, reject) => {
+        const id = "loom-pages-structure-req-" + (++requestId);
+        pending.set(id, { resolve, reject });
+        postHost({ id, method, params: params || {} });
+        setTimeout(() => {
+          if (pending.has(id)) {
+            pending.delete(id);
+            reject(new Error("timeout waiting for " + method));
+          }
+        }, 15000);
+      });
+    }
+
+    window.addEventListener("message", (event) => {
+      const payload = event && event.data;
+      if (!payload || payload.jsonrpc !== "2.0") return;
+      if (payload.id !== undefined && pending.has(payload.id)) {
+        const p = pending.get(payload.id);
+        pending.delete(payload.id);
+        if ("error" in payload) p.reject(payload.error);
+        else p.resolve(payload.result);
+      }
+    });
+
+    function clean(args) {
+      for (const key of Object.keys(args)) {
+        if (args[key] === "") delete args[key];
+      }
+      return args;
+    }
+
+    async function callStructureTool(tool, args) {
+      if (!structure.structure?.structure_id) throw new Error("no structure selected");
+      actionStatus.textContent = "Saving...";
+      await request("tools/call", {
+        name: "apps_call_tool",
+        arguments: {
+          app_uri: appUri,
+          tool,
+          arguments: clean(Object.assign({
+            workspace,
+            structure_id: structure.structure.structure_id,
+            expected_root: structure.structure.profile_root
+          }, args))
+        }
+      });
+      actionStatus.textContent = "Saved";
+      location.reload();
+    }
+
+    document.getElementById("add-node").addEventListener("submit", (event) => {
+      event.preventDefault();
+      callStructureTool("structures_add_node", Object.fromEntries(new FormData(event.currentTarget).entries()))
+        .catch((e) => { actionStatus.textContent = "Save failed: " + ((e && e.message) || e); });
+    });
+    document.getElementById("move-node").addEventListener("submit", (event) => {
+      event.preventDefault();
+      callStructureTool("structures_move_node", Object.fromEntries(new FormData(event.currentTarget).entries()))
+        .catch((e) => { actionStatus.textContent = "Save failed: " + ((e && e.message) || e); });
+    });
+    document.getElementById("link-node").addEventListener("submit", (event) => {
+      event.preventDefault();
+      callStructureTool("structures_link_node", Object.fromEntries(new FormData(event.currentTarget).entries()))
+        .catch((e) => { actionStatus.textContent = "Save failed: " + ((e && e.message) || e); });
+    });
+  </script>
+</body>
+</html>

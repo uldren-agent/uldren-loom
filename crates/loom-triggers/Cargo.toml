@@ -1,0 +1,23 @@
+[package]
+authors.workspace = true
+description = "Reusable trigger binding and fire-record contracts for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-triggers"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_triggers"
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+croner.workspace = true
+loom-codec.workspace = true
+loom-types.workspace = true
+loom-watch.workspace = true

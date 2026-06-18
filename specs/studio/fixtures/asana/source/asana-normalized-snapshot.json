@@ -1,0 +1,268 @@
+{
+  "source_scope": "asana://workspace/engineering",
+  "projects": [
+    {
+      "gid": "p-eng",
+      "key_prefix": "ENG",
+      "name": "Engineering Roadmap",
+      "archived": false,
+      "color": "light-blue",
+      "icon": "rocket",
+      "created_at": "2026-06-01T10:00:00Z",
+      "modified_at": "2026-07-11T18:25:00Z",
+      "start_on": "2026-07-01",
+      "due_on": "2026-09-30",
+      "default_view": "board",
+      "permalink_url": "https://app.asana.com/0/p-eng/list",
+      "workspace": {
+        "gid": "w-eng",
+        "resource_type": "workspace",
+        "name": "Engineering",
+        "email_domains": [
+          "example.com"
+        ],
+        "is_organization": true
+      },
+      "team": {
+        "gid": "team-platform",
+        "resource_type": "team",
+        "name": "Platform",
+        "visibility": "request_to_join"
+      },
+      "owner": {
+        "gid": "user-17",
+        "resource_type": "user",
+        "name": "Alice Rivera",
+        "email": "alice@example.com"
+      },
+      "members": [
+        {
+          "gid": "user-17",
+          "resource_type": "user",
+          "name": "Alice Rivera"
+        }
+      ],
+      "followers": [
+        {
+          "gid": "user-18",
+          "resource_type": "user",
+          "name": "Bob Chen"
+        }
+      ],
+      "current_status": {
+        "gid": "status-1",
+        "resource_type": "project_status",
+        "title": "On track",
+        "text": "Hosted import is on track.",
+        "color": "green",
+        "created_at": "2026-07-10T15:30:00Z"
+      },
+      "custom_field_settings": [
+        {
+          "gid": "cfs-1",
+          "resource_type": "custom_field_setting",
+          "is_important": true,
+          "custom_field": {
+            "gid": "cf-lane",
+            "resource_type": "custom_field",
+            "name": "Launch lane",
+            "resource_subtype": "enum",
+            "enum_options": [
+              {
+                "gid": "enum-enterprise",
+                "resource_type": "enum_option",
+                "name": "Enterprise",
+                "enabled": true,
+                "color": "green"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "gid": "t-100",
+      "project_gid": "p-eng",
+      "name": "Ship hosted import adapter",
+      "notes": "Normalize Asana task data into Loom tickets.",
+      "html_notes": "<body>Normalize <strong>Asana</strong> task data into Loom tickets.</body>",
+      "resource_subtype": "default_task",
+      "approval_status": "pending",
+      "assignee_status": "today",
+      "completed": false,
+      "created_at": "2026-07-01T09:15:00Z",
+      "created_by": {
+        "gid": "user-17",
+        "resource_type": "user",
+        "name": "Alice Rivera"
+      },
+      "modified_at": "2026-07-10T12:00:00Z",
+      "assigned_by": {
+        "gid": "user-18",
+        "resource_type": "user",
+        "name": "Bob Chen"
+      },
+      "assignee": {
+        "gid": "user-17",
+        "resource_type": "user",
+        "name": "Alice Rivera",
+        "email": "alice@example.com"
+      },
+      "assignee_section": {
+        "gid": "my-today",
+        "resource_type": "section",
+        "name": "Today"
+      },
+      "workspace": {
+        "gid": "w-eng",
+        "resource_type": "workspace",
+        "name": "Engineering"
+      },
+      "external": {
+        "gid": "ext-100",
+        "data": "source-system-id=100"
+      },
+      "due_on": "2026-07-31",
+      "due_at": "2026-07-31T18:00:00Z",
+      "start_on": "2026-07-01",
+      "start_at": "2026-07-01T09:00:00Z",
+      "actual_time_minutes": 95,
+      "liked": true,
+      "num_likes": 1,
+      "num_subtasks": 1,
+      "is_rendered_as_separator": false,
+      "tags": [
+        "customer-impact",
+        "p1"
+      ],
+      "custom_fields": {
+        "Estimated hours": 13.5,
+        "Launch lane": "Enterprise",
+        "Launch risks": [
+          "security-review",
+          "schema-review"
+        ],
+        "Formula score": {
+          "representation_type": "formula",
+          "value": "effort * risk"
+        },
+        "External owner": {
+          "gid": "user-17",
+          "name": "Alice Rivera"
+        }
+      },
+      "dependencies": [
+        {
+          "gid": "t-099",
+          "resource_type": "task"
+        }
+      ],
+      "dependents": [
+        {
+          "gid": "t-101",
+          "resource_type": "task"
+        }
+      ],
+      "memberships": [
+        {
+          "project": {
+            "gid": "p-eng",
+            "resource_type": "project",
+            "name": "Engineering Roadmap"
+          },
+          "section": {
+            "gid": "section-implementation",
+            "resource_type": "section",
+            "name": "Implementation"
+          }
+        }
+      ],
+      "followers": [
+        {
+          "gid": "user-18",
+          "resource_type": "user",
+          "name": "Bob Chen"
+        }
+      ],
+      "likes": [
+        {
+          "gid": "like-1",
+          "user": {
+            "gid": "user-18",
+            "resource_type": "user",
+            "name": "Bob Chen"
+          }
+        }
+      ],
+      "subtasks": [
+        {
+          "gid": "t-100-sub-1",
+          "name": "Write migration note"
+        }
+      ],
+      "stories": [
+        {
+          "gid": "story-1",
+          "type": "comment",
+          "text": "Looks good for the enterprise rollout."
+        },
+        {
+          "gid": "story-2",
+          "type": "system",
+          "resource_subtype": "marked_complete",
+          "created_at": "2026-07-10T12:00:00Z"
+        }
+      ],
+      "attachments": [
+        {
+          "gid": "att-1",
+          "name": "requirements.pdf",
+          "resource_subtype": "asana",
+          "created_at": "2026-07-02T08:00:00Z",
+          "download_url": "https://example.invalid/asana/requirements.pdf",
+          "permanent_url": "https://app.asana.com/0/p-eng/t-100/f",
+          "host": "asana",
+          "size": 2048,
+          "view_url": "https://app.asana.com/app/asana/-/get_asset?asset_id=att-1"
+        }
+      ],
+      "portfolios": [
+        {
+          "gid": "portfolio-1",
+          "name": "Customer Programs"
+        }
+      ],
+      "goals": [
+        {
+          "gid": "goal-1",
+          "name": "Reduce import friction"
+        }
+      ]
+    },
+    {
+      "gid": 101,
+      "project_id": "p-eng",
+      "name": "Approve cutover checklist",
+      "notes": "Approval task retained as a normal task until approval workflow lowering exists.",
+      "resource_subtype": "approval",
+      "approval_status": "approved",
+      "completed": true,
+      "completed_at": "2026-08-01T10:00:00Z",
+      "completed_by": {
+        "gid": "user-18",
+        "resource_type": "user",
+        "name": "Bob Chen"
+      },
+      "assignee": "Bob Chen",
+      "due_on": "2026-08-05",
+      "tags": [
+        "approval"
+      ],
+      "custom_fields": {
+        "Approval state": "approved"
+      }
+    }
+  ]
+}

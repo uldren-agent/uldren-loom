@@ -1,0 +1,19 @@
+[package]
+authors.workspace = true
+description = "Reusable import and export interchange contracts for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-interchange"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_interchange"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-codec.workspace = true
+loom-types.workspace = true

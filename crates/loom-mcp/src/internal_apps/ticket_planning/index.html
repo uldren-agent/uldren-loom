@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tickets</title>
+  <style>
+    {{ loom.app_shell.css }}
+
+    main {
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: flex-start;
+      margin-bottom: 16px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 22px;
+    }
+
+    h2 {
+      font-size: 16px;
+    }
+
+    h3 {
+      font-size: 14px;
+    }
+
+    .meta,
+    .empty,
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(280px, 0.8fr);
+      gap: 14px;
+      align-items: start;
+    }
+
+    .columns {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+    }
+
+    .panel,
+    .ticket,
+    .lane,
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .panel {
+      padding: 14px;
+    }
+
+    .ticket,
+    .lane,
+    .metric {
+      padding: 12px;
+    }
+
+    .list {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .ticket {
+      display: grid;
+      gap: 6px;
+    }
+
+    .ticket-title {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      justify-content: space-between;
+    }
+
+    .key {
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0 9px;
+      background: var(--accent-soft);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .fields {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 8px;
+    }
+
+    .field {
+      min-width: 0;
+    }
+
+    .field-label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .field-value {
+      overflow-wrap: anywhere;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    input,
+    select {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--ink);
+      padding: 0 10px;
+      font: inherit;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 24px;
+    }
+
+    .timeline {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .timeline-item {
+      border-left: 3px solid var(--accent);
+      padding-left: 10px;
+    }
+
+    @media (max-width: 820px) {
+      header,
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      header {
+        display: grid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1 id="title">Tickets</h1>
+        <div class="meta" id="subtitle"></div>
+      </div>
+      <div class="toolbar">
+        <select id="status">
+          <option value="backlog">backlog</option>
+          <option value="planned">planned</option>
+          <option value="ready">ready</option>
+          <option value="in_progress">in_progress</option>
+          <option value="blocked">blocked</option>
+          <option value="waiting_for_review">waiting_for_review</option>
+          <option value="feedback_available">feedback_available</option>
+          <option value="accepted">accepted</option>
+          <option value="rejected">rejected</option>
+          <option value="closed">closed</option>
+        </select>
+        <input id="assignee" type="text" placeholder="principal id">
+        <button type="button" id="apply">Update selected</button>
+        <span class="small" id="action-status"></span>
+      </div>
+    </header>
+    <section class="grid">
+      <section class="panel">
+        <div class="metrics" id="metrics"></div>
+        <div class="columns" id="columns"></div>
+      </section>
+      <aside class="panel">
+        <h2 id="selected-title">Selected ticket</h2>
+        <div class="list" id="selected"></div>
+        <h2>History</h2>
+        <div class="timeline" id="history"></div>
+        <h2>Lanes</h2>
+        <div class="list" id="lanes"></div>
+      </aside>
+    </section>
+  </main>
+  <script>
+    (() => {
+      const data = {{ loom.tickets | tojson }};
+      const appId = data.definition?.app_id ?? "tickets";
+      const tickets = Array.isArray(data.tickets) ? data.tickets : [];
+      const lanes = Array.isArray(data.lanes) ? data.lanes : [];
+      const history = Array.isArray(data.history) ? data.history : [];
+      const selected = data.ticket ?? tickets[0] ?? null;
+      const refs = data.refs ?? null;
+      const appUri = data.app_uri ?? data.definition?.resource_uri ?? "";
+
+      const title = document.getElementById("title");
+      const subtitle = document.getElementById("subtitle");
+      title.textContent = data.definition?.display_name ?? "Tickets";
+      subtitle.textContent = `${data.workspace?.name ?? data.profile_id ?? "workspace"} - ${appUri}`;
+
+      function field(ticket, name) {
+        const value = ticket?.fields?.[name];
+        if (value == null) return "";
+        if (typeof value === "string") return value;
+        if (typeof value === "number" || typeof value === "boolean") return String(value);
+        for (const key of ["String", "Text", "EnumOption", "Principal", "Number", "Timestamp"]) {
+          if (value[key] != null) return String(value[key]);
+        }
+        return JSON.stringify(value);
+      }
+
+      function summary(ticket) {
+        return field(ticket, "summary") || field(ticket, "title") || ticket.ticket_id;
+      }
+
+      function status(ticket) {
+        return field(ticket, "status_category") || field(ticket, "status") || "todo";
+      }
+
+      function assignee(ticket) {
+        return field(ticket, "assignee") || "unassigned";
+      }
+
+      function sprint(ticket) {
+        return field(ticket, "sprint") || field(ticket, "milestone") || "unscheduled";
+      }
+
+      function points(ticket) {
+        const raw = field(ticket, "story_points") || field(ticket, "points");
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) ? parsed : 0;
+      }
+
+      function due(ticket) {
+        return field(ticket, "due_date") || field(ticket, "target_date") || "no date";
+      }
+
+      function createTicketCard(ticket) {
+        const item = document.createElement("article");
+        item.className = "ticket";
+        item.dataset.ticketId = ticket.ticket_id;
+        item.innerHTML = "";
+        const head = document.createElement("div");
+        head.className = "ticket-title";
+        const key = document.createElement("span");
+        key.className = "key";
+        key.textContent = ticket.primary_key || ticket.ticket_id;
+        const state = document.createElement("span");
+        state.className = "pill";
+        state.textContent = status(ticket);
+        head.append(key, state);
+        const text = document.createElement("div");
+        text.textContent = summary(ticket);
+        const fields = document.createElement("div");
+        fields.className = "fields";
+        for (const [label, value] of [
+          ["Assignee", assignee(ticket)],
+          ["Sprint", sprint(ticket)],
+          ["Due", due(ticket)],
+          ["Points", String(points(ticket))]
+        ]) {
+          const cell = document.createElement("div");
+          cell.className = "field";
+          cell.innerHTML = `<div class="field-label"></div><div class="field-value"></div>`;
+          cell.querySelector(".field-label").textContent = label;
+          cell.querySelector(".field-value").textContent = value;
+          fields.append(cell);
+        }
+        item.append(head, text, fields);
+        return item;
+      }
+
+      function renderMetrics() {
+        const open = tickets.filter(ticket => !["done", "accepted"].includes(status(ticket))).length;
+        const pointTotal = tickets.reduce((total, ticket) => total + points(ticket), 0);
+        const metrics = [
+          ["Tickets", tickets.length],
+          ["Open", open],
+          ["Lanes", lanes.length],
+          ["Points", pointTotal]
+        ];
+        const root = document.getElementById("metrics");
+        for (const [label, value] of metrics) {
+          const item = document.createElement("div");
+          item.className = "metric";
+          item.innerHTML = `<strong></strong><span></span>`;
+          item.querySelector("strong").textContent = String(value);
+          item.querySelector("span").textContent = label;
+          root.append(item);
+        }
+      }
+
+      function groupKey(ticket) {
+        if (appId === "roadmap") return due(ticket);
+        if (appId === "sprint-planner") return sprint(ticket);
+        if (appId === "backlog-triage") return assignee(ticket) === "unassigned" ? "needs triage" : "assigned";
+        if (appId === "dashboards") return ticket.project_id || "project";
+        return status(ticket);
+      }
+
+      function renderColumns() {
+        const groups = new Map();
+        for (const ticket of tickets) {
+          const key = groupKey(ticket);
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(ticket);
+        }
+        const root = document.getElementById("columns");
+        if (groups.size === 0) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "No tickets";
+          root.append(empty);
+          return;
+        }
+        for (const [key, items] of [...groups.entries()].sort()) {
+          const column = document.createElement("section");
+          column.className = "panel";
+          const heading = document.createElement("h2");
+          heading.textContent = key;
+          const list = document.createElement("div");
+          list.className = "list";
+          for (const ticket of items) list.append(createTicketCard(ticket));
+          column.append(heading, list);
+          root.append(column);
+        }
+      }
+
+      function renderSelected() {
+        const root = document.getElementById("selected");
+        if (!selected) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "No ticket selected";
+          root.append(empty);
+          return;
+        }
+        document.getElementById("selected-title").textContent = selected.primary_key || selected.ticket_id;
+        document.getElementById("status").value = status(selected);
+        document.getElementById("assignee").value = assignee(selected) === "unassigned" ? "" : assignee(selected);
+        root.append(createTicketCard(selected));
+        const refCount = document.createElement("div");
+        refCount.className = "small";
+        const inbound = refs?.inbound?.length ?? 0;
+        const outbound = refs?.outbound?.length ?? 0;
+        refCount.textContent = `References: ${inbound} inbound, ${outbound} outbound`;
+        root.append(refCount);
+      }
+
+      function renderHistory() {
+        const root = document.getElementById("history");
+        if (history.length === 0) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "No history";
+          root.append(empty);
+          return;
+        }
+        for (const record of history.slice(-8).reverse()) {
+          const item = document.createElement("div");
+          item.className = "timeline-item";
+          item.textContent = `${record.sequence ?? ""} ${record.operation_kind ?? record.operation_id ?? "operation"}`;
+          root.append(item);
+        }
+      }
+
+      function renderLanes() {
+        const root = document.getElementById("lanes");
+        if (lanes.length === 0) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "No lanes";
+          root.append(empty);
+          return;
+        }
+        for (const lane of lanes) {
+          const item = document.createElement("div");
+          item.className = "lane";
+          item.textContent = `${lane.lane_key || lane.lane_id}: ${lane.lane_status} (${lane.lane_tickets?.length ?? 0})`;
+          root.append(item);
+        }
+      }
+
+      function postHost(message) {
+        const host = window.parent;
+        if (!host || host === window) return false;
+        try {
+          host.postMessage(Object.assign({ jsonrpc: "2.0" }, message), "*");
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+
+      let requestId = 0;
+      const pending = new Map();
+      function request(method, params) {
+        return new Promise((resolve, reject) => {
+          const id = "loom-tickets-req-" + (++requestId);
+          pending.set(id, { resolve, reject });
+          if (!postHost({ id, method, params: params || {} })) {
+            pending.delete(id);
+            reject(new Error("host bridge unavailable"));
+            return;
+          }
+          setTimeout(() => {
+            if (pending.has(id)) {
+              pending.delete(id);
+              reject(new Error("timeout waiting for " + method));
+            }
+          }, 15000);
+        });
+      }
+
+      window.addEventListener("message", (event) => {
+        const payload = event && event.data;
+        if (!payload || payload.jsonrpc !== "2.0") return;
+        if (payload.id !== undefined && pending.has(payload.id)) {
+          const p = pending.get(payload.id);
+          pending.delete(payload.id);
+          if ("error" in payload) p.reject(payload.error);
+          else p.resolve(payload.result);
+        }
+      });
+
+      document.getElementById("apply").disabled = !selected;
+      document.getElementById("apply").addEventListener("click", async () => {
+        if (!selected) return;
+        const apply = document.getElementById("apply");
+        const actionStatus = document.getElementById("action-status");
+        const params = {
+          workspace: data.workspace?.name ?? data.workspace?.id ?? data.profile_id,
+          ticket_id: selected.ticket_id,
+          target_status: document.getElementById("status").value,
+          observed_source_status: status(selected),
+          assignee: document.getElementById("assignee").value || null
+        };
+        apply.disabled = true;
+        actionStatus.textContent = "Updating...";
+        try {
+          await request("tools/call", {
+            name: "apps_call_tool",
+            arguments: {
+              app_uri: appUri,
+              tool: "tickets_update",
+              arguments: params
+            }
+          });
+          actionStatus.textContent = "Updated";
+        } catch (e) {
+          apply.disabled = false;
+          actionStatus.textContent = "Update failed: " + ((e && e.message) || e);
+        }
+      });
+
+      renderMetrics();
+      renderColumns();
+      renderSelected();
+      renderHistory();
+      renderLanes();
+    })();
+  </script>
+</body>
+</html>

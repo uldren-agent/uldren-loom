@@ -1,38 +1,162 @@
 # cargo-deny policy. Run with `just deny` / `cargo deny check`.
-# Every dependency must be permissively licensed (no copyleft); the project's own crates are
-# source-available (BUSL-1.1) and exempted below.
+# Dependencies must be permissively licensed; the project's own crates are source-available
+# (BUSL-1.1) and exempted below. MPL-2.0 is additionally allowed: it is file-level copyleft, safe to
+# link into a source-available product (only modifications to MPL files must be shared), and it
+# unblocks engines such as Cozo for the optional facet/AI-memory work.
 
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # bincode 1.3.3 is feature-complete and unmaintained by the maintainers' DELIBERATE choice (not a
+    # security vulnerability) - see RUSTSEC-2025-0141. It is pulled only transitively by hnsw_rs (the
+    # native ANN accelerator), and there is no safe upgrade. Revisit if hnsw_rs migrates off bincode.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 unmaintained-by-choice, transitive via hnsw_rs, no fix available" },
+    # paste 1.0.15 is unmaintained (not a security vulnerability) and is currently an unconditional
+    # transitive dependency of parquet 59.0.0 for the columnar Arrow/Parquet projection. parquet exposes
+    # no feature switch to remove it, and the local dependency set has no safe upgrade. Revisit on the
+    # next Arrow/Parquet bump or if the projection replaces the parquet crate.
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained, unconditional transitive via parquet 59.0.0, no feature-level removal or safe upgrade available" },
+    # rsa 0.9.10 Marvin timing side-channel (RUSTSEC-2023-0071). Upstream has NO safe upgrade ("No safe
+    # upgrade is available"); a constant-time rewrite is in progress. Reachable only through the hosted
+    # SAML/OIDC crypto stack (bergshamra/openidconnect -> rsa), never the compute/exec path, and the
+    # attack requires observing RSA private-key operation timing over the network. Accept per upstream
+    # guidance; drop this the moment a constant-time rsa releases.
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side-channel; no safe upgrade exists upstream; transitive only via the hosted SAML/OIDC stack" },
+]
 
 [licenses]
 confidence-threshold = 0.9
 unused-allowed-license = "allow"
 version = 2
 allow = [
+    "0BSD",
     "Apache-2.0 WITH LLVM-exception",
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
     "CC0-1.0",
     "ISC",
     "MIT-0",
     "MIT",
+    "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
 ]
 exceptions = [
     { name = "uldren-loom-cli", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-chat", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-client", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-codec", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-compute", allow = ["BUSL-1.1"] },
     { name = "uldren-loom-conformance", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-coordination", allow = ["BUSL-1.1"] },
     { name = "uldren-loom-core", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-columnar", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-dataframe", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-delivery", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-drive", allow = ["BUSL-1.1"] },
     { name = "uldren-loom-ffi", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-hnsw", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-hosted", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-hosted-core", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-hosted-pim", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-inference", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-interchange", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-interchange-io", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-lanes", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-lifecycle", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-locator", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-logs", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-mcp", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-metrics", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-native", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-pages", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-pim", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-polars", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-protocol-conformance", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-redis", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-remote-codegen", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-remote-client", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-remote-protocol", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-reference", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-result", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-rrule", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-sql", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-store", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-substrate", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-tantivy", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-templates", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-tickets", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-triggers", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-traces", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-types", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-vector", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-vfs", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-vfs-fuse", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-vfs-nfs", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-watch", allow = ["BUSL-1.1"] },
+    { name = "uldren-loom-wire", allow = ["BUSL-1.1"] },
+    # webpki-roots ships Mozilla CA root data under CDLA-Permissive-2.0 through hf-hub/reqwest/rustls.
+    # Keep the exception scoped to that data package instead of allowing CDLA globally.
+    { name = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [bans]
 allow-wildcard-paths = true
 multiple-versions = "warn"
 wildcards = "warn"
+skip = [
+    # rmcp 0.16 (MCP serving) -> rand 0.10 pulls chacha20 0.10, while our at-rest AEAD stack
+    # (chacha20poly1305 0.10.1, the latest) still pins chacha20 0.9. There is no chacha20poly1305 release
+    # on chacha20 0.10 yet, so the two coexist. Skip the rmcp-side 0.10 (the AEAD-side 0.9 stays the
+    # canonical entry); revisit when chacha20poly1305 bumps to chacha20 0.10.
+    { crate = "chacha20@0.10.1", reason = "rmcp->rand 0.10 pulls chacha20 0.10 while chacha20poly1305 0.10.1 pins chacha20 0.9; not dedupable from our side" },
+    # x509-parser 0.18 / asn1-rs / rusticata-macros (the rcgen TLS certificate stack reached from
+    # `loom-cli`) pin nom 7, while icalendar 0.17 (the calendar facet, via loom-core) uses nom 8. Neither
+    # upstream accepts the other's major, so skip the x509 side (nom 7); nom 8 stays the canonical entry.
+    # Revisit when x509-parser/asn1-rs move to nom 8.
+    { crate = "nom@7.1.3", reason = "x509-parser 0.18/asn1-rs pin nom 7 while icalendar 0.17 uses nom 8; not dedupable from our side" },
+    # ring 0.17 (via rcgen, TLS key/cert generation from loom-cli) pins windows-sys 0.52, while
+    # rpassword/rtoolbox (the CLI passphrase prompt) pins windows-sys 0.59. A Windows-only transitive
+    # duplicate; skip the ring side (0.52) so 0.59 stays canonical. Revisit on a ring/rcgen bump.
+    { crate = "windows-sys@0.52.0", reason = "ring 0.17 (via rcgen) pins windows-sys 0.52 while rpassword/rtoolbox pin 0.59; not dedupable from our side" },
+    # caden 0.7 pins x509-parser 0.16 and its older asn1-rs / der-parser / oid-registry stack, while
+    # the CLI and hosted TLS path use x509-parser 0.18. Keep the newer x509-parser stack canonical and
+    # revisit when caden accepts x509-parser 0.18 or is replaced.
+    { crate = "asn1-rs@0.6.2", reason = "caden 0.7 pins x509-parser 0.16 and the older asn1-rs stack while CLI/hosted TLS use x509-parser 0.18; not dedupable from our side" },
+    { crate = "asn1-rs-derive@0.5.1", reason = "caden 0.7 pins x509-parser 0.16 and the older asn1-rs derive stack while CLI/hosted TLS use x509-parser 0.18; not dedupable from our side" },
+    { crate = "der-parser@9.0.0", reason = "caden 0.7 pins x509-parser 0.16 and der-parser 9 while CLI/hosted TLS use x509-parser 0.18 and der-parser 10; not dedupable from our side" },
+    { crate = "oid-registry@0.7.1", reason = "caden 0.7 pins x509-parser 0.16 and oid-registry 0.7 while CLI/hosted TLS use x509-parser 0.18 and oid-registry 0.8; not dedupable from our side" },
+    { crate = "x509-parser@0.16.0", reason = "caden 0.7 pins x509-parser 0.16 while CLI/hosted TLS use x509-parser 0.18; not dedupable from our side" },
+    { crate = "itertools@0.10.5", reason = "openidconnect 4.0.1 pins itertools 0.10 while gluesql uses 0.12 and prost uses 0.14; not dedupable from our side" },
+    { crate = "itertools@0.14.0", reason = "prost 0.14 pins itertools 0.14 while gluesql uses 0.12 and openidconnect uses 0.10; not dedupable from our side" },
+    { crate = "ordered-float@2.10.1", reason = "openidconnect 4.0.1 -> serde-value pins ordered-float 2 while gluesql and tantivy use newer incompatible majors; not dedupable from our side" },
+    { crate = "ordered-float@5.3.0", reason = "tantivy-query-grammar 0.26 pins ordered-float 5 while gluesql and openidconnect use incompatible majors; not dedupable from our side" },
+    { crate = "yasna@0.5.2", reason = "bergshamra-pkcs12 pins yasna 0.5 while rcgen 0.14 pins yasna 0.6; not dedupable from our side" },
+    { crate = "core-foundation@0.9.4", reason = "hyper-util 0.1 reaches system-configuration 0.7 and core-foundation 0.9 while reqwest 0.13 and rustls-native-certs use core-foundation 0.10; not dedupable from our side" },
+    { crate = "untrusted@0.7.1", reason = "aws-lc-rs pins untrusted 0.7 while ring/rustls-webpki use untrusted 0.9; not dedupable from our side" },
+    # croner 3.0.1 reaches derive_builder 0.20, which pins darling 0.20, while rmcp and serde_with use
+    # darling 0.23. The older derive_builder side is pinned by upstream.
+    { crate = "darling@0.20.11", reason = "croner 3.0.1 -> derive_builder 0.20 pins darling 0.20 while rmcp/serde_with use darling 0.23; not dedupable from our side" },
+    { crate = "darling_core@0.20.11", reason = "croner 3.0.1 -> derive_builder 0.20 pins darling_core 0.20 while rmcp/serde_with use darling_core 0.23; not dedupable from our side" },
+    { crate = "darling_macro@0.20.11", reason = "croner 3.0.1 -> derive_builder 0.20 pins darling_macro 0.20 while rmcp/serde_with use darling_macro 0.23; not dedupable from our side" },
+    # toml 0.8, used by loom-locator, pins toml_edit 0.22, while fuser 0.17 reaches toml_edit 0.25
+    # through num_enum. The requirements are disjoint; revisit when either upstream converges.
+    { crate = "toml_edit@0.22.27", reason = "toml 0.8 pins toml_edit 0.22 while fuser 0.17 -> num_enum requires 0.25; incompatible upstream constraints" },
+]
+# gluesql-core 0.19 (the `sql` engine) and hnsw_rs 0.3 (the native ANN accelerator) each drag in their
+# own pinned dependency versions - old proc-macro crates (syn 1.x, derive_utils 0.11), the rand 0.8 vs
+# 0.9 trees, and multiple hashbrown / indexmap / getrandom / r-efi / thiserror - that cannot be
+# deduplicated from our side until those upstreams bump their deps. Skip their whole subtrees in the
+# multiple-versions check so the warnings clear while the check stays active for everything we control.
+# Revisit (and prune) on each gluesql / hnsw_rs upgrade.
+skip-tree = [
+    { crate = "gluesql-core", reason = "transitive dup versions (syn 1.x, thiserror 1.x, rand 0.8, indexmap 1.x, getrandom 0.2/0.4, heck 0.4) pinned by gluesql; not dedupable from our side" },
+    { crate = "hnsw_rs", reason = "transitive dup versions (rand 0.9 tree, hashbrown 0.15/0.17, indexmap 2.x, getrandom 0.3, r-efi) pinned by hnsw_rs; not dedupable from our side" },
+    { crate = "saml-rs", reason = "hosted SAML verification pins the newer bergshamra/kryptering RustCrypto stack while Loom's at-rest encryption pins the stable 0.10-era AEAD stack; not dedupable from our side" },
+]
 
 [sources]
 unknown-git = "deny"

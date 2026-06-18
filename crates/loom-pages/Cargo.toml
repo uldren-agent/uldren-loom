@@ -1,0 +1,24 @@
+[package]
+authors.workspace = true
+description = "Pages, spaces, and structures service model for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-pages"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_pages"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-core.workspace = true
+loom-reference.workspace = true
+loom-store.workspace = true
+loom-substrate = { workspace = true, features = ["studio-pages"] }
+loom-tickets.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true

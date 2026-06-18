@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+description = "Reusable watch contracts and observation helpers for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-watch"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_watch"
+
+[lints]
+workspace = true
+
+[dependencies]
+hex.workspace = true
+loom-codec.workspace = true
+loom-types.workspace = true

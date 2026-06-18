@@ -3,10 +3,58 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/loom-codec",
+    "crates/loom-types",
+    "crates/loom-inference",
+    "crates/loom-native",
+    "crates/loom-dataframe",
+    "crates/loom-coordination",
+    "crates/loom-redis",
+    "crates/loom-polars",
+    "crates/loom-columnar",
+    "crates/loom-vector",
+    "crates/loom-pim",
     "crates/loom-core",
+    "crates/loom-rrule",
+    "crates/loom-compute",
+    "crates/loom-templates",
+    "crates/loom-substrate",
+    "crates/loom-reference",
+    "crates/loom-tickets",
+    "crates/loom-lanes",
+    "crates/loom-chat",
+    "crates/loom-drive",
+    "crates/loom-pages",
+    "crates/loom-lifecycle",
+    "crates/loom-interchange",
+    "crates/loom-interchange-io",
     "crates/loom-cli",
     "crates/loom-ffi",
     "crates/loom-conformance",
+    "crates/loom-protocol-conformance",
+    "crates/loom-sql",
+    "crates/loom-hnsw",
+    "crates/loom-store",
+    "crates/loom-hosted-core",
+    "crates/loom-hosted-pim",
+    "crates/loom-hosted",
+    "crates/loom-delivery",
+    "crates/loom-watch",
+    "crates/loom-metrics",
+    "crates/loom-logs",
+    "crates/loom-traces",
+    "crates/loom-triggers",
+    "crates/loom-vfs",
+    "crates/loom-vfs-fuse",
+    "crates/loom-vfs-nfs",
+    "crates/loom-mcp",
+    "crates/loom-locator",
+    "crates/loom-remote-protocol",
+    "crates/loom-remote-codegen",
+    "crates/loom-client",
+    "crates/loom-remote-client",
+    "crates/loom-result",
+    "crates/loom-wire",
 ]
 # Language bindings build with their own toolchains (napi-rs, wasm-pack, Gradle/FFM, CMake), so
 # they are excluded from the default `cargo build --workspace`. See bindings/*/README.md.
@@ -14,7 +62,16 @@ exclude = [
     "bindings/cpp",
     "bindings/jvm",
     "bindings/node",
+    "bindings/python",
     "bindings/wasm",
+    # Manual FUSE mount smoke check; run by hand (see its Cargo.toml), never by the workspace gate.
+    "prototypes/loom-fuse-smoke",
+    # Throwaway prototype for the compression-frame decision; its own deps (zstd C
+    # build, lz4_flex, miniz_oxide), never the workspace gate.
+    "prototypes/loom-compress",
+    # Optional native full-text engine. Built directly with its own manifest so the default workspace
+    # gate does not link Tantivy.
+    "crates/loom-tantivy",
 ]
 
 [workspace.package]
@@ -24,20 +81,144 @@ edition = "2024"
 homepage = "https://uldren.com"
 license = "BUSL-1.1"
 repository = "https://github.com/uldrenai/uldren-loom"
-rust-version = "1.85"
-version = "0.0.1"
+rust-version = "1.89"
+version = "0.1.0-alpha.1"
 
 [workspace.dependencies]
 # Core engine deps (all permissive; enforced by deny.toml).
 blake3 = "1"
+# Encryption-at-rest crypto, all MIT OR Apache-2.0 (deny.toml-clean) and pure-Rust
+# / wasm32-capable, so the key layer lives in loom-core (wasm-clean). Suite-agile: XChaCha20-Poly1305 is
+# the default; AES-256-GCM is the NIST/FIPS-oriented profile and derives its CEK via HKDF-SHA-256 (no
+# BLAKE3 in its cryptographic path). `getrandom` is the native randomness source (loom-store/CLI only;
+# the key layer takes all randomness as input so it needs no RNG).
+aes-gcm = "0.10"
+anyhow = "1"
+argon2 = "0.5"
+arrow-array = { version = "59.0.0", default-features = false }
+arrow-ipc = { version = "59.0.0", default-features = false }
+arrow-schema = { version = "59.0.0", default-features = false }
+bytes = "1"
+candle-core = { version = "0.11", default-features = false }
+candle-nn = { version = "0.11", default-features = false }
+candle-transformers = { version = "0.11", default-features = false }
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
+croner = "3.0.1"
+getrandom = "0.4"
+hkdf = "0.12"
+# PBKDF2-HMAC-SHA-256: the FIPS-profile passphrase KDF. RustCrypto, MIT/Apache,
+# shares the cpufeatures 0.2 line with aes-gcm/sha2/polyval. The default profile keeps Argon2id; PBKDF2
+# is used only when the identity profile is FIPS.
+pbkdf2 = "0.12"
+p256 = { version = "0.13", features = ["ecdsa"] }
+ed25519-dalek = "2.2.0"
+sha2 = "0.10"
+sha1 = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
 clap = { version = "4", features = ["derive"] }
+# Interactive no-echo passphrase prompt for the CLI: the primary, secure way to acquire an
+# encryption passphrase (env vars are never a key source). MIT/Apache-2.0, deny.toml-clean.
+rpassword = "7"
 hex = "0.4"
-loom-core = { package = "uldren-loom-core", path = "crates/loom-core", version = "0.0.1" }
+flate2 = "1.1.9"
+regex = "1.12.4"
+genai = { version = "=0.7.0-beta.9", default-features = false, features = ["rustls-tls"] }
+hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
+kafka-protocol = { version = "0.17.0", default-features = false, features = ["broker", "client", "gzip", "lz4", "snappy", "zstd"] }
+libloading = "0.8"
+sysinfo = "0.39.5"
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
+unicode-normalization = "0.1"
+uuid = "1"
+toml = "0.8"
+futures-core = "0.3"
+loom-client = { package = "uldren-loom-client", path = "crates/loom-client", version = "0.1.0-alpha.1" }
+loom-codec = { package = "uldren-loom-codec", path = "crates/loom-codec", version = "0.1.0-alpha.1" }
+loom-compute = { package = "uldren-loom-compute", path = "crates/loom-compute", version = "0.1.0-alpha.1" }
+loom-core = { package = "uldren-loom-core", path = "crates/loom-core", version = "0.1.0-alpha.1" }
+loom-columnar = { package = "uldren-loom-columnar", path = "crates/loom-columnar", version = "0.1.0-alpha.1" }
+loom-coordination = { package = "uldren-loom-coordination", path = "crates/loom-coordination", version = "0.1.0-alpha.1" }
+loom-dataframe = { package = "uldren-loom-dataframe", path = "crates/loom-dataframe", version = "0.1.0-alpha.1" }
+loom-redis = { package = "uldren-loom-redis", path = "crates/loom-redis", version = "0.1.0-alpha.1" }
+loom-result = { package = "uldren-loom-result", path = "crates/loom-result", version = "0.1.0-alpha.1" }
+loom-remote-protocol = { package = "uldren-loom-remote-protocol", path = "crates/loom-remote-protocol", version = "0.1.0-alpha.1" }
+loom-remote-client = { package = "uldren-loom-remote-client", path = "crates/loom-remote-client", version = "0.1.0-alpha.1" }
+loom-pim = { package = "uldren-loom-pim", path = "crates/loom-pim", version = "0.1.0-alpha.1" }
+loom-polars = { package = "uldren-loom-polars", path = "crates/loom-polars", version = "0.1.0-alpha.1" }
+loom-types = { package = "uldren-loom-types", path = "crates/loom-types", version = "0.1.0-alpha.1" }
+loom-wire = { package = "uldren-loom-wire", path = "crates/loom-wire", version = "0.1.0-alpha.1" }
+loom-inference = { package = "uldren-loom-inference", path = "crates/loom-inference", version = "0.1.0-alpha.1" }
+loom-locator = { package = "uldren-loom-locator", path = "crates/loom-locator", version = "0.1.0-alpha.1" }
+loom-native = { package = "uldren-loom-native", path = "crates/loom-native", version = "0.1.0-alpha.1" }
+loom-vector = { package = "uldren-loom-vector", path = "crates/loom-vector", version = "0.1.0-alpha.1" }
+loom-delivery = { package = "uldren-loom-delivery", path = "crates/loom-delivery", version = "0.1.0-alpha.1" }
+loom-metrics = { package = "uldren-loom-metrics", path = "crates/loom-metrics", version = "0.1.0-alpha.1" }
+loom-logs = { package = "uldren-loom-logs", path = "crates/loom-logs", version = "0.1.0-alpha.1" }
+loom-traces = { package = "uldren-loom-traces", path = "crates/loom-traces", version = "0.1.0-alpha.1" }
+loom-rrule = { package = "uldren-loom-rrule", path = "crates/loom-rrule", version = "0.1.0-alpha.1" }
+loom-templates = { package = "uldren-loom-templates", path = "crates/loom-templates", version = "0.1.0-alpha.1" }
+loom-substrate = { package = "uldren-loom-substrate", path = "crates/loom-substrate", version = "0.1.0-alpha.1" }
+loom-reference = { package = "uldren-loom-reference", path = "crates/loom-reference", version = "0.1.0-alpha.1" }
+loom-tickets = { package = "uldren-loom-tickets", path = "crates/loom-tickets", version = "0.1.0-alpha.1" }
+loom-lanes = { package = "uldren-loom-lanes", path = "crates/loom-lanes", version = "0.1.0-alpha.1" }
+loom-chat = { package = "uldren-loom-chat", path = "crates/loom-chat", version = "0.1.0-alpha.1" }
+loom-drive = { package = "uldren-loom-drive", path = "crates/loom-drive", version = "0.1.0-alpha.1" }
+loom-pages = { package = "uldren-loom-pages", path = "crates/loom-pages", version = "0.1.0-alpha.1" }
+loom-lifecycle = { package = "uldren-loom-lifecycle", path = "crates/loom-lifecycle", version = "0.1.0-alpha.1" }
+loom-interchange = { package = "uldren-loom-interchange", path = "crates/loom-interchange", version = "0.1.0-alpha.1" }
+loom-interchange-io = { package = "uldren-loom-interchange-io", path = "crates/loom-interchange-io", version = "0.1.0-alpha.1" }
+loom-sql = { package = "uldren-loom-sql", path = "crates/loom-sql", version = "0.1.0-alpha.1" }
+loom-store = { package = "uldren-loom-store", path = "crates/loom-store", version = "0.1.0-alpha.1" }
+loom-mcp = { package = "uldren-loom-mcp", path = "crates/loom-mcp", version = "0.1.0-alpha.1" }
+loom-protocol-conformance = { package = "uldren-loom-protocol-conformance", path = "crates/loom-protocol-conformance", version = "0.1.0-alpha.1" }
+loom-hosted = { package = "uldren-loom-hosted", path = "crates/loom-hosted", version = "0.1.0-alpha.1" }
+loom-hosted-core = { package = "uldren-loom-hosted-core", path = "crates/loom-hosted-core", version = "0.1.0-alpha.1" }
+loom-hosted-pim = { package = "uldren-loom-hosted-pim", path = "crates/loom-hosted-pim", version = "0.1.0-alpha.1" }
+loom-watch = { package = "uldren-loom-watch", path = "crates/loom-watch", version = "0.1.0-alpha.1" }
+loom-triggers = { package = "uldren-loom-triggers", path = "crates/loom-triggers", version = "0.1.0-alpha.1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = { version = "0.4.46", default-features = false }
 thiserror = "2"
+# Lean civil-time math (proleptic Gregorian: Date/Time/PrimitiveDateTime/Duration/Weekday) for the
+# owned RRULE engine. default-features=false keeps it wasm-clean and pulls no
+# timezone database - offsets come from each resource's embedded VTIMEZONE, not chrono-tz. MIT/Apache.
+time = { version = "0.3", default-features = false }
+# Wire-format codecs for the communication facets. Structured records are canonical; these
+# parse/serialize the wire text on demand. Recurrence stays the owned
+# `loom-rrule` engine, so icalendar's `recurrence` feature (which pulls the `rrule` crate +
+# chrono-tz) is OFF, and `chrono-tz` is OFF (no +3 MiB timezone database; offsets come from each
+# resource's VTIMEZONE). Verified license-clean against deny.toml (all permissive MIT/Apache/etc.);
+# pinned versions verified 2026-06: icalendar 0.17.12, vcard4 0.7.3, mail-parser 0.11.4.
+# icalendar: typed RFC 5545 build + parse; `parser` only. Pulls chrono (clock, no tz) - already
+# in our lockfile via gluesql, so ~+48 KiB net. MIT/Apache.
+icalendar = { version = "0.17", default-features = false, features = ["parser"] }
+# vcard4: strict RFC 6350 vCard 4.0 parse + build. MIT/Apache.
+vcard4 = "0.7"
+# mail-parser: RFC 5322 / MIME parse (index only; no SMTP, we store the raw body in CAS). Lean
+# default (no encoding_rs); this profile does not decode non-UTF-8 charsets.
+# Apache/MIT.
+mail-parser = "0.11"
+# WASM execution engine for the compute facet: pure-Rust interpreter, wasm32-capable, with
+# built-in fuel metering (MIT/Apache). The default and only engine in the workspace; Wasmtime stays a
+# prototype-only native fast-path (it cannot target wasm32). The 1.x line drops the unmaintained
+# `paste` proc-macro that 0.31 pulled in (RUSTSEC-2024-0436).
+wasmi = "1"
+# Loom Templates wraps MiniJinja behind a stable Loom API. AST extraction uses MiniJinja's internal
+# parser, but that instability is confined to `crates/loom-templates`.
+minijinja = { version = "2.21.0", default-features = false, features = ["builtins", "json", "macros", "multi_template", "std_collections", "serde", "unstable_machinery"] }
+ollama-rs = { version = "0.3.5", default-features = false, features = ["rustls"] }
+parquet = { version = "59.0.0", default-features = false, features = ["arrow"] }
+polars = { version = "0.54.4", default-features = false, features = ["rows"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "io-std", "net", "time", "sync"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+zstd = "0.13.3"
 
 # Pin lints once, share across crates.
 [workspace.lints.rust]
-unsafe_code = "forbid" # overridden to "allow" in loom-ffi (the only crate that needs FFI)
+unsafe_code = "forbid" # overridden to "allow" in loom-ffi and loom-native
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

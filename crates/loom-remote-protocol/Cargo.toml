@@ -1,0 +1,21 @@
+[package]
+authors.workspace = true
+description = "Loom Remote Protocol envelopes and stable error mapping for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-remote-protocol"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_remote_protocol"
+
+[lints]
+workspace = true
+
+[dependencies]
+futures-core = { workspace = true }
+loom-codec = { workspace = true }
+loom-types = { workspace = true }
+thiserror = { workspace = true }

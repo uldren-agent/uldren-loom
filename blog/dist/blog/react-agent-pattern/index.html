@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The ReAct Agent Pattern | Uldren Engineering Blog</title>
+  <meta name="description" content="An intro to ReAct, the reason-act-observe pattern behind many tool-using agents.">
+  <link rel="canonical" href="/blog/react-agent-pattern/">
+  <link rel="stylesheet" href="/blog/assets/blog.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script defer src="/blog/assets/blog.js"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "neutral",
+      securityLevel: "strict",
+      flowchart: {
+        htmlLabels: true,
+        wrappingWidth: 180,
+      },
+    });
+  </script>
+</head>
+<body class="post">
+  <header class="site-bar">
+    <a class="site-mark" href="/blog/">Uldren</a>
+    <nav aria-label="Primary">
+      <a href="/blog/">Blog</a>
+      <a href="/">Home</a>
+    </nav>
+  </header>
+  <main>
+<article class="markdown-page">
+  <header class="article-head">
+    <h1>The ReAct Agent Pattern</h1>
+    <div class="article-meta">
+      <time datetime="2026-06-17">June 17, 2026</time>
+      <span>Uldren</span>
+    </div>
+    <p>An intro to ReAct, the reason-act-observe pattern behind many tool-using agents.</p>
+  </header>
+  <div class="markdown-body">
+<p>ReAct is the inner loop that lets a model use evidence instead of only prediction.</p>
+<p>The simplest useful agent loop is explicit.</p>
+<p>The model thinks about what to do next. It takes an action. It observes what happened. Then it repeats.</p>
+<p>That is the practical reading of ReAct:</p>
+<pre class="mermaid">flowchart TD
+  A[&quot;`**Reason**`&quot;] --&gt; B[&quot;`**Act**`&quot;]
+  B --&gt; C[&quot;`**Observe**`&quot;]
+  C --&gt; A</pre>
+<p>The original paper, <a href="https://arxiv.org/abs/2210.03629">ReAct: Synergizing Reasoning and Acting in Language Models</a>, introduced the pattern as a way to interleave reasoning traces with task-specific actions. The project page describes the core question plainly: what happens if reasoning and acting are combined instead of treated as separate capabilities?</p>
+<h2 id="what-react-is-trying-to-fix">What ReAct Is Trying To Fix</h2>
+<p>Before ReAct, two common shapes were easy to find.</p>
+<p>One shape was reasoning without tools. The model would produce a chain of reasoning and answer from its internal knowledge. That can work, but it is not grounded in the environment. If the model needs fresh information, a file, an API result, or a test output, internal reasoning is not enough.</p>
+<p>The other shape was acting without enough reasoning. The model could call tools or choose actions, but it might not maintain a useful plan, recover from mistakes, or explain why the next action made sense.</p>
+<p>ReAct joins those together.</p>
+<p>The model can reason in language, take an action, receive an observation from the environment, and use that observation to update the next step.</p>
+<h2 id="the-basic-loop">The Basic Loop</h2>
+<p>A ReAct-style agent usually has three visible beats.</p>
+<h3 id="reason">Reason</h3>
+<p>The agent decides what it knows, what it needs, and what it should try next.</p>
+<p>In a coding task, that might mean:</p>
+<ul>
+<li>Identify which test is failing</li>
+<li>Decide which file is likely relevant</li>
+<li>Notice that the last error changed</li>
+<li>Adjust the plan after a failed command</li>
+</ul>
+<h3 id="act">Act</h3>
+<p>The agent does something through a tool.</p>
+<p>Examples:</p>
+<ul>
+<li>Search a codebase</li>
+<li>Read a file</li>
+<li>Edit a file</li>
+<li>Run a test</li>
+<li>Query a database</li>
+<li>Search documentation</li>
+</ul>
+<h3 id="observe">Observe</h3>
+<p>The environment returns evidence.</p>
+<p>Examples:</p>
+<ul>
+<li>Test output</li>
+<li>Compiler errors</li>
+<li>Search results</li>
+<li>File contents</li>
+<li>HTTP response</li>
+<li>Screenshot</li>
+</ul>
+<p>The observation is what makes the loop more than a monologue. The model is no longer just predicting a plausible answer. It is reacting to what happened.</p>
+<h2 id="why-the-observation-matters">Why The Observation Matters</h2>
+<p>The Observe step is the part beginners often underweight.</p>
+<p>Without observation, a model can sound finished without being finished. With observation, the agent can be forced to confront the result of its action.</p>
+<p>In software, this is the difference between:</p>
+<pre><code class="language-text">I changed the code and it should work.</code></pre>
+<p>and:</p>
+<pre><code class="language-text">I changed the code, ran the test, saw this failure, adjusted the fix, and ran it again.</code></pre>
+<p>That second shape is why ReAct became foundational for coding agents.</p>
+<h2 id="react-is-not-a-whole-product-architecture">ReAct Is Not A Whole Product Architecture</h2>
+<p>ReAct is a pattern for a single agent&#39;s behavior inside a task. It does not answer every system design question.</p>
+<p>It does not decide:</p>
+<ul>
+<li>Which model should handle which role</li>
+<li>When a human should approve a step</li>
+<li>How to persist the task state</li>
+<li>How to compare two agents&#39; proposals</li>
+<li>How to verify that a final output satisfies a plan</li>
+</ul>
+<p>Those questions live at higher layers.</p>
+<p>In the <a href="/blog/model-relay-pattern/">Model Relay Pattern</a>, ReAct can sit inside any phase. The Executor might use ReAct to edit files and run tests. The Critic might use ReAct to inspect a repository. The Verifier might use ReAct to gather evidence.</p>
+<p>But Model Relay is about passing work through roles. ReAct is about how one role can reason, act, and observe.</p>
+<h2 id="a-small-example">A Small Example</h2>
+<p>Prompt:</p>
+<pre><code class="language-text">Fix the failing test. You may read files and run the test command. Stop after five attempts if it still fails.</code></pre>
+<p>A ReAct-style trajectory might look like:</p>
+<pre><code class="language-text">Reason: I need to see which test fails.
+Act: run tests
+Observe: one assertion fails in parser_test.
+
+Reason: The failure points to whitespace handling. I should inspect the parser.
+Act: read parser source
+Observe: trim is applied before tokenization.
+
+Reason: The test expects trailing whitespace to be preserved in one mode. I should inspect the mode flag.
+Act: edit parser
+Observe: file changed.
+
+Reason: I need to verify.
+Act: run parser tests
+Observe: parser tests pass.</code></pre>
+<p>The important part is not the labels. The important part is that action changes the environment, observation reports back, and the next step is based on evidence.</p>
+<h2 id="failure-modes">Failure Modes</h2>
+<p>ReAct can still fail.</p>
+<p>It can loop on the same bad idea. It can call tools without reading the output carefully. It can produce a plausible explanation for a command it did not actually run. It can overfit to a visible test while missing the real requirement.</p>
+<p>That is why ReAct needs guardrails:</p>
+<ul>
+<li>A clear goal</li>
+<li>Tool permissions</li>
+<li>A maximum number of turns</li>
+<li>A real stopping condition</li>
+<li>Logs of actions and observations</li>
+<li>Verification outside the agent when stakes are high</li>
+</ul>
+<h2 id="canonical-sources">Canonical Sources</h2>
+<p>Start with the original sources:</p>
+<ul>
+<li><a href="https://arxiv.org/abs/2210.03629">ReAct paper on arXiv</a></li>
+<li><a href="https://react-lm.github.io/">ReAct project page</a></li>
+<li><a href="https://research.google/blog/react-synergizing-reasoning-and-acting-in-language-models/">Google Research blog post</a></li>
+</ul>
+<p>The paper frames ReAct as an interleaving of reasoning traces and actions. The Google Research post gives a readable overview and examples. The project page links the paper, code, and examples.</p>
+<h2 id="the-useful-mental-model">The Useful Mental Model</h2>
+<p>ReAct is the inner loop.</p>
+<p>It is what lets a single model operate against a real environment instead of answering from prior context alone.</p>
+<p>When people say an agent &quot;uses tools,&quot; ReAct is often the shape underneath. When people say an agent &quot;keeps working until the tests pass,&quot; ReAct is one of the mechanisms that makes that possible.</p>
+<p>But ReAct is not the whole stack. It is the small loop inside larger patterns like Model Relay and loop engineering.</p>
+  </div>
+</article>
+  </main>
+  <footer class="site-footer">
+    <a href="/blog/">Index</a>
+    <span>Uldren Engineering</span>
+  </footer>
+</body>
+</html>

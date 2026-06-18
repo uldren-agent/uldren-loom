@@ -1,0 +1,191 @@
+{
+  "source_scope": "drive://workspace/example",
+  "folders": [
+    {
+      "id": "folder-eng",
+      "parent_id": "root",
+      "parents": [
+        "root",
+        "legacy-parent"
+      ],
+      "name": "Engineering",
+      "source_system": "google-drive",
+      "mime_type": "application/vnd.google-apps.folder",
+      "drive_id": "shared-drive-1",
+      "created_time": "2024-03-01T10:00:00Z",
+      "modified_time": "2024-03-02T11:00:00Z",
+      "trashed": false,
+      "web_view_link": "https://drive.google.com/drive/folders/folder-eng",
+      "permissions": [
+        {
+          "id": "perm-folder-1",
+          "type": "user",
+          "role": "writer",
+          "emailAddress": "alice@example.com"
+        }
+      ],
+      "comments": [
+        {
+          "id": "folder-comment-1",
+          "content": "Folder-level note"
+        }
+      ],
+      "metadata": {
+        "google": {
+          "capabilities": {
+            "canShare": true
+          }
+        }
+      }
+    },
+    {
+      "id": "folder-sp",
+      "parent_id": "root",
+      "name": "SharePoint Library",
+      "source_system": "sharepoint",
+      "mime_type": "folder",
+      "drive_id": "sp-drive-1",
+      "created_time": "2024-04-01T10:00:00Z",
+      "modified_time": "2024-04-02T11:00:00Z",
+      "sharepoint_ids": {
+        "siteId": "site-1",
+        "webId": "web-1",
+        "listId": "list-1",
+        "listItemId": "101"
+      },
+      "retention_label": {
+        "name": "Records"
+      }
+    }
+  ],
+  "files": [
+    {
+      "id": "file-readme",
+      "parent_id": "folder-eng",
+      "parents": [
+        "folder-eng",
+        "legacy-parent"
+      ],
+      "name": "README.md",
+      "source_system": "google-drive",
+      "mime_type": "text/markdown",
+      "drive_id": "shared-drive-1",
+      "created_time": "2024-03-01T12:00:00Z",
+      "modified_time": "2024-03-02T12:30:00Z",
+      "trashed": false,
+      "text": "Drive README body",
+      "web_view_link": "https://drive.google.com/file/d/file-readme/view",
+      "web_content_link": "https://drive.google.com/uc?id=file-readme",
+      "size": "17",
+      "md5_checksum": "00000000000000000000000000000000",
+      "sha1_checksum": "1111111111111111111111111111111111111111",
+      "sha256_checksum": "2222222222222222222222222222222222222222222222222222222222222222",
+      "owners": [
+        {
+          "displayName": "Alice Rivera",
+          "emailAddress": "alice@example.com"
+        }
+      ],
+      "last_modifying_user": {
+        "displayName": "Bob Chen",
+        "emailAddress": "bob@example.com"
+      },
+      "labels": [
+        {
+          "id": "label-sensitive",
+          "name": "Sensitive"
+        }
+      ],
+      "capabilities": {
+        "canEdit": true,
+        "canShare": true
+      },
+      "content_restrictions": [
+        {
+          "readOnly": true,
+          "reason": "Approved"
+        }
+      ],
+      "link_share_metadata": {
+        "securityUpdateEligible": true,
+        "securityUpdateEnabled": true
+      },
+      "permissions": [
+        {
+          "id": "perm-file-1",
+          "type": "user",
+          "role": "reader",
+          "emailAddress": "bob@example.com"
+        }
+      ],
+      "comments": [
+        {
+          "id": "comment-1",
+          "content": "Review this",
+          "resolved": false
+        }
+      ],
+      "revisions": [
+        {
+          "id": "1",
+          "modifiedTime": "2024-03-01T12:00:00Z"
+        }
+      ],
+      "metadata": {
+        "exportLinks": {
+          "text/markdown": "https://example.com/export/readme.md"
+        }
+      }
+    },
+    {
+      "id": "file-binary",
+      "parent_id": "folder-eng",
+      "name": "binary.bin",
+      "source_system": "google-drive",
+      "mime_type": "application/octet-stream",
+      "content_hex": "000102ff",
+      "download_url": "https://example.com/download/binary.bin",
+      "thumbnails": [
+        {
+          "small": {
+            "url": "https://example.com/thumb"
+          }
+        }
+      ]
+    },
+    {
+      "id": "file-sidecar",
+      "parent_id": "folder-sp",
+      "name": "path-note.txt",
+      "source_system": "sharepoint",
+      "mime_type": "text/plain",
+      "content_path": "files/path-note.txt",
+      "sharepoint_ids": {
+        "siteId": "site-1",
+        "webId": "web-1",
+        "listId": "list-1",
+        "listItemId": "102"
+      },
+      "retention_label": {
+        "name": "Records"
+      },
+      "list_item": {
+        "fields": {
+          "Department": "Engineering"
+        }
+      }
+    },
+    {
+      "id": "file-shortcut",
+      "parent_id": "folder-eng",
+      "name": "Shortcut to README",
+      "source_system": "google-drive",
+      "mime_type": "application/vnd.google-apps.shortcut",
+      "text": "Shortcut target: file-readme",
+      "shortcut_target": "file-readme",
+      "remote_item": {
+        "id": "file-readme"
+      }
+    }
+  ]
+}

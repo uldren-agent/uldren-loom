@@ -1,0 +1,28 @@
+# THROWAWAY: keeper slice (events & triggers). A host-side driver that fires a stored program
+# on a cron schedule, passing the firing instant as a seeded input, deterministically and idempotently.
+# Detached from the parent workspace via the empty [workspace] table so it builds on its own and never
+# affects `just ci`. Safe to delete.
+[workspace]
+
+[package]
+name = "keeper-prototype"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "keeper"
+path = "src/main.rs"
+
+[dependencies]
+# croner is the selected cron dialect; chrono backs its time math.
+croner = "*"
+chrono = "*"
+# blake3 stands in for a Loom Digest; the real engine uses the same hash.
+blake3 = "*"
+hex = "*"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

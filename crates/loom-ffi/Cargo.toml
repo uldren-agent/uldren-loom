@@ -18,5 +18,34 @@ name = "uldren_loom"
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 
+[features]
+default = []
+fips = ["loom-core/fips"]
+integration-tests = []
+remote = []
+
 [dependencies]
 loom-core.workspace = true
+loom-compute = { workspace = true, features = ["guards", "sql-state-access"] }
+loom-codec.workspace = true
+loom-chat.workspace = true
+loom-drive.workspace = true
+loom-interchange.workspace = true
+loom-interchange-io.workspace = true
+loom-lanes.workspace = true
+loom-pages.workspace = true
+loom-result.workspace = true
+loom-sql.workspace = true
+loom-substrate = { workspace = true, features = ["studio-surfaces"] }
+loom-store.workspace = true
+loom-tickets.workspace = true
+loom-types.workspace = true
+loom-wire.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+libloading.workspace = true
+wat = "1.253"

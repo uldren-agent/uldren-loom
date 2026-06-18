@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loop Engineering | Uldren Engineering Blog</title>
+  <meta name="description" content="An intro to loop engineering as the design of recurring agent workflows with goals, checks, memory, and human gates.">
+  <link rel="canonical" href="/blog/loop-engineering/">
+  <link rel="stylesheet" href="/blog/assets/blog.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script defer src="/blog/assets/blog.js"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "neutral",
+      securityLevel: "strict",
+      flowchart: {
+        htmlLabels: true,
+        wrappingWidth: 180,
+      },
+    });
+  </script>
+</head>
+<body class="post">
+  <header class="site-bar">
+    <a class="site-mark" href="/blog/">Uldren</a>
+    <nav aria-label="Primary">
+      <a href="/blog/">Blog</a>
+      <a href="/">Home</a>
+    </nav>
+  </header>
+  <main>
+<article class="markdown-page">
+  <header class="article-head">
+    <h1>Loop Engineering</h1>
+    <div class="article-meta">
+      <time datetime="2026-06-18">June 18, 2026</time>
+      <span>Uldren</span>
+    </div>
+    <p>An intro to loop engineering as the design of recurring agent workflows with goals, checks, memory, and human gates.</p>
+  </header>
+  <div class="markdown-body">
+<p>Prompting asks once. Loop engineering designs the system that keeps working, checking, and stopping.</p>
+<p>Prompting is what you do when you want one answer.</p>
+<p>Loop engineering is what you do when you want a system to keep working until a condition is met.</p>
+<p>That distinction sounds small until you use coding agents for real work. A prompt gives the model a task. A loop gives the model a task, tools, feedback, memory, stopping rules, and a way to try again.</p>
+<p>In the simplest version:</p>
+<pre class="mermaid">flowchart TD
+  A[&quot;`**Goal**`&quot;] --&gt; B[&quot;`Agent **acts**`&quot;]
+  B --&gt; C[&quot;`Environment **responds**`&quot;]
+  C --&gt; D[&quot;`Agent **adjusts**`&quot;]
+  D --&gt; E{&quot;`**Done check**`&quot;}
+  E --&gt;|Repeat| B
+  E --&gt;|Stop| F[&quot;`**Stop**`&quot;]</pre>
+<h2 id="why-people-are-talking-about-loops">Why People Are Talking About Loops</h2>
+<p>The recent conversation around loop engineering is partly a naming catch-up.</p>
+<p>Agents have always had loops somewhere inside them. A model calls a tool, sees the result, and decides what to do next. What changed is that people are now designing the loops directly instead of only writing better prompts.</p>
+<p>Addy Osmani describes loop engineering as replacing yourself as the person who keeps prompting the agent. Instead of typing every next instruction, you design the system that finds work, hands it out, checks it, records state, and decides what comes next.</p>
+<p>LangChain frames the stack as multiple loops:</p>
+<ul>
+<li>The basic agent loop</li>
+<li>A verification loop</li>
+<li>An event-driven loop</li>
+<li>A hill-climbing loop that improves the harness from traces</li>
+</ul>
+<p>MindStudio explains the beginner version: a loop is a repeating cycle where the model acts, observes the result, and uses that feedback to decide the next move until a termination condition is met.</p>
+<p>These are not competing definitions. They are different zoom levels.</p>
+<h2 id="the-core-loop">The Core Loop</h2>
+<p>At the center is the same shape as the ReAct agent pattern:</p>
+<pre class="mermaid">flowchart TD
+  A[&quot;`**Reason**`&quot;] --&gt; B[&quot;`**Act**`&quot;]
+  B --&gt; C[&quot;`**Observe**`&quot;]
+  C --&gt; A</pre>
+<p>The agent reasons about the next step, acts through a tool, observes the result, and uses that observation to continue.</p>
+<p>For coding agents, the loop often looks like:</p>
+<pre><code class="language-text">read files -&gt; edit code -&gt; run tests -&gt; inspect failure -&gt; revise -&gt; run tests again</code></pre>
+<p>This is why loop engineering matters more for coding than for many one-shot tasks. Software already has feedback surfaces: tests, type checks, lint, screenshots, logs, benchmarks, and review comments. A useful agent can use those surfaces as observations.</p>
+<p>Read the companion intro: <a href="/blog/react-agent-pattern/">The ReAct Agent Pattern</a>.</p>
+<h2 id="what-makes-a-loop-engineered">What Makes A Loop Engineered</h2>
+<p>A loop is not engineered just because it repeats.</p>
+<p>A good loop has a few explicit parts.</p>
+<h3 id="a-goal">A Goal</h3>
+<p>The loop needs to know what it is trying to accomplish.</p>
+<p>Bad:</p>
+<pre><code class="language-text">Improve the app.</code></pre>
+<p>Better:</p>
+<pre><code class="language-text">Make the checkout flow pass the existing browser test and do not change the payment API.</code></pre>
+<h3 id="a-done-check">A Done Check</h3>
+<p>The loop needs a stopping condition.</p>
+<p>Examples:</p>
+<ul>
+<li>Unit tests pass</li>
+<li>Generated report has all required sections</li>
+<li>Screenshot matches a rubric</li>
+<li>Human approves the plan</li>
+<li>Maximum attempts reached</li>
+</ul>
+<p>Without a done check, a loop either stops arbitrarily or keeps spending.</p>
+<h3 id="tools">Tools</h3>
+<p>The agent needs a way to interact with the world.</p>
+<p>For software work, tools are usually file reads, file edits, shell commands, search, test runners, browser control, and issue tracker access.</p>
+<p>The tool set should be narrow enough to be safe and broad enough to let the agent verify its own work.</p>
+<h3 id="memory">Memory</h3>
+<p>Loops need memory outside the current model response.</p>
+<p>That can be a state file, a task board, a trace store, a database row, or a versioned object. The key is that the loop should know what it already tried and what happened.</p>
+<p>Without memory, a loop repeats mistakes.</p>
+<h3 id="verification">Verification</h3>
+<p>A loop should not trust the same generation step that produced the work.</p>
+<p>Verification can be deterministic, like tests. It can be model-based, like a rubric grader. It can be human, especially for judgment-heavy or sensitive work.</p>
+<p>The point is to make &quot;done&quot; mean something.</p>
+<h3 id="human-gates">Human Gates</h3>
+<p>Some actions need approval.</p>
+<p>Examples:</p>
+<ul>
+<li>Deleting data</li>
+<li>Spending money</li>
+<li>Publishing externally</li>
+<li>Changing production settings</li>
+<li>Making irreversible edits</li>
+</ul>
+<p>Automation does not remove the human. It changes where the human belongs.</p>
+<h2 id="how-loop-engineering-relates-to-model-relay">How Loop Engineering Relates To Model Relay</h2>
+<p>Loop engineering sits above the <a href="/blog/model-relay-pattern/">Model Relay Pattern</a>.</p>
+<p>Loop engineering answers:</p>
+<ul>
+<li>When does the system run?</li>
+<li>What triggers it?</li>
+<li>What is the stopping condition?</li>
+<li>What happens when it fails?</li>
+<li>How does it improve over time?</li>
+</ul>
+<p>Model Relay answers:</p>
+<ul>
+<li>Which role handles this phase?</li>
+<li>Which model should do that role?</li>
+<li>What artifact is passed to the next role?</li>
+<li>Who approves the handoff?</li>
+<li>What evidence is attached?</li>
+</ul>
+<p>They compose naturally.</p>
+<p>Example:</p>
+<pre><code class="language-text">Event-driven loop:
+  When a new issue is labeled &quot;ready&quot;
+
+Model Relay:
+  Proposer -&gt; Critic -&gt; Reconciler -&gt; Executor -&gt; Verifier
+
+Done check:
+  Verified patch exists, tests pass, human approves PR</code></pre>
+<p>The loop keeps the workflow moving. The relay keeps the work separated into accountable roles.</p>
+<h2 id="the-common-failure-modes">The Common Failure Modes</h2>
+<h3 id="no-exit">No Exit</h3>
+<p>The agent keeps trying because nobody defined failure.</p>
+<p>Fix:</p>
+<pre><code class="language-text">Stop after five attempts, repeated identical failures, or 20 minutes.</code></pre>
+<h3 id="fake-progress">Fake Progress</h3>
+<p>The agent keeps changing things, but the underlying result is not improving.</p>
+<p>Fix:</p>
+<p>Track attempts and compare observations. If the same error appears twice, require a strategy change.</p>
+<h3 id="context-bloat">Context Bloat</h3>
+<p>Every iteration adds more logs, diffs, and commentary until the model loses the task.</p>
+<p>Fix:</p>
+<p>Keep full logs outside the prompt. Feed the model a compact state summary.</p>
+<h3 id="self-grading">Self-Grading</h3>
+<p>The agent that made the work declares it finished.</p>
+<p>Fix:</p>
+<p>Use a separate verifier, a deterministic check, or a human gate.</p>
+<h3 id="too-much-autonomy-too-early">Too Much Autonomy Too Early</h3>
+<p>The loop runs before the team understands how it behaves.</p>
+<p>Fix:</p>
+<p>Run it manually first. Then run it with approval gates. Then automate the boring parts.</p>
+<h2 id="a-small-loop-worth-building">A Small Loop Worth Building</h2>
+<p>Do not start with a swarm.</p>
+<p>Start with a boring loop:</p>
+<pre class="mermaid">flowchart TD
+  A[&quot;`Every morning`&quot;] --&gt; B[&quot;`Read&lt;br/&gt;open issues labeled&lt;br/&gt;needs triage`&quot;]
+  B --&gt; C[&quot;`Propose&lt;br/&gt;a short plan&lt;br/&gt;for each issue`&quot;]
+  C --&gt; D[&quot;`Ask&lt;br/&gt;a critic model&lt;br/&gt;to reject weak plans`&quot;]
+  D --&gt; E[&quot;`Write&lt;br/&gt;accepted plans&lt;br/&gt;to a triage note`&quot;]
+  E --&gt; F[&quot;`Stop`&quot;]</pre>
+<p>No code execution. No autonomous merging. No production changes.</p>
+<p>That loop is already useful because it removes repeated prompting and creates a durable work artifact.</p>
+<p>Once that is reliable, add execution. Once execution is reliable, add verification. Once verification is reliable, add scheduling.</p>
+<h2 id="sources-worth-reading">Sources Worth Reading</h2>
+<ul>
+<li><a href="https://addyosmani.com/blog/loop-engineering/">Loop Engineering, Addy Osmani</a></li>
+<li><a href="https://www.langchain.com/blog/the-art-of-loop-engineering">The Art of Loop Engineering, LangChain</a></li>
+<li><a href="https://www.mindstudio.ai/blog/what-is-loop-engineering-ai-coding-agents">What Is Loop Engineering?, MindStudio</a></li>
+<li><a href="https://arxiv.org/abs/2210.03629">ReAct paper on arXiv</a></li>
+</ul>
+<p>The ReAct paper is the canonical source for the inner reason-act-observe loop. The loop engineering posts are practitioner sources for the newer outer-loop vocabulary: triggers, verification, traces, memory, schedules, and self-improving harnesses.</p>
+<h2 id="the-useful-mental-model">The Useful Mental Model</h2>
+<p>Prompting is conversation.</p>
+<p>ReAct is the inner loop of one agent using tools.</p>
+<p>Model Relay is the handoff of one task through role-specific models.</p>
+<p>Loop engineering is the outer system that decides when those workflows run, how they repeat, and when they stop.</p>
+<p>Those layers should not be blurred. Separating them makes the system easier to build, audit, and improve.</p>
+  </div>
+</article>
+  </main>
+  <footer class="site-footer">
+    <a href="/blog/">Index</a>
+    <span>Uldren Engineering</span>
+  </footer>
+</body>
+</html>

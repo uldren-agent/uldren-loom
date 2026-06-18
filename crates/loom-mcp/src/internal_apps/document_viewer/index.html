@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spec Document Viewer</title>
+  <style>
+    {{ loom.app_shell.css }}
+
+    main {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    aside {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+      padding: 18px 14px;
+    }
+
+    section {
+      min-width: 0;
+      padding: 22px;
+    }
+
+    h1,
+    h2 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 18px;
+    }
+
+    h2 {
+      font-size: 20px;
+    }
+
+    .meta,
+    .empty {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .space-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .space {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: var(--bg);
+    }
+
+    .workspace {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .toolbar {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .action-status {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .document {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      min-height: 320px;
+      padding: 18px;
+      white-space: pre-wrap;
+    }
+
+    .revision {
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: 110px minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+    }
+
+    .backlinks {
+      margin-top: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 14px;
+    }
+
+    .backlink-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .backlink {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--bg);
+      padding: 10px;
+      font-size: 13px;
+    }
+
+    input[type="range"] {
+      width: 100%;
+    }
+
+    @media (max-width: 760px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+
+      aside {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .toolbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <aside>
+      <h1>Pages</h1>
+      <div class="workspace" id="workspace"></div>
+      <div class="space-list" id="spaces"></div>
+    </aside>
+    <section>
+      <div class="toolbar">
+        <div>
+          <h2 id="title">Document</h2>
+          <div class="meta" id="status"></div>
+        </div>
+        <div class="actions">
+          <button type="button" id="publish">Publish</button>
+          <span class="action-status" id="action-status"></span>
+        </div>
+      </div>
+      <article class="document" id="body"></article>
+      <div class="revision">
+        <label for="revision">Revision</label>
+        <input id="revision" type="range" min="0" max="0" value="0">
+      </div>
+      <section class="backlinks" aria-label="Backlinks">
+        <h2>Backlinks</h2>
+        <div class="backlink-list" id="backlinks"></div>
+      </section>
+    </section>
+  </main>
+  <script>
+    (() => {
+    const data = {{ loom.pages | tojson }};
+    const workspace = data.workspace?.name ?? data.profile_id ?? "workspace";
+    const page = data.page ?? null;
+    const spaces = Array.isArray(data.spaces) ? data.spaces : [];
+    const appUri = data.app_uri ?? data.definition?.resource_uri ?? "";
+    document.getElementById("workspace").textContent = workspace;
+    const spaceList = document.getElementById("spaces");
+    if (spaces.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "No spaces";
+      spaceList.append(empty);
+    } else {
+      for (const space of spaces) {
+        const item = document.createElement("div");
+        item.className = "space";
+        item.textContent = space.title || space.space_id;
+        spaceList.append(item);
+      }
+    }
+    document.getElementById("title").textContent = page?.title ?? data.definition?.display_name ?? "Document";
+    document.getElementById("status").textContent = page
+      ? `${page.status || "unknown"} revision ${page.current_revision ?? "none"}`
+      : "No page selected";
+    document.getElementById("body").textContent =
+      page?.draft_rendered_body ?? page?.rendered_body ?? "Select or open a page to view its current document body.";
+    const revision = document.getElementById("revision");
+    const count = Array.isArray(data.history) ? data.history.length : 0;
+    revision.max = String(Math.max(0, count - 1));
+    revision.value = String(Math.max(0, count - 1));
+    const backlinks = data.backlinks?.inbound ?? [];
+    const backlinkList = document.getElementById("backlinks");
+    if (backlinks.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "No backlinks";
+      backlinkList.append(empty);
+    } else {
+      for (const backlink of backlinks) {
+        const item = document.createElement("div");
+        item.className = "backlink";
+        item.textContent = `${backlink.source_facet}:${backlink.source_collection}:${backlink.source_id} ${backlink.relation}`;
+        backlinkList.append(item);
+      }
+    }
+    const publish = document.getElementById("publish");
+    const actionStatus = document.getElementById("action-status");
+    publish.disabled = !page;
+
+    function postHost(message) {
+      const host = window.parent;
+      if (!host || host === window) return;
+      try {
+        host.postMessage(Object.assign({ jsonrpc: "2.0" }, message), "*");
+      } catch (_) {
+      }
+    }
+
+    let requestId = 0;
+    const pending = new Map();
+    function request(method, params) {
+      return new Promise((resolve, reject) => {
+        const id = "loom-pages-req-" + (++requestId);
+        pending.set(id, { resolve, reject });
+        postHost({ id, method, params: params || {} });
+        setTimeout(() => {
+          if (pending.has(id)) {
+            pending.delete(id);
+            reject(new Error("timeout waiting for " + method));
+          }
+        }, 15000);
+      });
+    }
+
+    window.addEventListener("message", (event) => {
+      const payload = event && event.data;
+      if (!payload || payload.jsonrpc !== "2.0") return;
+      if (payload.id !== undefined && pending.has(payload.id)) {
+        const p = pending.get(payload.id);
+        pending.delete(payload.id);
+        if ("error" in payload) p.reject(payload.error);
+        else p.resolve(payload.result);
+      }
+    });
+
+    publish.addEventListener("click", async () => {
+      if (!page) return;
+      publish.disabled = true;
+      actionStatus.textContent = "Publishing...";
+      try {
+        await request("tools/call", {
+          name: "apps_call_tool",
+          arguments: {
+            app_uri: appUri,
+            tool: "pages_publish",
+            arguments: {
+              workspace,
+              page_id: page.page_id,
+              expected_root: page.profile_root
+            }
+          }
+        });
+        actionStatus.textContent = "Published";
+      } catch (e) {
+        publish.disabled = false;
+        actionStatus.textContent = "Publish failed: " + ((e && e.message) || e);
+      }
+    });
+    })();
+  </script>
+</body>
+</html>

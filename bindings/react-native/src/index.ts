@@ -1,11 +1,31 @@
-import UldrenLoom from './NativeUldrenLoom';
+export type { QueueSeq, LoomAuth, LoomCell, LoomKey, LoomStatement } from './internal';
 
-/** The engine version. */
-export function version(): string {
-  return UldrenLoom.version();
-}
-
-/** The content address ("algo:hex", e.g. "blake3:...") of `bytes` as an Uldren Loom blob. */
-export function blobDigest(bytes: Uint8Array | number[]): string {
-  return UldrenLoom.blobDigest(Array.from(bytes));
-}
+export * from './session';
+export * from './facets/lifecycle';
+export * from './facets/execution';
+export * from './facets/workspace';
+export * from './facets/identity';
+export * from './facets/sql';
+export * from './facets/vcs';
+export * from './facets/queue';
+export * from './facets/cas';
+export * from './facets/archive';
+export * from './facets/kv';
+export * from './facets/document';
+export * from './facets/timeseries';
+export * from './facets/telemetry';
+export * from './facets/ledger';
+export * from './facets/calendar';
+export * from './facets/contacts';
+export * from './facets/mail';
+export * from './facets/meetings';
+export * from './facets/drive';
+export * from './facets/tickets';
+export * from './facets/pages';
+export * from './facets/lanes';
+export * from './facets/chat';
+export * from './facets/graph';
+export * from './facets/vector';
+export * from './facets/columnar';
+export * from './facets/dataframe';
+export * from './facets/search';

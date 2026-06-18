@@ -77,8 +77,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-android-arm64')
         const bindingPackageVersion = require('@uldrenai/loom-android-arm64/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -93,8 +93,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-android-arm-eabi')
         const bindingPackageVersion = require('@uldrenai/loom-android-arm-eabi/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -114,8 +114,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-win32-x64-gnu')
         const bindingPackageVersion = require('@uldrenai/loom-win32-x64-gnu/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -130,8 +130,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-win32-x64-msvc')
         const bindingPackageVersion = require('@uldrenai/loom-win32-x64-msvc/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -147,8 +147,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-win32-ia32-msvc')
         const bindingPackageVersion = require('@uldrenai/loom-win32-ia32-msvc/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -163,8 +163,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-win32-arm64-msvc')
         const bindingPackageVersion = require('@uldrenai/loom-win32-arm64-msvc/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -182,8 +182,8 @@ function requireNative() {
     try {
       const binding = require('@uldrenai/loom-darwin-universal')
       const bindingPackageVersion = require('@uldrenai/loom-darwin-universal/package.json').version
-      if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-        throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+      if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+        throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
       }
       return binding
     } catch (e) {
@@ -198,8 +198,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-darwin-x64')
         const bindingPackageVersion = require('@uldrenai/loom-darwin-x64/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -214,8 +214,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-darwin-arm64')
         const bindingPackageVersion = require('@uldrenai/loom-darwin-arm64/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -234,8 +234,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-freebsd-x64')
         const bindingPackageVersion = require('@uldrenai/loom-freebsd-x64/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -250,8 +250,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-freebsd-arm64')
         const bindingPackageVersion = require('@uldrenai/loom-freebsd-arm64/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -271,8 +271,8 @@ function requireNative() {
         try {
           const binding = require('@uldrenai/loom-linux-x64-musl')
           const bindingPackageVersion = require('@uldrenai/loom-linux-x64-musl/package.json').version
-          if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -287,8 +287,8 @@ function requireNative() {
         try {
           const binding = require('@uldrenai/loom-linux-x64-gnu')
           const bindingPackageVersion = require('@uldrenai/loom-linux-x64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -305,8 +305,8 @@ function requireNative() {
         try {
           const binding = require('@uldrenai/loom-linux-arm64-musl')
           const bindingPackageVersion = require('@uldrenai/loom-linux-arm64-musl/package.json').version
-          if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -321,8 +321,8 @@ function requireNative() {
         try {
           const binding = require('@uldrenai/loom-linux-arm64-gnu')
           const bindingPackageVersion = require('@uldrenai/loom-linux-arm64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -339,8 +339,8 @@ function requireNative() {
         try {
           const binding = require('@uldrenai/loom-linux-arm-musleabihf')
           const bindingPackageVersion = require('@uldrenai/loom-linux-arm-musleabihf/package.json').version
-          if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -355,8 +355,8 @@ function requireNative() {
         try {
           const binding = require('@uldrenai/loom-linux-arm-gnueabihf')
           const bindingPackageVersion = require('@uldrenai/loom-linux-arm-gnueabihf/package.json').version
-          if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -373,8 +373,8 @@ function requireNative() {
         try {
           const binding = require('@uldrenai/loom-linux-loong64-musl')
           const bindingPackageVersion = require('@uldrenai/loom-linux-loong64-musl/package.json').version
-          if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -389,8 +389,8 @@ function requireNative() {
         try {
           const binding = require('@uldrenai/loom-linux-loong64-gnu')
           const bindingPackageVersion = require('@uldrenai/loom-linux-loong64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -407,8 +407,8 @@ function requireNative() {
         try {
           const binding = require('@uldrenai/loom-linux-riscv64-musl')
           const bindingPackageVersion = require('@uldrenai/loom-linux-riscv64-musl/package.json').version
-          if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -423,8 +423,8 @@ function requireNative() {
         try {
           const binding = require('@uldrenai/loom-linux-riscv64-gnu')
           const bindingPackageVersion = require('@uldrenai/loom-linux-riscv64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -440,8 +440,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-linux-ppc64-gnu')
         const bindingPackageVersion = require('@uldrenai/loom-linux-ppc64-gnu/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -456,8 +456,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-linux-s390x-gnu')
         const bindingPackageVersion = require('@uldrenai/loom-linux-s390x-gnu/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -476,8 +476,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-openharmony-arm64')
         const bindingPackageVersion = require('@uldrenai/loom-openharmony-arm64/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -492,8 +492,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-openharmony-x64')
         const bindingPackageVersion = require('@uldrenai/loom-openharmony-x64/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -508,8 +508,8 @@ function requireNative() {
       try {
         const binding = require('@uldrenai/loom-openharmony-arm')
         const bindingPackageVersion = require('@uldrenai/loom-openharmony-arm/package.json').version
-        if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.1.0-alpha.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.1.0-alpha.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -587,5 +587,324 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.LoomSql = nativeBinding.LoomSql
+module.exports.LoomSqlBatch = nativeBinding.LoomSqlBatch
+module.exports.aclGrant = nativeBinding.aclGrant
+module.exports.aclGrantScoped = nativeBinding.aclGrantScoped
+module.exports.aclListJson = nativeBinding.aclListJson
+module.exports.aclRevoke = nativeBinding.aclRevoke
+module.exports.aclRevokeScoped = nativeBinding.aclRevokeScoped
+module.exports.appendFile = nativeBinding.appendFile
+module.exports.archiveExport = nativeBinding.archiveExport
+module.exports.archiveImport = nativeBinding.archiveImport
+module.exports.authenticatePassphrase = nativeBinding.authenticatePassphrase
 module.exports.blobDigest = nativeBinding.blobDigest
+module.exports.calCreateCollection = nativeBinding.calCreateCollection
+module.exports.calDeleteCollection = nativeBinding.calDeleteCollection
+module.exports.calDeleteEntry = nativeBinding.calDeleteEntry
+module.exports.calEntryIcs = nativeBinding.calEntryIcs
+module.exports.calGetEntry = nativeBinding.calGetEntry
+module.exports.calListCollections = nativeBinding.calListCollections
+module.exports.calListEntries = nativeBinding.calListEntries
+module.exports.calPutEntry = nativeBinding.calPutEntry
+module.exports.calPutIcs = nativeBinding.calPutIcs
+module.exports.calRange = nativeBinding.calRange
+module.exports.calSearch = nativeBinding.calSearch
+module.exports.capabilities = nativeBinding.capabilities
+module.exports.cardCreateBook = nativeBinding.cardCreateBook
+module.exports.cardDeleteBook = nativeBinding.cardDeleteBook
+module.exports.cardDeleteEntry = nativeBinding.cardDeleteEntry
+module.exports.cardEntryVcard = nativeBinding.cardEntryVcard
+module.exports.cardGetEntry = nativeBinding.cardGetEntry
+module.exports.cardListBooks = nativeBinding.cardListBooks
+module.exports.cardListEntries = nativeBinding.cardListEntries
+module.exports.cardPutEntry = nativeBinding.cardPutEntry
+module.exports.cardPutVcard = nativeBinding.cardPutVcard
+module.exports.cardSearch = nativeBinding.cardSearch
+module.exports.carExport = nativeBinding.carExport
+module.exports.carImport = nativeBinding.carImport
+module.exports.casDelete = nativeBinding.casDelete
+module.exports.casGet = nativeBinding.casGet
+module.exports.casHas = nativeBinding.casHas
+module.exports.casListJson = nativeBinding.casListJson
+module.exports.casPut = nativeBinding.casPut
+module.exports.cherryPick = nativeBinding.cherryPick
+module.exports.columnarAggregate = nativeBinding.columnarAggregate
+module.exports.columnarAppend = nativeBinding.columnarAppend
+module.exports.columnarColumns = nativeBinding.columnarColumns
+module.exports.columnarCompact = nativeBinding.columnarCompact
+module.exports.columnarCreate = nativeBinding.columnarCreate
+module.exports.columnarInspect = nativeBinding.columnarInspect
+module.exports.columnarRows = nativeBinding.columnarRows
+module.exports.columnarScan = nativeBinding.columnarScan
+module.exports.columnarSelect = nativeBinding.columnarSelect
+module.exports.columnarSourceDigest = nativeBinding.columnarSourceDigest
+module.exports.commitStaged = nativeBinding.commitStaged
+module.exports.createLoom = nativeBinding.createLoom
+module.exports.daemonPinAdd = nativeBinding.daemonPinAdd
+module.exports.daemonPinRemove = nativeBinding.daemonPinRemove
+module.exports.daemonSessionAttach = nativeBinding.daemonSessionAttach
+module.exports.daemonSessionDetach = nativeBinding.daemonSessionDetach
+module.exports.daemonStatusJson = nativeBinding.daemonStatusJson
+module.exports.dataframeCollect = nativeBinding.dataframeCollect
+module.exports.dataframeCreate = nativeBinding.dataframeCreate
+module.exports.dataframeMaterialize = nativeBinding.dataframeMaterialize
+module.exports.dataframePlanDigest = nativeBinding.dataframePlanDigest
+module.exports.dataframePreview = nativeBinding.dataframePreview
+module.exports.dataframeSourceDigests = nativeBinding.dataframeSourceDigests
+module.exports.docDelete = nativeBinding.docDelete
+module.exports.docFindJson = nativeBinding.docFindJson
+module.exports.docGetBinary = nativeBinding.docGetBinary
+module.exports.docGetText = nativeBinding.docGetText
+module.exports.docIndexCreate = nativeBinding.docIndexCreate
+module.exports.docIndexCreateJson = nativeBinding.docIndexCreateJson
+module.exports.docIndexDrop = nativeBinding.docIndexDrop
+module.exports.docIndexListJson = nativeBinding.docIndexListJson
+module.exports.docIndexRebuild = nativeBinding.docIndexRebuild
+module.exports.docIndexStatusJson = nativeBinding.docIndexStatusJson
+module.exports.docListBinary = nativeBinding.docListBinary
+module.exports.docPutBinary = nativeBinding.docPutBinary
+module.exports.docPutText = nativeBinding.docPutText
+module.exports.docQueryJson = nativeBinding.docQueryJson
+module.exports.execCbor = nativeBinding.execCbor
+module.exports.fileClose = nativeBinding.fileClose
+module.exports.fileFlush = nativeBinding.fileFlush
+module.exports.fileOpen = nativeBinding.fileOpen
+module.exports.fileRead = nativeBinding.fileRead
+module.exports.fileReadAt = nativeBinding.fileReadAt
+module.exports.fileStat = nativeBinding.fileStat
+module.exports.fileTruncate = nativeBinding.fileTruncate
+module.exports.fileWrite = nativeBinding.fileWrite
+module.exports.fileWriteAt = nativeBinding.fileWriteAt
+module.exports.fsExport = nativeBinding.fsExport
+module.exports.fsImport = nativeBinding.fsImport
+module.exports.graphExplainQuery = nativeBinding.graphExplainQuery
+module.exports.graphGetEdge = nativeBinding.graphGetEdge
+module.exports.graphGetNode = nativeBinding.graphGetNode
+module.exports.graphInEdges = nativeBinding.graphInEdges
+module.exports.graphNeighbors = nativeBinding.graphNeighbors
+module.exports.graphOutEdges = nativeBinding.graphOutEdges
+module.exports.graphQuery = nativeBinding.graphQuery
+module.exports.graphReachable = nativeBinding.graphReachable
+module.exports.graphRemoveEdge = nativeBinding.graphRemoveEdge
+module.exports.graphRemoveNode = nativeBinding.graphRemoveNode
+module.exports.graphShortestPath = nativeBinding.graphShortestPath
+module.exports.graphUpsertEdge = nativeBinding.graphUpsertEdge
+module.exports.graphUpsertNode = nativeBinding.graphUpsertNode
+module.exports.identityAddPrincipal = nativeBinding.identityAddPrincipal
+module.exports.identityAddPublicKey = nativeBinding.identityAddPublicKey
+module.exports.identityAssignRole = nativeBinding.identityAssignRole
+module.exports.identityCreateExternalCredential = nativeBinding.identityCreateExternalCredential
+module.exports.identityListJson = nativeBinding.identityListJson
+module.exports.identityRemovePrincipal = nativeBinding.identityRemovePrincipal
+module.exports.identityRenamePrincipalHandle = nativeBinding.identityRenamePrincipalHandle
+module.exports.identityRevokeExternalCredential = nativeBinding.identityRevokeExternalCredential
+module.exports.identityRevokePublicKey = nativeBinding.identityRevokePublicKey
+module.exports.identityRevokeRole = nativeBinding.identityRevokeRole
+module.exports.identitySetPassphrase = nativeBinding.identitySetPassphrase
+module.exports.keyAddWrapKeyed = nativeBinding.keyAddWrapKeyed
+module.exports.keyAddWrapWithKek = nativeBinding.keyAddWrapWithKek
+module.exports.keyRemoveWrap = nativeBinding.keyRemoveWrap
+module.exports.kvDelete = nativeBinding.kvDelete
+module.exports.kvGet = nativeBinding.kvGet
+module.exports.kvList = nativeBinding.kvList
+module.exports.kvPut = nativeBinding.kvPut
+module.exports.kvRange = nativeBinding.kvRange
+module.exports.lanesCreate = nativeBinding.lanesCreate
+module.exports.lanesGet = nativeBinding.lanesGet
+module.exports.lanesList = nativeBinding.lanesList
+module.exports.lanesReviewerFeedbackUpdate = nativeBinding.lanesReviewerFeedbackUpdate
+module.exports.lanesStatusReportUpdate = nativeBinding.lanesStatusReportUpdate
+module.exports.lanesTicketAdd = nativeBinding.lanesTicketAdd
+module.exports.lanesTicketRemove = nativeBinding.lanesTicketRemove
+module.exports.ledgerAppend = nativeBinding.ledgerAppend
+module.exports.ledgerGet = nativeBinding.ledgerGet
+module.exports.ledgerHead = nativeBinding.ledgerHead
+module.exports.ledgerLen = nativeBinding.ledgerLen
+module.exports.ledgerVerify = nativeBinding.ledgerVerify
+module.exports.lockAcquireJson = nativeBinding.lockAcquireJson
+module.exports.lockRefreshJson = nativeBinding.lockRefreshJson
+module.exports.lockRelease = nativeBinding.lockRelease
+module.exports.logsGetRecord = nativeBinding.logsGetRecord
+module.exports.logsPutRecord = nativeBinding.logsPutRecord
+module.exports.logsQuery = nativeBinding.logsQuery
+module.exports.mailCreateMailbox = nativeBinding.mailCreateMailbox
+module.exports.mailDeleteMailbox = nativeBinding.mailDeleteMailbox
+module.exports.mailDeleteMessage = nativeBinding.mailDeleteMessage
+module.exports.mailGetFlags = nativeBinding.mailGetFlags
+module.exports.mailGetMessage = nativeBinding.mailGetMessage
+module.exports.mailIngestMessage = nativeBinding.mailIngestMessage
+module.exports.mailListMailboxes = nativeBinding.mailListMailboxes
+module.exports.mailListMessages = nativeBinding.mailListMessages
+module.exports.mailSearch = nativeBinding.mailSearch
+module.exports.mailSetFlags = nativeBinding.mailSetFlags
+module.exports.mailToEml = nativeBinding.mailToEml
+module.exports.meetingsImportSnapshot = nativeBinding.meetingsImportSnapshot
+module.exports.meetingsSourceRead = nativeBinding.meetingsSourceRead
+module.exports.driveListJson = nativeBinding.driveListJson
+module.exports.driveStatJson = nativeBinding.driveStatJson
+module.exports.driveReadFile = nativeBinding.driveReadFile
+module.exports.driveListVersionsJson = nativeBinding.driveListVersionsJson
+module.exports.driveListConflictsJson = nativeBinding.driveListConflictsJson
+module.exports.driveListSharesJson = nativeBinding.driveListSharesJson
+module.exports.driveListRetentionJson = nativeBinding.driveListRetentionJson
+module.exports.driveCreateFolderJson = nativeBinding.driveCreateFolderJson
+module.exports.driveCreateUploadJson = nativeBinding.driveCreateUploadJson
+module.exports.driveUploadChunkJson = nativeBinding.driveUploadChunkJson
+module.exports.driveCommitUploadJson = nativeBinding.driveCommitUploadJson
+module.exports.driveRenameJson = nativeBinding.driveRenameJson
+module.exports.driveMoveJson = nativeBinding.driveMoveJson
+module.exports.driveDeleteJson = nativeBinding.driveDeleteJson
+module.exports.driveResolveConflictJson = nativeBinding.driveResolveConflictJson
+module.exports.driveGrantShareJson = nativeBinding.driveGrantShareJson
+module.exports.driveRevokeShareJson = nativeBinding.driveRevokeShareJson
+module.exports.driveApplyShareExpiryJson = nativeBinding.driveApplyShareExpiryJson
+module.exports.drivePinRetentionJson = nativeBinding.drivePinRetentionJson
+module.exports.driveUnpinRetentionJson = nativeBinding.driveUnpinRetentionJson
+module.exports.driveApplyRetentionJson = nativeBinding.driveApplyRetentionJson
+module.exports.ticketsProjectCreateJson = nativeBinding.ticketsProjectCreateJson
+module.exports.ticketsProjectRekeyJson = nativeBinding.ticketsProjectRekeyJson
+module.exports.ticketsProjectSettingsGetJson = nativeBinding.ticketsProjectSettingsGetJson
+module.exports.ticketsProjectSettingsSetJson = nativeBinding.ticketsProjectSettingsSetJson
+module.exports.ticketsFieldsJson = nativeBinding.ticketsFieldsJson
+module.exports.ticketsFieldPutJson = nativeBinding.ticketsFieldPutJson
+module.exports.ticketsFieldRetireJson = nativeBinding.ticketsFieldRetireJson
+module.exports.ticketsCreateJson = nativeBinding.ticketsCreateJson
+module.exports.ticketsUpdateJson = nativeBinding.ticketsUpdateJson
+module.exports.ticketsDeleteJson = nativeBinding.ticketsDeleteJson
+module.exports.ticketsRelationSetJson = nativeBinding.ticketsRelationSetJson
+module.exports.ticketsRelationRemoveJson = nativeBinding.ticketsRelationRemoveJson
+module.exports.ticketsGetJson = nativeBinding.ticketsGetJson
+module.exports.ticketsListJson = nativeBinding.ticketsListJson
+module.exports.ticketsHistoryJson = nativeBinding.ticketsHistoryJson
+module.exports.spacesCreateJson = nativeBinding.spacesCreateJson
+module.exports.spacesListJson = nativeBinding.spacesListJson
+module.exports.spacesGetJson = nativeBinding.spacesGetJson
+module.exports.pagesCreateJson = nativeBinding.pagesCreateJson
+module.exports.pagesUpdateJson = nativeBinding.pagesUpdateJson
+module.exports.pagesPublishJson = nativeBinding.pagesPublishJson
+module.exports.pagesGetJson = nativeBinding.pagesGetJson
+module.exports.pagesListJson = nativeBinding.pagesListJson
+module.exports.pagesHistoryJson = nativeBinding.pagesHistoryJson
+module.exports.structuresCreateJson = nativeBinding.structuresCreateJson
+module.exports.structuresAddNodeJson = nativeBinding.structuresAddNodeJson
+module.exports.structuresUpdateNodeJson = nativeBinding.structuresUpdateNodeJson
+module.exports.structuresBindJson = nativeBinding.structuresBindJson
+module.exports.structuresMoveNodeJson = nativeBinding.structuresMoveNodeJson
+module.exports.structuresLinkNodeJson = nativeBinding.structuresLinkNodeJson
+module.exports.structuresDecomposeToTicketsJson = nativeBinding.structuresDecomposeToTicketsJson
+module.exports.structuresGetJson = nativeBinding.structuresGetJson
+module.exports.structuresListJson = nativeBinding.structuresListJson
+module.exports.chatCreateChannelJson = nativeBinding.chatCreateChannelJson
+module.exports.chatRenameChannelJson = nativeBinding.chatRenameChannelJson
+module.exports.chatListChannelsJson = nativeBinding.chatListChannelsJson
+module.exports.chatPostMessageJson = nativeBinding.chatPostMessageJson
+module.exports.chatEditMessageJson = nativeBinding.chatEditMessageJson
+module.exports.chatRedactMessageJson = nativeBinding.chatRedactMessageJson
+module.exports.chatCreateThreadJson = nativeBinding.chatCreateThreadJson
+module.exports.chatCreateTaskJson = nativeBinding.chatCreateTaskJson
+module.exports.chatClaimTaskJson = nativeBinding.chatClaimTaskJson
+module.exports.chatCompleteTaskJson = nativeBinding.chatCompleteTaskJson
+module.exports.chatInvokeAgentJson = nativeBinding.chatInvokeAgentJson
+module.exports.chatAgentReplyJson = nativeBinding.chatAgentReplyJson
+module.exports.chatRequestHandoffJson = nativeBinding.chatRequestHandoffJson
+module.exports.chatAddReactionJson = nativeBinding.chatAddReactionJson
+module.exports.chatRemoveReactionJson = nativeBinding.chatRemoveReactionJson
+module.exports.chatEmojiListJson = nativeBinding.chatEmojiListJson
+module.exports.chatEmojiRegisterJson = nativeBinding.chatEmojiRegisterJson
+module.exports.chatEmojiUnregisterJson = nativeBinding.chatEmojiUnregisterJson
+module.exports.chatMessagesJson = nativeBinding.chatMessagesJson
+module.exports.chatCursorJson = nativeBinding.chatCursorJson
+module.exports.chatUpdateCursorJson = nativeBinding.chatUpdateCursorJson
+module.exports.chatFetchEventsJson = nativeBinding.chatFetchEventsJson
+module.exports.mergeAbort = nativeBinding.mergeAbort
+module.exports.mergeConflicts = nativeBinding.mergeConflicts
+module.exports.mergeContinue = nativeBinding.mergeContinue
+module.exports.mergeInProgress = nativeBinding.mergeInProgress
+module.exports.mergeResolve = nativeBinding.mergeResolve
+module.exports.metricsGetDescriptor = nativeBinding.metricsGetDescriptor
+module.exports.metricsPutDescriptor = nativeBinding.metricsPutDescriptor
+module.exports.metricsPutObservation = nativeBinding.metricsPutObservation
+module.exports.metricsQuery = nativeBinding.metricsQuery
+module.exports.protectedRefGetJson = nativeBinding.protectedRefGetJson
+module.exports.protectedRefListJson = nativeBinding.protectedRefListJson
+module.exports.protectedRefRemove = nativeBinding.protectedRefRemove
+module.exports.protectedRefSet = nativeBinding.protectedRefSet
+module.exports.queueAppend = nativeBinding.queueAppend
+module.exports.queueConsumerAdvance = nativeBinding.queueConsumerAdvance
+module.exports.queueConsumerPosition = nativeBinding.queueConsumerPosition
+module.exports.queueConsumerRead = nativeBinding.queueConsumerRead
+module.exports.queueConsumerReset = nativeBinding.queueConsumerReset
+module.exports.queueGet = nativeBinding.queueGet
+module.exports.queueLen = nativeBinding.queueLen
+module.exports.queueRange = nativeBinding.queueRange
+module.exports.readAt = nativeBinding.readAt
+module.exports.readFile = nativeBinding.readFile
+module.exports.readLink = nativeBinding.readLink
+module.exports.rebase = nativeBinding.rebase
+module.exports.removeFile = nativeBinding.removeFile
+module.exports.restoreFile = nativeBinding.restoreFile
+module.exports.restorePath = nativeBinding.restorePath
+module.exports.resultToBridgeJson = nativeBinding.resultToBridgeJson
+module.exports.resultToJson = nativeBinding.resultToJson
+module.exports.revert = nativeBinding.revert
+module.exports.runtimeProfile = nativeBinding.runtimeProfile
+module.exports.searchCreate = nativeBinding.searchCreate
+module.exports.searchDelete = nativeBinding.searchDelete
+module.exports.searchGet = nativeBinding.searchGet
+module.exports.searchIds = nativeBinding.searchIds
+module.exports.searchIndex = nativeBinding.searchIndex
+module.exports.searchQuery = nativeBinding.searchQuery
+module.exports.searchRemap = nativeBinding.searchRemap
+module.exports.sqlBlame = nativeBinding.sqlBlame
+module.exports.sqlDiff = nativeBinding.sqlDiff
+module.exports.sqlIndexScan = nativeBinding.sqlIndexScan
+module.exports.sqlIndexScanAt = nativeBinding.sqlIndexScanAt
+module.exports.sqlReadTable = nativeBinding.sqlReadTable
+module.exports.sqlReadTableAt = nativeBinding.sqlReadTableAt
+module.exports.sqlTableDiff = nativeBinding.sqlTableDiff
+module.exports.squash = nativeBinding.squash
+module.exports.stage = nativeBinding.stage
+module.exports.stageAll = nativeBinding.stageAll
+module.exports.statusJson = nativeBinding.statusJson
+module.exports.studioSurfaceCatalogJson = nativeBinding.studioSurfaceCatalogJson
+module.exports.symlink = nativeBinding.symlink
+module.exports.tagCreate = nativeBinding.tagCreate
+module.exports.tagDelete = nativeBinding.tagDelete
+module.exports.tagList = nativeBinding.tagList
+module.exports.tagRename = nativeBinding.tagRename
+module.exports.tagTarget = nativeBinding.tagTarget
+module.exports.tracesGetSpan = nativeBinding.tracesGetSpan
+module.exports.tracesPutSpan = nativeBinding.tracesPutSpan
+module.exports.tracesQuery = nativeBinding.tracesQuery
+module.exports.tracesTraceSpans = nativeBinding.tracesTraceSpans
+module.exports.truncateFile = nativeBinding.truncateFile
+module.exports.tsGet = nativeBinding.tsGet
+module.exports.tsLatest = nativeBinding.tsLatest
+module.exports.tsPut = nativeBinding.tsPut
+module.exports.tsRange = nativeBinding.tsRange
+module.exports.unstage = nativeBinding.unstage
+module.exports.vcsBlame = nativeBinding.vcsBlame
+module.exports.vcsDiff = nativeBinding.vcsDiff
+module.exports.vectorCreate = nativeBinding.vectorCreate
+module.exports.vectorCreateMetadataIndex = nativeBinding.vectorCreateMetadataIndex
+module.exports.vectorDelete = nativeBinding.vectorDelete
+module.exports.vectorDropMetadataIndex = nativeBinding.vectorDropMetadataIndex
+module.exports.vectorEmbeddingModel = nativeBinding.vectorEmbeddingModel
+module.exports.vectorGet = nativeBinding.vectorGet
+module.exports.vectorIds = nativeBinding.vectorIds
+module.exports.vectorMetadataIndexKeys = nativeBinding.vectorMetadataIndexKeys
+module.exports.vectorSearch = nativeBinding.vectorSearch
+module.exports.vectorSearchPolicy = nativeBinding.vectorSearchPolicy
+module.exports.vectorSourceText = nativeBinding.vectorSourceText
+module.exports.vectorUpsert = nativeBinding.vectorUpsert
+module.exports.vectorUpsertSource = nativeBinding.vectorUpsertSource
 module.exports.version = nativeBinding.version
+module.exports.watchPoll = nativeBinding.watchPoll
+module.exports.watchSubscribe = nativeBinding.watchSubscribe
+module.exports.workspaceCreate = nativeBinding.workspaceCreate
+module.exports.workspaceDelete = nativeBinding.workspaceDelete
+module.exports.workspaceListJson = nativeBinding.workspaceListJson
+module.exports.workspaceRename = nativeBinding.workspaceRename
+module.exports.writeAt = nativeBinding.writeAt
+module.exports.writeFile = nativeBinding.writeFile

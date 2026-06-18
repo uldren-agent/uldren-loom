@@ -1,0 +1,26 @@
+[package]
+authors.workspace = true
+description = "Reusable ticket-domain model, persistence, and conformance contracts for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-tickets"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_tickets"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-codec.workspace = true
+loom-core.workspace = true
+loom-store.workspace = true
+loom-substrate.workspace = true
+loom-reference.workspace = true
+loom-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v4"] }

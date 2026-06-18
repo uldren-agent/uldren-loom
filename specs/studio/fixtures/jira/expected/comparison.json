@@ -1,0 +1,113 @@
+{
+  "source_scope": "jira://tenant/example",
+  "rows_imported": 6,
+  "project": {
+    "project_id": "CORE",
+    "key_prefix": "CORE",
+    "name": "Core Platform"
+  },
+  "board": {
+    "board_id": "CORE-jira-board",
+    "board_key": "JIRA-CORE",
+    "name": "Jira status board",
+    "mode": "status_mapped",
+    "columns": [
+      {
+        "column_id": "in-progress",
+        "name": "In Progress",
+        "mapped_statuses": [
+          "In Progress"
+        ]
+      },
+      {
+        "column_id": "to-do",
+        "name": "To Do",
+        "mapped_statuses": [
+          "To Do"
+        ]
+      }
+    ]
+  },
+  "issue": {
+    "external_identity": "issue:10042",
+    "project_id": "CORE",
+    "subject": "Ship ticket importer",
+    "jira_issue_key": "CORE-42",
+    "description": "{\"content\":[{\"content\":[{\"text\":\"Normalize Jira issue data into Loom tickets.\",\"type\":\"text\"}],\"type\":\"paragraph\"}],\"type\":\"doc\",\"version\":1}",
+    "issue_type": "Story",
+    "status": "In Progress",
+    "status_category": "In Progress",
+    "priority": "High",
+    "assignee": "{\"accountId\":\"acct-alice\",\"active\":true,\"displayName\":\"Alice Rivera\",\"emailAddress\":\"alice@example.com\"}",
+    "reporter": "{\"accountId\":\"acct-bob\",\"active\":true,\"displayName\":\"Bob Chen\"}",
+    "creator": "{\"accountId\":\"acct-bob\",\"active\":true,\"displayName\":\"Bob Chen\"}",
+    "created_at": "2026-07-01T09:00:00.000Z",
+    "updated_at": "2026-07-11T15:30:00.000Z",
+    "due_date": "2026-07-31",
+    "environment": "{\"content\":[{\"content\":[{\"text\":\"Production import cluster\",\"type\":\"text\"}],\"type\":\"paragraph\"}],\"type\":\"doc\",\"version\":1}",
+    "parent": "{\"fields\":{\"summary\":\"Importer epic\"},\"id\":\"10001\",\"key\":\"CORE-1\"}",
+    "security": "{\"id\":\"40001\",\"name\":\"Engineering only\"}",
+    "votes": "{\"hasVoted\":true,\"self\":\"https://example.atlassian.net/rest/api/3/issue/CORE-42/votes\",\"votes\":3}",
+    "watches": "{\"isWatching\":true,\"self\":\"https://example.atlassian.net/rest/api/3/issue/CORE-42/watchers\",\"watchCount\":2,\"watchers\":[{\"accountId\":\"acct-alice\",\"displayName\":\"Alice Rivera\"},{\"accountId\":\"acct-bob\",\"displayName\":\"Bob Chen\"}]}",
+    "sprint": "{\"endDate\":\"2026-07-31T18:00:00.000Z\",\"goal\":\"Close importer fidelity gaps\",\"id\":37,\"name\":\"Import hardening\",\"originBoardId\":5,\"startDate\":\"2026-07-01T09:00:00.000Z\",\"state\":\"active\"}",
+    "labels": [
+      "customer-impact",
+      "backend"
+    ],
+    "components": [
+      "{\"id\":\"20001\",\"name\":\"Importer\"}"
+    ],
+    "fix_versions": [
+      "{\"id\":\"30001\",\"name\":\"2026.7\",\"released\":false}"
+    ],
+    "affected_versions": [
+      "{\"id\":\"30000\",\"name\":\"2026.6\",\"released\":true}"
+    ],
+    "issue_links": [
+      "{\"id\":\"50001\",\"outwardIssue\":{\"fields\":{\"summary\":\"Deploy importer\"},\"id\":\"10050\",\"key\":\"CORE-50\"},\"type\":{\"id\":\"10000\",\"inward\":\"is blocked by\",\"name\":\"Blocks\",\"outward\":\"blocks\"}}"
+    ],
+    "subtasks": [
+      "{\"fields\":{\"summary\":\"Write fixture matrix\"},\"id\":\"10044\",\"key\":\"CORE-44\"}"
+    ],
+    "transitions": [
+      "{\"id\":\"31\",\"name\":\"Done\",\"to\":{\"id\":\"10002\",\"name\":\"Done\",\"statusCategory\":{\"key\":\"done\",\"name\":\"Done\"}}}"
+    ],
+    "properties": "{\"com.example.import\":{\"batch\":\"fixture\"}}",
+    "development": "{\"pullRequests\":[{\"id\":\"42\",\"name\":\"Import Jira fixture\"}]}",
+    "custom_fields": "{\"Business Owners\":[\"Alice Rivera\",\"Bob Chen\"],\"Epic Link\":\"CORE-1\",\"Severity\":\"High\",\"Story Points\":8}",
+    "jira_issue_id": "issue:10042"
+  },
+  "bug": {
+    "external_identity": "issue:10043",
+    "subject": "Fix importer retry",
+    "issue_type": "Bug",
+    "policy_labels": [
+      "bug"
+    ]
+  },
+  "unsupported_fields": [
+    "archived",
+    "attachments",
+    "avatar_urls",
+    "changelog",
+    "comments",
+    "components",
+    "deleted",
+    "description",
+    "insight",
+    "issue_links",
+    "issue_types",
+    "lead",
+    "private",
+    "project_category",
+    "project_type_key",
+    "roles",
+    "self_url",
+    "simplified",
+    "style",
+    "subtasks",
+    "transitions",
+    "versions",
+    "worklog"
+  ]
+}

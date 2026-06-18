@@ -1,0 +1,34 @@
+{
+  "schema": "loom.substrate.workgraph-fact.v1",
+  "workspace_id": "organization",
+  "fact": {
+    "event_id": "workgraph-event-1",
+    "occurred_at": 4000,
+    "task_id": "task-1",
+    "batch_id": "batch-1",
+    "actor_kind": "agent",
+    "actor_id": "agent-1",
+    "correlation_id": "corr-1",
+    "causation_id": "cause-1",
+    "attempt": 1,
+    "previous_state": "ready",
+    "next_state": "assigned",
+    "payload_digest_input": "workgraph payload",
+    "reason_code": null,
+    "kind": "assignment_issued"
+  },
+  "operation": {
+    "app_id": "workgraph",
+    "scope_id": "workgraph:organization",
+    "operation_id": "workgraph-event-1",
+    "operation_kind": "workgraph.assignment_issued",
+    "sequence": 1,
+    "target_entity_id": "workgraph:task-1",
+    "policy_labels": ["team"]
+  },
+  "expected": {
+    "operation_log_key": "profile/workgraph/v1/organization/operations",
+    "next_cursor_after_one": "oplog:2:workgraph:organization",
+    "duplicate_transition_identity": "invalid"
+  }
+}

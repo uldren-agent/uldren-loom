@@ -1,0 +1,107 @@
+{
+  "source_scope": "asana://workspace/engineering",
+  "rows_imported": 6,
+  "project": {
+    "project_id": "p-eng",
+    "key_prefix": "ENG",
+    "name": "Engineering Roadmap"
+  },
+  "board": {
+    "board_id": "p-eng-asana-board",
+    "board_key": "ASANA-p-eng",
+    "name": "Asana sections",
+    "mode": "manual",
+    "columns": [
+      {
+        "column_id": "section-my-today",
+        "name": "Today"
+      },
+      {
+        "column_id": "unsectioned",
+        "name": "Unsectioned"
+      }
+    ]
+  },
+  "task": {
+    "external_identity": "task:t-100",
+    "project_id": "p-eng",
+    "subject": "Ship hosted import adapter",
+    "description": "Normalize Asana task data into Loom tickets.",
+    "html_notes": "<body>Normalize <strong>Asana</strong> task data into Loom tickets.</body>",
+    "resource_subtype": "default_task",
+    "approval_status": "pending",
+    "assignee_status": "today",
+    "completed": false,
+    "created_at": "2026-07-01T09:15:00Z",
+    "created_by": "{\"gid\":\"user-17\",\"name\":\"Alice Rivera\",\"resource_type\":\"user\"}",
+    "modified_at": "2026-07-10T12:00:00Z",
+    "assigned_by": "{\"gid\":\"user-18\",\"name\":\"Bob Chen\",\"resource_type\":\"user\"}",
+    "assignee": "{\"email\":\"alice@example.com\",\"gid\":\"user-17\",\"name\":\"Alice Rivera\",\"resource_type\":\"user\"}",
+    "assignee_section": "{\"gid\":\"my-today\",\"name\":\"Today\",\"resource_type\":\"section\"}",
+    "workspace": "{\"gid\":\"w-eng\",\"name\":\"Engineering\",\"resource_type\":\"workspace\"}",
+    "external": "{\"data\":\"source-system-id=100\",\"gid\":\"ext-100\"}",
+    "due_on": "2026-07-31",
+    "due_at": "2026-07-31T18:00:00Z",
+    "start_on": "2026-07-01",
+    "start_at": "2026-07-01T09:00:00Z",
+    "actual_time_minutes": 95,
+    "liked": true,
+    "num_likes": 1,
+    "num_subtasks": 1,
+    "is_rendered_as_separator": false,
+    "tags": [
+      "customer-impact",
+      "p1"
+    ],
+    "custom_fields": "{\"Estimated hours\":13.5,\"External owner\":{\"gid\":\"user-17\",\"name\":\"Alice Rivera\"},\"Formula score\":{\"representation_type\":\"formula\",\"value\":\"effort * risk\"},\"Launch lane\":\"Enterprise\",\"Launch risks\":[\"security-review\",\"schema-review\"]}",
+    "dependencies": [
+      "{\"gid\":\"t-099\",\"resource_type\":\"task\"}"
+    ],
+    "dependents": [
+      "{\"gid\":\"t-101\",\"resource_type\":\"task\"}"
+    ],
+    "memberships": [
+      "{\"project\":{\"gid\":\"p-eng\",\"name\":\"Engineering Roadmap\",\"resource_type\":\"project\"},\"section\":{\"gid\":\"section-implementation\",\"name\":\"Implementation\",\"resource_type\":\"section\"}}"
+    ],
+    "followers": [
+      "{\"gid\":\"user-18\",\"name\":\"Bob Chen\",\"resource_type\":\"user\"}"
+    ],
+    "likes": [
+      "{\"gid\":\"like-1\",\"user\":{\"gid\":\"user-18\",\"name\":\"Bob Chen\",\"resource_type\":\"user\"}}"
+    ],
+    "asana_task_gid": "task:t-100"
+  },
+  "approval_task": {
+    "external_identity": "task:101",
+    "subject": "Approve cutover checklist",
+    "resource_subtype": "approval",
+    "completed": true,
+    "policy_labels": [
+      "approval"
+    ]
+  },
+  "unsupported_fields": [
+    "archived",
+    "attachments",
+    "color",
+    "created_at",
+    "current_status",
+    "custom_field_settings",
+    "default_view",
+    "due_on",
+    "goals",
+    "followers",
+    "icon",
+    "members",
+    "memberships",
+    "modified_at",
+    "owner",
+    "permalink_url",
+    "portfolios",
+    "start_on",
+    "stories",
+    "subtasks",
+    "team",
+    "workspace"
+  ]
+}

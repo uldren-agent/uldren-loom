@@ -1,0 +1,87 @@
+{
+  "source_scope": "vault",
+  "space": {
+    "space_id": "docs",
+    "title": "Markdown"
+  },
+  "pages": {
+    "intro": {
+      "title": "Intro",
+      "body_contains": [
+        "Intro",
+        "Welcome to Loom.",
+        "Import task",
+        "Ordered step",
+        "Quoted",
+        "owner:: docs",
+        "graph TD"
+      ]
+    },
+    "embed": {
+      "title": "Embed",
+      "block_refs": [
+        {
+          "entity": "page:intro",
+          "block": null,
+          "section": false
+        },
+        {
+          "entity": "page:intro",
+          "block": "intro",
+          "section": true
+        },
+        {
+          "entity": "page:intro",
+          "block": "welcome",
+          "section": false
+        }
+      ]
+    },
+    "guides": {
+      "title": "Guides",
+      "body_contains": [
+        "Guides",
+        "Folder note."
+      ]
+    },
+    "guides-setup": {
+      "title": "Setup",
+      "body_contains": [
+        "Setup",
+        "Run init."
+      ]
+    }
+  },
+  "unsupported_fields": [
+    "attachments",
+    "autolinks",
+    "block-ids",
+    "callouts",
+    "canvas",
+    "code-blocks",
+    "dataview",
+    "equations",
+    "excalidraw",
+    "footnotes",
+    "frontmatter",
+    "highlights",
+    "html",
+    "inline-code",
+    "markdown-links",
+    "mermaid",
+    "obsidian-comments",
+    "obsidian-config",
+    "strikethrough",
+    "tables",
+    "tasks-plugin",
+    "wikilinks"
+  ],
+  "block_ref_fidelity": {
+    "source": "obsidian-embeds",
+    "mode": "native-block-ref",
+    "count": 3
+  },
+  "not_unsupported_fields": [
+    "whole-page-obsidian-embed"
+  ]
+}

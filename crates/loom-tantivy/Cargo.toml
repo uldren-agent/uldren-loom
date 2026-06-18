@@ -1,0 +1,23 @@
+[package]
+authors = ["Uldren Technologies LLC"]
+description = "Optional native Tantivy full-text engine for Uldren Loom."
+edition = "2024"
+license = "BUSL-1.1"
+name = "uldren-loom-tantivy"
+repository = "https://github.com/uldrenai/uldren-loom"
+rust-version = "1.89"
+version = "0.1.0-alpha.1"
+
+[lib]
+name = "loom_tantivy"
+
+[dependencies]
+loom-core = { package = "uldren-loom-core", path = "../loom-core", version = "0.1.0-alpha.1" }
+tantivy = "0.26.1"
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cohort Heatmap Server</title>
+<style>
+:root { --ink:#1f2933; --muted:#697586; --line:#d8dee8; --panel:#f8fafc; --accent:#0f766e; --hot:#b91c1c; --mid:#d97706; --cool:#0f766e; }
+* { box-sizing:border-box; }
+body { margin:0; min-height:100vh; color:var(--ink); background:#eef2f6; font:14px/1.4 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+.app { min-height:100vh; display:grid; grid-template-columns:minmax(270px,340px) 1fr; }
+aside { background:var(--panel); border-right:1px solid var(--line); padding:18px; display:grid; align-content:start; gap:16px; }
+h1 { margin:0; font-size:22px; letter-spacing:0; }
+p { margin:4px 0 0; color:var(--muted); }
+.segmented { display:grid; grid-template-columns:repeat(3,1fr); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+button { border:0; border-right:1px solid var(--line); background:white; min-height:36px; cursor:pointer; color:var(--ink); }
+button:last-child { border-right:0; }
+button[aria-pressed="true"] { background:var(--accent); color:white; }
+label { color:var(--muted); display:grid; gap:5px; font-size:12px; }
+input { width:100%; }
+.summary { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.card { background:white; border:1px solid var(--line); border-radius:8px; padding:10px; }
+.card strong { display:block; font-size:20px; }
+main { min-width:0; overflow:auto; padding:18px; }
+.heatmap { min-width:760px; display:grid; grid-template-columns:120px repeat(12, minmax(44px,1fr)); border:1px solid var(--line); background:white; }
+.cell, .head, .cohort { min-height:42px; display:grid; place-items:center; border-right:1px solid var(--line); border-bottom:1px solid var(--line); }
+.head { color:var(--muted); background:#f8fafc; font-size:12px; }
+.cohort { justify-items:start; padding-left:12px; font-weight:600; background:#f8fafc; }
+.cell { color:white; font-weight:700; cursor:default; position:relative; }
+.cell[data-empty="true"] { background:#edf1f6; color:#9aa4b2; }
+.tooltip { position:fixed; pointer-events:none; background:#111827; color:white; padding:8px 10px; border-radius:8px; font-size:12px; transform:translate(12px,12px); display:none; z-index:3; }
+@media (max-width:760px) { .app { grid-template-columns:1fr; } aside { border-right:0; border-bottom:1px solid var(--line); } main { padding:12px; } }
+</style>
+</head>
+<body>
+<div class="app">
+<aside>
+  <header><h1>Cohort Heatmap</h1><p>Retention cohort analysis</p></header>
+  <div class="segmented" aria-label="Metric">
+    <button data-metric="retention" aria-pressed="true">Retention</button>
+    <button data-metric="revenue" aria-pressed="false">Revenue</button>
+    <button data-metric="risk" aria-pressed="false">Risk</button>
+  </div>
+  <label>Periods <input id="periods" type="range" min="6" max="12" value="12"></label>
+  <section class="summary">
+    <div class="card"><strong id="best">72%</strong><span>Best M6</span></div>
+    <div class="card"><strong id="avg">49%</strong><span>Average</span></div>
+  </section>
+</aside>
+<main>
+  <div class="heatmap" id="heatmap"></div>
+</main>
+</div>
+<div class="tooltip" id="tooltip"></div>
+<script>
+(() => {
+const heatmap = document.getElementById("heatmap");
+const tooltip = document.getElementById("tooltip");
+const periods = document.getElementById("periods");
+let metric = "retention";
+const cohorts = [
+  {name:"2025 Q1", base:84, decay:5.2, revenue:121, risk:18},
+  {name:"2025 Q2", base:79, decay:4.7, revenue:134, risk:22},
+  {name:"2025 Q3", base:76, decay:4.4, revenue:148, risk:25},
+  {name:"2025 Q4", base:73, decay:4.0, revenue:156, risk:29},
+  {name:"2026 Q1", base:81, decay:3.6, revenue:171, risk:20},
+  {name:"2026 Q2", base:86, decay:3.1, revenue:189, risk:17}
+];
+function valueFor(c, month) {
+  if (metric === "retention") return Math.max(18, Math.round(c.base - c.decay * month + Math.sin(month + c.base) * 3));
+  if (metric === "revenue") return Math.round(c.revenue * Math.pow(.94, month) + month * 4);
+  return Math.min(92, Math.round(c.risk + month * 4.6 + Math.cos(month) * 4));
+}
+function color(v) {
+  if (metric === "risk") {
+    const hue = 138 - v * 1.1;
+    return `hsl(${hue} 70% 38%)`;
+  }
+  const max = metric === "revenue" ? 190 : 90;
+  const ratio = Math.max(0, Math.min(1, v / max));
+  return `hsl(${165 - ratio * 120} 72% ${32 + ratio * 10}%)`;
+}
+function render() {
+  const cols = Number(periods.value);
+  heatmap.style.gridTemplateColumns = `120px repeat(${cols}, minmax(44px,1fr))`;
+  heatmap.innerHTML = `<div class="head">Cohort</div>` + Array.from({length:cols},(_,i)=>`<div class="head">M${i}</div>`).join("");
+  let total = 0, count = 0, bestM6 = 0;
+  for (const c of cohorts) {
+    heatmap.insertAdjacentHTML("beforeend", `<div class="cohort">${c.name}</div>`);
+    for (let m=0;m<cols;m++) {
+      const v = valueFor(c,m);
+      total += v; count++;
+      if (m === 6) bestM6 = Math.max(bestM6, v);
+      const suffix = metric === "revenue" ? "$" : "%";
+      const display = metric === "revenue" ? `$${v}` : `${v}%`;
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      cell.style.background = color(v);
+      cell.textContent = display;
+      cell.dataset.tip = `${c.name} M${m}: ${display} ${metric}`;
+      heatmap.appendChild(cell);
+    }
+  }
+  document.getElementById("best").textContent = metric === "revenue" ? `$${bestM6}` : `${bestM6}%`;
+  const avg = Math.round(total / count);
+  document.getElementById("avg").textContent = metric === "revenue" ? `$${avg}` : `${avg}%`;
+}
+heatmap.addEventListener("mousemove", event => {
+  const cell = event.target.closest(".cell");
+  if (!cell) { tooltip.style.display = "none"; return; }
+  tooltip.textContent = cell.dataset.tip;
+  tooltip.style.left = `${event.clientX}px`;
+  tooltip.style.top = `${event.clientY}px`;
+  tooltip.style.display = "block";
+});
+heatmap.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
+document.querySelectorAll("[data-metric]").forEach(button => {
+  button.addEventListener("click", () => {
+    metric = button.dataset.metric;
+    document.querySelectorAll("[data-metric]").forEach(b => b.setAttribute("aria-pressed", String(b === button)));
+    render();
+  });
+});
+periods.addEventListener("input", render);
+render();
+})();
+</script>
+</body>
+</html>

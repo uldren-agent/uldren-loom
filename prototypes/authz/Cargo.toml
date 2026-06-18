@@ -1,0 +1,19 @@
+# THROWAWAY: principal + stored-grant evaluator slice. It mirrors the compute layer's
+# capability grammar (`prototypes/loom-compute/src/access.rs`: facet + scope + mode) and extends it
+# with the version-control axes (namespace, ref-glob), the `Right` set, `effect` (allow/deny), and
+# principals/roles, then adds the policy enforcement point with deny-precedence and default-deny.
+# Detached from the parent workspace; pure std, no dependencies. Safe to delete.
+[workspace]
+
+[package]
+name = "authz-prototype"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "authz"
+path = "src/main.rs"
+
+[profile.release]
+strip = true

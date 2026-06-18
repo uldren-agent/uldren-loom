@@ -1,0 +1,18 @@
+[package]
+authors.workspace = true
+description = "Reusable single-node coordination contracts for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-coordination"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_coordination"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-types.workspace = true

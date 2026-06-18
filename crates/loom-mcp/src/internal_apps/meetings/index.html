@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meetings</title>
+  <style>
+    {{ loom.app_shell.css }}
+
+    main {
+      display: grid;
+      grid-template-columns: 300px minmax(0, 1fr) 340px;
+      min-height: 100vh;
+    }
+
+    aside,
+    section {
+      min-width: 0;
+      padding: 18px;
+    }
+
+    aside {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .right {
+      border-left: 1px solid var(--line);
+      border-right: 0;
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 21px;
+    }
+
+    h2 {
+      font-size: 16px;
+      margin-top: 18px;
+    }
+
+    h3 {
+      font-size: 14px;
+    }
+
+    .meta,
+    .empty,
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .list,
+    .grid {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .grid {
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    }
+
+    .entry,
+    .panel,
+    .metric,
+    .record {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 11px;
+    }
+
+    aside .entry {
+      background: var(--bg);
+    }
+
+    .entry,
+    .record {
+      display: grid;
+      gap: 5px;
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+    }
+
+    .key {
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0 9px;
+      background: var(--accent-soft);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin: 14px 0;
+    }
+
+    input {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--ink);
+      padding: 0 10px;
+      font: inherit;
+      min-width: min(100%, 260px);
+      flex: 1;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 23px;
+    }
+
+    .transcript {
+      min-height: 140px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    @media (max-width: 980px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+
+      aside,
+      .right {
+        border: 0;
+        border-bottom: 1px solid var(--line);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <aside>
+      <h1 id="title">Meetings</h1>
+      <div class="meta" id="subtitle"></div>
+      <h2>Meetings</h2>
+      <div class="list" id="meetings"></div>
+    </aside>
+    <section>
+      <div class="row">
+        <div>
+          <h1 id="meeting-title">Meeting</h1>
+          <div class="meta" id="meeting-meta"></div>
+        </div>
+        <span class="pill" id="mode"></span>
+      </div>
+      <div class="toolbar">
+        <input id="search-query" type="text" placeholder="search meetings">
+        <button type="button" id="search-button">Search</button>
+        <span class="small" id="action-status"></span>
+      </div>
+      <div class="grid" id="metrics"></div>
+      <h2>Details</h2>
+      <div class="panel transcript" id="details"></div>
+      <h2>Annotations</h2>
+      <div class="list" id="annotations"></div>
+      <h2>Projection Outputs</h2>
+      <div class="list" id="outputs"></div>
+    </section>
+    <aside class="right">
+      <h2>Extraction Review</h2>
+      <div class="list" id="review"></div>
+      <h2>Memory Graph</h2>
+      <div class="list" id="graph"></div>
+      <h2>Import Coverage</h2>
+      <div class="list" id="coverage"></div>
+      <h2>Access Audit</h2>
+      <div class="list" id="audit"></div>
+      <h2>Tools</h2>
+      <div class="list" id="tools"></div>
+    </aside>
+  </main>
+  <script>
+    (() => {
+      const data = {{ loom.meetings | tojson }};
+      const appId = data.definition?.app_id ?? "meeting-details";
+      const appUri = data.app_uri ?? data.definition?.resource_uri ?? "";
+      const list = data.list ?? { meetings: [] };
+      const meetings = Array.isArray(list.meetings) ? list.meetings : [];
+      const meeting = data.meeting ?? null;
+      const annotations = Array.isArray(meeting?.annotations) ? meeting.annotations : [];
+      const outputs = Array.isArray(data.projection?.outputs) ? data.projection.outputs : [];
+      const review = data.review ?? {};
+
+      function postHost(message) {
+        const host = window.parent;
+        if (!host || host === window) return;
+        try {
+          host.postMessage(Object.assign({ jsonrpc: "2.0" }, message), "*");
+        } catch (_) {
+        }
+      }
+
+      function renderEmpty(root, label) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = label;
+        root.replaceChildren(empty);
+      }
+
+      function item(root, className, title, detail, extra) {
+        const node = document.createElement("div");
+        node.className = className;
+        const top = document.createElement("div");
+        top.className = "row";
+        const key = document.createElement("div");
+        key.className = "key";
+        key.textContent = title;
+        const pill = document.createElement("span");
+        pill.className = "pill";
+        pill.textContent = detail;
+        top.append(key, pill);
+        node.append(top);
+        if (extra) {
+          const body = document.createElement("div");
+          body.className = "small";
+          body.textContent = extra;
+          node.append(body);
+        }
+        root.append(node);
+        return node;
+      }
+
+      function renderRecords(rootId, records, empty, formatter) {
+        const root = document.getElementById(rootId);
+        root.replaceChildren();
+        if (!records.length) return renderEmpty(root, empty);
+        for (const record of records) {
+          const parts = formatter(record);
+          item(root, "record", parts[0], parts[1], parts[2]);
+        }
+      }
+
+      function callTool(tool, args) {
+        postHost({
+          method: "tools/call",
+          params: {
+            name: "apps_call_tool",
+            arguments: { app_uri: appUri, tool, arguments: args }
+          }
+        });
+        document.getElementById("action-status").textContent = `${tool} requested`;
+      }
+
+      function renderMeetings() {
+        const root = document.getElementById("meetings");
+        root.replaceChildren();
+        if (!meetings.length) return renderEmpty(root, "No meetings");
+        for (const row of meetings) {
+          item(root, "entry", row.title, row.status, row.meeting_id);
+        }
+      }
+
+      function renderMetrics() {
+        const metrics = [
+          ["Meetings", list.total ?? meetings.length],
+          ["Annotations", annotations.length],
+          ["Outputs", outputs.length],
+          ["Vocabulary", review.vocabulary_terms ?? 0]
+        ];
+        const root = document.getElementById("metrics");
+        root.replaceChildren();
+        for (const [label, value] of metrics) {
+          const metric = document.createElement("div");
+          metric.className = "metric";
+          metric.innerHTML = `<strong>${value}</strong><span>${label}</span>`;
+          root.append(metric);
+        }
+      }
+
+      function renderDetails() {
+        const root = document.getElementById("details");
+        if (!meeting) {
+          root.textContent = "Select a Meeting Details app instance to inspect a meeting.";
+          return;
+        }
+        root.textContent = [
+          `id: ${meeting.meeting_id}`,
+          `status: ${meeting.status}`,
+          `sources: ${(meeting.source_refs ?? []).join(", ")}`,
+          `attendees: ${(meeting.attendee_refs ?? []).join(", ") || "none"}`,
+          `summary_ref: ${meeting.summary_ref ?? "none"}`,
+          `digest: ${meeting.current_source_digest}`
+        ].join("\n");
+      }
+
+      function renderAnnotations() {
+        const root = document.getElementById("annotations");
+        root.replaceChildren();
+        if (!annotations.length) return renderEmpty(root, "No annotations");
+        for (const annotation of annotations) {
+          const node = item(
+            root,
+            "record",
+            annotation.label,
+            `${annotation.kind} / ${annotation.status}`,
+            annotation.annotation_id
+          );
+          if ((data.definition?.write_tools ?? []).includes("meetings_accept_annotation")) {
+            const row = document.createElement("div");
+            row.className = "toolbar";
+            const accept = document.createElement("button");
+            accept.type = "button";
+            accept.textContent = "Accept";
+            accept.addEventListener("click", () => callTool("meetings_accept_annotation", {
+              workspace: data.workspace?.name,
+              annotation_id: annotation.annotation_id
+            }));
+            const reject = document.createElement("button");
+            reject.type = "button";
+            reject.textContent = "Reject";
+            reject.addEventListener("click", () => callTool("meetings_reject_annotation", {
+              workspace: data.workspace?.name,
+              annotation_id: annotation.annotation_id
+            }));
+            row.append(accept, reject);
+            node.append(row);
+          }
+        }
+      }
+
+      function renderReview() {
+        const rows = [
+          ["Suggested", (review.suggested_annotation_ids ?? []).length, (review.suggested_annotation_ids ?? []).join(", ")],
+          ["Accepted", (review.accepted_annotation_ids ?? []).length, (review.accepted_annotation_ids ?? []).join(", ")],
+          ["Rejected", (review.rejected_annotation_ids ?? []).length, (review.rejected_annotation_ids ?? []).join(", ")]
+        ];
+        renderRecords("review", rows, "No review projection", (row) => [
+          row[0],
+          String(row[1]),
+          row[2] || "none"
+        ]);
+      }
+
+      function renderGraph() {
+        const nodes = [];
+        for (const row of meetings) nodes.push(["meeting", row.meeting_id, row.title]);
+        for (const annotation of annotations) nodes.push([annotation.kind, annotation.annotation_id, annotation.label]);
+        renderRecords("graph", nodes, "No graph nodes", (row) => [row[2], row[0], row[1]]);
+      }
+
+      function renderCoverage() {
+        const coverage = data.import_coverage ?? {};
+        const records = [
+          ["Imported rows", String(coverage.imported_rows ?? meetings.length), coverage.status ?? "source-backed list"],
+          ["Import tool", "meetings_import_snapshot", coverage.import_tool ?? "available through MCP"],
+          ["Coverage gaps", String((coverage.gaps ?? []).length), (coverage.gaps ?? []).join(", ") || "none reported"]
+        ];
+        renderRecords("coverage", records, "No import coverage", (row) => row);
+      }
+
+      function renderAudit() {
+        const audit = data.access_audit ?? {};
+        const records = [
+          ["Read policy", audit.read_policy ?? "shared Studio ACL", data.profile_id ?? ""],
+          ["Audit source", audit.status ?? "target", audit.reason ?? "audit projection is not promoted yet"]
+        ];
+        renderRecords("audit", records, "No audit data", (row) => row);
+      }
+
+      document.getElementById("search-button").addEventListener("click", () => {
+        const query = document.getElementById("search-query").value.trim();
+        if (!query) return;
+        callTool("meetings_search", { workspace: data.workspace?.name, query });
+      });
+
+      document.getElementById("title").textContent = data.definition?.display_name ?? "Meetings";
+      document.getElementById("subtitle").textContent = data.workspace?.name ?? "";
+      document.getElementById("meeting-title").textContent = meeting?.title ?? "Meeting";
+      document.getElementById("meeting-meta").textContent = meeting?.meeting_id ?? data.profile_id ?? "";
+      document.getElementById("mode").textContent = appId;
+      renderMeetings();
+      renderMetrics();
+      renderDetails();
+      renderAnnotations();
+      renderRecords("outputs", outputs, "No projection outputs", (output) => [
+        output.output_id,
+        output.projection,
+        `${output.entity_kind}:${output.entity_id}`
+      ]);
+      renderReview();
+      renderGraph();
+      renderCoverage();
+      renderAudit();
+      renderRecords("tools", (data.definition?.write_tools ?? []).map((tool) => ({
+        tool,
+        target: "Meetings MCP",
+        description: "source-backed tool"
+      })), "No write tools", (item) => [
+        item.tool,
+        item.target,
+        item.description
+      ]);
+    })();
+  </script>
+</body>
+</html>

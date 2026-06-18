@@ -1,0 +1,56 @@
+{
+  "source_scope": "notion-api://workspace/main",
+  "space": {
+    "space_id": "notion",
+    "title": "notion"
+  },
+  "pages": {
+    "page-intro": {
+      "title": "Intro",
+      "body_contains": [
+        "Intro",
+        "Welcome from Notion API.@Alice",
+        "Plan",
+        "Details",
+        "Import task",
+        "Bullet item",
+        "Numbered item",
+        "Quoted note"
+      ]
+    },
+    "child": {
+      "title": "Child",
+      "parent_page_id": "page-intro",
+      "body_contains": [
+        "Child page"
+      ]
+    },
+    "database-row": {
+      "title": "Roadmap Row",
+      "body_contains": [
+        "Database row body"
+      ]
+    }
+  },
+  "unsupported_fields": [
+    "attachments",
+    "comments",
+    "database",
+    "formulas",
+    "permissions",
+    "property_values",
+    "rich_text_semantics",
+    "rollups",
+    "source_metadata",
+    "synced_blocks",
+    "unsupported_blocks",
+    "users",
+    "views"
+  ],
+  "block_ref_fidelity": {
+    "source_entity_id": "page:page-intro",
+    "field": "synced_blocks",
+    "mode": "fidelity-issue",
+    "reason_contains": "Notion synced blocks"
+  }
+}

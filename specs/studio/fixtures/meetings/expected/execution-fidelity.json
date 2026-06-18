@@ -1,0 +1,89 @@
+{
+  "suite": "loom.meetings.import-execution-fidelity.v1",
+  "idempotent_warning": "meetings snapshot already current",
+  "invalid_source_state_message": "unsupported meetings source_state",
+  "cases": [
+    {
+      "name": "granola-app-broad",
+      "input_profile": "granola-app",
+      "fixture": "granola-broad-snapshot.json",
+      "coverage": "partial",
+      "source_scope": "granola://account/acme/workspace/design",
+      "rows_imported": 3,
+      "sources": 3,
+      "meetings": 3,
+      "spans": 4,
+      "annotations": 10,
+      "payload_sources": [
+        "granola-note-complete",
+        "granola-note-partial",
+        "granola-csv-row-legacy"
+      ],
+      "meeting_statuses": {
+        "meeting/granola-note-complete": "active",
+        "meeting/granola-note-partial": "active",
+        "meeting/granola-csv-row-legacy": "retained_metadata_only"
+      }
+    },
+    {
+      "name": "granola-api",
+      "input_profile": "granola-api",
+      "fixture": "granola-api-snapshot.json",
+      "coverage": "partial",
+      "source_scope": "granola-api://account/acme/filter/updated-since-2024-07-01",
+      "rows_imported": 3,
+      "sources": 3,
+      "meetings": 3,
+      "spans": 1,
+      "annotations": 1,
+      "payload_sources": [
+        "api-note-visible",
+        "api-note-summary-pending",
+        "api-note-deleted"
+      ],
+      "meeting_statuses": {
+        "meeting/api-note-visible": "active",
+        "meeting/api-note-summary-pending": "active",
+        "meeting/api-note-deleted": "deleted_at_source"
+      }
+    },
+    {
+      "name": "granola-mcp",
+      "input_profile": "granola-mcp",
+      "fixture": "granola-mcp-snapshot.json",
+      "coverage": "partial",
+      "source_scope": "mcp://granola/session/session-123/note/mcp-note-1",
+      "rows_imported": 1,
+      "sources": 1,
+      "meetings": 1,
+      "spans": 1,
+      "annotations": 1,
+      "payload_sources": [
+        "mcp-note-1"
+      ],
+      "meeting_statuses": {
+        "meeting/mcp-note-1": "active"
+      }
+    },
+    {
+      "name": "csv-degraded",
+      "input_profile": "csv",
+      "fixture": "granola-csv-snapshot.json",
+      "coverage": "degraded",
+      "source_scope": "file:///imports/granola-notes.csv",
+      "rows_imported": 2,
+      "sources": 2,
+      "meetings": 2,
+      "spans": 0,
+      "annotations": 0,
+      "payload_sources": [
+        "csv-row-1",
+        "csv-row-2"
+      ],
+      "meeting_statuses": {
+        "meeting/csv-row-1": "active",
+        "meeting/csv-row-2": "retained_metadata_only"
+      }
+    }
+  ]
+}

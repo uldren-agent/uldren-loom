@@ -12,5 +12,43 @@ version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["substrate-studio"]
+substrate-studio = [
+    "loom-substrate/studio-lifecycle",
+    "loom-substrate/studio-meetings",
+    "loom-substrate/studio-pages",
+    "loom-substrate/studio-surfaces",
+]
+
 [dependencies]
+ed25519-dalek.workspace = true
+hex.workspace = true
+loom-codec.workspace = true
+loom-compute = { workspace = true, features = ["sql-state-access"] }
 loom-core.workspace = true
+loom-chat.workspace = true
+loom-delivery.workspace = true
+loom-drive.workspace = true
+loom-interchange.workspace = true
+loom-interchange-io.workspace = true
+loom-logs.workspace = true
+loom-metrics.workspace = true
+loom-pages.workspace = true
+loom-pim.workspace = true
+loom-result.workspace = true
+loom-sql.workspace = true
+loom-store.workspace = true
+loom-substrate.workspace = true
+loom-tickets.workspace = true
+loom-templates.workspace = true
+loom-traces.workspace = true
+loom-types.workspace = true
+loom-watch.workspace = true
+loom-wire.workspace = true
+serde_json.workspace = true
+zip.workspace = true
+# Assemble the `exec` conformance guest programs from WAT to wasm bytes (Apache-2.0 WITH
+# LLVM-exception; allowed by deny.toml). Not a dev-dependency: `run_exec_behavior` is part of the
+# shared runner surface, so the fixtures live in `src`.
+wat = "1.253"

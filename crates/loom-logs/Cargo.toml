@@ -1,0 +1,19 @@
+[package]
+authors.workspace = true
+description = "Native logs contracts for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-logs"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_logs"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-codec.workspace = true
+loom-types.workspace = true

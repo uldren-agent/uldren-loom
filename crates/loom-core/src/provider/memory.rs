@@ -3,15 +3,27 @@
 //! Backed by a `BTreeMap` keyed by digest bytes, so iteration order is deterministic.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use super::ObjectStore;
 use crate::digest::Digest;
 use crate::error::Result;
 
-/// A simple, deterministic in-memory [`ObjectStore`].
-#[derive(Debug, Default, Clone)]
+/// A simple, deterministic in-memory [`ObjectStore`]. Interior mutability via a `Mutex`, so the store
+/// is `Send + Sync` and shareable across threads - matching the [`ObjectStore`] contract (and letting a
+/// type-erased `Arc<dyn ObjectStore + Send + Sync>` wrap it, e.g. the lazy SQL base snapshot). A clone
+/// is an independent copy (the data is cloned, not the lock).
+#[derive(Debug, Default)]
 pub struct MemoryStore {
-    objects: BTreeMap<[u8; crate::digest::DIGEST_LEN], Vec<u8>>,
+    objects: Mutex<BTreeMap<[u8; crate::digest::DIGEST_LEN], Vec<u8>>>,
+}
+
+impl Clone for MemoryStore {
+    fn clone(&self) -> Self {
+        Self {
+            objects: Mutex::new(self.objects.lock().expect("memory store lock").clone()),
+        }
+    }
 }
 
 impl MemoryStore {
@@ -19,27 +31,33 @@ impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<[u8; crate::digest::DIGEST_LEN], Vec<u8>>> {
+        self.objects.lock().expect("memory store lock")
+    }
 }
 
 impl ObjectStore for MemoryStore {
-    fn put(&mut self, canonical: &[u8]) -> Result<Digest> {
+    fn put(&self, canonical: &[u8]) -> Result<Digest> {
         let digest = Digest::blake3(canonical);
-        self.objects
+        self.lock()
             .entry(*digest.bytes())
             .or_insert_with(|| canonical.to_vec());
         Ok(digest)
     }
 
     fn get(&self, digest: &Digest) -> Result<Option<Vec<u8>>> {
-        Ok(self.objects.get(digest.bytes()).cloned())
+        Ok(self.lock().get(digest.bytes()).cloned())
     }
 
     fn has(&self, digest: &Digest) -> Result<bool> {
-        Ok(self.objects.contains_key(digest.bytes()))
+        Ok(self.lock().contains_key(digest.bytes()))
     }
 
     fn len(&self) -> usize {
-        self.objects.len()
+        self.lock().len()
     }
 }
 
@@ -50,7 +68,7 @@ mod tests {
 
     #[test]
     fn put_get_has_roundtrip() {
-        let mut store = MemoryStore::new();
+        let store = MemoryStore::new();
         assert!(store.is_empty());
 
         let obj = Object::Blob(b"hello loom".to_vec());
@@ -68,7 +86,7 @@ mod tests {
 
     #[test]
     fn put_is_idempotent() {
-        let mut store = MemoryStore::new();
+        let store = MemoryStore::new();
         let canonical = Object::Blob(b"dup".to_vec()).canonical();
         let d1 = store.put(&canonical).unwrap();
         let d2 = store.put(&canonical).unwrap();

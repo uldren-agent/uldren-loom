@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+description = "Canonical API/wire CBOR encoders and decoders shared by the generated local, server, and C ABI surfaces."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-wire"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_wire"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-codec.workspace = true
+loom-core.workspace = true
+loom-types.workspace = true

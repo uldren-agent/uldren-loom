@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VCS</title>
+  <style>
+    {{ loom.app_shell.css }}
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 240px minmax(0, 1fr);
+    }
+
+    html.mcp-embedded .app {
+      min-height: 0;
+    }
+
+    nav {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+      padding: 18px 14px;
+    }
+
+    h1 {
+      margin: 0 0 18px;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .tabs {
+      display: grid;
+      gap: 6px;
+    }
+
+    .tab {
+      display: block;
+      color: var(--muted);
+      text-decoration: none;
+      padding: 9px 10px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+    }
+
+    .tab[aria-current="page"] {
+      color: var(--accent-ink);
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    main {
+      min-width: 0;
+      padding: 22px;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 18px;
+    }
+
+    .title {
+      min-width: 0;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: 0;
+    }
+
+    .meta {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .metric,
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .metric {
+      padding: 14px;
+      min-height: 86px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .panel {
+      overflow: hidden;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .empty {
+      padding: 28px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .badge {
+      display: inline-block;
+      min-width: 72px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      text-align: center;
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .badge.warn {
+      color: var(--warn);
+    }
+
+    .badge.danger {
+      color: var(--danger);
+    }
+
+    @media (max-width: 760px) {
+      .app {
+        grid-template-columns: 1fr;
+      }
+
+      nav {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .tabs {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+
+      .tab {
+        text-align: center;
+      }
+
+      main {
+        padding: 16px;
+      }
+
+      .toolbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <nav>
+      <h1>VCS</h1>
+      <div class="tabs" aria-label="VCS sections">
+        <a class="tab" href="#status" data-tab="status">Status</a>
+        <a class="tab" href="#changes" data-tab="changes">Changes</a>
+        <a class="tab" href="#branches" data-tab="branches">Branches</a>
+        <a class="tab" href="#history" data-tab="history">History</a>
+      </div>
+    </nav>
+    <main>
+      <div class="toolbar">
+        <div class="title">
+          <h2 id="view-title">Status</h2>
+          <div class="meta" id="view-meta">Workspace version state</div>
+        </div>
+        <button type="button" id="refresh">Refresh</button>
+      </div>
+
+      <section id="status" data-view>
+        <div class="grid">
+          <div class="metric"><strong data-count="staged">0</strong><span>Staged</span></div>
+          <div class="metric"><strong data-count="unstaged">0</strong><span>Unstaged</span></div>
+          <div class="metric"><strong data-count="untracked">0</strong><span>Untracked</span></div>
+        </div>
+        <div class="panel">
+          <table>
+            <thead><tr><th>Path</th><th>State</th></tr></thead>
+            <tbody data-table="status"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="changes" data-view hidden>
+        <div class="panel">
+          <table>
+            <thead><tr><th>Path</th><th>Change</th><th>Stage</th></tr></thead>
+            <tbody data-table="changes"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="branches" data-view hidden>
+        <div class="panel">
+          <table>
+            <thead><tr><th>Branch</th><th>Tip</th><th>State</th></tr></thead>
+            <tbody data-table="branches"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="history" data-view hidden>
+        <div class="panel">
+          <table>
+            <thead><tr><th>Commit</th><th>Author</th><th>Message</th></tr></thead>
+            <tbody data-table="history"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    (() => {
+    const loomVcs = {{ loom.vcs | tojson }};
+    const APP_MODES = {{ meta.ui.availableDisplayModes | tojson }};
+    const displayModes = Array.isArray(APP_MODES) && APP_MODES.length ? APP_MODES : ["inline"];
+    const workspace = loomVcs.workspace || {};
+    const statusValue = loomVcs.status && loomVcs.status.ok && loomVcs.status.value
+      ? loomVcs.status.value
+      : { staged: [], unstaged: [], untracked: [], conflicts: [] };
+
+    function changeRows(items, state) {
+      return items.map((item) => [item.path || item, item.kind || state]);
+    }
+
+    function statusRows() {
+      const rows = [
+        ...changeRows(statusValue.staged || [], "staged"),
+        ...changeRows(statusValue.unstaged || [], "unstaged"),
+        ...(statusValue.untracked || []).map((path) => [path, "untracked"]),
+        ...(statusValue.conflicts || []).map((path) => [path, "conflict"])
+      ];
+      if (rows.length > 0) return rows;
+      if (loomVcs.status && !loomVcs.status.ok) return [[loomVcs.status.error || "Status unavailable", "error"]];
+      return [["No changes", "Clean"]];
+    }
+
+    function historyRows() {
+      if (loomVcs.history && loomVcs.history.ok) {
+        return (loomVcs.history.items || []).map((commit) => [commit, "", ""]);
+      }
+      return [[loomVcs.history && loomVcs.history.error ? loomVcs.history.error : "History unavailable", "", ""]];
+    }
+
+    function branchRows() {
+      const rows = [["main", workspace.head || "No commits", "current"]];
+      if (loomVcs.tags && loomVcs.tags.ok) {
+        for (const tag of loomVcs.tags.items || []) rows.push([tag, "", "tag"]);
+      }
+      return rows;
+    }
+
+    function changeTableRows() {
+      const rows = [
+        ...changeRows(statusValue.staged || [], "staged").map((row) => [row[0], row[1], "index"]),
+        ...changeRows(statusValue.unstaged || [], "unstaged").map((row) => [row[0], row[1], "working tree"]),
+        ...(statusValue.untracked || []).map((path) => [path, "untracked", "working tree"]),
+        ...(statusValue.conflicts || []).map((path) => [path, "conflict", "merge"])
+      ];
+      return rows;
+    }
+
+    const views = {
+      status: {
+        title: "Status",
+        meta: workspace.name ? `Workspace ${workspace.name}` : "Workspace version state",
+        rows: statusRows()
+      },
+      changes: {
+        title: "Changes",
+        meta: "Working tree and index",
+        rows: changeTableRows()
+      },
+      branches: {
+        title: "Branches",
+        meta: "Refs in this workspace",
+        rows: branchRows()
+      },
+      history: {
+        title: "History",
+        meta: "Recent commits",
+        rows: historyRows()
+      }
+    };
+
+    const tables = {
+      status: document.querySelector("[data-table='status']"),
+      changes: document.querySelector("[data-table='changes']"),
+      branches: document.querySelector("[data-table='branches']"),
+      history: document.querySelector("[data-table='history']")
+    };
+
+    function cell(value, className) {
+      const td = document.createElement("td");
+      if (className) td.className = className;
+      td.textContent = value;
+      return td;
+    }
+
+    function renderTable(name) {
+      const table = tables[name];
+      table.textContent = "";
+      const rows = views[name].rows;
+      const columnCount = table.closest("table").querySelectorAll("th").length;
+      if (rows.length === 0) {
+        const row = document.createElement("tr");
+        const td = cell("No entries");
+        td.colSpan = columnCount;
+        td.className = "empty";
+        row.append(td);
+        table.append(row);
+        return;
+      }
+      for (const values of rows) {
+        const row = document.createElement("tr");
+        for (const value of values) {
+          row.append(cell(value));
+        }
+        table.append(row);
+      }
+    }
+
+    function setView(name) {
+      const selected = views[name] ? name : "status";
+      for (const section of document.querySelectorAll("[data-view]")) {
+        section.hidden = section.id !== selected;
+      }
+      for (const tab of document.querySelectorAll("[data-tab]")) {
+        tab.setAttribute("aria-current", tab.dataset.tab === selected ? "page" : "false");
+      }
+      document.getElementById("view-title").textContent = views[selected].title;
+      document.getElementById("view-meta").textContent = views[selected].meta;
+      renderTable(selected);
+      if (location.hash.slice(1) !== selected) {
+        history.replaceState(null, "", "#" + selected);
+      }
+    }
+
+    function refreshCounts() {
+      document.querySelector("[data-count='staged']").textContent = String((statusValue.staged || []).length);
+      document.querySelector("[data-count='unstaged']").textContent = String((statusValue.unstaged || []).length);
+      document.querySelector("[data-count='untracked']").textContent = String((statusValue.untracked || []).length);
+    }
+
+    window.addEventListener("hashchange", () => setView(location.hash.slice(1)));
+    document.getElementById("refresh").addEventListener("click", () => {
+      window.location.reload();
+    });
+    refreshCounts();
+    setView(location.hash.slice(1));
+
+    (function connectHost() {
+      const host = window.parent;
+      if (!host || host === window) return;
+      document.documentElement.classList.add("mcp-embedded");
+      const INIT_ID = "loom-vcs-init";
+      let initSent = false;
+      let initialized = false;
+
+      function post(message) {
+        try {
+          host.postMessage(Object.assign({ jsonrpc: "2.0" }, message), "*");
+        } catch (_) {
+        }
+      }
+
+      let reqSeq = 0;
+      const pending = new Map();
+      function request(method, params) {
+        return new Promise((resolve, reject) => {
+          const id = "loom-vcs-req-" + (++reqSeq);
+          pending.set(id, { resolve, reject });
+          post({ id, method, params: params || {} });
+          setTimeout(() => {
+            if (pending.has(id)) {
+              pending.delete(id);
+              reject(new Error("timeout waiting for " + method));
+            }
+          }, 8000);
+        });
+      }
+
+      function sendInitialize() {
+        if (initSent) return;
+        initSent = true;
+        post({
+          id: INIT_ID,
+          method: "ui/initialize",
+          params: { appCapabilities: { availableDisplayModes: displayModes } }
+        });
+      }
+
+      function announceInitialized() {
+        if (initialized) return;
+        initialized = true;
+        post({ method: "ui/notifications/initialized" });
+        scheduleNotifySize();
+      }
+
+      let lastWidth = 0;
+      let lastHeight = 0;
+      let sizeTimer = null;
+      function notifySize() {
+        const doc = document.documentElement;
+        const body = document.body;
+        const height = Math.ceil(
+          Math.max(doc ? doc.scrollHeight : 0, body ? body.scrollHeight : 0)
+        ) + 1;
+        const width = Math.ceil((doc && doc.clientWidth) || window.innerWidth || 0);
+        if (!height || (height === lastHeight && width === lastWidth)) return;
+        lastHeight = height;
+        lastWidth = width;
+        post({
+          method: "ui/notifications/size-changed",
+          params: { width, height }
+        });
+      }
+      function scheduleNotifySize() {
+        if (sizeTimer) clearTimeout(sizeTimer);
+        sizeTimer = setTimeout(notifySize, 120);
+      }
+      if (typeof ResizeObserver !== "undefined") {
+        const observer = new ResizeObserver(scheduleNotifySize);
+        if (document.documentElement) observer.observe(document.documentElement);
+        if (document.body) observer.observe(document.body);
+      }
+      window.addEventListener("load", scheduleNotifySize);
+      window.addEventListener("hashchange", scheduleNotifySize);
+
+      window.addEventListener("message", (event) => {
+        const data = event && event.data;
+        if (!data || data.jsonrpc !== "2.0") return;
+        if (typeof data.method === "string" && data.method.indexOf("sandbox") !== -1) {
+          sendInitialize();
+          return;
+        }
+        if (data.id === INIT_ID && (("result" in data) || ("error" in data))) {
+          announceInitialized();
+          return;
+        }
+        if (data.id !== undefined && data.id !== null && pending.has(data.id)) {
+          const p = pending.get(data.id);
+          pending.delete(data.id);
+          if ("error" in data) p.reject(data.error);
+          else p.resolve(data.result);
+        }
+      });
+
+      function buildTestPanel() {
+        const ns = (workspace && workspace.name) || "";
+        const panel = document.createElement("div");
+        panel.style.cssText =
+          "margin:12px 16px;padding:10px;border:1px solid var(--line,#ccc);border-radius:8px;font:12px/1.4 system-ui,sans-serif;";
+        const title = document.createElement("div");
+        title.textContent = "Bridge test panel";
+        title.style.cssText = "font-weight:600;margin-bottom:6px;";
+        const bar = document.createElement("div");
+        bar.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;";
+        const out = document.createElement("pre");
+        out.style.cssText =
+          "margin:0;max-height:160px;overflow:auto;background:rgba(127,127,127,.12);padding:8px;border-radius:6px;white-space:pre-wrap;";
+        panel.append(title, bar, out);
+
+        function log(label, data) {
+          const body = typeof data === "string" ? data : JSON.stringify(data);
+          out.textContent =
+            "[" + new Date().toLocaleTimeString() + "] " + label + ": " + body + "\n" + out.textContent;
+        }
+        function btn(label, fn) {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.textContent = label;
+          b.style.cssText = "padding:4px 8px;cursor:pointer;";
+          b.addEventListener("click", () => {
+            try {
+              const r = fn();
+              if (r && typeof r.then === "function") {
+                r.then((v) => log(label + " OK", v)).catch((e) => log(label + " ERR", (e && e.message) || e));
+              }
+            } catch (e) {
+              log(label + " threw", (e && e.message) || String(e));
+            }
+          });
+          bar.append(b);
+        }
+        function applyStatus(value) {
+          if (!value) return;
+          const set = (k, arr) => {
+            const el = document.querySelector("[data-count='" + k + "']");
+            if (el) el.textContent = String((arr || []).length);
+          };
+          set("staged", value.staged);
+          set("unstaged", value.unstaged);
+          set("untracked", value.untracked);
+        }
+        const statusFrom = (r) => r && r.structuredContent && r.structuredContent.value;
+
+        btn("Reload (page)", () => {
+          location.reload();
+          return "reloading";
+        });
+        btn("Refresh (tools/call vcs_status)", () =>
+          request("tools/call", { name: "vcs_status", arguments: ns ? { workspace: ns } : {} }).then((r) => {
+            applyStatus(statusFrom(r));
+            return r;
+          })
+        );
+        btn("Refresh (tools/call vcs.status dotted)", () =>
+          request("tools/call", { name: "vcs.status", arguments: ns ? { workspace: ns } : {} }).then((r) => {
+            applyStatus(statusFrom(r));
+            return r;
+          })
+        );
+        btn("Re-read resource", () => request("resources/read", { uri: "loom://" + ns + "/" }));
+
+        displayModes.forEach((mode) => {
+          btn("Display: " + mode, () => request("ui/request-display-mode", { mode }));
+        });
+
+        btn("ui/message", () =>
+          request("ui/message", { role: "user", content: [{ type: "text", text: "Please refresh the VCS view." }] })
+        );
+        btn("ui/update-model-context", () =>
+          request("ui/update-model-context", {
+            content: [{ type: "text", text: "User is viewing VCS status for " + (ns || "workspace") + "." }]
+          })
+        );
+        btn("ui/open-link", () =>
+          request("ui/open-link", { url: "https://modelcontextprotocol.io/extensions/apps/overview" })
+        );
+
+        document.body.insertBefore(panel, document.body.firstChild);
+      }
+      buildTestPanel();
+
+      sendInitialize();
+      scheduleNotifySize();
+    })();
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drive</title>
+  <style>
+    {{ loom.app_shell.css }}
+
+    main {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr) 340px;
+      min-height: 100vh;
+    }
+
+    aside,
+    section {
+      min-width: 0;
+      padding: 18px;
+    }
+
+    aside {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .right {
+      border-left: 1px solid var(--line);
+      border-right: 0;
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 21px;
+    }
+
+    h2 {
+      font-size: 16px;
+      margin-top: 18px;
+    }
+
+    h3 {
+      font-size: 14px;
+    }
+
+    .meta,
+    .empty,
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .list {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .entry,
+    .panel,
+    .metric,
+    .record {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 11px;
+    }
+
+    aside .entry {
+      background: var(--bg);
+    }
+
+    .entry {
+      display: grid;
+      gap: 5px;
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+    }
+
+    .key {
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0 9px;
+      background: var(--accent-soft);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin: 14px 0;
+    }
+
+    input,
+    select {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--ink);
+      padding: 0 10px;
+      font: inherit;
+    }
+
+    input[type="text"] {
+      min-width: min(100%, 260px);
+      flex: 1;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 10px;
+      margin: 14px 0;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 23px;
+    }
+
+    .preview {
+      min-height: 180px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    @media (max-width: 980px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+
+      aside,
+      .right {
+        border: 0;
+        border-bottom: 1px solid var(--line);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <aside>
+      <h1 id="title">Drive</h1>
+      <div class="meta" id="subtitle"></div>
+      <h2>Folders</h2>
+      <div class="list" id="folders"></div>
+    </aside>
+    <section>
+      <div class="row">
+        <div>
+          <h1 id="folder-title">Folder</h1>
+          <div class="meta" id="folder-meta"></div>
+        </div>
+        <span class="pill" id="mode"></span>
+      </div>
+      <div class="toolbar">
+        <input id="name" type="text" placeholder="name">
+        <input id="id" type="text" placeholder="id">
+        <button type="button" id="create-folder">Create folder</button>
+        <button type="button" id="upload">Start upload</button>
+        <span class="small" id="action-status"></span>
+      </div>
+      <div class="metrics" id="metrics"></div>
+      <h2>Entries</h2>
+      <div class="list" id="entries"></div>
+      <h2 id="preview-title">Preview</h2>
+      <div class="panel preview" id="preview"></div>
+    </section>
+    <aside class="right">
+      <h2>Versions</h2>
+      <div class="list" id="versions"></div>
+      <h2>Conflicts</h2>
+      <div class="list" id="conflicts"></div>
+      <h2>Shares</h2>
+      <div class="list" id="shares"></div>
+      <h2>Retention</h2>
+      <div class="list" id="retention"></div>
+      <h2>Leases</h2>
+      <div class="list" id="leases"></div>
+      <h2>Tools</h2>
+      <div class="list" id="tools"></div>
+    </aside>
+  </main>
+  <script>
+    (() => {
+      const data = {{ loom.drive | tojson }};
+      const appId = data.definition?.app_id ?? "drive-browser";
+      const appUri = data.app_uri ?? data.definition?.resource_uri ?? "";
+      const folder = data.folder ?? null;
+      const entries = Array.isArray(folder?.entries) ? folder.entries : [];
+      const folders = entries.filter((entry) => entry.kind === "folder");
+      const stat = data.stat ?? null;
+      const versions = Array.isArray(data.versions) ? data.versions : [];
+      const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+      const shares = Array.isArray(data.shares) ? data.shares : [];
+      const retention = Array.isArray(data.retention) ? data.retention : [];
+      const selectedFile = data.selected_file ?? null;
+
+      function bytesText(bytes) {
+        if (!Array.isArray(bytes)) return "";
+        return new TextDecoder().decode(new Uint8Array(bytes));
+      }
+
+      function postHost(message) {
+        const host = window.parent;
+        if (!host || host === window) return;
+        try {
+          host.postMessage(Object.assign({ jsonrpc: "2.0" }, message), "*");
+        } catch (_) {
+        }
+      }
+
+      function renderEmpty(root, label) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = label;
+        root.replaceChildren(empty);
+      }
+
+      function item(root, className, title, detail, extra) {
+        const node = document.createElement("div");
+        node.className = className;
+        const top = document.createElement("div");
+        top.className = "row";
+        const key = document.createElement("div");
+        key.className = "key";
+        key.textContent = title;
+        const pill = document.createElement("span");
+        pill.className = "pill";
+        pill.textContent = detail;
+        top.append(key, pill);
+        node.append(top);
+        if (extra) {
+          const body = document.createElement("div");
+          body.className = "small";
+          body.textContent = extra;
+          node.append(body);
+        }
+        root.append(node);
+      }
+
+      function renderEntries() {
+        const root = document.getElementById("entries");
+        root.replaceChildren();
+        if (!entries.length) return renderEmpty(root, "No entries");
+        for (const entry of entries) {
+          item(root, "entry", entry.name, entry.kind, entry.node_id);
+        }
+      }
+
+      function renderFolders() {
+        const root = document.getElementById("folders");
+        root.replaceChildren();
+        if (!folders.length) return renderEmpty(root, "No child folders");
+        for (const entry of folders) {
+          item(root, "entry", entry.name, "folder", entry.node_id);
+        }
+      }
+
+      function renderRecords(rootId, records, empty, formatter) {
+        const root = document.getElementById(rootId);
+        root.replaceChildren();
+        if (!records.length) return renderEmpty(root, empty);
+        for (const record of records) {
+          const parts = formatter(record);
+          item(root, "record", parts[0], parts[1], parts[2]);
+        }
+      }
+
+      function renderMetrics() {
+        const metrics = [
+          ["Entries", entries.length],
+          ["Versions", versions.length],
+          ["Conflicts", conflicts.filter((item) => item.resolution === "open").length],
+          ["Shares", shares.length],
+          ["Retention", retention.length]
+        ];
+        const root = document.getElementById("metrics");
+        root.replaceChildren();
+        for (const [label, value] of metrics) {
+          const metric = document.createElement("div");
+          metric.className = "metric";
+          metric.innerHTML = `<strong>${value}</strong><span>${label}</span>`;
+          root.append(metric);
+        }
+      }
+
+      function renderPreview() {
+        document.getElementById("preview-title").textContent = selectedFile
+          ? `Preview: ${selectedFile.file_id}`
+          : "Preview";
+        const preview = document.getElementById("preview");
+        if (Array.isArray(data.file_bytes)) {
+          preview.textContent = bytesText(data.file_bytes);
+        } else if (stat?.latest_version) {
+          preview.textContent = `Latest digest: ${stat.latest_version.content_digest}`;
+        } else {
+          preview.textContent = "Select a file-backed Drive app instance to preview bytes.";
+        }
+      }
+
+      function callTool(tool, args) {
+        postHost({
+          method: "tools/call",
+          params: {
+            name: "apps_call_tool",
+            arguments: { app_uri: appUri, tool, arguments: args }
+          }
+        });
+        document.getElementById("action-status").textContent = `${tool} requested`;
+      }
+
+      document.getElementById("create-folder").addEventListener("click", () => {
+        const name = document.getElementById("name").value.trim();
+        const folderId = document.getElementById("id").value.trim();
+        if (!name || !folderId || !folder?.profile_root) return;
+        callTool("drive_create_folder", {
+          workspace: data.workspace?.name,
+          parent_folder_id: folder.folder_id ?? "root",
+          folder_id: folderId,
+          name,
+          expected_root: folder.profile_root
+        });
+      });
+
+      document.getElementById("upload").addEventListener("click", () => {
+        const name = document.getElementById("name").value.trim();
+        const fileId = document.getElementById("id").value.trim();
+        if (!name || !fileId || !folder?.profile_root) return;
+        callTool("drive_create_upload", {
+          workspace: data.workspace?.name,
+          upload_id: `upload-${Date.now()}`,
+          parent_folder_id: folder.folder_id ?? "root",
+          name,
+          file_id: fileId,
+          expected_root: folder.profile_root,
+          replace_file: false
+        });
+      });
+
+      document.getElementById("title").textContent = data.definition?.display_name ?? "Drive";
+      document.getElementById("subtitle").textContent = data.workspace?.name ?? "";
+      document.getElementById("folder-title").textContent = folder
+        ? `Folder ${folder.folder_id}`
+        : "Folder root";
+      document.getElementById("folder-meta").textContent = folder?.profile_root ?? "";
+      document.getElementById("mode").textContent = appId;
+      renderFolders();
+      renderEntries();
+      renderMetrics();
+      renderPreview();
+      renderRecords("versions", versions, "No file versions", (item) => [
+        `v${item.version}`,
+        `${item.size} bytes`,
+        item.content_digest
+      ]);
+      renderRecords("conflicts", conflicts, "No conflicts", (item) => [
+        item.conflict_id,
+        item.resolution,
+        item.conflict_name
+      ]);
+      renderRecords("shares", shares, "No share grants", (item) => [
+        item.grant_id,
+        item.role,
+        `${item.target_kind}:${item.target_id} -> ${item.principal}`
+      ]);
+      renderRecords("retention", retention, "No retention pins", (item) => [
+        item.pin_id,
+        item.kind,
+        item.target_entity_id ?? item.root
+      ]);
+      renderRecords("leases", data.lease_tools ?? [], "Lease actions use Drive MCP tools", (item) => [
+        item.tool,
+        item.target,
+        item.description
+      ]);
+      renderRecords("tools", (data.definition?.write_tools ?? []).map((tool) => ({
+        tool,
+        target: "Drive MCP",
+        description: "source-backed tool"
+      })), "No write tools", (item) => [
+        item.tool,
+        item.target,
+        item.description
+      ]);
+    })();
+  </script>
+</body>
+</html>

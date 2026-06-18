@@ -1,0 +1,58 @@
+{
+  "nodes": [
+    {
+      "id": "intro",
+      "type": "file",
+      "file": "Intro.md",
+      "subpath": "#Intro",
+      "x": 0,
+      "y": 0,
+      "width": 400,
+      "height": 240,
+      "color": "1"
+    },
+    {
+      "id": "text-note",
+      "type": "text",
+      "text": "Canvas text node with **markdown**.",
+      "x": 460,
+      "y": 0,
+      "width": 320,
+      "height": 180,
+      "color": "#336699"
+    },
+    {
+      "id": "external-link",
+      "type": "link",
+      "url": "https://example.com",
+      "x": 0,
+      "y": 320,
+      "width": 280,
+      "height": 160
+    },
+    {
+      "id": "group",
+      "type": "group",
+      "label": "Planning",
+      "background": "Attachments/diagram.png",
+      "backgroundStyle": "cover",
+      "x": -40,
+      "y": -40,
+      "width": 900,
+      "height": 420
+    }
+  ],
+  "edges": [
+    {
+      "id": "intro-to-text",
+      "fromNode": "intro",
+      "fromSide": "right",
+      "fromEnd": "none",
+      "toNode": "text-note",
+      "toSide": "left",
+      "toEnd": "arrow",
+      "color": "4",
+      "label": "explains"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+[package]
+authors.workspace = true
+description = "Reusable calendar, contacts, and mail record models for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-pim"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_pim"
+
+[lints]
+workspace = true
+
+[dependencies]
+icalendar.workspace = true
+loom-codec.workspace = true
+loom-rrule.workspace = true
+loom-types.workspace = true
+mail-parser.workspace = true
+time.workspace = true
+vcard4.workspace = true

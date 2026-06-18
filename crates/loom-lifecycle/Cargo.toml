@@ -1,0 +1,21 @@
+[package]
+authors.workspace = true
+description = "Lifecycle service model for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-lifecycle"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_lifecycle"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-core.workspace = true
+loom-store.workspace = true
+loom-substrate = { workspace = true, features = ["studio-lifecycle"] }
+serde = { workspace = true }

@@ -1,7 +1,8 @@
 # uldren-loom-core
 
-The Uldren Loom engine: a content-addressed object model (BLAKE3-256 digests with a canonical,
-type-tagged encoding) and the `ObjectStore` provider trait, with an in-memory implementation.
+The Uldren Loom engine: a content-addressed object model (default BLAKE3-256 identity, optional
+SHA-256/FIPS identity, canonical type-tagged encoding) and the `ObjectStore` provider trait, with an
+in-memory implementation.
 
 This is the core that the `loom` CLI, the C ABI (`uldren-loom-ffi`), and every language binding build
 on. Part of [Uldren Loom](https://github.com/uldrenai/uldren-loom) - a universal, content-addressed,
@@ -18,7 +19,7 @@ The library is imported as `loom_core`:
 ```rust
 use loom_core::Object;
 
-// The content address ("algo:hex") of a blob.
+// The default-profile content address ("algo:hex") of a blob.
 let address = Object::Blob(b"hello".to_vec()).digest().to_string();
 assert!(address.starts_with("blake3:"));
 ```

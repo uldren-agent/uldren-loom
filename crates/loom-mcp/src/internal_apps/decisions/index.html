@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Decisions</title>
+  <style>
+    {{ loom.app_shell.css }}
+
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    header.page {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .page .meta {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 14px;
+    }
+
+    .card.skipped {
+      opacity: 0.55;
+    }
+
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 6px;
+    }
+
+    .card-head .ordinal {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .question {
+      margin: 0 0 8px;
+      font-size: 15px;
+      font-weight: 650;
+    }
+
+    .context {
+      margin: 0 0 10px;
+      color: var(--muted);
+    }
+
+    details.examples {
+      margin: 0 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: var(--bg);
+    }
+
+    details.examples summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 13px;
+      user-select: none;
+    }
+
+    details.examples .body {
+      margin-top: 8px;
+      white-space: pre-wrap;
+      font-size: 13px;
+    }
+
+    .options {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    label.option {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      cursor: pointer;
+    }
+
+    label.option:has(input:checked) {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    label.option input {
+      margin-top: 3px;
+      accent-color: var(--accent);
+    }
+
+    .option .label {
+      font-weight: 600;
+    }
+
+    .option .description {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    textarea.free-text {
+      width: 100%;
+      min-height: 64px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--bg);
+      color: var(--ink);
+      padding: 10px 12px;
+      font: inherit;
+      margin-bottom: 12px;
+    }
+
+    textarea.free-text:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: -6px 0 12px;
+    }
+
+    .chips button {
+      border: 1px solid var(--line);
+      background: var(--bg);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .recommendation {
+      border-left: 3px solid var(--accent);
+      background: var(--accent-soft);
+      border-radius: 0 8px 8px 0;
+      padding: 8px 12px;
+      font-size: 13px;
+    }
+
+    .recommendation .tag {
+      display: block;
+      font-weight: 650;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--accent);
+      margin-bottom: 2px;
+    }
+
+    .skip-note {
+      color: var(--warn);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    footer.actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: flex-end;
+      margin-top: 4px;
+    }
+
+    footer.actions .status {
+      margin-right: auto;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      min-height: 34px;
+      padding: 0 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-ink);
+      font-weight: 650;
+    }
+
+    button.danger {
+      color: var(--danger);
+    }
+
+    button.small {
+      min-height: 26px;
+      padding: 0 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .empty {
+      border: 1px dashed var(--line);
+      border-radius: 10px;
+      padding: 28px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .answered-summary td {
+      padding: 6px 10px 6px 0;
+      vertical-align: top;
+    }
+
+    .answered-summary td:first-child {
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+  </style>
+</head>
+<body>
+  <main>
+    <header class="page">
+      <h1>Decisions</h1>
+      <div class="meta" id="page-meta"></div>
+    </header>
+    <div id="content"></div>
+  </main>
+
+  <script>
+    (() => {
+    const ASK = {{ loom.ask | tojson }};
+    const APP_MODES = {{ meta.ui.availableDisplayModes | tojson }};
+    const displayModes = Array.isArray(APP_MODES) && APP_MODES.length ? APP_MODES : ["inline"];
+    const workspace = (ASK && ASK.workspace && ASK.workspace.name) || "";
+    const current = ASK ? ASK.current : null;
+
+    const content = document.getElementById("content");
+    const pageMeta = document.getElementById("page-meta");
+    pageMeta.textContent = workspace ? "Workspace " + workspace : "";
+
+    const responses = [];
+
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function renderEmpty(message) {
+      content.textContent = "";
+      content.append(el("div", "empty", message));
+    }
+
+    function answeredRow(table, label, value) {
+      const tr = el("tr");
+      tr.append(el("td", "", label), el("td", "", value));
+      table.append(tr);
+    }
+
+    function renderResolved(ask) {
+      content.textContent = "";
+      const card = el("div", "card");
+      card.append(el("p", "question", ask.status === "aborted" ? "Aborted" : "Answers submitted"));
+      const table = el("table", "answered-summary");
+      for (const answer of ask.answers || []) {
+        const value = answer.status === "skipped"
+          ? "Skip"
+          : (answer.selected || []).join(", ") + (answer.text ? (answer.selected && answer.selected.length ? "; " : "") + answer.text : "");
+        answeredRow(table, answer.question, value || "Skip");
+      }
+      card.append(table);
+      content.append(card);
+    }
+
+    function questionCard(question, index) {
+      const card = el("div", "card");
+      card.dataset.index = String(index);
+
+      const head = el("div", "card-head");
+      const ordinal = el("span", "ordinal", "Question " + (index + 1) + " of " + current.questions.length);
+      const skip = el("button", "small");
+      skip.type = "button";
+      skip.textContent = "Skip";
+      head.append(ordinal, skip);
+      card.append(head);
+
+      card.append(el("h2", "question", question.question));
+      if (question.context) card.append(el("p", "context", question.context));
+      if (question.examples) {
+        const details = el("details", "examples");
+        details.append(el("summary", "", "Example"));
+        details.append(el("div", "body", question.examples));
+        card.append(details);
+      }
+
+      const shape = question.shape === "checkbox" || question.shape === "text" ? question.shape : "radio";
+      const options = Array.isArray(question.options) ? question.options : [];
+
+      if (shape === "text") {
+        if (options.length) {
+          const chips = el("div", "chips");
+          for (const option of options) {
+            const chip = el("button", "", option.label);
+            chip.type = "button";
+            chip.addEventListener("click", () => {
+              textarea.value = option.label;
+              responses[index].text = option.label;
+              unskip(index);
+            });
+            chips.append(chip);
+          }
+          card.append(chips);
+        }
+        const textarea = el("textarea", "free-text");
+        textarea.placeholder = "Type your answer";
+        textarea.addEventListener("input", () => {
+          responses[index].text = textarea.value;
+          if (textarea.value) unskip(index);
+        });
+        card.append(textarea);
+      } else {
+        const group = el("div", "options");
+        for (const option of options) {
+          const label = el("label", "option");
+          const input = document.createElement("input");
+          input.type = shape === "checkbox" ? "checkbox" : "radio";
+          input.name = "q" + index;
+          input.value = option.label;
+          input.addEventListener("change", () => {
+            const inputs = group.querySelectorAll("input");
+            responses[index].selected = Array.from(inputs)
+              .filter((i) => i.checked)
+              .map((i) => i.value);
+            unskip(index);
+          });
+          const text = el("span");
+          text.append(el("span", "label", option.label));
+          if (option.description) text.append(el("span", "description", " " + option.description));
+          label.append(input, text);
+          group.append(label);
+        }
+        card.append(group);
+      }
+
+      if (question.recommendation) {
+        const recommendation = el("div", "recommendation");
+        recommendation.append(el("span", "tag", "Recommendation"));
+        recommendation.append(document.createTextNode(question.recommendation));
+        card.append(recommendation);
+      }
+
+      const skipNote = el("p", "skip-note", "Skipped: this question will be answered as \"Skip\".");
+      skipNote.hidden = true;
+      card.append(skipNote);
+
+      skip.addEventListener("click", () => {
+        const skipped = !responses[index].skipped;
+        responses[index].skipped = skipped;
+        card.classList.toggle("skipped", skipped);
+        skipNote.hidden = !skipped;
+        skip.textContent = skipped ? "Unskip" : "Skip";
+      });
+
+      function unskip(i) {
+        if (!responses[i].skipped) return;
+        responses[i].skipped = false;
+        card.classList.remove("skipped");
+        skipNote.hidden = true;
+        skip.textContent = "Skip";
+      }
+
+      return card;
+    }
+
+    function buildAnswers(aborted) {
+      return current.questions.map((question, index) => {
+        const response = responses[index];
+        const answered = !aborted
+          && !response.skipped
+          && (response.selected.length > 0 || response.text.trim().length > 0);
+        return {
+          index,
+          question: question.question,
+          status: answered ? "answered" : "skipped",
+          selected: answered ? response.selected : [],
+          text: answered ? response.text.trim() : ""
+        };
+      });
+    }
+
+    function renderPending() {
+      content.textContent = "";
+      for (let i = 0; i < current.questions.length; i += 1) {
+        responses.push({ skipped: false, selected: [], text: "" });
+        content.append(questionCard(current.questions[i], i));
+      }
+      const actions = el("footer", "actions");
+      const status = el("span", "status", "");
+      const abort = el("button", "danger", "Abort");
+      abort.type = "button";
+      const submit = el("button", "primary", "Submit answers");
+      submit.type = "button";
+      actions.append(status, abort, submit);
+      content.append(actions);
+
+      async function send(aborted) {
+        submit.disabled = true;
+        abort.disabled = true;
+        status.textContent = aborted ? "Aborting..." : "Submitting...";
+        const answers = buildAnswers(aborted);
+        try {
+          await submitAnswers(current.id, answers, aborted);
+          renderResolved({ status: aborted ? "aborted" : "answered", answers });
+        } catch (e) {
+          submit.disabled = false;
+          abort.disabled = false;
+          status.textContent = "Submit failed: " + ((e && e.message) || e);
+        }
+      }
+
+      submit.addEventListener("click", () => send(false));
+      abort.addEventListener("click", () => send(true));
+    }
+
+    if (!current || !Array.isArray(current.questions) || current.questions.length === 0) {
+      renderEmpty("No questions to answer.");
+    } else if (current.status !== "pending") {
+      renderResolved(current);
+    } else {
+      renderPending();
+    }
+
+    let bridgeRequest = null;
+
+    (function connectHost() {
+      const host = window.parent;
+      if (!host || host === window) return;
+      document.documentElement.classList.add("mcp-embedded");
+      const INIT_ID = "loom-decisions-init";
+      let initSent = false;
+      let initialized = false;
+
+      function post(message) {
+        try {
+          host.postMessage(Object.assign({ jsonrpc: "2.0" }, message), "*");
+        } catch (_) {
+        }
+      }
+
+      let reqSeq = 0;
+      const pending = new Map();
+      function request(method, params) {
+        return new Promise((resolve, reject) => {
+          const id = "loom-decisions-req-" + (++reqSeq);
+          pending.set(id, { resolve, reject });
+          post({ id, method, params: params || {} });
+          setTimeout(() => {
+            if (pending.has(id)) {
+              pending.delete(id);
+              reject(new Error("timeout waiting for " + method));
+            }
+          }, 15000);
+        });
+      }
+      bridgeRequest = request;
+
+      function sendInitialize() {
+        if (initSent) return;
+        initSent = true;
+        post({
+          id: INIT_ID,
+          method: "ui/initialize",
+          params: { appCapabilities: { availableDisplayModes: displayModes } }
+        });
+      }
+
+      function announceInitialized() {
+        if (initialized) return;
+        initialized = true;
+        post({ method: "ui/notifications/initialized" });
+        scheduleNotifySize();
+      }
+
+      let lastWidth = 0;
+      let lastHeight = 0;
+      let sizeTimer = null;
+      function notifySize() {
+        const doc = document.documentElement;
+        const body = document.body;
+        const height = Math.ceil(
+          Math.max(doc ? doc.scrollHeight : 0, body ? body.scrollHeight : 0)
+        ) + 1;
+        const width = Math.ceil((doc && doc.clientWidth) || window.innerWidth || 0);
+        if (!height || (height === lastHeight && width === lastWidth)) return;
+        lastHeight = height;
+        lastWidth = width;
+        post({ method: "ui/notifications/size-changed", params: { width, height } });
+      }
+      function scheduleNotifySize() {
+        if (sizeTimer) clearTimeout(sizeTimer);
+        sizeTimer = setTimeout(notifySize, 120);
+      }
+      if (typeof ResizeObserver !== "undefined") {
+        const observer = new ResizeObserver(scheduleNotifySize);
+        if (document.documentElement) observer.observe(document.documentElement);
+        if (document.body) observer.observe(document.body);
+      }
+      window.addEventListener("load", scheduleNotifySize);
+
+      window.addEventListener("message", (event) => {
+        const data = event && event.data;
+        if (!data || data.jsonrpc !== "2.0") return;
+        if (typeof data.method === "string" && data.method.indexOf("sandbox") !== -1) {
+          sendInitialize();
+          return;
+        }
+        if (data.id === INIT_ID && (("result" in data) || ("error" in data))) {
+          announceInitialized();
+          return;
+        }
+        if (data.id !== undefined && data.id !== null && pending.has(data.id)) {
+          const p = pending.get(data.id);
+          pending.delete(data.id);
+          if ("error" in data) p.reject(data.error);
+          else p.resolve(data.result);
+        }
+      });
+
+      sendInitialize();
+      scheduleNotifySize();
+    })();
+
+    async function submitAnswers(id, answers, aborted) {
+      if (!bridgeRequest) throw new Error("not connected to an MCP host");
+      const args = { id, answers, aborted };
+      if (workspace) args.workspace = workspace;
+      try {
+        return await bridgeRequest("tools/call", { name: "ask_record", arguments: args });
+      } catch (_) {
+        return await bridgeRequest("tools/call", { name: "ask.record", arguments: args });
+      }
+    }
+    })();
+  </script>
+</body>
+</html>

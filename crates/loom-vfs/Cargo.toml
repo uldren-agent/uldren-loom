@@ -1,0 +1,19 @@
+# Portable filesystem-projection layer for Uldren Loom. Maps a generic inode/callback filesystem
+# surface onto the loom `fs` working-tree ops, so platform backends (FUSE, NFSv3, ...) are thin
+# adapters over this one mapping. wasm32-clean: no native filesystem dependencies live here.
+# Licensed under BUSL-1.1 (see ../../LICENSE). (c) Uldren Technologies LLC.
+[package]
+name = "uldren-loom-vfs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Portable filesystem-projection layer (inode mapping) over Uldren Loom working trees."
+
+[dependencies]
+loom-core = { workspace = true }
+
+[lints]
+workspace = true

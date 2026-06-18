@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+description = "Loom locator parsing and alias resolution for Uldren Loom clients."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-locator"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_locator"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }

@@ -1,0 +1,67 @@
+{
+  "source_scope": "confluence://site/example",
+  "rows_imported": 4,
+  "spaces": [
+    {
+      "space_id": "ENG",
+      "title": "Engineering"
+    },
+    {
+      "space_id": "OPS",
+      "title": "Operations"
+    }
+  ],
+  "pages": {
+    "home": {
+      "title": "Engineering Home",
+      "opaque_kind": "confluence.storage",
+      "opaque_contains": "structured-macro"
+    },
+    "child-adf": {
+      "title": "ADF Design",
+      "parent_page_id": "home",
+      "opaque_kind": "confluence.adf",
+      "opaque_contains": "ADF body retained byte-for-byte"
+    },
+    "runbook": {
+      "title": "Runbook",
+      "body_contains": [
+        "Runbook",
+        "Restart the worker after draining imports."
+      ]
+    },
+    "text-fallback": {
+      "title": "Plain Text Note",
+      "parent_page_id": "runbook",
+      "body_contains": [
+        "Plain text fallback is lowered through the markdown body path."
+      ]
+    }
+  },
+  "unsupported_fields": [
+    "ancestors",
+    "author_id",
+    "attachments",
+    "comments",
+    "created_at",
+    "descendants",
+    "description",
+    "homepage_id",
+    "labels",
+    "links",
+    "owner_id",
+    "permissions",
+    "properties",
+    "restrictions",
+    "status",
+    "type",
+    "version"
+  ],
+  "block_ref_fidelity": {
+    "mode": "opaque-body-retention",
+    "opaque_pages": [
+      "home",
+      "child-adf"
+    ]
+  }
+}

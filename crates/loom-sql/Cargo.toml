@@ -1,0 +1,33 @@
+[package]
+authors.workspace = true
+description = "Uldren Loom SQL frontend: GlueSQL over the loom-core tabular substrate."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-sql"
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "loom_sql"
+
+[dependencies]
+# GlueSQL core: SQL parser (sqlparser-rs), planner, executor, and the Store/StoreMut storage traits
+# we implement over the tabular substrate. Pure Rust, wasm-capable. First
+# heavy third-party engine in the workspace, validated by `cargo deny`.
+gluesql-core = "0.19"
+loom-core.workspace = true
+loom-codec.workspace = true
+loom-result.workspace = true
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The SQL <-> tabular value bridge (A2) converts GlueSQL's `Decimal`/temporal types to loom-core's
+# primitive carriers. These are GlueSQL's own dependencies (same versions), kept out of loom-core.
+rust_decimal = "1"
+chrono = "0.4"

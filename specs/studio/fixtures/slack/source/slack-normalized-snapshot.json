@@ -1,0 +1,206 @@
+{
+  "source_scope": "slack://workspace/example",
+  "channels": [
+    {
+      "id": "CENG",
+      "handle": "eng-imports",
+      "name": "eng-imports",
+      "name_normalized": "eng-imports",
+      "is_channel": true,
+      "is_group": false,
+      "is_im": false,
+      "is_mpim": false,
+      "is_private": false,
+      "is_archived": false,
+      "is_general": false,
+      "is_shared": true,
+      "is_ext_shared": false,
+      "created": 1710000000,
+      "updated": 1710003600000,
+      "creator": "U1",
+      "topic": {
+        "value": "Importer hardening",
+        "creator": "U1",
+        "last_set": 1710000000
+      },
+      "purpose": {
+        "value": "Coordinate import fixture work",
+        "creator": "U1",
+        "last_set": 1710000000
+      },
+      "properties": {
+        "tabs": [
+          {
+            "id": "files",
+            "type": "files"
+          }
+        ],
+        "posting_restricted_to": {
+          "type": [
+            "admin"
+          ]
+        }
+      },
+      "previous_names": [
+        "imports"
+      ],
+      "shared_team_ids": [
+        "T1",
+        "T2"
+      ],
+      "members": [
+        "U1",
+        "U2"
+      ]
+    }
+  ],
+  "messages": [
+    {
+      "type": "message",
+      "channel_id": "CENG",
+      "ts": "1710000000.000100",
+      "user": "U1",
+      "team": "T1",
+      "channel_type": "channel",
+      "text": "Hello <@U2>, review <https://example.com|the importer>.",
+      "edited": {
+        "user": "U1",
+        "ts": "1710000001.000000"
+      },
+      "is_starred": true,
+      "pinned_to": [
+        "CENG"
+      ],
+      "blocks": [
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": "*Hello* <@U2>"
+          }
+        }
+      ],
+      "attachments": [
+        {
+          "fallback": "Legacy attachment",
+          "text": "Legacy attachment body"
+        }
+      ],
+      "files": [
+        {
+          "id": "F1",
+          "name": "import-plan.md",
+          "mimetype": "text/markdown"
+        }
+      ],
+      "metadata": {
+        "event_type": "import.fixture",
+        "event_payload": {
+          "row": 770
+        }
+      },
+      "client_msg_id": "client-1",
+      "permalink": "https://example.slack.com/archives/CENG/p1710000000000100",
+      "reactions": [
+        {
+          "name": "wave",
+          "count": 2,
+          "users": [
+            "U2"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "channel_id": "CENG",
+      "ts": "1710000002.000200",
+      "thread_ts": "1710000000.000100",
+      "user": "U2",
+      "team": "T1",
+      "channel_type": "channel",
+      "text": "Thread reply with <#CENG|eng-imports> reference."
+    },
+    {
+      "type": "message",
+      "subtype": "bot_message",
+      "channel_id": "CENG",
+      "ts": "1710000003.000300",
+      "username": "Import Bot",
+      "bot_id": "B1",
+      "app_id": "A1",
+      "text": "Automated import summary."
+    },
+    {
+      "type": "message",
+      "subtype": "message_deleted",
+      "channel_id": "CENG",
+      "ts": "1710000004.000400",
+      "hidden": true,
+      "deleted_ts": "1710000003.000300",
+      "event_ts": "1710000004.000401",
+      "text": "A message was deleted."
+    }
+  ],
+  "users": [
+    {
+      "id": "U1",
+      "team_id": "T1",
+      "name": "alice",
+      "deleted": false,
+      "is_bot": false,
+      "profile": {
+        "real_name": "Alice Rivera",
+        "email": "alice@example.com"
+      }
+    },
+    {
+      "id": "U2",
+      "team_id": "T1",
+      "name": "bob",
+      "deleted": false,
+      "is_bot": false,
+      "profile": {
+        "real_name": "Bob Chen",
+        "email": "bob@example.com"
+      }
+    }
+  ],
+  "usergroups": [
+    {
+      "id": "S1",
+      "team_id": "T1",
+      "handle": "import-reviewers",
+      "name": "Import Reviewers",
+      "users": [
+        "U1",
+        "U2"
+      ]
+    }
+  ],
+  "files": [
+    {
+      "id": "F1",
+      "created": 1710000000,
+      "name": "import-plan.md",
+      "title": "Import plan",
+      "mimetype": "text/markdown",
+      "url_private": "https://files.slack.com/files-pri/T1-F1/import-plan.md"
+    }
+  ],
+  "custom_emoji": [
+    {
+      "name": "loom",
+      "url": "https://emoji.slack-edge.com/T1/loom/hash.png"
+    }
+  ],
+  "pins": [
+    {
+      "type": "message",
+      "channel": "CENG",
+      "message": {
+        "ts": "1710000000.000100"
+      }
+    }
+  ]
+}

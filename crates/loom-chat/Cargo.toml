@@ -1,0 +1,23 @@
+[package]
+authors.workspace = true
+description = "Reusable chat service layer for Uldren Loom Studio."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-chat"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_chat"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-core.workspace = true
+loom-reference.workspace = true
+loom-store.workspace = true
+loom-substrate = { workspace = true, features = ["studio-slackish"] }
+loom-tickets.workspace = true
+serde.workspace = true

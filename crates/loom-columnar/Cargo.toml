@@ -1,0 +1,28 @@
+[package]
+authors.workspace = true
+description = "Reusable columnar dataset model and execution contracts for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-columnar"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_columnar"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+arrow = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:bytes", "dep:parquet"]
+
+[dependencies]
+arrow-array = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+loom-codec.workspace = true
+loom-types.workspace = true
+parquet = { workspace = true, optional = true }

@@ -1,0 +1,37 @@
+[package]
+authors.workspace = true
+description = "Locator-aware Loom client surface (LoomApi traits) for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-client"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_client"
+
+[lints]
+workspace = true
+
+[dependencies]
+futures-core = { workspace = true }
+getrandom = { workspace = true }
+loom-codec = { workspace = true }
+loom-compute = { workspace = true }
+loom-core = { workspace = true }
+loom-chat = { workspace = true }
+loom-interchange = { workspace = true }
+loom-interchange-io = { workspace = true }
+loom-lanes = { workspace = true }
+loom-pages = { workspace = true }
+loom-reference = { workspace = true }
+loom-remote-protocol = { workspace = true }
+loom-result = { workspace = true }
+loom-sql = { workspace = true }
+loom-store = { workspace = true }
+loom-tickets = { workspace = true }
+loom-types = { workspace = true }
+loom-wire = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

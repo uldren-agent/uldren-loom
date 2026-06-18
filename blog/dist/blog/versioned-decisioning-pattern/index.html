@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Versioned Decisioning Pattern | Uldren Engineering Blog</title>
+  <meta name="description" content="A pattern for making model decisions durable, inspectable, reversible, and reusable across agent workflows.">
+  <link rel="canonical" href="/blog/versioned-decisioning-pattern/">
+  <link rel="stylesheet" href="/blog/assets/blog.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script defer src="/blog/assets/blog.js"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "neutral",
+      securityLevel: "strict",
+      flowchart: {
+        htmlLabels: true,
+        wrappingWidth: 180,
+      },
+    });
+  </script>
+</head>
+<body class="post">
+  <header class="site-bar">
+    <a class="site-mark" href="/blog/">Uldren</a>
+    <nav aria-label="Primary">
+      <a href="/blog/">Blog</a>
+      <a href="/">Home</a>
+    </nav>
+  </header>
+  <main>
+<article class="markdown-page">
+  <header class="article-head">
+    <h1>The Versioned Decisioning Pattern</h1>
+    <div class="article-meta">
+      <time datetime="2026-06-20">June 20, 2026</time>
+      <span>Uldren</span>
+    </div>
+    <p>A pattern for making model decisions durable, inspectable, reversible, and reusable across agent workflows.</p>
+  </header>
+  <div class="markdown-body">
+<p>Versioned Decisioning turns AI decisions from chat residue into state you can inspect, supersede, and reverse.</p>
+<p>Most agent workflows treat decision state as chat residue.</p>
+<p>The model proposes a plan. The user approves part of it. The model changes course after an error. Another model critiques the result. A human says to undo one choice but keep another. By the end, the important state is scattered across transcript fragments, tool logs, and memory.</p>
+<p>Versioned Decisioning is the pattern of turning meaningful model decisions into durable state.</p>
+<pre class="mermaid">flowchart TD
+  A[&quot;`User request`&quot;] --&gt; B[&quot;`Task node`&quot;]
+  B --&gt; C[&quot;`Decision node`&quot;]
+  C --&gt; D[&quot;`Evidence`&quot;]
+  D --&gt; E{&quot;`Accepted?`&quot;}
+  E --&gt;|Yes| F[&quot;`Next task or action`&quot;]
+  E --&gt;|No| G[&quot;`Superseded decision`&quot;]
+  G --&gt; C
+  F --&gt; H[&quot;`Verification evidence`&quot;]
+  H --&gt; I[&quot;`Inspectable history`&quot;]</pre>
+<h2 id="the-short-version">The Short Version</h2>
+<p>Versioned Decisioning makes the agent&#39;s task and decision history inspectable, traceable, and reversible.</p>
+<p>It records not only what the agent did, but why it did it, what evidence it used, what alternatives it rejected, and which later decision superseded an earlier one.</p>
+<p>The pattern is not &quot;save the chat.&quot; It is &quot;make decision state a first-class artifact.&quot;</p>
+<h2 id="what-gets-versioned">What Gets Versioned</h2>
+<p>A useful decision record includes:</p>
+<ul>
+<li>User request</li>
+<li>Active task</li>
+<li>Decision being made</li>
+<li>Options considered</li>
+<li>Chosen path</li>
+<li>Rejected paths</li>
+<li>Evidence used</li>
+<li>Tool outputs</li>
+<li>Human approvals</li>
+<li>Verification results</li>
+<li>Superseded decisions</li>
+</ul>
+<p>That state should be structured enough for a later role, model, or human to inspect it without reconstructing the whole conversation.</p>
+<h2 id="why-versioning-changes-the-model-process">Why Versioning Changes The Model Process</h2>
+<p>Versioning is not just storage.</p>
+<p>Once decisions are versioned, the model can work differently.</p>
+<p>It can ask:</p>
+<ul>
+<li>What task am I actually working on?</li>
+<li>Which decision created this task?</li>
+<li>What evidence supported that decision?</li>
+<li>Has a later decision superseded it?</li>
+<li>Did the user approve this branch?</li>
+<li>Can I revert only this task without undoing unrelated work?</li>
+</ul>
+<p>That gives the agent a memory that is more precise than a summary and more operational than a transcript.</p>
+<h2 id="loom-as-the-state-layer">Loom As The State Layer</h2>
+<p>Loom gives agents a durable state layer for this pattern.</p>
+<p>The Loom MCP exposes task tracking operations, then extends them with versioned decision state. The agent does not keep the important state in the chat transcript. It records the active task, the decision being made, the evidence behind it, and the accepted or superseded result in Loom.</p>
+<p>The agent can:</p>
+<ul>
+<li>Create and update tasks</li>
+<li>Mark tasks blocked or complete</li>
+<li>Create decision nodes</li>
+<li>Attach evidence</li>
+<li>Link decisions to tasks</li>
+<li>Inspect the task tree</li>
+<li>Inspect the decision tree</li>
+<li>Supersede a decision</li>
+<li>Revert a task</li>
+<li>Revert a decision</li>
+</ul>
+<p>The important extension is the tree.</p>
+<pre class="mermaid">flowchart TD
+  A[&quot;`Root task`&quot;] --&gt; B[&quot;`Task: design API`&quot;]
+  A --&gt; C[&quot;`Task: implement export`&quot;]
+  B --&gt; D[&quot;`Decision: choose CSV first`&quot;]
+  D --&gt; E[&quot;`Evidence: customer workflow`&quot;]
+  D --&gt; F[&quot;`Superseded by:&lt;br/&gt;CSV plus JSON`&quot;]
+  C --&gt; G[&quot;`Decision: stream large exports`&quot;]
+  G --&gt; H[&quot;`Verification evidence`&quot;]</pre>
+<p>A task can have child tasks. A decision can create or change tasks. A decision can supersede another decision. Evidence can attach to a task, a decision, or a verification result.</p>
+<p>That turns an agent run into inspectable state. A later model can ask Loom for the active task, read the decision that created it, inspect the evidence, and see which alternatives were rejected. A human can ask why a branch exists without rereading the whole conversation.</p>
+<h2 id="reverting-a-decision">Reverting A Decision</h2>
+<p>The most practical benefit is targeted reversal.</p>
+<p>Without versioned decisions, &quot;undo that&quot; is ambiguous. The agent may not know whether the user means the last file edit, the plan choice that caused it, the task branch, or the whole workflow.</p>
+<p>With Loom, the user can say:</p>
+<pre><code class="language-text">Revert the decision where we chose CSV only.</code></pre>
+<p>The agent asks Loom to inspect the decision tree, finds the decision node, identifies the accepted state before that decision, and explains the revert.</p>
+<p>The revert itself becomes a new decision node. Nothing disappears. The history records that the old branch was superseded.</p>
+<h2 id="agents-md">AGENTS.md</h2>
+<p>The pattern is mounted into an agent harness through AGENTS.md files:</p>
+<ul>
+<li><a href="/blog/versioned-decisioning-pattern/AGENTS.md">Versioned Decisioning AGENTS.md</a></li>
+<li><a href="/blog/versioned-decisioning-pattern/loom/AGENTS.md">Loom Versioned Decisioning AGENTS.md</a></li>
+</ul>
+<p>The generic file teaches the pattern. The Loom file tells the agent to use Loom as its decision and task tracking tool.</p>
+<p>When mounted, the agent treats Loom as the source of truth for active tasks, decisions, evidence, supersession, and targeted revert.</p>
+<h2 id="where-it-fits">Where It Fits</h2>
+<p>Versioned Decisioning composes with <a href="/blog/model-relay-pattern/">Model Relay</a>.</p>
+<p>Model Relay separates responsibility across roles. Versioned Decisioning records the handoff state between those roles.</p>
+<p>Together, they answer different questions:</p>
+<ul>
+<li>Model Relay: who should handle this phase?</li>
+<li>Versioned Decisioning: what decision state did they create, inspect, replace, or accept?</li>
+</ul>
+<p>That is the durable version of agent collaboration.</p>
+  </div>
+</article>
+  </main>
+  <footer class="site-footer">
+    <a href="/blog/">Index</a>
+    <span>Uldren Engineering</span>
+  </footer>
+</body>
+</html>

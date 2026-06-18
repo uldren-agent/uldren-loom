@@ -1,0 +1,26 @@
+# Manual FUSE mount smoke check for the Uldren Loom filesystem projection (0003c). Excluded from the
+# cargo workspace (see the root Cargo.toml `exclude`), so `cargo build --workspace` / `just ci` never
+# build it. Run it by hand to verify a real kernel mount end to end; on Linux an unprivileged mount
+# needs a user namespace, so run it under `unshare`:
+#
+#   cargo run --manifest-path prototypes/loom-fuse-smoke/Cargo.toml -- /tmp/t.loom /tmp/mnt
+#   # or, where the setuid fusermount path is restricted:
+#   unshare -Urm --map-root-user target/debug/loom-fuse-smoke /tmp/t.loom /tmp/mnt
+#
+# It creates a fresh loom, mounts it, exercises read/write/mkdir/readdir through the kernel, unmounts,
+# and prints `SMOKE: OK`. Licensed under BUSL-1.1.
+[package]
+name = "loom-fuse-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "BUSL-1.1"
+
+[dependencies]
+loom-core = { package = "uldren-loom-core", path = "../../crates/loom-core" }
+loom-store = { package = "uldren-loom-store", path = "../../crates/loom-store" }
+loom-vfs-fuse = { package = "uldren-loom-vfs-fuse", path = "../../crates/loom-vfs-fuse" }
+
+[[bin]]
+name = "loom-fuse-smoke"
+path = "src/main.rs"

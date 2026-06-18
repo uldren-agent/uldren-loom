@@ -17,6 +17,97 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+# Both projection backends are on by default for macOS and Linux builds:
+#   - `nfs` (pure Rust via loom-vfs-nfs: nfsserve + a single-threaded tokio runtime) gives driverless
+#     mounts and needs no native library.
+#   - `fuse` (native via loom-vfs-fuse) links libfuse3 (Linux) / macFUSE (macOS) at build time; install
+#     it per docs/DEVELOPMENT.md.
+# For a driver-free build on a machine without libfuse, drop `fuse` with
+# `--no-default-features --features nfs`.
+[features]
+default = ["nfs", "fuse", "mcp", "serve", "remote-client", "native-fts", "inference-native-hf"]
+integration-tests = []
+# Locator-aware remote CLI execution: connect to a `loom serve remote` endpoint and forward migrated
+# store commands through the generated `RemoteLoomClient` over HTTP/2-over-TLS.
+remote-client = ["dep:tokio", "dep:loom-remote-client", "loom-remote-client/carrier", "dep:loom-remote-protocol", "dep:rustls-native-certs"]
+fips = ["serve-fips", "loom-hosted/fips"]
+nfs = ["dep:loom-vfs-nfs", "dep:ctrlc"]
+fuse = ["dep:loom-vfs-fuse", "loom-vfs-fuse/fuse"]
+mcp = ["dep:tokio", "dep:uldren-loom-mcp", "dep:loom-hosted", "uldren-loom-mcp/http", "loom-hosted/http"]
+serve = ["dep:tokio", "dep:ctrlc", "dep:loom-hosted", "dep:loom-hosted-core", "loom-hosted-core/http", "loom-hosted-core/tls", "loom-hosted/external-auth-standard", "loom-hosted/grpc", "loom-hosted/http", "loom-hosted/inference", "loom-hosted/kafka-wire", "loom-hosted/mysql-wire", "loom-hosted/neo4j-wire", "loom-hosted/pg-wire", "loom-hosted/tls"]
+serve-fips = ["dep:tokio", "dep:ctrlc", "dep:loom-hosted", "dep:loom-hosted-core", "loom-hosted-core/http", "loom-hosted-core/tls", "loom-hosted/grpc", "loom-hosted/http", "loom-hosted/inference", "loom-hosted/kafka-wire", "loom-hosted/mysql-wire", "loom-hosted/neo4j-wire", "loom-hosted/pg-wire", "loom-hosted/tls"]
+inference-native-hf = ["dep:tokio", "loom-inference/native-hf"]
+inference-genai = ["loom-inference/genai"]
+# Local execution backends are opt-in so the default CLI remains portable across
+# developer, CI, VM, and agent environments.
+backend-candle-cpu = ["loom-inference/candle-cpu"]
+backend-candle-cuda = ["loom-inference/candle-cuda"]
+backend-core-ml = ["loom-inference/core-ml"]
+backend-llama-cpp = ["loom-inference/llama-cpp"]
+backend-mlx = ["loom-inference/mlx"]
+native-fts = ["dep:loom-tantivy"]
+
 [dependencies]
 clap.workspace = true
-loom-core.workspace = true
+loom-core = { workspace = true, features = ["columnar-arrow"] }
+loom-client.workspace = true
+loom-codec.workspace = true
+loom-compute = { workspace = true, features = ["guards", "sql-state-access"] }
+loom-chat.workspace = true
+loom-inference.workspace = true
+loom-interchange.workspace = true
+loom-interchange-io.workspace = true
+loom-lifecycle.workspace = true
+loom-lanes.workspace = true
+loom-locator.workspace = true
+loom-drive.workspace = true
+loom-pages.workspace = true
+loom-store.workspace = true
+loom-substrate = { workspace = true, features = ["studio-driveish", "studio-lifecycle", "studio-meetings", "studio-pages", "studio-surfaces"] }
+loom-reference.workspace = true
+loom-sql.workspace = true
+loom-tickets.workspace = true
+loom-types.workspace = true
+loom-wire.workspace = true
+loom-tantivy = { package = "uldren-loom-tantivy", path = "../loom-tantivy", version = "0.1.0-alpha.1", optional = true }
+loom-hosted = { package = "uldren-loom-hosted", path = "../loom-hosted", version = "0.1.0-alpha.1", optional = true }
+loom-hosted-core = { package = "uldren-loom-hosted-core", path = "../loom-hosted-core", version = "0.1.0-alpha.1", optional = true }
+loom-remote-client = { package = "uldren-loom-remote-client", path = "../loom-remote-client", version = "0.1.0-alpha.1", optional = true }
+loom-remote-protocol = { package = "uldren-loom-remote-protocol", path = "../loom-remote-protocol", version = "0.1.0-alpha.1", optional = true }
+loom-vfs-fuse = { package = "uldren-loom-vfs-fuse", path = "../loom-vfs-fuse", version = "0.1.0-alpha.1", optional = true }
+loom-vfs-nfs = { package = "uldren-loom-vfs-nfs", path = "../loom-vfs-nfs", version = "0.1.0-alpha.1", optional = true }
+uldren-loom-mcp = { path = "../loom-mcp", version = "0.1.0-alpha.1", optional = true }
+tokio = { workspace = true, optional = true }
+# Ctrl-C handler so `mount-nfs` can unmount cleanly on exit (the workspace forbids unsafe, so use the
+# crate rather than a raw signal handler). Only needed with the `nfs` feature.
+ctrlc = { version = "3", optional = true }
+# The SQL verb runs GlueSQL's async storage traits on a single thread via `block_on`; gluesql-core
+# supplies the `Payload`/`Value` result types the verb prints.
+gluesql-core = "0.19"
+futures = "0.3"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+# OS trust store for the `--tls system` trust selector (remote-client only).
+rustls-native-certs = { version = "0.8", optional = true }
+time = { workspace = true, features = ["std"] }
+x509-parser = { version = "0.18", default-features = false }
+# Randomness for at-rest encryption setup (KDF salt, DEK, AEAD nonces) at `init --encrypt` / `rekey`.
+# The key layer (loom-core) takes randomness as input; the native CLI supplies it.
+getrandom.workspace = true
+# Secure no-echo passphrase prompt: the primary key source. file:/fd: are the non-interactive
+# alternatives; environment variables are never a source.
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+kafka-protocol.workspace = true
+loom-protocol-conformance.workspace = true
+p256.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+interprocess = { version = "2.4.2", default-features = false }
+widestring = "1"

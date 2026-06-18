@@ -1,0 +1,25 @@
+[package]
+authors.workspace = true
+description = "Native HNSW accelerator for the Uldren Loom vector facet, behind the exact contract."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-hnsw"
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "loom_hnsw"
+
+[dependencies]
+loom-types.workspace = true
+loom-vector.workspace = true
+# Native ANN index (HNSW). NOT wasm-clean - it pulls mmap-rs/cpu-time - so this crate is a
+# native-only accelerator that sits BEHIND loom-core's exact, cross-platform contract.
+# It has no dependents in the workspace (loom-core must stay wasm-clean), so the workspace
+# gate only ever builds it for the host target; it is never pulled into the wasm binding.
+hnsw_rs = "0.3"

@@ -9,6 +9,19 @@ Linux/Windows inline. For day-to-day work you only need sections 1 and 2; cross-
 - Xcode Command Line Tools (provides `clang`, the linker, `git`): `xcode-select --install`
 - Homebrew: <https://brew.sh>
 - pnpm (used for the Node binding)
+- FUSE (the CLI's mount backend is on by default):
+  - Linux/BSD: nothing to install. `fuser` uses its pure-Rust mount implementation - real FUSE mounting
+    with no libfuse, no pkg-config, no dev package (mounting needs the kernel's `/dev/fuse` plus either
+    a setuid `fusermount3` or a user workspace, `unshare -Urm --map-root-user`).
+  - macOS: FUSE mounting is a kernel extension, so it requires macFUSE, linked at build time:
+    `brew install --cask macfuse` and `brew install pkg-config` (the build locates macFUSE via
+    pkg-config). The `just` recipes detect macFUSE and build FUSE when present; without it they skip the
+    FUSE backend and build the NFS-only CLI, so `just lint`/`test`/`build` still work. The driverless
+    macOS mount path is the NFS backend (`loom mount-nfs`), which needs nothing installed (it uses the
+    OS NFS client and runs `sudo mount_nfs` for you).
+
+For a smaller NFS-only binary without the FUSE subcommand, build with `just build-no-fuse`
+(`--no-default-features --features nfs`).
 
 ## 1. Rust toolchain (required)
 
@@ -29,8 +42,8 @@ Use `rustup`, not `brew install rust`, so toolchains, targets, and components ar
 
 ```bash
 cd uldren-loom
-# build everything and run the tests
-cargo test --workspace
+# run the default gate used before pushing
+just ci
 # prints the canonical "abc" digest: blake3:314b0f56...4058
 printf 'abc' | cargo run --bin loom -- hash -
 ```
@@ -51,6 +64,8 @@ Key recipes (run `just` to list all):
 
 - `just ci` - the gate that mirrors GitHub CI: `fmt` check, `clippy -D warnings`, `test`, and
   `cargo deny`. It does not mutate files. Run it before pushing.
+- `just test-integration` - the full integration diagnostic pass. It is slow, may bind local sockets,
+  build native artifacts, and run protocol suites, and is not a substitute for `just ci`.
 - `just all` - the full local "do everything": `fmt-fix`, `header` (regenerate `include/loom.h`),
   `sync-versions` (propagate the workspace version into the binding manifests), `lint`,
   `build-release` (optimized artifacts), `test`, `deny`, `audit`. It deliberately does not
@@ -60,9 +75,18 @@ Key recipes (run `just` to list all):
 - Granular: `just build`, `just build-release`, `just check`, `just test`, `just lint`,
   `just fmt-fix`, `just deny`, `just audit`, `just semver`, `just ffi`, `just header`,
   `just header-check`, `just sync-versions`.
-- Bindings: `just node`, `just wasm`, `just jvm`, `just cpp`, or `just bindings`.
+- Bindings: `just node`, `just wasm`, `just jvm`, `just cpp`, or `just test-bindings`.
 - Cleanup: `just clean` - remove all build artifacts: the workspace target plus every binding's
   toolchain output (`node_modules`, native addons, `wasm/pkg`, `cpp/build`, `jvm/build`).
+
+Test placement rules:
+
+- Unit tests stay in the default `just ci` path and should be fast, deterministic, and local to the process.
+- Integration tests that cross a process, socket, daemon, HTTP server, mounted filesystem, protocol
+  transcript, native dynamic library, model runtime, or external tool boundary live under
+  `crates/<crate>/tests/` and are wired to a `test-*` recipe.
+- If a test must stay in `src` to reach private helpers, keep it unit-sized. It must not bind sockets,
+  launch daemons, download models, require devices or emulators, or perform production-cost crypto.
 
 ## 4. Cross-compilation of the Rust workspace (`uldren-loom-core`, `uldren-loom-cli`, `uldren-loom-ffi`)
 
@@ -97,12 +121,12 @@ Notes:
 ## 5. Language bindings
 
 Each binding is built and cross-compiled by its own toolchain, not by `cargo zigbuild` or
-`cargo xwin`. `just bindings` builds every binding for your host platform; per-target prebuilds
+`cargo xwin`. `just test-bindings` builds every binding for your host platform; per-target prebuilds
 are produced in CI (for example, napi-rs builds one `.node` per platform).
 
 ### Node - `@uldrenai/loom` (napi-rs)
 
-Requires Node 18 or newer (`brew install node` if needed).
+Requires Node 20 or newer (`brew install node` if needed).
 
 ```bash
 cd bindings/node
@@ -128,6 +152,23 @@ cd bindings/wasm
 # emits pkg/ (js + .wasm + .d.ts)
 wasm-pack build --target web --release
 ```
+
+### Python - `uldrenai-loom` (PyO3 / maturin)
+
+Requires Python 3.9+ and maturin. Work inside a virtualenv so `maturin develop` installs into it:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate # Windows: .venv\Scripts\activate
+pip install maturin pytest
+cd bindings/python
+# builds the abi3 extension and installs uldrenai_loom into the venv
+maturin develop --release
+# prints/asserts version + blob_digest(b"abc")
+python -m pytest
+```
+
+CI builds one `abi3` wheel per platform (`maturin build --release`); a single wheel covers
+CPython 3.9+.
 
 ### JVM - `ai.uldren:loom` (FFM, JDK 22+)
 
@@ -165,35 +206,36 @@ cmake --build bindings/cpp/build
   rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
   ```
 
-The `kotlin/` Gradle wrapper (`gradlew`) is committed, so no separate Gradle install is needed.
+The `android/` Gradle wrapper (`gradlew`) is committed, so no separate Gradle install is needed.
 Run every command in this section from the repository root.
 
-### Swift / iOS - `UldrenLoom` (SwiftPM)
+### iOS / Apple - `UldrenLoom` (Swift, SwiftPM) - `bindings/ios`
 
-The C header is vendored at `bindings/swift/Sources/CUldrenLoom/include/loom.h` and kept in sync by
+The C header is vendored at `bindings/ios/Sources/CUldrenLoom/include/loom.h` and kept in sync by
 `just header`. Pass the library path at run time so the test binary can load `libuldren_loom`:
 
 ```bash
 cargo build -p uldren-loom-ffi --release
-cd bindings/swift && DYLD_LIBRARY_PATH="$PWD/../../target/release" swift test # Linux: LD_LIBRARY_PATH
+cd bindings/ios && DYLD_LIBRARY_PATH="$PWD/../../target/release" swift test # Linux: LD_LIBRARY_PATH
 ```
 
-For iOS, build `libuldren_loom.a` for the iOS targets and package an `.xcframework` (see `bindings/swift/README.md`).
+For on-device iOS, build `libuldren_loom.a` for the iOS targets and package an `.xcframework` (see
+`bindings/ios/README.md`).
 
-### Kotlin / Android - Kotlin Multiplatform over JNI
+### Android - Kotlin Multiplatform over JNI - `bindings/android`
 
-JVM (off Android) - build the native lib, then compile the Kotlin jvm target:
+JVM (off Android, for shared testing) - build the native lib, then compile the Kotlin jvm target:
 
 ```bash
 cargo build -p uldren-loom-ffi --release
-cd bindings/kotlin && ./gradlew :compileKotlinJvm
+cd bindings/android && ./gradlew :compileKotlinJvm
 ```
 
 Android - build the per-ABI Rust static lib (CMake links it from `target/<triple>/release`), then assemble the AAR:
 
 ```bash
 cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build -p uldren-loom-ffi --release
-cd bindings/kotlin && ./gradlew :assembleRelease
+cd bindings/android && ./gradlew :assembleRelease
 ```
 
 ### React Native - `@uldrenai/loom-react-native` (TurboModule)

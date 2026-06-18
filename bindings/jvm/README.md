@@ -17,5 +17,14 @@ DYLD_LIBRARY_PATH="$PWD/../../target/release" ./gradlew build   # Linux: LD_LIBR
 
 ## API
 
-- `Loom.version()` → `String`
-- `Loom.blobDigest(byte[])` → `String`
+- `Loom.version()` -> `String`
+- `Loom.blobDigest(byte[])` -> `String`
+- `Loom.create(path, profile, suite?, passphrase?)`
+- `Loom.createWithKek(path, profile, kek, suite?)`
+- Workspace lifecycle, queue helpers, and direct table/history readers are exposed as static `Loom`
+  methods.
+- `Loom.LoomSql` - SQL session with typed `exec`, `execJson`, `execBytes`, `execAsync`, `query`, and
+  `commit`.
+- `Loom.LoomSqlBatch` - held-open batch with `exec`, `execBytes`, `commit`, `commitVcs`, and `abort`.
+- `Loom.LoomResult` and `Loom.LoomRowStream` - typed result and streaming row views over the C ABI
+  result decoder.

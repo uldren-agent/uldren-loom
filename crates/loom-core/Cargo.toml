@@ -17,7 +17,44 @@ name = "loom_core"
 [lints]
 workspace = true
 
+[features]
+default = []
+columnar-arrow = ["loom-columnar/arrow"]
+dataframe-polars = ["dep:loom-polars"]
+fips = []
+
 [dependencies]
 blake3.workspace = true
 hex.workspace = true
+loom-codec.workspace = true
+loom-columnar.workspace = true
+loom-dataframe.workspace = true
+loom-inference.workspace = true
+loom-pim.workspace = true
+loom-polars = { workspace = true, optional = true }
+loom-types.workspace = true
+loom-vector.workspace = true
+loom-watch.workspace = true
+loom-delivery.workspace = true
+loom-logs.workspace = true
+loom-metrics.workspace = true
+loom-traces.workspace = true
+loom-triggers.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+time.workspace = true
 thiserror.workspace = true
+# Encryption key layer. Pure crypto, wasm-clean; randomness is supplied by callers.
+aes-gcm.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+pbkdf2.workspace = true
+p256.workspace = true
+ed25519-dalek.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }

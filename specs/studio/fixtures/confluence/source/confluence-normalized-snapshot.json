@@ -1,0 +1,188 @@
+{
+  "source_scope": "confluence://site/example",
+  "spaces": [
+    {
+      "id": "space-100",
+      "key": "ENG",
+      "name": "Engineering",
+      "description": {
+        "plain": {
+          "value": "Engineering knowledge base.",
+          "representation": "plain"
+        }
+      },
+      "type": "global",
+      "status": "current",
+      "homepage_id": "home",
+      "author_id": "acct-alice",
+      "created_at": "2026-07-01T09:00:00Z",
+      "links": {
+        "webui": "/spaces/ENG",
+        "self": "https://example.atlassian.net/wiki/api/v2/spaces/space-100"
+      },
+      "labels": [
+        {
+          "id": "label-space-eng",
+          "name": "engineering",
+          "prefix": "global"
+        }
+      ],
+      "properties": [
+        {
+          "id": "space-prop-1",
+          "key": "retention",
+          "version": {
+            "number": 1
+          },
+          "value": {
+            "class": "internal"
+          }
+        }
+      ],
+      "permissions": [
+        {
+          "operation": "read",
+          "principal": {
+            "type": "group",
+            "id": "engineering"
+          }
+        }
+      ]
+    },
+    {
+      "id": "space-200",
+      "key": "OPS",
+      "name": "Operations"
+    }
+  ],
+  "pages": [
+    {
+      "id": "home",
+      "title": "Engineering Home",
+      "space_id": "ENG",
+      "status": "current",
+      "version": {
+        "number": 7,
+        "minorEdit": false,
+        "message": "Refresh status macro coverage",
+        "authorId": "acct-alice",
+        "createdAt": "2026-07-10T12:00:00Z"
+      },
+      "author_id": "acct-alice",
+      "owner_id": "acct-alice",
+      "created_at": "2026-07-01T09:15:00Z",
+      "links": {
+        "webui": "/spaces/ENG/pages/home",
+        "editui": "/pages/resumedraft.action?draftId=home"
+      },
+      "labels": [
+        {
+          "id": "label-home",
+          "name": "home",
+          "prefix": "global"
+        }
+      ],
+      "properties": [
+        {
+          "id": "page-prop-1",
+          "key": "audience",
+          "version": {
+            "number": 2
+          },
+          "value": {
+            "groups": [
+              "engineering"
+            ]
+          }
+        }
+      ],
+      "restrictions": [
+        {
+          "operation": "update",
+          "principal": {
+            "type": "user",
+            "id": "acct-alice"
+          }
+        }
+      ],
+      "descendants": [
+        {
+          "id": "child-adf",
+          "type": "page",
+          "status": "current"
+        }
+      ],
+      "storage_xhtml": "<p>Welcome to the engineering space.</p><ac:structured-macro ac:name=\"status\"><ac:parameter ac:name=\"colour\">Green</ac:parameter></ac:structured-macro>",
+      "attachments": [
+        {
+          "id": "att-1",
+          "filename": "architecture.png",
+          "mediaType": "image/png",
+          "fileSize": 2048,
+          "version": {
+            "number": 1
+          },
+          "comment": "Architecture diagram"
+        }
+      ],
+      "comments": [
+        {
+          "id": "comment-1",
+          "status": "current",
+          "author_id": "acct-bob",
+          "version": {
+            "number": 1
+          },
+          "body": {
+            "storage": {
+              "value": "<p>Needs a final owner review.</p>",
+              "representation": "storage"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "child-adf",
+      "title": "ADF Design",
+      "space_id": "ENG",
+      "parent_page_id": "home",
+      "status": "current",
+      "ancestors": [
+        {
+          "id": "home",
+          "type": "page",
+          "title": "Engineering Home"
+        }
+      ],
+      "adf_json": {
+        "version": 1,
+        "type": "doc",
+        "content": [
+          {
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "ADF body retained byte-for-byte as opaque source."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "runbook",
+      "title": "Runbook",
+      "space_id": "OPS",
+      "markdown": "# Runbook\n\nRestart the worker after draining imports."
+    },
+    {
+      "id": "text-fallback",
+      "title": "Plain Text Note",
+      "space_id": "OPS",
+      "parent_page_id": "runbook",
+      "text": "Plain text fallback is lowered through the markdown body path."
+    }
+  ]
+}

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Uldren Loom - multi-tab SQL over OPFS (same-origin demo)</title>
+    <style>
+      body { font: 14px/1.5 ui-monospace, monospace; margin: 2rem; max-width: 64rem; }
+      button, select { font: inherit; padding: 0.3rem 0.6rem; margin-right: 0.4rem; }
+      pre { white-space: pre-wrap; background: #f5f5f5; padding: 1rem; border-radius: 6px; }
+      #status { background: #eef; padding: 0.5rem 0.8rem; border-radius: 6px; }
+      .err { color: #b00020; }
+    </style>
+  </head>
+  <body>
+    <h1>Uldren Loom - multi-tab SQL over OPFS</h1>
+    <p>
+      Same-origin demo: this page, the loader, the engine, and the coordinator are all served from this
+      one origin. (For the cross-origin "vendor CDN X + integrator Y" model, see <code>integrator/</code>.)
+      Multiple tabs read+write one <code>.loom</code>: one tab is the <strong>host</strong> (runs the OPFS
+      engine in a dedicated worker), a <strong>SharedWorker</strong> relays the others' ops to it.
+    </p>
+    <p>
+      <label>Source (<code>.loom</code>):
+        <select id="source">
+          <option value="demo.loom">demo.loom (share across tabs)</option>
+          <option value="alpha.loom">alpha.loom</option>
+          <option value="beta.loom">beta.loom</option>
+        </select>
+      </label>
+      &nbsp;Same source in two tabs = shared; different sources = independent looms.
+    </p>
+    <p id="status">connecting…</p>
+    <p>
+      <button id="seed">Create + insert + select</button>
+      <button id="select">Select</button>
+      <button id="commit">Commit</button>
+      <button id="reset">Reset OPFS</button>
+      <button id="conformance">Run conformance</button>
+    </p>
+    <pre id="out">loading…</pre>
+
+    <script type="module">
+      import { createLoomClient } from "./loom.js";
+
+      const SOURCE = new URLSearchParams(location.search).get("source") || "demo.loom";
+      const out = document.getElementById("out");
+      const statusEl = document.getElementById("status");
+      const log = (s) => { out.className = ""; out.textContent = s; };
+      const fail = (e) => { out.className = "err"; out.textContent = "error: " + (e && e.message ? e.message : e); };
+
+      const sel = document.getElementById("source");
+      if (![...sel.options].some((o) => o.value === SOURCE)) sel.add(new Option(SOURCE + " (custom)", SOURCE));
+      sel.value = SOURCE;
+      sel.onchange = () => { location.search = "?source=" + encodeURIComponent(sel.value); };
+
+      const loom = createLoomClient({
+        source: SOURCE,
+        coordinatorUrl: "./coordinator-impl.js", // same-origin here; the integrator uses a stub
+        onStatus: (t) => (statusEl.textContent = t),
+      });
+
+      log("ready - click a button. Open this same URL in a second tab for shared read+write.");
+
+      document.getElementById("seed").onclick = async () => {
+        try {
+          await loom.exec("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT)");
+          await loom.exec("INSERT INTO t VALUES (1, 'hello'), (2, 'world')");
+          log("seeded + selected:\n" + await loom.exec("SELECT id, v FROM t"));
+        } catch (e) { fail(e); }
+      };
+      document.getElementById("select").onclick = async () => {
+        try { log("rows (served by the host engine):\n" + await loom.exec("SELECT id, v FROM t")); }
+        catch (e) { fail(e); }
+      };
+      document.getElementById("commit").onclick = async () => {
+        try { log("committed: " + await loom.commit("seed", "prototype@uldren")); }
+        catch (e) { fail(e); }
+      };
+      document.getElementById("reset").onclick = () => { log(`reset requested for '${SOURCE}'…`); loom.reset(); };
+      document.getElementById("conformance").onclick = async () => {
+        try {
+          const { got, expected } = await loom.conformance();
+          const pass = got === expected;
+          out.className = pass ? "" : "err";
+          out.textContent = `conformance ${pass ? "PASS ✓" : "FAIL ✗"} (OPFS digest == native)\n  wasm32 (OPFS): ${got}\n  native pin   : ${expected}`;
+        } catch (e) { fail(e); }
+      };
+    </script>
+  </body>
+</html>

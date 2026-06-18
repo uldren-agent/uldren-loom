@@ -1,0 +1,14 @@
+[package]
+edition = "2024"
+name = "loom-program-engines-demo"
+publish = false
+version = "0.0.0"
+
+[workspace]
+
+[dependencies]
+loom-compute = { package = "uldren-loom-compute", path = "../../crates/loom-compute" }
+loom-core = { package = "uldren-loom-core", path = "../../crates/loom-core" }
+loom-store = { package = "uldren-loom-store", path = "../../crates/loom-store" }
+serde_json = "1"
+wat = "1"

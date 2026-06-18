@@ -1,0 +1,23 @@
+[package]
+authors.workspace = true
+description = "Shared stable model and error contracts for Uldren Loom components."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-types"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_types"
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3.workspace = true
+hex.workspace = true
+loom-codec.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

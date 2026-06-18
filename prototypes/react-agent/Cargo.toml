@@ -1,0 +1,20 @@
+[package]
+name = "react-agent"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone prototype: the empty [workspace] table detaches it from the repo workspace so its
+# async/HTTP deps never enter the wasm-clean core's dependency graph.
+[workspace]
+
+[dependencies]
+# the real Loom engine - the agent's `loom_search` tool queries the actual vector facet.
+# package is `uldren-loom-core`; the crate imports as `loom_core` (its [lib] name).
+uldren-loom-core = { path = "../../crates/loom-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# rustls (pure-Rust TLS) so there is no system-OpenSSL build dependency; works for http localhost
+# and https endpoints alike.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

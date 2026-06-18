@@ -1,0 +1,233 @@
+package ai.uldren.loom
+
+actual fun Loom.metricsPutDescriptor(
+    path: String,
+    workspace: String,
+    descriptor: ByteArray,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+) = LoomNative.nativeMetricsPutDescriptor(
+    path,
+    workspace,
+    descriptor,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)
+
+actual fun Loom.metricsGetDescriptor(
+    path: String,
+    workspace: String,
+    name: String,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+): ByteArray? = LoomNative.nativeMetricsGetDescriptor(
+    path,
+    workspace,
+    name,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)
+
+actual fun Loom.metricsPutObservation(
+    path: String,
+    workspace: String,
+    descriptorName: String,
+    observation: ByteArray,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+) = LoomNative.nativeMetricsPutObservation(
+    path,
+    workspace,
+    descriptorName,
+    observation,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)
+
+actual fun Loom.metricsQuery(
+    path: String,
+    workspace: String,
+    descriptorName: String,
+    fromTimestampMs: Long,
+    toTimestampMs: Long,
+    maxSeries: Int,
+    maxGroups: Int,
+    maxSamples: Int,
+    maxOutputBytes: Long,
+    nowTimestampMs: Long,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+): ByteArray = LoomNative.nativeMetricsQuery(
+    path,
+    workspace,
+    descriptorName,
+    fromTimestampMs,
+    toTimestampMs,
+    maxSeries,
+    maxGroups,
+    maxSamples,
+    maxOutputBytes,
+    nowTimestampMs,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)
+
+actual fun Loom.logsPutRecord(
+    path: String,
+    workspace: String,
+    record: ByteArray,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+): String = LoomNative.nativeLogsPutRecord(
+    path,
+    workspace,
+    record,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)
+
+actual fun Loom.logsGetRecord(
+    path: String,
+    workspace: String,
+    recordId: String,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+): ByteArray? = LoomNative.nativeLogsGetRecord(
+    path,
+    workspace,
+    recordId,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)
+
+actual fun Loom.logsQuery(
+    path: String,
+    workspace: String,
+    fromTimeUnixNano: Long,
+    toTimeUnixNano: Long,
+    maxRecords: Int,
+    maxOutputBytes: Long,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+): ByteArray = LoomNative.nativeLogsQuery(
+    path,
+    workspace,
+    fromTimeUnixNano,
+    toTimeUnixNano,
+    maxRecords,
+    maxOutputBytes,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)
+
+actual fun Loom.tracesPutSpan(
+    path: String,
+    workspace: String,
+    span: ByteArray,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+) = LoomNative.nativeTracesPutSpan(
+    path,
+    workspace,
+    span,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)
+
+actual fun Loom.tracesGetSpan(
+    path: String,
+    workspace: String,
+    traceId: String,
+    spanId: String,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+): ByteArray? = LoomNative.nativeTracesGetSpan(
+    path,
+    workspace,
+    traceId,
+    spanId,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)
+
+actual fun Loom.tracesTraceSpans(
+    path: String,
+    workspace: String,
+    traceId: String,
+    maxSpans: Int,
+    maxOutputBytes: Long,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+): ByteArray = LoomNative.nativeTracesTraceSpans(
+    path,
+    workspace,
+    traceId,
+    maxSpans,
+    maxOutputBytes,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)
+
+actual fun Loom.tracesQuery(
+    path: String,
+    workspace: String,
+    fromStartTimeNs: Long,
+    toStartTimeNs: Long,
+    maxSpans: Int,
+    maxOutputBytes: Long,
+    passphrase: String?,
+    kek: ByteArray?,
+    authPrincipal: String?,
+    authPassphrase: String?,
+): ByteArray = LoomNative.nativeTracesQuery(
+    path,
+    workspace,
+    fromStartTimeNs,
+    toStartTimeNs,
+    maxSpans,
+    maxOutputBytes,
+    passphrase?.encodeToByteArray(),
+    kek,
+    authPrincipal,
+    authPassphrase?.encodeToByteArray(),
+)

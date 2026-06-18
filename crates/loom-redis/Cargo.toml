@@ -1,0 +1,18 @@
+[package]
+authors.workspace = true
+description = "Reusable Redis-compatible data model and command substrate for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-redis"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_redis"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-types.workspace = true

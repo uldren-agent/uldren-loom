@@ -1,0 +1,48 @@
+{
+  "snapshot_version": 1,
+  "profile": "granola-mcp",
+  "source_system": "granola-mcp",
+  "source_scope": "mcp://granola/session/session-123/note/mcp-note-1",
+  "observed_at": 1720000200000,
+  "coverage": "partial",
+  "coverage_gaps": [
+    "mcp-single-note:folder-list-not-available"
+  ],
+  "resume_state": "granola-mcp:session=session-123:note=mcp-note-1",
+  "items": [
+    {
+      "source_entity_id": "mcp-note-1",
+      "source_digest": "blake3:8888888888888888888888888888888888888888888888888888888888888888",
+      "source_state": "active",
+      "source_sidecar": {
+        "connector_session_id": "session-123",
+        "requested_by": "assistant",
+        "coverage": "single-note"
+      },
+      "meeting_id": "meeting/mcp-note-1",
+      "title": "Assistant retrieved note",
+      "owner": "principal:mcp-owner@example.com",
+      "summary_text": "The assistant imported a single normalized note.",
+      "transcript_spans": [
+        {
+          "span_id": "span/mcp-note-1/0",
+          "locator": "transcript/00:00:01.000",
+          "speaker": "MCP Owner",
+          "language": "en",
+          "text": "This note was submitted through an assistant connector."
+        }
+      ],
+      "tasks": [
+        {
+          "id": "task/mcp-note-1/0",
+          "label": "Confirm the imported single-note workflow.",
+          "source_span_ids": [
+            "span/mcp-note-1/0"
+          ],
+          "confidence_ppm": 860000,
+          "extractor": "granola-mcp"
+        }
+      ]
+    }
+  ]
+}

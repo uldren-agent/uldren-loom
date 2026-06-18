@@ -32,3 +32,33 @@ cargo build -p uldren-loom-ffi --release --target aarch64-apple-ios
 
 - `version(): string`
 - `blobDigest(bytes: Uint8Array | number[]): string`
+
+The SQL methods are **async** (each resolves a `Promise`). The engine has no worker pool of its own,
+so the native module dispatches every call to a background queue (iOS) or thread pool (Android) and
+resolves off the JS thread - the JS thread never blocks on engine work.
+
+- `sqlExec(loomPath, ns, db, sql): Promise<LoomStatement[]>` - write-capable **typed** results: an array of
+  statement objects with idiomatic, lossless cells. The native layer returns lossless bridge JSON
+  (decoded once in Rust, since the RN bridge can't carry `BigInt`/`Uint8Array`) and the binding
+  `JSON.parse`s it - no CBOR is decoded in JS. Big ints / decimals / uuid / inet / bytes(base64) /
+  `f32` / non-finite `f64` / point arrive as single-key tagged objects (`$i64`, `$decimal`, `$bytes`,
+  ...); see `LoomCell` for the full set.
+- `sqlBatch(loomPath, ns, db, statements): Promise<LoomStatement[]>` - run a list of statements as one
+  **atomic transaction/batch** in a single native round-trip: the native layer opens a
+  held-open batch, runs each statement in order (including `BEGIN`/`COMMIT`/`ROLLBACK`), and on success
+  commits with one atomic save; any error aborts and discards every change. The writer lock stays
+  entirely inside native code, off the JS thread. Resolves the typed results of the **final** statement.
+- `sqlExecBytes(loomPath, ns, db, sql): Promise<Uint8Array>` - result payloads as canonical-CBOR
+  bytes from the write-capable exec path, the raw wire form for your own decoding.
+- `sqlQueryBytes(loomPath, ns, db, sql): Promise<Uint8Array[]>` - read-only row streaming; resolves one
+  canonical-CBOR row byte array per row and rejects mutating statements.
+- `sqlExecJson(loomPath, ns, db, sql): Promise<string>` - a JSON array of result payloads (debug/admin
+  form, not type-faithful) from the write-capable exec path.
+- `sqlCommit(loomPath, ns, db, message, author): Promise<string>` - the new commit's content address.
+
+Single `sqlExec`/`sqlExecBytes`/`sqlExecJson`/`sqlQueryBytes`/`sqlCommit` calls open the loom, run,
+and close (the engine's per-op model); no native handle is held across the JS bridge. `sqlBatch` holds
+the writer lock for the duration of one native call only - never across the bridge. Interactive
+cross-call transactions (app-code branching between statements inside one transaction) are
+intentionally not exposed; the core/C ABI can support a held-open handle, but that needs a guarded
+native handle registry and a concrete consumer first.

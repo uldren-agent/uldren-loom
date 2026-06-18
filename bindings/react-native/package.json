@@ -1,6 +1,6 @@
 {
   "name": "@uldrenai/loom-react-native",
-  "version": "0.0.0",
+  "version": "0.1.0-alpha.1",
   "description": "React Native binding for Uldren Loom - a TurboModule over the C ABI.",
   "license": "BUSL-1.1",
   "author": "Uldren Technologies LLC",

@@ -1,0 +1,4 @@
+*
+!.gitignore
+!manual-results/
+!manual-results/.gitkeep

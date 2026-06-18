@@ -1,0 +1,19 @@
+[package]
+authors.workspace = true
+description = "Reusable durable delivery contracts and helpers for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-delivery"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_delivery"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-codec.workspace = true
+loom-types.workspace = true

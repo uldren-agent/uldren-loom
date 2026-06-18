@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Directed Graph</title>
+  <style>
+    {{ loom.app_shell.css }}
+
+    main {
+      display: grid;
+      grid-template-rows: auto minmax(360px, 1fr);
+      min-height: 100vh;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+
+    .meta {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .stats {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .stat {
+      min-width: 86px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: var(--bg);
+      text-align: right;
+    }
+
+    .stat strong {
+      display: block;
+      font-size: 18px;
+    }
+
+    .stat span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .canvas {
+      position: relative;
+      min-height: 360px;
+      overflow: hidden;
+    }
+
+    svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+      min-height: 360px;
+    }
+
+    .edge {
+      stroke: var(--muted);
+      stroke-width: 1.5;
+      opacity: 0.75;
+    }
+
+    .node circle {
+      fill: var(--panel);
+      stroke: var(--accent);
+      stroke-width: 2;
+    }
+
+    .node text {
+      fill: var(--ink);
+      font-size: 12px;
+      text-anchor: middle;
+      dominant-baseline: middle;
+      pointer-events: none;
+    }
+
+    .empty {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      text-align: center;
+      padding: 32px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Directed Graph</h1>
+        <div class="meta" id="summary">Loading graph</div>
+      </div>
+      <div class="stats" aria-label="Graph counts">
+        <div class="stat"><strong id="node-count">0</strong><span>nodes</span></div>
+        <div class="stat"><strong id="edge-count">0</strong><span>edges</span></div>
+      </div>
+    </header>
+    <section class="canvas" aria-label="Directed graph canvas">
+      <svg id="graph" role="img" aria-label="Directed graph"></svg>
+      <div class="empty" id="empty">No graph projection is available for this workspace yet.</div>
+    </section>
+  </main>
+  <script>
+    const loomGraph = {{ loom.graph | tojson }};
+    const nodes = Array.isArray(loomGraph.nodes) ? loomGraph.nodes : [];
+    const edges = Array.isArray(loomGraph.edges) ? loomGraph.edges : [];
+    const width = 960;
+    const height = 520;
+    const radius = Math.min(width, height) * 0.34;
+    const cx = width / 2;
+    const cy = height / 2;
+    const svg = document.getElementById("graph");
+    const empty = document.getElementById("empty");
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    document.getElementById("node-count").textContent = String(nodes.length);
+    document.getElementById("edge-count").textContent = String(edges.length);
+    document.getElementById("summary").textContent =
+      `${loomGraph.workspace?.name ?? "workspace"} - ${loomGraph.definition?.display_name ?? "graph"}`;
+    empty.hidden = nodes.length > 0;
+
+    const positions = new Map();
+    nodes.forEach((node, index) => {
+      const angle = nodes.length === 1 ? -Math.PI / 2 : (Math.PI * 2 * index) / nodes.length - Math.PI / 2;
+      positions.set(node.id, {
+        x: cx + Math.cos(angle) * radius,
+        y: cy + Math.sin(angle) * radius,
+      });
+    });
+
+    for (const edge of edges) {
+      const from = positions.get(edge.from);
+      const to = positions.get(edge.to);
+      if (!from || !to) {
+        continue;
+      }
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      line.setAttribute("class", "edge");
+      line.setAttribute("x1", from.x);
+      line.setAttribute("y1", from.y);
+      line.setAttribute("x2", to.x);
+      line.setAttribute("y2", to.y);
+      svg.appendChild(line);
+    }
+
+    for (const node of nodes) {
+      const pos = positions.get(node.id);
+      const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      group.setAttribute("class", "node");
+      group.setAttribute("transform", `translate(${pos.x} ${pos.y})`);
+      const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      circle.setAttribute("r", 34);
+      const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      label.textContent = node.label ?? node.id;
+      group.appendChild(circle);
+      group.appendChild(label);
+      svg.appendChild(group);
+    }
+  </script>
+</body>
+</html>

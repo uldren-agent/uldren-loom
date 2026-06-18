@@ -3,7 +3,35 @@ project(uldren_loom_rn CXX)
 
 # JNI bridge for the React Native TurboModule, over the Uldren Loom C ABI. Links the per-ABI Rust
 # static lib that cargo-ndk builds into target/<rust-triple>/release/ (see README.md).
-add_library(uldren_loom_rn SHARED src/main/cpp/UldrenLoom.cpp)
+add_library(uldren_loom_rn SHARED
+    src/main/cpp/UldrenLoom_common.cpp
+    src/main/cpp/UldrenLoom_lifecycle.cpp
+    src/main/cpp/UldrenLoom_workspace.cpp
+    src/main/cpp/UldrenLoom_identity.cpp
+    src/main/cpp/UldrenLoom_sql.cpp
+    src/main/cpp/UldrenLoom_vcs.cpp
+    src/main/cpp/UldrenLoom_queue.cpp
+    src/main/cpp/UldrenLoom_cas.cpp
+    src/main/cpp/UldrenLoom_meetings.cpp
+    src/main/cpp/UldrenLoom_drive.cpp
+    src/main/cpp/UldrenLoom_tickets.cpp
+    src/main/cpp/UldrenLoom_pages.cpp
+    src/main/cpp/UldrenLoom_lanes.cpp
+    src/main/cpp/UldrenLoom_chat.cpp
+    src/main/cpp/UldrenLoom_archive.cpp
+    src/main/cpp/UldrenLoom_kv.cpp
+    src/main/cpp/UldrenLoom_document.cpp
+    src/main/cpp/UldrenLoom_timeseries.cpp
+    src/main/cpp/UldrenLoom_telemetry.cpp
+    src/main/cpp/UldrenLoom_ledger.cpp
+    src/main/cpp/UldrenLoom_calendar.cpp
+    src/main/cpp/UldrenLoom_contacts.cpp
+    src/main/cpp/UldrenLoom_mail.cpp
+    src/main/cpp/UldrenLoom_graph.cpp
+    src/main/cpp/UldrenLoom_vector.cpp
+    src/main/cpp/UldrenLoom_columnar.cpp
+    src/main/cpp/UldrenLoom_dataframe.cpp
+    src/main/cpp/UldrenLoom_search.cpp)
 target_include_directories(uldren_loom_rn PRIVATE ${CMAKE_SOURCE_DIR}/../../../include)
 
 # Map the Android ABI to the Rust target triple so we can link the right static library.

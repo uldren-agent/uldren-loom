@@ -1,0 +1,33 @@
+# FUSE backend for the Uldren Loom filesystem projection (0003c). A thin `fuser` adapter over the
+# portable `loom-vfs` layer; native-only, kept out of `loom-core`/`loom-vfs` per the 0032 parity rule.
+# Licensed under BUSL-1.1 (see ../../LICENSE). (c) Uldren Technologies LLC.
+[package]
+name = "uldren-loom-vfs-fuse"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "FUSE backend that mounts an Uldren Loom namespace working tree as a filesystem."
+
+# The `fuse` feature (ON by default) gates the `fuser` dependency and this crate's code. `fuser` is built
+# without a libfuse link: Linux/BSD use its pure-Rust mount path, and macOS uses this crate's direct
+# `/dev/fuse` mount path before handing the fd to `fuser::Session`.
+[features]
+default = ["fuse"]
+fuse = ["dep:fuser", "dep:nix"]
+
+[dependencies]
+loom-core = { workspace = true }
+loom-store = { workspace = true }
+loom-vfs = { package = "uldren-loom-vfs", path = "../loom-vfs", version = "0.1.0-alpha.1" }
+# `macos-no-mount` keeps fuser from linking libfuse on macOS; this crate owns the macOS mount syscall.
+fuser = { version = "0.17", features = ["macos-no-mount"], optional = true }
+nix = { version = "0.31", features = ["fs", "mount", "user"], optional = true }
+
+[lints]
+workspace = true
+
+[lib]
+name = "loom_vfs_fuse"

@@ -1,7 +1,9 @@
 # Uldren Loom - C/C++ binding
 
 The most direct binding: it *is* the C ABI. Use `include/loom.h` (C) directly, or the header-only
-C++ wrapper `bindings/cpp/include/loom.hpp` for RAII string handling.
+C++ wrapper `bindings/cpp/include/loom.hpp` for RAII errors, result views, SQL sessions, batches, row
+streams, async SQL exec, store creation, workspace lifecycle, queue helpers, key-wrap management, and
+direct table/history readers.
 
 Licensed under **BUSL-1.1** (see the repo `LICENSE`).
 
@@ -22,4 +24,4 @@ Or directly with a compiler:
 c++ -std=c++20 -Ibindings/cpp/include -Iinclude bindings/cpp/example/main.cpp -Ltarget/release -luldren_loom -o /tmp/loom_example
 ```
 
-The printed digest must match `loom hash` and the canonical `abc` vector (`blake3:314b0f56…4058`).
+The printed digest must match `loom hash` and the canonical `abc` vector (`blake3:314b0f56...4058`).

@@ -1,0 +1,22 @@
+[package]
+authors.workspace = true
+description = "Reusable drive service layer for Uldren Loom Studio."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-drive"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_drive"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-chat.workspace = true
+loom-core.workspace = true
+loom-store.workspace = true
+loom-substrate = { workspace = true, features = ["studio-webish"] }
+serde.workspace = true

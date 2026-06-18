@@ -1,0 +1,15 @@
+# Throwaway prototype: compare per-object compression-frame candidates.
+# Excluded from the workspace (see root Cargo.toml). Run: `cargo run --release` in this dir.
+[package]
+name = "loom-compress-proto"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lz4_flex = "0.11"      # pure-Rust LZ4, wasm32-clean
+miniz_oxide = "0.8"    # pure-Rust DEFLATE, wasm32-clean
+zstd = "0.13"          # libzstd C bindings (best ratio; needs a C build, not wasm32-clean)
+
+[profile.release]
+opt-level = 3

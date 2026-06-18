@@ -1,0 +1,18 @@
+[package]
+authors.workspace = true
+description = "Reusable vector set model and accelerator contracts for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-vector"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_vector"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-types.workspace = true

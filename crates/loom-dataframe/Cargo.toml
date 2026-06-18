@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+description = "Reusable dataframe model and execution contracts for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-dataframe"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_dataframe"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-codec.workspace = true
+loom-types.workspace = true
+serde_json.workspace = true

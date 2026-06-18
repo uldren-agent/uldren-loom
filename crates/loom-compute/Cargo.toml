@@ -1,0 +1,59 @@
+[package]
+authors.workspace = true
+description = "Uldren Loom compute layer: the capability model and program manifest for executable logic."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-compute"
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# Package is `uldren-loom-compute` (crates.io); the Rust crate is `loom_compute` so imports
+# (`use loom_compute::...`) and the dependency key match the rest of the workspace.
+[lib]
+name = "loom_compute"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-codec.workspace = true
+loom-core.workspace = true
+loom-templates.workspace = true
+loom-sql = { workspace = true, optional = true }
+loom-result = { workspace = true, optional = true }
+serde_json.workspace = true
+thiserror.workspace = true
+# wasmi: pure-Rust interpreter; the wasm32/browser engine and the default native engine.
+wasmi.workspace = true
+
+# Logic-layer engines, both feature-gated and both pure-Rust / wasm32-clean:
+# - `guards`: CEL predicate evaluation. `default-features = false` drops the optional `chrono` and
+#   `regex` builtins, leaving only the deterministic core (cel-parser/nom/paste/serde/thiserror), so
+#   a guard cannot read a wall clock and the guest stays wasm-clean.
+# - `derivations`: `crepe` is a Datalog proc-macro, so its build-time deps (syn/quote/proc-macro2)
+#   never ship to the wasm target; only generated `std` Rust does.
+cel-interpreter = { version = "0.10", default-features = false, optional = true }
+crepe = { version = "0.2", optional = true }
+
+# Wasmtime: native JIT (Cranelift), native-only (cannot target wasm32). Opt-in via `engine-wasmtime`
+# for native release builds; the wasm32/browser build always uses wasmi (dual-compile).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmtime = { version = "46", optional = true }
+
+[features]
+# Native builds may select Wasmtime instead of wasmi. Default (and wasm32) is wasmi.
+engine-wasmtime = ["dep:wasmtime"]
+# Logic layers, off by default so the base compute crate and the wasm/browser build stay minimal.
+# `statecharts` needs `guards` (transition guards are CEL); `workflows` needs `derivations` (it
+# orchestrates them). Neither adds a new external dependency of its own.
+guards = ["dep:cel-interpreter"]
+derivations = ["dep:crepe"]
+sql-state-access = ["dep:loom-sql", "dep:loom-result"]
+statecharts = ["guards"]
+workflows = ["derivations"]
+
+# Assemble WAT test programs to wasm bytes (Apache-2.0 WITH LLVM-exception; allowed by deny.toml).
+[dev-dependencies]
+wat = "1.253"

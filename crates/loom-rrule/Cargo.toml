@@ -1,0 +1,22 @@
+[package]
+authors.workspace = true
+description = "Owned RFC 5545 RRULE recurrence engine for Uldren Loom (no embedded timezone database)."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-rrule"
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_rrule"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+# The conformance vectors use the compile-time `datetime!` macro for readable fixtures.
+time = { workspace = true, features = ["macros"] }

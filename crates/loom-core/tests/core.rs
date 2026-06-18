@@ -4,7 +4,7 @@ use loom_core::{Digest, MemoryStore, Object, ObjectStore};
 
 #[test]
 fn end_to_end_store_a_blob() {
-    let mut store = MemoryStore::new();
+    let store = MemoryStore::new();
     let obj = Object::Blob(b"the quick brown fox".to_vec());
 
     let digest = store.put(&obj.canonical()).unwrap();

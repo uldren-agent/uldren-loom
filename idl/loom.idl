@@ -1,58 +1,708 @@
 // Uldren Loom interface definition.
 //
-// The language-neutral definition of the Loom interface. Bindings (Node, JVM, C/C++, WASM) and the
-// wire projections (gRPC, REST, JSON-RPC) are generated from this file so they never drift.
+// This file describes the Loom surface exposed by the C ABI (include/loom.h) and direct language
+// bindings. Hosted protocols and generated binding schemas are separate projections.
 //
-// Built-in generics used below: list<T> (ordered sequence), optional<T> (nullable),
-// stream<T> (asynchronous sequence). Scalars: bool i32 i64 u32 u64 f64 string bytes Timestamp Uuid.
+// Workspace selection: every operation takes a `workspace` string that is a UUID or a workspace name.
+// Names are unique across the loom, so a name or UUID identifies a workspace on its own; there is no
+// facet selector. A write by name ensures the workspace. Internal source identity is always the
+// workspace UUID. `workspace_create` carries `FacetKind` because it creates a data facet. ACL grants
+// carry `AclDomain`, which includes every data facet plus independent product authorization domains.
+//
+// Handles: workspace, key-source, CAS, queue, and version-control operations run against an open store
+// session (LoomSession) from `open`, `open_keyed`, or `open_with_kek`. `create` initializes a store path
+// and does not keep it open. SQL operations run against a session or batch handle.
+//
+// Built-in generics: list<T> (ordered sequence), optional<T> (nullable), stream<T> (asynchronous
+// sequence). Scalars: bool i32 i64 u32 u64 f64 string bytes Uuid. Opaque handle types: LoomSession,
+// SqlSession, SqlBatch, RowIter, Task, ResultView.
 
 struct Digest {
     string text; // "algo:hex", e.g. "blake3:af1349b9..."
 }
 
-struct Identity {
+enum FacetKind {
+    FILES,
+    VCS,
+    SQL,
+    KV,
+    DOCUMENT,
+    VECTOR,
+    GRAPH,
+    COLUMNAR,
+    QUEUE,
+    TIME_SERIES,
+    CAS,
+    LEDGER,
+    PROGRAM,
+    CALENDAR,
+    CONTACTS,
+    MAIL,
+    SEARCH,
+    DATAFRAME,
+    METRICS,
+    LOGS,
+    TRACES,
+}
+
+enum AclDomain {
+    FILES,
+    VCS,
+    SQL,
+    KV,
+    DOCUMENT,
+    VECTOR,
+    GRAPH,
+    COLUMNAR,
+    QUEUE,
+    TIME_SERIES,
+    CAS,
+    LEDGER,
+    PROGRAM,
+    CALENDAR,
+    CONTACTS,
+    MAIL,
+    SEARCH,
+    DATAFRAME,
+    METRICS,
+    LOGS,
+    TRACES,
+    TICKETS,
+    PAGES,
+    CHAT,
+    LIFECYCLE,
+    MEETINGS,
+}
+
+struct Workspace {
+    Uuid id;
     string name;
-    string id;          // email or key id
-    Timestamp timestamp;
+    list<FacetKind> facets;
+    optional Digest head;
 }
 
-enum NodeKind {
-    TREE,
-    FILE,
-    SYMLINK,
-    SUBLOOM,
+struct MergeResult {
+    optional Digest commit;   // set for a fast-forward or a merge commit
+    bool fast_forwarded;
+    list<string> conflicts;   // conflicting paths when the merge stopped without committing
+}
+
+// The status of an asynchronous Task. A task starts PENDING; the first poll runs it to a terminal
+// READY/ERROR/CANCELLED; taking its result leaves it TAKEN.
+enum TaskStatus {
+    PENDING,
+    READY,
+    ERROR,
+    CANCELLED,
+    TAKEN,
+}
+
+// The decoded type of one result cell, the tag of LoomValue. Matches the shared cell codec tags.
+enum ValueKind {
+    NULL,
+    BOOL,
+    INT,
+    FLOAT,
+    TEXT,
+    BYTES,
+    I8,
+    I16,
+    I32,
+    I128,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    F32,
+    DECIMAL,
+    DATE,
+    TIME,
+    TIMESTAMP,
+    INTERVAL,
+    UUID,
+    INET,
+    POINT,
+    LIST,
+    MAP,
+}
+
+// The kind of one result item: a SQL statement outcome or a direct reader result.
+enum ResultKind {
+    SELECT,
+    SELECT_MAP,
+    SHOW_COLUMNS,
+    INSERT,
+    DELETE,
+    UPDATE,
+    DROP_TABLE,
+    CREATE,
+    DROP_FUNCTION,
+    ALTER_TABLE,
+    CREATE_INDEX,
+    DROP_INDEX,
+    START_TRANSACTION,
+    COMMIT,
+    ROLLBACK,
+    SHOW_VARIABLE,
+    ROWS,
+    BLAME,
+    DIFF,
+    COMMIT_LOG,
+    MERGE,
+}
+
+// The variable a ShowVariable result item reports.
+enum VariableKind {
+    TABLES,
+    FUNCTIONS,
+    VERSION,
+}
+
+// The outcome of a Merge result item. The commit (fast-forward or merged) or conflict paths are read as
+// the item's string list.
+enum MergeOutcome {
+    UP_TO_DATE,
+    FAST_FORWARD,
+    MERGED,
+    CONFLICTS,
+}
+
+// The change kind of one diff entry.
+enum DiffChange {
+    ADDED,
+    REMOVED,
+    UPDATED,
+}
+
+// The side of a diff entry to read: VALUES is an added/removed row's values or an update's from side; TO
+// is an update's to side.
+enum DiffSide {
+    VALUES,
+    TO,
+}
+
+// One decoded scalar cell, the C ABI LoomValue. `tag` is a ValueKind; only the field(s) it selects are
+// meaningful and the rest are zero. `data` borrows until the owning view is closed: UTF-8 for TEXT, raw
+// bytes for BYTES, and canonical CBOR for LIST/MAP. `bytes16` is little-endian for I128/U128/UUID and the
+// decimal mantissa (with `scale`); for INET it holds 4 or 16 octets with `uint_val` 4 or 6. Floats fill
+// `float_val` and `bits` (raw IEEE-754); POINT uses `float_val`/`bits` for x and `float_val2`/`bits2` for
+// y.
+struct LoomValue {
+    i32 tag;            // a ValueKind
+    u32 scale;
+    i64 int_val;
+    i64 int_val2;
+    u64 uint_val;
+    f64 float_val;
+    f64 float_val2;
+    u64 bits;
+    u64 bits2;
+    bytes bytes16;      // 16 bytes
+    bytes data;         // borrowed
+    u64 data_len;
+}
+
+// One entry of a SelectMap row: a borrowed key and its decoded value.
+struct MapEntry {
+    bytes key;
+    LoomValue value;
+}
+
+// This thread's most recent error: a stable numeric code (0 when the last call succeeded), the
+// message (absent when there is no error), and canonical CBOR structured details (absent when none).
+// SQL execution failures preserve the stable Code values named SQL_SYNTAX,
+// SQL_CONSTRAINT_VIOLATION, SQL_TABLE_NOT_FOUND, SQL_TYPE_MISMATCH, and SQL_EXECUTION_FAILED.
+// Search index readiness preserves INDEX_NOT_READY for native derived-index reads that cannot trust
+// the current artifact.
+struct LastError {
+    i32 code;
+    optional string message;
+    optional bytes details;
+}
+
+enum DaemonState {
+    RUNNING,
+    STOPPED,
+}
+
+struct DaemonStatus {
+    DaemonState state;
+    u32 protocol;
+    string transport;
+    optional string pid;
+    string store;
+    u64 sessions;
+    u64 pins;
+}
+
+enum LockMode {
+    EXCLUSIVE,
+    SHARED,
+    SEMAPHORE,
+}
+
+struct LockToken {
+    string key;
+    string principal;
+    string session;
+    LockMode mode;
+    u32 permits;
+    u32 capacity;
+    u32 fence_authority;
+    u32 fence_epoch;
+    u64 fence_sequence;
+    u64 lease_deadline_ms;
+}
+
+enum PrincipalKind {
+    ROOT,
+    USER,
+    SERVICE,
+}
+
+struct PrincipalRecord {
+    Uuid id;
+    string handle;
+    string name;
+    PrincipalKind kind;
+    bool enabled;
+    bool has_passphrase;
+    list<Uuid> roles;
+}
+
+struct RoleRecord {
+    Uuid id;
+    string name;
+    bool enabled;
+}
+
+enum ExternalCredentialKind {
+    PUBLIC_KEY,
+    MTLS_CERTIFICATE,
+    PASSKEY,
+    OIDC_SUBJECT,
+    SAML_SUBJECT,
+}
+
+struct AppCredentialRecord {
+    Uuid id;
+    Uuid principal;
+    string label;
+    bool enabled;
+}
+
+struct ExternalCredentialRecord {
+    Uuid id;
+    Uuid principal;
+    ExternalCredentialKind kind;
+    string label;
+    string issuer;
+    string subject;
+    optional string material_digest;
+    bool enabled;
+}
+
+struct ExternalCredentialSpec {
+    ExternalCredentialKind kind;
+    string label;
+    string issuer;
+    string subject;
+    optional string material_digest;
+}
+
+struct IdentityPublicKeyRecord {
+    Uuid id;
+    Uuid principal;
+    string label;
+    string algorithm;
+    bytes public_key;
+    bool enabled;
+}
+
+enum IdentityAuthorityMode {
+    AUTHORITY,
+    MIRROR,
+    DETACHED,
+}
+
+struct IdentityAuthorityState {
+    IdentityAuthorityMode mode;
+    Uuid authority;
+    u64 generation;
+    optional Digest head;
+}
+
+struct IdentityAuthorityHandoff {
+    Uuid from;
+    Uuid to;
+    u64 generation;
+    optional Digest head;
+    bytes signed_record;
+}
+
+struct IdentityAuthorityDetach {
+    Uuid previous_authority;
+    Uuid new_authority;
+    u64 generation;
+    string reason;
+}
+
+struct IdentitySnapshot {
+    bool authenticated_mode;
+    optional Uuid root;
+    IdentityAuthorityState authority;
+    list<IdentityAuthorityHandoff> authority_handoffs;
+    optional IdentityAuthorityDetach forced_detach;
+    list<PrincipalRecord> principals;
+    list<RoleRecord> roles;
+    list<AppCredentialRecord> app_credentials;
+    list<ExternalCredentialRecord> external_credentials;
+    list<IdentityPublicKeyRecord> public_keys;
+}
+
+// The audited result of an identity control-plane mutation: the audit sequence assigned to the mutation,
+// the minted id when one is created (external credential or public key), and the echoed audit action and
+// redacted target. Carries no secret material.
+struct IdentityAuditResult {
+    u64 audit_seq;
+    optional Uuid id;
+    string action;
+    optional string target;
+}
+
+// The one-time result of an app-credential create: the audit sequence, the stored (secret-free) record
+// fields, and the plaintext bearer token delivered exactly once (never re-readable, never persisted).
+struct AppCredentialCreateResult {
+    u64 audit_seq;
+    Uuid id;
+    Uuid principal;
+    string label;
+    bool enabled;
+    string secret_token;
+}
+
+// An opaque, session-scoped transfer handle minted by transfer_import_open. Carried back on each
+// subsequent write/finish/cancel call and released on finish, cancel, or session/lease expiry.
+struct TransferId {
+    bytes id;
+}
+
+// The write-side backpressure reply: the total bytes accepted so far for the transfer and the credit
+// (further bytes the server will accept before the next write must wait).
+struct TransferAccept {
+    u64 accepted_bytes;
+    u64 credit;
+}
+
+enum AclEffect {
+    ALLOW,
+    DENY,
+}
+
+enum AclRight {
+    READ,
+    WRITE,
+    ADVANCE,
+    MERGE,
+    EXECUTE,
+    ADMIN,
+}
+
+enum AclScopeKind {
+    ALL,
+    REF,
+    COLLECTION,
+    PATH,
+    KEY,
     TABLE,
+    EXEC,
 }
 
+struct AclScopeRecord {
+    AclScopeKind kind;
+    bytes prefix;               // empty for ALL, otherwise the raw prefix bytes
+}
+
+struct AclPredicateRecord {
+    string language;             // "cel" for the source-backed stored predicate language
+    string expression;
+}
+
+struct AclGrantRecord {
+    AclEffect effect;
+    string subject;              // "*", a principal UUID string, or "role:<role-uuid>"
+    string subject_kind;         // "everyone", "principal", or "role"
+    optional Uuid workspace;     // absent for a global grant
+    optional AclDomain domain;   // absent for all authorization domains
+    optional string ref_glob;    // absent for all refs; otherwise a branch/tag glob
+    list<AclRight> rights;
+    list<AclScopeRecord> scopes;
+    optional AclPredicateRecord predicate;
+}
+
+struct ProtectedRefPolicyRecord {
+    string ref_name;              // exact "branch/name" or "tag/name"
+    bool fast_forward_only;
+    bool signed_commits_required;
+    bool signed_ref_advance_required;
+    u32 required_review_count;
+    bool retention_lock;
+    bool governance_lock;
+}
+
+enum CapabilityProofStatus {
+    EXECUTABLE,
+    SOURCE_BACKED,
+    SCENARIO,
+    TARGET,
+    DEPRECATED,
+}
+
+enum CapabilityOperationalState {
+    SUPPORTED,
+    DEGRADED,
+    DISABLED,
+    UNAVAILABLE,
+    DENIED,
+    UNSUPPORTED,
+    TARGET,
+}
+
+struct CapabilityDimensions {
+    optional string facet;
+    optional string facade;
+    optional string engine;
+    optional string transport;
+    optional string compile_feature;
+    optional string listener;
+    optional string binding;
+    optional string policy;
+}
+
+struct CapabilityScope {
+    string surface_kind;
+    string surface_id;
+    optional string platform_profile;
+    optional string engine;
+    optional string listener_id;
+    optional string transport;
+    optional string requested_profile;
+}
+
+struct CapabilityDegradation {
+    string fallback;
+    string result_equivalence;
+}
+
+struct CapabilityRecord {
+    string capability_id;
+    u32 current;
+    u32 minimum_compatible;
+    list<string> owning_specs;
+    string owner_module;
+    CapabilityDimensions dimensions;
+    CapabilityProofStatus proof_status;
+    CapabilityOperationalState operational_state;
+    optional string reason_code;
+    optional string stable_error;
+    CapabilityScope scope;
+    list<string> profiles;
+    bytes limits;
+    optional CapabilityDegradation degradation;
+    list<string> evidence;
+    optional u64 observed_at_ms;
+    optional u64 freshness_ms;
+}
+
+struct CapabilitySet {
+    u32 schema_version;
+    list<CapabilityRecord> records;
+}
+
+// ---- store lifecycle and helpers ----
+// `create`/`open` take a filesystem path to a `.loom`. `profile` is "default"/"blake3" or
+// "fips"/"sha256". `suite` is the at-rest AEAD ("xchacha20-poly1305" or "aes-256-gcm"), or empty for the
+// profile default. A non-empty `passphrase`, or a 32-byte `kek`, encrypts the store; both empty is an
+// unencrypted store. `open_keyed`/`open_with_kek` unlock an encrypted store. `close` frees a handle.
+interface Store {
+    string version();
+    // Canonical-CBOR CapabilitySet with independent proof_status and operational_state.
+    bytes capabilities();
+    // Runtime provider/profile report as canonical CBOR: binary_channel, runtime_policy,
+    // default_identity_profile, crypto_provider, tls_provider, fips_capable, fips_tls_claim.
+    bytes runtime_profile();
+    Digest blob_digest(bytes data);
+    // The store's digest algorithm as a stable lowercase string (e.g. "blake3", "sha256"): the algo
+    // component of every content address this store produces. A property of the open store, so hosts
+    // that reassemble content-addressed results (e.g. the MCP document_query composite) can reproduce
+    // `Digest::hash(algo, bytes)` over a remote store instead of assuming a fixed algorithm.
+    string digest_algo();
+    void create(string loom_path, string profile, optional string suite, optional bytes passphrase);
+    void create_with_kek(string loom_path, string profile, optional string suite, bytes kek);
+    LoomSession open(string loom_path);
+    LoomSession open_keyed(string loom_path, bytes passphrase);
+    LoomSession open_with_kek(string loom_path, bytes kek);
+    void close(LoomSession handle);
+}
+
+// ---- key sources ----
+// Add or remove DEK unlock wraps on an encrypted store opened with an existing unlock credential.
+// Some direct bindings project this as `(loom_path, existing_passphrase, new_credential, ...)`, but
+// the C ABI shape is handle-based. `allow_no_recovery` permits leaving or removing the last passphrase
+// recovery wrap. A `kek` is 32 bytes. Provider acquisition (keychain, TPM, KMS) and callback providers
+// are outside this interface.
+interface KeySource {
+    void key_add_wrap_keyed(LoomSession handle, bytes new_passphrase, bool allow_no_recovery);
+    void key_add_wrap_with_kek(LoomSession handle, bytes kek, bool allow_no_recovery);
+    void key_remove_wrap(LoomSession handle, u64 index, bool allow_no_recovery);
+}
+
+// ---- workspaces ----
+// `workspace` selects by UUID or name. `workspace_create` returns the new workspace UUID. The C ABI and
+// bindings return `workspace_list` as JSON records carrying the same fields.
+interface Workspaces {
+    Uuid workspace_create(LoomSession handle, optional string name, optional FacetKind facet);
+    list<Workspace> workspace_list(LoomSession handle);
+    void workspace_rename(LoomSession handle, string workspace, string new_name);
+    void workspace_delete(LoomSession handle, string workspace);
+}
+
+// ---- program execution ----
+// Executes a canonical `loom.exec.request.v1` CBOR request and returns a canonical
+// `loom.exec.result.v1` CBOR response. The request carries the workspace UUID, principal, role set,
+// context grant upper bound, execution mode, per-step manifests, WASM bodies, inputs, fuel, and commit
+// metadata.
+interface Exec {
+    bytes exec_cbor(LoomSession handle, bytes request);
+}
+
+// ---- program lifecycle ----
+// Program records cross as canonical CBOR `[name, manifest_digest, body_digest, body_len,
+// manifest]`. `program_get` returns `[record, body]`. `manifest` is the canonical
+// `loom_compute::Manifest` byte form.
+interface Program {
+    bytes program_put(LoomSession handle, string workspace, string name, bytes manifest, bytes body);
+    optional bytes program_inspect(LoomSession handle, string workspace, string name);
+    optional bytes program_get(LoomSession handle, string workspace, string name);
+    bytes program_list(LoomSession handle, string workspace);
+    bool program_remove(LoomSession handle, string workspace, string name);
+}
+
+// ---- sessions, identity, and ACL ----
+// A LoomSession may bind an authenticated principal for subsequent calls. The store starts with an
+// initial root principal and no passphrase; while no credential or second principal exists,
+// unauthenticated root mode is active. Setting a passphrase or adding another principal turns on
+// authenticated mode. Identity and ACL management require global ADMIN once authenticated mode is active.
+// `acl_grant` and `acl_revoke` use `effect` ALLOW/DENY, `subject` "*" or a principal UUID or
+// "role:<role-uuid>", optional workspace UUID/name, optional facet, optional ref glob, optional
+// structured scopes, an optional `{language, expression}` predicate, and a non-empty rights list.
+// `acl_revoke` returns whether a matching direct grant was removed.
+interface Sessions {
+    void authenticate_passphrase(LoomSession handle, Uuid principal, bytes passphrase);
+    void clear_authentication(LoomSession handle);
+}
+
+interface Identity {
+    IdentitySnapshot identity_list(LoomSession handle);
+    Uuid identity_add_principal(LoomSession handle, string principal_handle, string name,
+                                PrincipalKind kind);
+    void identity_rename_principal_handle(LoomSession handle, Uuid principal,
+                                          string principal_handle);
+    void identity_set_passphrase(LoomSession handle, Uuid principal, bytes passphrase);
+    void identity_remove_principal(LoomSession handle, Uuid principal);
+    void identity_assign_role(LoomSession handle, Uuid principal, Uuid role);
+    bool identity_revoke_role(LoomSession handle, Uuid principal, Uuid role);
+    IdentityAuditResult identity_create_external_credential(LoomSession handle, Uuid principal,
+                                             ExternalCredentialSpec credential);
+    IdentityAuditResult identity_revoke_external_credential(LoomSession handle, Uuid credential);
+    IdentityAuditResult identity_add_public_key(LoomSession handle, Uuid principal, string label,
+                                 string algorithm, bytes public_key);
+    IdentityAuditResult identity_revoke_public_key(LoomSession handle, Uuid key);
+    AppCredentialCreateResult identity_create_app_credential(LoomSession handle, Uuid principal,
+                                             string label);
+    IdentityAuditResult identity_revoke_app_credential(LoomSession handle, Uuid credential);
+}
+
+interface Acl {
+    list<AclGrantRecord> acl_list(LoomSession handle);
+    void acl_grant(LoomSession handle, AclEffect effect, string subject, optional string workspace,
+                   optional AclDomain domain, optional string ref_glob,
+                   optional list<AclScopeRecord> scopes, optional list<AclRight> rights,
+                   optional AclPredicateRecord predicate);
+    bool acl_revoke(LoomSession handle, AclEffect effect, string subject, optional string workspace,
+                    optional AclDomain domain, optional string ref_glob,
+                    optional list<AclScopeRecord> scopes, optional list<AclRight> rights,
+                    optional AclPredicateRecord predicate);
+}
+
+interface ProtectedRefs {
+    list<ProtectedRefPolicyRecord> protected_ref_list(LoomSession handle, string workspace);
+    optional ProtectedRefPolicyRecord protected_ref_get(LoomSession handle, string workspace,
+                                                        string ref_name);
+    void protected_ref_set(LoomSession handle, string workspace, string ref_name,
+                           bool fast_forward_only, bool signed_commits_required,
+                           bool signed_ref_advance_required, u32 required_review_count,
+                           bool retention_lock, bool governance_lock);
+    bool protected_ref_remove(LoomSession handle, string workspace, string ref_name);
+}
+
+// ---- daemon lifecycle and locks ----
+// The daemon is an executable/runtime control plane keyed by canonical `.loom` path, not an MCP tool
+// and not workspace data. The `loom` CLI owns the detached daemon lifecycle. Embedded and
+// closed-filesystem bindings manage Loom through their host application lifecycle instead of spawning
+// the CLI daemon. If a runtime host exposes `daemon_start`, it is idempotent for an already-running
+// daemon for the same store; `daemon_stop` fails while pins are live. Session attach/detach is host
+// lifecycle plumbing for long-lived clients such as MCP servers and mounts. Locks are daemon-backed,
+// leased, and fenced; a true stateless caller that cannot attach to the daemon must reject these
+// methods.
+interface Daemon {
+    void daemon_start(string loom_path);
+    void daemon_stop(string loom_path);
+    void daemon_restart(string loom_path);
+    DaemonStatus daemon_status(string loom_path);
+    DaemonStatus daemon_doctor(string loom_path);
+    void daemon_session_attach(string loom_path, string session);
+    void daemon_session_detach(string loom_path, string session);
+    void daemon_pin_add(string loom_path, string pin);
+    void daemon_pin_remove(string loom_path, string pin);
+}
+
+interface Locks {
+    LockToken lock_acquire(string loom_path, string key, string principal, string session,
+                           LockMode mode, u32 permits, u32 capacity, u64 lease_ms, u64 wait_ms);
+    LockToken lock_refresh(string loom_path, string key, string principal, string session,
+                           LockMode mode, u32 permits, u32 capacity, u64 fence_low,
+                           u64 fence_high, u64 lease_ms);
+    void lock_release(string loom_path, string key, string principal, string session, LockMode mode,
+                      u32 permits, u32 capacity, u64 fence_low, u64 fence_high);
+}
+
+// How merge_resolve settles one conflicted path of an in-progress merge: keep the current branch slot
+// (OURS), take the merged branch slot (THEIRS), or accept whatever is currently staged at the path
+// (WORKING: a hand-merged file, edited conflict markers, or a deletion).
+enum ConflictResolution {
+    OURS,
+    THEIRS,
+    WORKING,
+}
+
+// The kind of a working-state change relative to a baseline.
 enum ChangeKind {
     ADDED,
     MODIFIED,
     DELETED,
-    RENAMED,
 }
 
-struct Stat {
-    string path;
-    NodeKind kind;
-    u64 size;
-    Digest digest;
-    u32 mode;
-    bool executable;
-}
-
-struct Object {
-    Digest digest;
-    u32 object_type;    // 1=Blob 2=ChunkList 3=Tree 4=Commit 5=Tag
-    bytes canonical;    // canonical serialized form
-}
-
+// One path-level change in a status report.
 struct Change {
     string path;
     ChangeKind kind;
-    optional Digest old;
-    optional Digest new;
 }
 
+// A workspace's working state relative to HEAD and the shared staging index: staged is index-vs-HEAD,
+// unstaged is working-vs-index for tracked paths, untracked is working paths in neither the index nor
+// HEAD, and conflicts are the unresolved paths of any in-progress merge.
 struct Status {
     list<Change> staged;
     list<Change> unstaged;
@@ -60,65 +710,1269 @@ struct Status {
     list<string> conflicts;
 }
 
-struct Commit {
-    Digest digest;
-    Digest tree;
-    list<Digest> parents;
-    Identity author;
-    string message;
+enum WatchScopeKind {
+    ALL,
+    KEY_PREFIX,
 }
 
-struct Diff {
-    list<Change> changes;
+struct WatchScope {
+    WatchScopeKind kind;
+    bytes prefix;                 // empty for ALL; otherwise a domain-owned canonical key prefix
 }
 
-struct Conflict {
-    string path;
-    optional Digest base;
-    optional Digest ours;
-    optional Digest theirs;
+struct WatchSelector {
+    string workspace;             // workspace UUID or name
+    string ref;                   // exact branch/tag ref for this cursor, e.g. "main" or "branch/main"
+    WatchScope scope;
+    list<string> domains;         // empty means all authorized domains; otherwise sorted and unique
+    list<ChangeKind> kinds;       // empty means all normalized create/update/delete classes
 }
 
-struct MergeResult {
-    optional Digest commit;
-    bool fast_forwarded;
-    list<Conflict> conflicts;
+struct DomainChange {
+    string domain;
+    u32 schema_version;
+    string kind;
+    bytes key;
+    optional Digest before;
+    optional Digest after;
+    optional bytes detail;        // canonical domain-owned payload
 }
 
-// ---- filesystem ----
-interface FileSystem {
-    bytes read_file(string path);
-    Stat write_file(string path, bytes content);
-    Stat create_file(string path, bytes content);
-    void delete_file(string path);
-    void create_directory(string path, bool recursive);
-    void remove_directory(string path, bool recursive);
-    list<Stat> read_directory(string path);
-    Stat stat(string path);
-    bool exists(string path);
-    void move(string src, string dst, bool overwrite);
-    void copy(string src, string dst, bool overwrite);
+struct UnsupportedDomainDetail {
+    string domain;
+    string capability;
+}
+
+struct DataChange {
+    Uuid workspace;
+    string ref;
+    Digest commit;
+    u64 seq;
+    list<DomainChange> changes;
+    list<UnsupportedDomainDetail> unsupported_domains;
+}
+
+// A stateless watch subscription cursor encoded for transport.
+struct WatchSubscription {
+    string cursor;
+}
+
+// A pull-watch batch and the cursor to use for the next poll.
+struct WatchBatch {
+    list<DataChange> events;
+    string next;
 }
 
 // ---- version control ----
+// Selects a workspace by `facet` and name. `commit` records the working tree and returns the new
+// commit's content address. `log` returns commit content addresses, newest first. `merge` reconciles
+// `from_branch` into the current branch; `cell_level` reconciles tables at cell granularity. When a
+// merge stops with conflicts it enters an in-progress state for the workspace, leaving the branch tip
+// unchanged: `merge_in_progress` reports it, `merge_conflicts` lists the unresolved paths, `merge_resolve`
+// settles one path, `merge_abort` restores the pre-merge working tree, and `merge_continue` records the
+// two-parent merge commit once every path is resolved. The in-progress state is operational metadata,
+// excluded from commits, reachability, clone, push, bundle, and ordinary sync.
 interface VersionControl {
-    Digest commit(string message);
-    Status status();
-    void branch_create(string name, optional Digest at);
-    list<string> branch_list();
-    void checkout(string rev);
-    MergeResult merge(string source);
-    Digest rebase(string upstream);
-    Digest squash(string from, string to, string message);
-    void tag_create(string name, string rev);
-    stream<Commit> log();
-    Diff diff(string from, string to);
+    Digest commit(LoomSession handle, string workspace, string author, string message, u64 timestamp_ms);
+    void branch(LoomSession handle, string workspace, string branch);
+    void checkout(LoomSession handle, string workspace, string branch);
+    list<Digest> log(LoomSession handle, string workspace, string branch);
+    // The current HEAD branch name for `workspace` (what `vcs log` resolves locally).
+    string head_branch(LoomSession handle, string workspace);
+    MergeResult merge(LoomSession handle, string workspace, string from_branch,
+                      string author, bool cell_level, u64 timestamp_ms);
+    bool merge_in_progress(LoomSession handle, string workspace);
+    list<string> merge_conflicts(LoomSession handle, string workspace);
+    void merge_resolve(LoomSession handle, string workspace, string path,
+                       ConflictResolution resolution);
+    void merge_abort(LoomSession handle, string workspace);
+    Digest merge_continue(LoomSession handle, string workspace, string author, u64 timestamp_ms);
+    // Workspace history. `diff` is the cross-facet structural `LMDIFF` envelope between two commits;
+    // `blame` pairs each current path on `branch` with the commit that last set it. All return
+    // canonical CBOR.
+    bytes diff(LoomSession handle, string workspace, string from_commit, string to_commit);
+    bytes blame(LoomSession handle, string workspace, string branch);
+    // Async (Task-returning) forms of the version-control history queries.
+    Task log_async(LoomSession handle, string workspace, string branch);
+    Task merge_async(LoomSession handle, string workspace, string from_branch,
+                     string author, bool cell_level);
+
+    // Staging: one shared index per workspace across all facets. `commit` (above) records the whole
+    // working tree (staged plus unstaged); `commit_staged` records only the index. `stage`/`stage_all`
+    // move working-tree changes into the index, `unstage` reverts an index entry to HEAD, and `status`
+    // reports the working state.
+    Status status(LoomSession handle, string workspace);
+    void stage(LoomSession handle, string workspace, string path);
+    void stage_all(LoomSession handle, string workspace);
+    void unstage(LoomSession handle, string workspace, string path);
+    Digest commit_staged(LoomSession handle, string workspace, string author,
+                         string message, u64 timestamp_ms);
+
+    // Tags. `tag_create` resolves `rev` (HEAD, a branch name, or a digest) to a commit and creates a
+    // tag: an empty `message` makes a lightweight tag (the ref points at the commit), a non-empty
+    // `message` makes an annotated tag (a stored Tag object carrying `tagger`/`message`), and returns
+    // the ref target digest. `tag_target` reads the raw ref (the commit, or the tag object) and is
+    // absent for an unknown tag. `tag_delete` is NOT_FOUND if absent; `tag_rename` is NOT_FOUND on a
+    // missing source and ALREADY_EXISTS on a taken destination.
+    Digest tag_create(LoomSession handle, string workspace, string name, string rev,
+                      string tagger, string message, u64 timestamp_ms);
+    list<string> tag_list(LoomSession handle, string workspace);
+    Digest? tag_target(LoomSession handle, string workspace, string name);
+    void tag_delete(LoomSession handle, string workspace, string name);
+    void tag_rename(LoomSession handle, string workspace, string old_name,
+                    string new_name);
+
+    // Restore / path-restricted checkout. `restore_file` resets one path in the working tree to the
+    // snapshot `rev` resolves to (HEAD, a branch name, or a digest), removing it if absent there;
+    // `restore_path` resets the subtree under `prefix` (a `""` prefix restores the whole tree). Both
+    // touch the working tree only - HEAD, the branch, and the staging index are unchanged.
+    void restore_file(LoomSession handle, string workspace, string rev, string path);
+    void restore_path(LoomSession handle, string workspace, string rev, string prefix);
+
+    // History replay (cherry-pick / revert / rebase). These are workspace-level and cross-facet (a
+    // commit is a cross-facet snapshot); the per-slot merge strategy is dispatched by facet (files text,
+    // tables row/cell, default whole-slot). `dry_run` previews conflicts without changing anything. The
+    // outcome reports whether the replay applied (with the new tip), was clean (dry run), hit conflicts
+    // (with the unresolved paths), or had nothing to do. Multi-commit ops are atomic: the first conflict
+    // makes no change.
+    ReplayOutcome cherry_pick(LoomSession handle, string workspace,
+                              list<Digest> commits, bool dry_run, u64 timestamp_ms);
+    ReplayOutcome revert(LoomSession handle, string workspace, list<Digest> commits,
+                         string author, bool dry_run, u64 timestamp_ms);
+    ReplayOutcome rebase(LoomSession handle, string workspace, string onto,
+                         bool dry_run, u64 timestamp_ms);
+
+    // Squash the commits after `onto` up to the tip into one commit (parent `onto`, the tip's tree,
+    // `author`/`message`); returns the new commit. `onto` must be an ancestor of the tip and not the tip
+    // itself (INVALID_ARGUMENT).
+    Digest squash(LoomSession handle, string workspace, string onto, string author,
+                  string message, u64 timestamp_ms);
 }
 
-// ---- objects ----
-interface Objects {
-    Digest write_object(Object object);
-    Object read_object(Digest digest);
-    bytes read_blob(Digest digest);
-    bool has_object(Digest digest);
+// ---- watch ----
+// Portable pull-watch over workspace history. Cursor strings are opaque, versioned source cursors.
+// The current source-backed v1 profile is first-parent and commit-level for one exact branch; selector
+// narrowing may return UNSUPPORTED until promoted by the implementation.
+interface Watch {
+    WatchSubscription subscribe(LoomSession handle, WatchSelector selector, optional Digest from);
+    WatchBatch poll(LoomSession handle, string cursor, u32 max);
+    stream<DataChange> stream(LoomSession handle, WatchSelector selector, optional Digest from);
+}
+
+// The result of a history-replay op. `tip` is set for REPLAYED; `paths` for CONFLICTS.
+enum ReplayKind { REPLAYED, CLEAN, CONFLICTS, EMPTY }
+struct ReplayOutcome {
+    ReplayKind kind;
+    Digest? tip;
+    list<string> paths;
+}
+
+// ---- file system (working tree) ----
+// Whole-file operations on a workspace working tree, selected by `facet` and name. `write_file` is
+// create-or-replace and requires the parent directory to exist (`mode` 0 uses the default 0o100644);
+// `append_file` creates the file if absent and concatenates otherwise (POSIX-style), also requiring the
+// parent; `read_file` returns the staged bytes; `remove_file` stages a deletion. Appending to a path
+// that is a directory is ALREADY_EXISTS; a missing parent is NOT_FOUND.
+interface FileSystem {
+    void write_file(LoomSession handle, string workspace, string path, bytes content,
+                    u32 mode);
+    bytes read_file(LoomSession handle, string workspace, string path);
+    void append_file(LoomSession handle, string workspace, string path, bytes content);
+    void remove_file(LoomSession handle, string workspace, string path);
+
+    // ---- byte-range I/O (path form) ----
+    // `read_at` returns up to `len` bytes from `offset`, loading only the overlapping chunks; reads past
+    // the end clamp (fewer bytes, or empty), and a missing file is NOT_FOUND (POSIX pread). `write_at`
+    // writes `content` at `offset`, creating the file if absent and zero-filling any gap before `offset`
+    // (POSIX pwrite); only the affected chunks are re-stored. `truncate` resizes to `size`, zero-extending
+    // or dropping bytes, creating a missing file zero-filled (POSIX truncate). A missing parent is
+    // NOT_FOUND; a directory path is ALREADY_EXISTS. A handle open on the path sees these changes.
+    bytes read_at(LoomSession handle, string workspace, string path, u64 offset, u64 len);
+    void write_at(LoomSession handle, string workspace, string path, u64 offset,
+                  bytes content);
+    void truncate(LoomSession handle, string workspace, string path, u64 size);
+
+    // Symbolic links (git-style: a file slot with the S_IFLNK mode whose content is the target). The
+    // target is opaque and may be dangling; symlinks are not followed by other fs operations. `symlink`
+    // requires an existing parent (`NOT_FOUND`) and a free `link_path` (`ALREADY_EXISTS`). `read_link`
+    // is `NOT_FOUND` if absent and `INVALID_ARGUMENT` if the path is not a symlink.
+    void symlink(LoomSession handle, string workspace, string target, string link_path);
+    string read_link(LoomSession handle, string workspace, string path);
+
+    // ---- directories and metadata ----
+    // `create_directory` records `path` as a directory (idempotent if it is already a directory,
+    // `ALREADY_EXISTS` if it is a file); without `recursive` the parent must already exist (`NOT_FOUND`).
+    // `remove_directory` deletes `path`; without `recursive` a non-empty directory is `INVALID_ARGUMENT`
+    // and an absent directory is `NOT_FOUND`. `stat` returns canonical-CBOR `loom.fs.stat.v1`
+    // (`[path, kind, size, mode]`, `kind` = 0 file / 1 directory / 2 symlink); a path resolving to neither
+    // file nor directory is `NOT_FOUND`. `list_directory` returns canonical-CBOR `loom.fs.dir-listing.v1`
+    // (an array of `[name, kind]` sorted by name; root is `""` or `"/"`); a non-directory path is `NOT_FOUND`.
+    void create_directory(LoomSession handle, string workspace, string path, bool recursive);
+    void remove_directory(LoomSession handle, string workspace, string path, bool recursive);
+    bytes stat(LoomSession handle, string workspace, string path);
+    bytes list_directory(LoomSession handle, string workspace, string path);
+
+    // Host filesystem import/export over a workspace file tree. Return values are canonical-CBOR
+    // `loom.interchange.import-report.v1` or `loom.interchange.export-report.v1` records.
+    bytes import_fs(LoomSession handle, string workspace, string src_path, bool commit,
+                    bool dry_run);
+    bytes export_fs(LoomSession handle, string workspace, string dst_path,
+                    optional string revision, bool dry_run);
+    Task import_fs_async(LoomSession handle, string workspace, string src_path, bool commit,
+                         bool dry_run);
+    Task export_fs_async(LoomSession handle, string workspace, string dst_path,
+                         optional string revision, bool dry_run);
+}
+
+// ---- archive interchange ----
+// Host archive import/export over a workspace file tree. `kind` is one of `tar-zstd`, `tar`,
+// `tar-gzip`, `zip`, or `gzip` for import; export supports `tar-zstd`, `tar`, `tar-gzip`, or `zip`.
+// Return values are canonical-CBOR `loom.interchange.import-report.v1` or
+// `loom.interchange.export-report.v1` records. `revision` is absent for the current working tree or a
+// supported revision selector.
+interface Archive {
+    bytes archive_import(LoomSession handle, string workspace, string src_path, string kind,
+                         bool dry_run);
+    bytes archive_export(LoomSession handle, string workspace, string dst_path, string kind,
+                         optional string revision, bool dry_run);
+    Task archive_import_async(LoomSession handle, string workspace, string src_path, string kind,
+                              bool dry_run);
+    Task archive_export_async(LoomSession handle, string workspace, string dst_path, string kind,
+                              optional string revision, bool dry_run);
+}
+
+// ---- CAR interchange ----
+// Deterministic Loom CAR import/export for a workspace object graph. Return values are canonical-CBOR
+// `loom.interchange.import-report.v1` or `loom.interchange.export-report.v1` records.
+interface Car {
+    bytes car_import(LoomSession handle, string src_path, bool dry_run);
+    bytes car_export(LoomSession handle, string workspace, string dst_path, bool dry_run);
+    Task car_import_async(LoomSession handle, string src_path, bool dry_run);
+    Task car_export_async(LoomSession handle, string workspace, string dst_path, bool dry_run);
+}
+
+// ---- file handles (open file descriptions) ----
+// How a file handle is opened. A handle binds to an inode, not a path: two opens of the same path share
+// one inode (each with its own cursor) and a handle survives the path being renamed or unlinked
+// (delete-on-last-close). READ requires the file to exist (NOT_FOUND); the other modes create it if
+// missing (parent must exist). WRITE truncates the shared inode on open. A directory path is
+// ALREADY_EXISTS.
+enum OpenMode {
+    READ,          // read-only; writes are INVALID_ARGUMENT
+    WRITE,         // write-only, create-if-missing, truncate-on-open; reads are INVALID_ARGUMENT
+    READ_WRITE,    // read-write, create-if-missing, no truncate
+    APPEND,        // create-if-missing; every sequential write goes to the current end of file
+}
+
+// File metadata for an open handle (the inode's live size and mode); a handle has no path of its own.
+struct FileStat {
+    u64 size;
+    u32 mode;
+}
+
+// A POSIX-style open file description over a workspace working tree. `open` returns a handle id valid
+// until `close` (it persists across the stateless per-op reopen). `read`/`write` use the handle cursor
+// and advance it; `read_at`/`write_at` are positional (pread/pwrite) and leave the cursor put. `truncate`
+// resizes; `flush` validates the handle (writes already apply per operation; durability is the engine
+// save); `stat` returns the live size and mode; `close` releases the handle and, when the last handle on
+// an unlinked inode closes, reclaims its bytes. The open-file table is operational metadata: excluded
+// from commits, reachability, clone, push, bundle, and ordinary sync.
+interface FileHandle {
+    u64 open(LoomSession handle, string workspace, string path, OpenMode mode);
+    bytes read(LoomSession handle, u64 file, u64 len);
+    bytes read_at(LoomSession handle, u64 file, u64 offset, u64 len);
+    u64 write(LoomSession handle, u64 file, bytes content);
+    u64 write_at(LoomSession handle, u64 file, u64 offset, bytes content);
+    void truncate(LoomSession handle, u64 file, u64 size);
+    void flush(LoomSession handle, u64 file);
+    FileStat stat(LoomSession handle, u64 file);
+    void close(LoomSession handle, u64 file);
+}
+
+// ---- content-addressed store ----
+// `workspace` selects by UUID or name; a `put` by name ensures a CAS-facet workspace. `list` enumerates
+// the workspace working tree, not a global inventory. An absent `get` returns no value; a content or
+// digest mismatch is INTEGRITY_FAILURE.
+interface Cas {
+    Digest put(LoomSession handle, string workspace, bytes content);
+    optional bytes get(LoomSession handle, string workspace, Digest digest);
+    bool has(LoomSession handle, string workspace, Digest digest);
+    // `delete` unlinks the blob from the workspace's current working tree (making it unreachable going
+    // forward) and returns whether it was present. CAS stays immutable: the bytes are reclaimed by GC
+    // once unreferenced, and an earlier commit that held the blob still restores it.
+    bool delete(LoomSession handle, string workspace, Digest digest);
+    list<Digest> list(LoomSession handle, string workspace);
+}
+
+// ---- key-value ----
+// A versioned map keyed by a typed, order-preserving key, valued by opaque bytes. `workspace` selects by
+// UUID or name; a `put` by name ensures a Kv-facet workspace. Keys cross as one Loom Canonical CBOR
+// typed cell each (the SQL cell codec). `delete` returns whether the key was present. `list` and `range`
+// return the canonical CBOR array of `[key, value]` pairs in key order; `range` is half-open [lo, hi).
+// An absent key or map reads as absent (no value / empty list), not an error.
+interface Kv {
+    void put(LoomSession handle, string workspace, string collection, bytes key, bytes value);
+    optional bytes get(LoomSession handle, string workspace, string collection, bytes key);
+    bool delete(LoomSession handle, string workspace, string collection, bytes key);
+    bytes list(LoomSession handle, string workspace, string collection);
+    bytes range(LoomSession handle, string workspace, string collection, bytes lo, bytes hi);
+    // The collection (map) names present in the workspace, canonical CBOR array of strings.
+    bytes list_collections(LoomSession handle, string workspace);
+}
+
+// Property graph (Graph facet). Node/edge `props` cross as a canonical CBOR map of text -> scalar; an
+// edge crosses as the CBOR array [src, dst, label, props]; neighbour/reachable/path results cross as a
+// CBOR array of node-id text; out-/in-edge results cross as a CBOR array of [edge_id, edge]. For
+// `reachable`, max_depth < 0 is no limit; `via_label` empty follows every edge, else only that label.
+interface Graph {
+    void upsert_node(LoomSession handle, string workspace, string name, string id, bytes props);
+    optional bytes get_node(LoomSession handle, string workspace, string name, string id);
+    void remove_node(LoomSession handle, string workspace, string name, string id, bool cascade);
+    void upsert_edge(LoomSession handle, string workspace, string name, string id, string src, string dst, string label, bytes props);
+    void upsert_edge_indexed(LoomSession handle, string workspace, string name, string id, string src, string dst, string label, bytes props);
+    optional bytes get_edge(LoomSession handle, string workspace, string name, string id);
+    bool remove_edge(LoomSession handle, string workspace, string name, string id);
+    bool remove_edge_indexed(LoomSession handle, string workspace, string name, string id);
+    bytes neighbors(LoomSession handle, string workspace, string name, string id);
+    bytes out_edges(LoomSession handle, string workspace, string name, string id);
+    bytes in_edges(LoomSession handle, string workspace, string name, string id);
+    bytes reachable(LoomSession handle, string workspace, string name, string start, i64 max_depth, string via_label);
+    optional bytes shortest_path(LoomSession handle, string workspace, string name, string from, string to, string via_label);
+    bytes query(LoomSession handle, string workspace, string name, string query);
+    bytes explain_query(LoomSession handle, string workspace, string name, string query);
+}
+
+// Vector set (Vector facet). An embedding crosses as raw little-endian f32 bytes; `metadata` crosses as
+// a canonical CBOR map of text -> cell; a get crosses as [vector_bytes, metadata]; a search crosses as
+// a CBOR array of [id, score_cell], highest score first. `metric`: 1 cosine, 2 L2, 3 dot. The search
+// `filter` is a recursive CBOR array: [0] all, [1,key,value] eq, [2,a,b] and, [3,a,b] or,
+// [4,a] not, [5,key] exists, [6,key,value] ne, [7,key,value] lt, [8,key,value] le,
+// [9,key,value] gt, [10,key,value] ge, [11,key,[values...]] in. Empty bytes mean all.
+interface Vector {
+    void create(LoomSession handle, string workspace, string name, u64 dim, i32 metric);
+    void upsert(LoomSession handle, string workspace, string name, string id, bytes vector, bytes metadata);
+    void upsert_source(LoomSession handle, string workspace, string name, string id, bytes vector,
+                       bytes metadata, bytes source_text, optional string model_id,
+                       optional string weights_digest);
+    optional bytes get(LoomSession handle, string workspace, string name, string id);
+    optional bytes source_text(LoomSession handle, string workspace, string name, string id);
+    optional bytes embedding_model(LoomSession handle, string workspace, string name);
+    bytes ids(LoomSession handle, string workspace, string name, optional string prefix);
+    bytes metadata_index_keys(LoomSession handle, string workspace, string name);
+    bool create_metadata_index(LoomSession handle, string workspace, string name, string key);
+    bool drop_metadata_index(LoomSession handle, string workspace, string name, string key);
+    bool delete(LoomSession handle, string workspace, string name, string id);
+    bytes search(LoomSession handle, string workspace, string name, bytes query, u64 k, bytes filter);
+    bytes search_policy(LoomSession handle, string workspace, string name, bytes query, u64 k,
+                        bytes filter, i32 policy, u64 threshold, u64 ef, u64 pq_m, u64 pq_k,
+                        u64 pq_iters);
+}
+
+// Columnar dataset (Columnar facet). `columns` crosses as a CBOR array of [name, type_tag]; a row
+// crosses as a CBOR cell array; scan/select/columns cross as a CBOR array. The `select` filter is the
+// CBOR array [column, op, value_cell] (op: 0 eq, 1 ne, 2 lt, 3 le, 4 gt, 5 ge; empty = scan all).
+// Aggregate expressions cross as [[op, column?] ...] where op is 0 count, 1 count-non-null, 2 min,
+// 3 max, 4 sum. Aggregate results cross as a CBOR cell array.
+interface Columnar {
+    void create(LoomSession handle, string workspace, string name, bytes columns, u64 target_segment_rows);
+    void append(LoomSession handle, string workspace, string name, bytes row);
+    void compact(LoomSession handle, string workspace, string name);
+    bytes inspect(LoomSession handle, string workspace, string name);
+    bytes source_digest(LoomSession handle, string workspace, string name);
+    bytes scan(LoomSession handle, string workspace, string name);
+    bytes columns(LoomSession handle, string workspace, string name);
+    u64 rows(LoomSession handle, string workspace, string name);
+    bytes select(LoomSession handle, string workspace, string name, bytes columns, bytes filter);
+    bytes aggregate(LoomSession handle, string workspace, string name, bytes aggregates, bytes filter);
+}
+
+// Dataframe frame (Dataframe facet). A plan crosses as canonical `DataframePlan` CBOR. Collect and
+// preview return `[columns, rows]` canonical CBOR, where `columns` is `[name, type_tag, nullable]`
+// and each row is a CBOR cell array. Source digests are the explicit digests pinned in the plan.
+interface Dataframe {
+    void create(LoomSession handle, string workspace, string name, bytes plan);
+    bytes collect(LoomSession handle, string workspace, string name);
+    bytes preview(LoomSession handle, string workspace, string name, u64 rows);
+    optional Digest materialize(LoomSession handle, string workspace, string name);
+    Digest plan_digest(LoomSession handle, string workspace, string name);
+    bytes source_digests(LoomSession handle, string workspace, string name);
+}
+
+// Search collection (Search facet). A mapping crosses as a CBOR map of field -> [type_tag, stored,
+// faceted] (type 0 text, 1 keyword); a document as field -> value (each value text or bytes); a
+// document id is opaque bytes. The query request is the CBOR array [query, limit, offset] with a
+// recursive query node ([0, field, text] match / [1, field, value] term / [2, field, [terms], slop]
+// phrase / [3, field, lower, upper, incl_lower, incl_upper] range / [4, [must], [should], [must_not]]
+// bool); the response is [reduced, [[id, score_cell] ...]]. For `ids`, has_prefix false lists every id.
+interface Search {
+    void create(LoomSession handle, string workspace, string name, bytes mapping);
+    void index(LoomSession handle, string workspace, string name, bytes id, bytes doc);
+    optional bytes get(LoomSession handle, string workspace, string name, bytes id);
+    bool delete(LoomSession handle, string workspace, string name, bytes id);
+    bytes ids(LoomSession handle, string workspace, string name, bytes prefix, bool has_prefix);
+    void remap(LoomSession handle, string workspace, string name, bytes mapping);
+    bytes query(LoomSession handle, string workspace, string name, bytes request);
+    // Derived source digest of index `name` (status/introspection), over the served store's algorithm.
+    Digest source_digest(LoomSession handle, string workspace, string name);
+    // Full index status for `name` at `engine_version`: canonical CBOR/bytes of `[source_digest,
+    // DerivedArtifactStatus]` about the served store's derived tantivy artifact.
+    bytes status(LoomSession handle, string workspace, string name, string engine_version);
+}
+
+enum KvTier {
+    VERSIONED,
+    EPHEMERAL,
+}
+
+enum EvictionPolicy {
+    NONE,
+    LRU,
+    LFU,
+    RANDOM,
+    FIFO,
+    TTL_PRIORITY,
+}
+
+enum OnEvict {
+    DROP,
+    WRITE_THROUGH,
+}
+
+// Write-behind back-pressure once the cache crosses `flush_high_water_pct` of a capacity bound: BLOCK
+// drains the queue synchronously, PRESSURE rejects with LOCKED while saturated, ASSISTED flushes one
+// bounded batch then proceeds.
+enum BackPressure {
+    BLOCK,
+    PRESSURE,
+    ASSISTED,
+}
+
+// Durable config for a named KV map. `max_entries`/`max_bytes`/`flush_batch` absent = unbounded;
+// `flush_high_water_pct` absent = only the hard bound. Write modes are a precedence ladder:
+// write_around > write_behind > write_through > cache-only.
+struct KvMapConfig {
+    KvTier tier;
+    optional u64 default_ttl_ms;
+    optional u64 default_idle_ttl_ms;
+    bool read_through;
+    bool write_through;
+    optional u64 max_entries;
+    optional u64 max_bytes;
+    EvictionPolicy eviction;
+    OnEvict on_evict;
+    bool write_behind;
+    bool write_around;
+    BackPressure back_pressure;
+    optional u8 flush_high_water_pct;
+    optional u64 flush_batch;
+}
+
+// ---- management: KV control plane ----
+// Map config changes durability and sync behavior for a named KV map. It is public control-plane
+// surface, not KV data-plane surface.
+interface ManagementKv {
+    void set_config(LoomSession handle, string workspace, string collection, KvMapConfig config);
+    KvMapConfig get_config(LoomSession handle, string workspace, string collection);
+}
+
+// ---- document ----
+// A versioned collection of opaque documents keyed by string id, in id order. `workspace` selects by
+// UUID or name; a `put_binary` by name ensures a Document-facet workspace. `delete` returns whether the id was
+// present. `list_binary` returns the canonical CBOR array of `[id, bytes]` pairs in id order. An absent id or
+// collection reads as absent (no value / empty list). Native secondary-index management and query
+// cross as JSON for portable binding parity: index lists/statuses/find/query return UTF-8 JSON bytes,
+// and `query_json` accepts the shared document query JSON contract.
+//
+// The indexed methods pair the binary document/graph write with the MCP host's substrate reference-index
+// overlay in one server-side op, so a remote MCP write keeps the reference index consistent exactly like a
+// local one. They are host-internal and not projected as MCP tools.
+struct DocumentReplaceTextResult {
+    u64 replacements;
+    Digest digest;
+    string entity_tag;
+}
+struct DocumentPutResult {
+    Digest digest;
+    string entity_tag;
+}
+struct DocumentTextResult {
+    string text;
+    Digest digest;
+    string entity_tag;
+}
+struct DocumentBinaryResult {
+    bytes bytes;
+    Digest digest;
+    string entity_tag;
+}
+interface Document {
+    DocumentPutResult put_text(LoomSession handle, string workspace, string collection, string id, string text, optional string expected_entity_tag);
+    optional DocumentTextResult get_text(LoomSession handle, string workspace, string collection, string id);
+    DocumentPutResult put_binary(LoomSession handle, string workspace, string collection, string id, bytes bytes, optional string expected_entity_tag);
+    optional DocumentBinaryResult get_binary(LoomSession handle, string workspace, string collection, string id);
+    bytes list_binary(LoomSession handle, string workspace, string collection);
+    void put_binary_indexed(LoomSession handle, string workspace, string collection, string id, bytes bytes);
+    bool delete(LoomSession handle, string workspace, string collection, string id);
+    bool delete_indexed(LoomSession handle, string workspace, string collection, string id);
+    DocumentReplaceTextResult replace_text_indexed(LoomSession handle, string workspace, string collection, string id, string find, string replace, bool replace_all, Digest base_digest);
+    // The collection names present in the workspace, canonical CBOR array of strings.
+    bytes list_collections(LoomSession handle, string workspace);
+    void index_create(LoomSession handle, string workspace, string collection, string name, string path, bool unique);
+    void index_create_json(LoomSession handle, string workspace, string collection, bytes declaration_json);
+    bool index_drop(LoomSession handle, string workspace, string collection, string name);
+    void index_rebuild(LoomSession handle, string workspace, string collection, string name);
+    bytes index_list_json(LoomSession handle, string workspace, string collection);
+    bytes index_status_json(LoomSession handle, string workspace, string collection);
+    bytes find_json(LoomSession handle, string workspace, string collection, string index, bytes value_json);
+    bytes query_json(LoomSession handle, string workspace, string collection, bytes query_json);
+}
+
+// ---- calendar ----
+// Structured iCalendar records (RFC 5545) are the source of truth: an entry is a typed record,
+// not raw .ics bytes; .ics, CalDAV, and the mount projection are serialized from it on demand. `workspace`
+// selects by UUID or name; a `create_collection` ensures a Calendar-facet workspace. Entries live per
+// `principal` and `collection`, one record per UID. Entry records and collection metadata cross as Loom
+// Canonical CBOR; the ETag is the record's content address. A
+// `put_entry` into a collection that does not exist is NOT_FOUND (MKCALENDAR-before-PUT); an empty or
+// invalid UID or DTSTART is INVALID_ARGUMENT. `list_collections`/`list_entries`/`search` return the
+// canonical CBOR array of their items; `range` is half-open [from, to) over recurrence-expanded
+// occurrences (each `[uid, start]`), `from`/`to` being iCalendar date-times. `search` filters by
+// `component` ("event"/"todo"/"" for any) and a case-insensitive `summary` substring (""/any). `to_ics`
+// is the on-demand iCalendar projection of one entry, used by the mount and CalDAV surfaces. An absent
+// uid or collection reads as absent.
+interface Calendar {
+    void create_collection(LoomSession handle, string workspace, string principal, string collection,
+                           bytes meta);
+    optional bytes get_collection(LoomSession handle, string workspace, string principal,
+                                  string collection);
+    bytes list_collections(LoomSession handle, string workspace, string principal);
+    bool delete_collection(LoomSession handle, string workspace, string principal, string collection);
+    // Import an iCalendar (.ics) document into `collection`, ensuring the collection; returns the etag Digest.
+    Digest put_ics(LoomSession handle, string workspace, string principal, string collection, string ics);
+    Digest put_entry(LoomSession handle, string workspace, string principal, string collection,
+                     bytes entry);
+    optional bytes get_entry(LoomSession handle, string workspace, string principal, string collection,
+                             string uid);
+    bool delete_entry(LoomSession handle, string workspace, string principal, string collection,
+                      string uid);
+    bytes list_entries(LoomSession handle, string workspace, string principal, string collection);
+    bytes range(LoomSession handle, string workspace, string principal, string collection,
+                string from, string to);
+    bytes search(LoomSession handle, string workspace, string principal, string collection,
+                 string component, string text);
+    optional bytes to_ics(LoomSession handle, string workspace, string principal, string collection,
+                          string uid);
+}
+
+// ---- contacts ----
+// Structured vCard records (RFC 6350) are the source of truth: a contact is a
+// typed record, not raw .vcf bytes; vCard and CardDAV bodies are serialized on demand. `workspace`
+// selects by UUID or name; a `create_book` ensures a Contacts-facet workspace. Contacts live per
+// `principal` and address `book`, one record per UID. Records and book metadata cross as Loom Canonical
+// CBOR; the ETag is the record's content address. `put_entry` into a missing book is NOT_FOUND; an empty
+// UID or FN is INVALID_ARGUMENT. `list_books`/`list_entries`/`search` return the canonical CBOR array of
+// their items; `search` is a case-insensitive substring over name/org/email. `to_vcard` is the on-demand
+// vCard projection of one contact. An absent uid or book reads as absent.
+interface Contacts {
+    void create_book(LoomSession handle, string workspace, string principal, string book, bytes meta);
+    optional bytes get_book(LoomSession handle, string workspace, string principal, string book);
+    bytes list_books(LoomSession handle, string workspace, string principal);
+    bool delete_book(LoomSession handle, string workspace, string principal, string book);
+    // Import a vCard (.vcf) document into `book`, ensuring the book; returns the etag Digest.
+    Digest put_vcard(LoomSession handle, string workspace, string principal, string book, string vcard);
+    Digest put_entry(LoomSession handle, string workspace, string principal, string book, bytes entry);
+    optional bytes get_entry(LoomSession handle, string workspace, string principal, string book,
+                             string uid);
+    bool delete_entry(LoomSession handle, string workspace, string principal, string book, string uid);
+    bytes list_entries(LoomSession handle, string workspace, string principal, string book);
+    bytes search(LoomSession handle, string workspace, string principal, string book, string text);
+    optional bytes to_vcard(LoomSession handle, string workspace, string principal, string book,
+                            string uid);
+}
+
+// ---- mail ----
+// Email for the agent. Only the message body is immutable: the raw RFC 5322 bytes are stored once in the
+// CAS and the `.eml` projection is exactly those bytes. A structured index record (parsed
+// headers + the body's CAS digest) and a separate mutable flag set sit around it. `workspace` selects by
+// UUID or name; a `create_mailbox` ensures a Mail-facet workspace. Messages live per `principal` and
+// `mailbox`. `ingest_message` stores the body and indexes the headers, returning the body's content
+// address; `get_message` returns the parsed structured index record (Loom Canonical CBOR),
+// `to_eml` returns the raw RFC 5322 bytes (the `.eml`). Flags are an independent versioned sub-tree:
+// `get_flags`/`set_flags` carry the CBOR array of flag strings (sorted, deduplicated). `ingest_message`
+// or `set_flags` against a missing mailbox/message is NOT_FOUND. There is no SMTP.
+interface Mail {
+    void create_mailbox(LoomSession handle, string workspace, string principal, string mailbox,
+                        bytes meta);
+    optional bytes get_mailbox(LoomSession handle, string workspace, string principal, string mailbox);
+    bytes list_mailboxes(LoomSession handle, string workspace, string principal);
+    bool delete_mailbox(LoomSession handle, string workspace, string principal, string mailbox);
+    Digest ingest_message(LoomSession handle, string workspace, string principal, string mailbox,
+                          string uid, bytes raw);
+    optional bytes get_message(LoomSession handle, string workspace, string principal, string mailbox,
+                               string uid);
+    optional bytes to_eml(LoomSession handle, string workspace, string principal, string mailbox,
+                          string uid);
+    bool delete_message(LoomSession handle, string workspace, string principal, string mailbox,
+                        string uid);
+    bytes list_messages(LoomSession handle, string workspace, string principal, string mailbox);
+    bytes get_flags(LoomSession handle, string workspace, string principal, string mailbox, string uid);
+    void set_flags(LoomSession handle, string workspace, string principal, string mailbox, string uid,
+                   bytes flags);
+    bytes search(LoomSession handle, string workspace, string principal, string mailbox, string text);
+}
+
+// ---- lanes ----
+struct LaneTicket {
+    string ticket_id;
+}
+struct Lane {
+    string lane_id;
+    string lane_key;
+    string title;
+    string description;
+    string lane_kind;
+    optional string owner_principal;
+    string lane_status;
+    list<LaneTicket> lane_tickets;
+    optional string active_ticket_id;
+    string status_report;
+    string reviewer_feedback;
+    u64 updated_at;
+    string updated_by;
+}
+struct MutationChange {
+    string kind;
+    string field;
+    optional string before;
+    optional string after;
+    list<string> before_order;
+    list<string> after_order;
+}
+struct MutationReceipt {
+    string operation;
+    string resource_kind;
+    string resource_id;
+    optional string operation_id;
+    optional string root_before;
+    optional string root_after;
+    list<MutationChange> changes;
+}
+interface Lanes {
+    Lane create(LoomSession handle, string workspace, Lane lane);
+    optional Lane get(LoomSession handle, string workspace, string lane_id);
+    list<Lane> list(LoomSession handle, string workspace);
+    // Atomically update one or more first-class Lane fields. At least one optional field must be
+    // present; an absent optional leaves that field unchanged while an empty string clears text.
+    Lane update(LoomSession handle, string workspace, string lane_id,
+                optional string title, optional string description, optional string lane_status,
+                optional string status_report, optional string reviewer_feedback, string updated_by);
+    Lane ticket_add(LoomSession handle, string workspace, string lane_id, string ticket_id,
+                    string updated_by);
+    Lane ticket_remove(LoomSession handle, string workspace, string lane_id, string ticket_id,
+                       string updated_by);
+    Lane ticket_transfer(LoomSession handle, string workspace, string source_lane_id,
+                         string target_lane_id, string ticket_id, string updated_by);
+    Lane delete(LoomSession handle, string workspace, string lane_id, string updated_by);
+    // Compact and detailed Lane views resolved against `ticket_workspace_id`. Detailed returns the
+    // full LaneView (stored status, owner, updated time, ordered ticket summaries with status,
+    // priority, and title, status report, and reviewer feedback); compact returns the label, derived
+    // display status, and ordered ticket ids only. `get_view_json` returns the JSON literal null when
+    // the lane is absent; `list_views_json` returns a JSON array. Ticket descriptions, comments, and
+    // history are excluded.
+    string get_view_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                         string lane_id, bool detailed);
+    string list_views_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                           bool detailed);
+}
+
+// ---- pages ----
+interface Pages {
+    string spaces_create_json(LoomSession handle, string workspace, string page_workspace_id,
+                              string space_id, string title, optional string expected_root);
+    string spaces_list_json(LoomSession handle, string workspace, string page_workspace_id);
+    string spaces_get_json(LoomSession handle, string workspace, string page_workspace_id,
+                           string space_id);
+    string pages_create_json(LoomSession handle, string workspace, string page_workspace_id,
+                             string page_id, string space_id, optional string parent_page_id,
+                             string title, optional string expected_root);
+    string pages_update_json(LoomSession handle, string workspace, string page_workspace_id,
+                             string page_id, string body_text, optional string expected_root);
+    string pages_publish_json(LoomSession handle, string workspace, string page_workspace_id,
+                              string page_id, optional string expected_root);
+    string pages_get_json(LoomSession handle, string workspace, string page_workspace_id,
+                          string page_id);
+    string pages_list_json(LoomSession handle, string workspace, string page_workspace_id);
+    string pages_history_json(LoomSession handle, string workspace, string page_workspace_id,
+                              string page_id);
+    string structures_create_json(LoomSession handle, string workspace, string page_workspace_id,
+                                  string structure_id, string space_id, string kind, string title,
+                                  optional string expected_root);
+    string structures_add_node_json(LoomSession handle, string workspace,
+                                    string page_workspace_id, string structure_id, string node_id,
+                                    string kind, string label, optional string body_digest,
+                                    optional string entity_ref, optional string expected_root);
+    string structures_update_node_json(LoomSession handle, string workspace,
+                                       string page_workspace_id, string structure_id,
+                                       string node_id, string kind, string label,
+                                       optional string body_digest, optional string entity_ref,
+                                       optional string expected_root);
+    string structures_bind_json(LoomSession handle, string workspace, string page_workspace_id,
+                                string structure_id, string node_id, optional string entity_ref,
+                                optional string expected_root);
+    string structures_move_node_json(LoomSession handle, string workspace, string page_workspace_id,
+                                     string structure_id, string node_id,
+                                     optional string parent_node_id, optional string label,
+                                     optional string expected_root);
+    string structures_link_node_json(LoomSession handle, string workspace, string page_workspace_id,
+                                     string structure_id, string edge_id, string src_node_id,
+                                     string dst_node_id, string label, optional string target_ref,
+                                     optional string expected_root);
+    string structures_decompose_to_tickets_json(LoomSession handle, string workspace,
+                                                string page_workspace_id, string structure_id,
+                                                string items_json);
+    string structures_get_json(LoomSession handle, string workspace, string page_workspace_id,
+                               string structure_id);
+    string structures_list_json(LoomSession handle, string workspace, string page_workspace_id);
+}
+
+// ---- time-series ----
+// A versioned series of points keyed by an i64 timestamp, in time order. `workspace` selects by UUID or
+// name; a `put` by name ensures a TimeSeries-facet workspace; a repeated timestamp replaces the point.
+// `range` is half-open [from, to) and returns the canonical CBOR array of `[ts, value]` pairs; `latest`
+// returns the most recent point as a single canonical `[ts, value]` CBOR pair (carrying both the
+// timestamp and the value), or none. An absent timestamp or series reads as absent.
+interface TimeSeries {
+    void put(LoomSession handle, string workspace, string collection, i64 ts, bytes value);
+    optional bytes get(LoomSession handle, string workspace, string collection, i64 ts);
+    bytes range(LoomSession handle, string workspace, string collection, i64 from, i64 to);
+    optional bytes latest(LoomSession handle, string workspace, string collection);
+    // The collection (series-set) names present in the workspace, canonical CBOR array of strings.
+    bytes list_collections(LoomSession handle, string workspace);
+}
+
+// ---- metrics ----
+// Native metric descriptors and observations use Loom-owned canonical CBOR records. `workspace`
+// selects by UUID or name; writes by name ensure a Metrics-facet workspace. `query` is half-open
+// [from_timestamp_ms, to_timestamp_ms), bounded by scanned series, returned groups, samples, and
+// output bytes, and returns canonical CBOR `[observations, partial, stale]`, where `observations` is
+// an array of canonical observation record bytes.
+interface Metrics {
+    void put_descriptor(LoomSession handle, string workspace, bytes descriptor);
+    optional bytes get_descriptor(LoomSession handle, string workspace, string name);
+    void put_observation(LoomSession handle, string workspace, string descriptor_name,
+                         bytes observation);
+    bytes query(LoomSession handle, string workspace, string descriptor_name,
+                u64 from_timestamp_ms, u64 to_timestamp_ms,
+                u32 max_series, u32 max_groups, u32 max_samples,
+                u64 max_output_bytes, u64 now_timestamp_ms);
+}
+
+// ---- logs ----
+// Native log records use Loom-owned canonical CBOR records. `workspace` selects by UUID or name;
+// writes by name ensure a Logs-facet workspace. `query` is half-open
+// [from_time_unix_nano, to_time_unix_nano), bounded by returned records and output bytes, and returns
+// canonical CBOR `[records, partial]`, where `records` is an array of canonical log record bytes.
+interface Logs {
+    string put_record(LoomSession handle, string workspace, bytes record);
+    optional bytes get_record(LoomSession handle, string workspace, string record_id);
+    bytes query(LoomSession handle, string workspace, u64 from_time_unix_nano,
+                u64 to_time_unix_nano, u32 max_records, u64 max_output_bytes);
+}
+
+// ---- traces ----
+// Native span records use Loom-owned canonical CBOR records. `workspace` selects by UUID or name;
+// writes by name ensure a Traces-facet workspace. Trace listing and `query` return canonical CBOR
+// `[spans, partial]`, where `spans` is an array of canonical span record bytes.
+interface Traces {
+    void put_span(LoomSession handle, string workspace, bytes span);
+    optional bytes get_span(LoomSession handle, string workspace, string trace_id, string span_id);
+    bytes trace_spans(LoomSession handle, string workspace, string trace_id, u32 max_spans,
+                      u64 max_output_bytes);
+    bytes query(LoomSession handle, string workspace, u64 from_start_time_ns,
+                u64 to_start_time_ns, u32 max_spans, u64 max_output_bytes);
+}
+
+// ---- ledger ----
+// A versioned, append-only, tamper-evident log: each entry is hash-chained to the previous under the
+// store's identity profile. `workspace` selects by UUID or name; an `append` by name ensures a
+// Ledger-facet workspace and returns the new zero-based sequence. `head` is the chain head digest the
+// caller attests to (none for an empty ledger); `verify` recomputes the chain and fails with
+// INTEGRITY_FAILURE on any altered payload or broken link. The chain is fast-forward-only; divergence
+// is reconciled by replay, never a silent interleave.
+interface Ledger {
+    u64 append(LoomSession handle, string workspace, string collection, bytes payload);
+    optional bytes get(LoomSession handle, string workspace, string collection, u64 seq);
+    optional Digest head(LoomSession handle, string workspace, string collection);
+    u64 len(LoomSession handle, string workspace, string collection);
+    void verify(LoomSession handle, string workspace, string collection);
+    // The collection (log) names present in the workspace, canonical CBOR array of strings.
+    bytes list_collections(LoomSession handle, string workspace);
+}
+
+// ---- append-log queue ----
+// `workspace` selects by UUID or name; an `append` by name ensures a Queue-facet workspace. `append`
+// returns the assigned zero-based sequence. `range` is half-open [lo, hi) and ordered by sequence. An
+// absent `get` returns no value.
+interface Queue {
+    u64 append(LoomSession handle, string workspace, string stream, bytes entry);
+    optional bytes get(LoomSession handle, string workspace, string stream, u64 seq);
+    list<bytes> range(LoomSession handle, string workspace, string stream, u64 lo, u64 hi);
+    u64 len(LoomSession handle, string workspace, string stream);
+    // The stream (collection) names present in the workspace, canonical CBOR array of strings.
+    bytes list_streams(LoomSession handle, string workspace);
+}
+
+// ---- queue consumer offsets ----
+// Per-consumer progress for a queue stream. Offsets are operational metadata in the local store: they
+// are not part of workspace commits, stream roots, clone, push, bundle, or ordinary sync. A missing
+// offset reads as next_seq 0. `consumer_read` does not advance; `consumer_advance` is monotonic (rejects
+// backward) while `consumer_reset` may move backward. `consumer_id` is non-empty and free of `/`, NUL,
+// and control characters.
+interface QueueConsumers {
+    u64 consumer_position(LoomSession handle, string workspace, string stream, string consumer_id);
+    list<bytes> consumer_read(LoomSession handle, string workspace, string stream, string consumer_id,
+                              u32 max);
+    void consumer_advance(LoomSession handle, string workspace, string stream, string consumer_id,
+                          u64 next_seq);
+    void consumer_reset(LoomSession handle, string workspace, string stream, string consumer_id,
+                        u64 next_seq);
+}
+
+// ---- sql sessions and transaction batches ----
+// A session opens over a `.loom` path, a workspace name, and a database name; the workspace SQL facet is
+// created if absent. `sql_exec` runs one or more `;`-separated statements and returns the result
+// payloads as Loom Canonical CBOR; `sql_query` streams a SELECT's rows, each a canonical-CBOR cell
+// array. `sql_commit` records a commit and returns its content address. A batch holds the store open so
+// a SQL transaction (BEGIN/COMMIT/ROLLBACK) can span `sql_batch_exec` calls; `sql_batch_commit` makes
+// accumulated changes durable with one atomic save, and `sql_batch_commit_vcs` also records a
+// version-control commit and returns its address. `sql_batch_abort` discards un-persisted changes, and
+// closing without a commit discards them too. Encrypted stores open with a passphrase or a 32-byte kek.
+interface Sql {
+    SqlSession sql_open(string loom_path, string workspace, string db);
+    SqlSession sql_open_keyed(string loom_path, string workspace, string db, bytes passphrase);
+    SqlSession sql_open_with_kek(string loom_path, string workspace, string db, bytes kek);
+    SqlSession sql_open_authenticated(string loom_path, string workspace, string db,
+                                      Uuid auth_principal, bytes auth_passphrase);
+    SqlSession sql_open_keyed_authenticated(string loom_path, string workspace, string db,
+                                            bytes passphrase, Uuid auth_principal,
+                                            bytes auth_passphrase);
+    SqlSession sql_open_with_kek_authenticated(string loom_path, string workspace, string db,
+                                               bytes kek, Uuid auth_principal,
+                                               bytes auth_passphrase);
+    void sql_authenticate_passphrase(SqlSession session, Uuid principal, bytes passphrase);
+    bytes sql_exec(SqlSession session, string sql);
+    stream<bytes> sql_query(SqlSession session, string sql);
+    Digest sql_commit(SqlSession session, string message, string author, u64 timestamp_ms);
+    void sql_close(SqlSession session);
+
+    SqlBatch sql_batch_begin(string loom_path, string workspace, string db);
+    SqlBatch sql_batch_begin_keyed(string loom_path, string workspace, string db, bytes passphrase);
+    SqlBatch sql_batch_begin_with_kek(string loom_path, string workspace, string db, bytes kek);
+    SqlBatch sql_batch_begin_authenticated(string loom_path, string workspace, string db,
+                                           Uuid auth_principal, bytes auth_passphrase);
+    SqlBatch sql_batch_begin_keyed_authenticated(string loom_path, string workspace, string db,
+                                                 bytes passphrase, Uuid auth_principal,
+                                                 bytes auth_passphrase);
+    SqlBatch sql_batch_begin_with_kek_authenticated(string loom_path, string workspace, string db,
+                                                    bytes kek, Uuid auth_principal,
+                                                    bytes auth_passphrase);
+    bytes sql_batch_exec(SqlBatch batch, string sql);
+    void sql_batch_commit(SqlBatch batch);
+    Digest sql_batch_commit_vcs(SqlBatch batch, string message, string author);
+    void sql_batch_abort(SqlBatch batch);
+    void sql_batch_close(SqlBatch batch);
+
+    // Handle-based direct/version-aware readers over the SQL facet's staged tables (bound to the sql
+    // facet; decode with a ResultView). `sql_read_table` reads a staged table as columns and rows;
+    // `sql_index_scan` returns the rows of secondary `index` matching `prefix` (a canonical-CBOR cell
+    // array; an empty prefix is the canonical CBOR of an empty array); `sql_blame` returns each current
+    // row of `table` on `branch` with the commit that last set it; `sql_diff` returns the row-level diff
+    // of `table` between two commits; `sql_table_diff` returns schema-aware table records. The `_at`
+    // readers read from a commit without changing the working tree. The current reader set has async
+    // forms returning a Task.
+    bytes sql_read_table(LoomSession handle, string workspace, string table);
+    bytes sql_read_table_at(LoomSession handle, string workspace, string table, string commit);
+    bytes sql_index_scan(LoomSession handle, string workspace, string table, string index, bytes prefix);
+    bytes sql_index_scan_at(LoomSession handle, string workspace, string table, string index,
+                            bytes prefix, string commit);
+    bytes sql_blame(LoomSession handle, string workspace, string branch, string table);
+    bytes sql_diff(LoomSession handle, string workspace, string table, string from_commit, string to_commit);
+    bytes sql_table_diff(LoomSession handle, string workspace, string table, string from_commit,
+                         string to_commit);
+    Task sql_read_table_async(LoomSession handle, string workspace, string table);
+    Task sql_index_scan_async(LoomSession handle, string workspace, string table, string index, bytes prefix);
+    Task sql_blame_async(LoomSession handle, string workspace, string branch, string table);
+    Task sql_diff_async(LoomSession handle, string workspace, string table, string from_commit,
+                        string to_commit);
+    // The database (collection) names present in the workspace, canonical CBOR array of strings.
+    bytes sql_list_databases(LoomSession handle, string workspace);
+    // Run a read-only query against database `db` and return the FULL result payload (the same canonical
+    // CBOR `sql_exec` produces: an array of per-statement payloads carrying column labels and rows). Unlike
+    // `sql_query` (which streams only the first SELECT's rows and drops the statement/label structure) this
+    // returns the complete `exec_cbor` shape, and unlike `sql_exec` it never persists: a statement that
+    // dirties the store is rejected, so the read-only contract is preserved. This backs the MCP
+    // `sql_query` tool over remote at full parity.
+    bytes sql_query_result(LoomSession handle, string workspace, string db, string sql);
+}
+
+interface StudioSurfaces {
+    string studio_surface_catalog_json(string workspace, string set);
+}
+
+interface Meetings {
+    string meetings_import_snapshot(
+        LoomSession handle,
+        string workspace,
+        string input_profile,
+        bytes snapshot,
+        bool dry_run
+    );
+    bytes meetings_source_read(LoomSession handle, string workspace, string source_id, string leaf);
+}
+
+interface Drive {
+    string drive_list_json(LoomSession handle, string workspace, string drive_workspace_id, string folder_id);
+    string drive_stat_json(LoomSession handle, string workspace, string drive_workspace_id,
+                           string folder_id, string name);
+    bytes drive_read_file(LoomSession handle, string workspace, string drive_workspace_id, string file_id);
+    string drive_list_versions_json(LoomSession handle, string workspace, string drive_workspace_id,
+                                    string file_id);
+    string drive_list_conflicts_json(LoomSession handle, string workspace, string drive_workspace_id);
+    string drive_list_shares_json(LoomSession handle, string workspace, string drive_workspace_id);
+    string drive_list_retention_json(LoomSession handle, string workspace, string drive_workspace_id);
+    string drive_create_folder_json(LoomSession handle, string workspace, string drive_workspace_id,
+                                    string parent_folder_id, string folder_id, string name,
+                                    string expected_root);
+    string drive_create_upload_json(LoomSession handle, string workspace, string drive_workspace_id,
+                                    string upload_id, string parent_folder_id, string name,
+                                    string file_id, string expected_root, u64 created_at_ms,
+                                    bool replace_file);
+    string drive_upload_chunk_json(LoomSession handle, string workspace, string drive_workspace_id,
+                                   string upload_id, bytes chunk);
+    string drive_commit_upload_json(LoomSession handle, string workspace, string drive_workspace_id,
+                                    string upload_id);
+    string drive_rename_json(LoomSession handle, string workspace, string drive_workspace_id,
+                             string folder_id, string node_id, string new_name, string expected_root);
+    string drive_move_json(LoomSession handle, string workspace, string drive_workspace_id,
+                           string source_folder_id, string target_folder_id, string node_id,
+                           string expected_root);
+    string drive_delete_json(LoomSession handle, string workspace, string drive_workspace_id,
+                             string folder_id, string node_id, string expected_root);
+    string drive_resolve_conflict_json(LoomSession handle, string workspace, string drive_workspace_id,
+                                       string conflict_id, string resolution);
+    string drive_grant_share_json(LoomSession handle, string workspace, string drive_workspace_id,
+                                  string grant_id, string target_kind, string target_id,
+                                  string principal, string role, u64 granted_at_ms,
+                                  optional u64 expires_at_ms);
+    string drive_revoke_share_json(LoomSession handle, string workspace, string drive_workspace_id,
+                                   string grant_id);
+    string drive_apply_share_expiry_json(LoomSession handle, string workspace,
+                                         string drive_workspace_id, u64 now_ms);
+    string drive_pin_retention_json(LoomSession handle, string workspace, string drive_workspace_id,
+                                    string pin_id, string kind, string root,
+                                    optional string target_entity_id, u64 added_at_ms,
+                                    optional u64 expires_at_ms);
+    string drive_unpin_retention_json(LoomSession handle, string workspace, string drive_workspace_id,
+                                      string pin_id);
+    string drive_apply_retention_json(LoomSession handle, string workspace,
+                                      string drive_workspace_id, u64 now_ms);
+}
+
+interface Tickets {
+    string tickets_project_create_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                                       string project_id, string key_prefix, string name,
+                                       optional string expected_root);
+    string tickets_project_rekey_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                                      string project_id, string key_prefix,
+                                      optional string expected_root);
+    string tickets_project_settings_get_json(LoomSession handle, string workspace,
+                                             string ticket_workspace_id, string project_id);
+    string tickets_project_settings_set_json(LoomSession handle, string workspace,
+                                             string ticket_workspace_id, string project_id,
+                                             optional string default_projection,
+                                             string enable_projections_json,
+                                             string disable_projections_json,
+                                             optional string actor_enforcement,
+                                             optional string project_owner_principal,
+                                             bool clear_project_owner_principal,
+                                             optional string acceptance_authorities_json,
+                                             optional string expected_root);
+    string tickets_fields_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                               optional string project_id, optional string projection,
+                               optional string operation);
+    string tickets_field_put_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                                  string project_id, string field_id, string key, string name,
+                                  optional string description, string field_type,
+                                  optional string option_set, u32 max_length, bool has_max_length,
+                                  bool required, bool searchable, bool orderable,
+                                  string cardinality, string applicable_type_ids_json,
+                                  optional string expected_root);
+    string tickets_field_retire_json(LoomSession handle, string workspace,
+                                     string ticket_workspace_id, string project_id,
+                                     string field_id, optional string expected_root);
+    // Ticket mutation JSON methods return `{ "resource": ..., "receipt": MutationReceipt }`.
+    string tickets_create_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                               string project_id, string ticket_type,
+                               optional string external_source, optional string external_id,
+                               string fields_json, string policy_labels_json,
+                               optional string expected_root);
+    string tickets_update_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                               string ticket_id, optional string set_fields_json,
+                               string delete_fields_json, optional string action,
+                               optional string target_status, optional string observed_source_status,
+                               optional string observed_workflow_version, optional string assignee,
+                               optional string comment_id, optional string comment_type,
+                               optional string comment_body, optional string expected_root,
+                               optional string comments_json, optional string relation_sets_json,
+                               optional string relation_removes_json);
+    string tickets_delete_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                               string ticket_id, optional string expected_root);
+    string tickets_comments_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                                 string ticket_id);
+    string tickets_comment_add_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                                    string ticket_id, optional string comment_id,
+                                    optional string comment_type, string body,
+                                    optional string expected_root);
+    string tickets_comment_update_json(LoomSession handle, string workspace,
+                                       string ticket_workspace_id, string ticket_id,
+                                       string comment_id, optional string comment_type,
+                                       optional string body, optional string expected_root);
+    string tickets_comment_delete_json(LoomSession handle, string workspace,
+                                       string ticket_workspace_id, string ticket_id,
+                                       string comment_id, optional string expected_root);
+    string tickets_relation_set_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                                     string ticket_id, optional string relation_id, string kind,
+                                     string target_id, optional string expected_root);
+    string tickets_relation_remove_json(LoomSession handle, string workspace,
+                                        string ticket_workspace_id, string ticket_id,
+                                        string relation_id, optional string expected_root);
+    string tickets_relation_list_json(LoomSession handle, string workspace,
+                                      string ticket_workspace_id, string ticket_id);
+    string tickets_get_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                            string ticket_id, optional string projection);
+    string boards_create_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                              string request_json);
+    string boards_get_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                           string board_id);
+    string boards_list_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                            bool include_deleted);
+    string boards_update_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                              string board_id, string request_json);
+    string boards_delete_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                              string board_id, optional string expected_root);
+    string boards_configure_columns_json(LoomSession handle, string workspace,
+                                         string ticket_workspace_id, string board_id,
+                                         string request_json);
+    string boards_move_card_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                                 string board_id, string request_json);
+    // Bounded, filtered, ordered, paginated ticket listing. `request` is an optional JSON object:
+    // {projection, statuses[], assignees[], priorities[], ticket_types[], labels[], policy_labels[],
+    // lane, board, ready, include_completed, limit, cursor}. Returns a JSON page {items[], total,
+    // next_cursor}. Default 25, hard cap 100. Board-scoped lists use Board card order; Lane plus
+    // Board intersects membership and uses Lane order; `next_cursor` is opaque.
+    string tickets_list_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                             optional string request);
+    string tickets_history_json(LoomSession handle, string workspace, string ticket_workspace_id,
+                                optional string ticket_id);
+}
+
+interface Chat {
+    string chat_create_channel_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                    string channel_id, string channel_handle, string name);
+    string chat_rename_channel_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                    string selector, string channel_handle);
+    string chat_list_channels_json(LoomSession handle, string workspace, string chat_workspace_id);
+    string chat_post_message_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                  string channel_id, string message_id, optional string thread_id,
+                                  string body_text);
+    string chat_edit_message_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                  string channel_id, string message_id, string body_text);
+    string chat_redact_message_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                    string channel_id, string message_id, optional string reason);
+    string chat_create_thread_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                   string channel_id, string thread_id, string parent_message_id);
+    string chat_create_task_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                 string channel_id, string task_id, optional string message_id,
+                                 string title);
+    string chat_claim_task_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                string channel_id, string task_id, string claim_id,
+                                optional string lease_token);
+    string chat_complete_task_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                   string channel_id, string task_id, string claim_id,
+                                   optional string result_message_id);
+    string chat_invoke_agent_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                  string channel_id, string invocation_id, string agent_principal,
+                                  string source_message_ids_json, string prompt_text);
+    string chat_agent_reply_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                 string channel_id, string invocation_id, string message_id);
+    string chat_request_handoff_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                     string channel_id, string handoff_id,
+                                     string from_agent_principal, optional string to_principal,
+                                     optional string reason);
+    string chat_add_reaction_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                  string channel_id, string message_id, string kind);
+    string chat_remove_reaction_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                     string channel_id, string message_id, string kind);
+    string chat_emoji_list_json(LoomSession handle, string workspace, string chat_workspace_id);
+    string chat_emoji_register_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                    string kind);
+    string chat_emoji_unregister_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                      string kind);
+    string chat_messages_json(LoomSession handle, string workspace, string chat_workspace_id,
+                              string channel_id);
+    string chat_cursor_json(LoomSession handle, string workspace, string chat_workspace_id,
+                            string channel_id);
+    string chat_update_cursor_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                   string channel_id, u64 next_sequence);
+    string chat_fetch_events_json(LoomSession handle, string workspace, string chat_workspace_id,
+                                  string channel_id, u64 from_sequence, u64 max);
+}
+
+// ---- result rendering and diagnostics ----
+// `result_to_json` renders a canonical-CBOR result buffer to debug JSON (for inspection, not the typed
+// API). `result_to_bridge_json` renders the lossless React Native bridge projection, where big ints,
+// decimals, uuids, inet, bytes, f32, non-finite f64, and points cross as tagged objects; it is not the
+// normative wire form and not the general typed binding API. `last_error` returns this thread's most
+// recent error.
+interface Diagnostics {
+    string result_to_json(bytes result);
+    string result_to_bridge_json(bytes result);
+    LastError last_error();
+}
+
+// ---- streaming iterators and asynchronous tasks ----
+// `sql_query` (above) is projected by bindings as a stream; its source realization is a forward-only
+// RowIter advanced by `iter_next` (which returns the next item's canonical-CBOR bytes, or none at
+// end-of-stream) and released by `iter_free`. The async-first ops return a pollable Task: `sql_exec_async`
+// (and the reader `*_async` forms below) start a pending task; `task_poll` drives it toward a terminal
+// status and reports whether it is done (the first poll may block on the portable backend);
+// `task_status` reports its TaskStatus or no value for an invalid handle; `task_result` takes the one
+// owned result buffer, leaving the task TAKEN; `task_wait` polls to completion and takes the result in
+// one call; `task_cancel` cancels a still-pending task; `task_free` releases the handle.
+interface Tasks {
+    optional bytes iter_next(RowIter iter);
+    void iter_free(RowIter iter);
+    Task sql_exec_async(SqlSession session, string sql);
+    bool task_poll(Task task);
+    optional TaskStatus task_status(Task task);
+    bytes task_result(Task task);
+    void task_cancel(Task task);
+    void task_free(Task task);
+    bytes task_wait(Task task);
+}
+
+// ---- result views ----
+// A ResultView decodes a canonical-CBOR result buffer into an indexed, typed view so a binding need not
+// parse CBOR or replicate the cell tag table. `result_open` decodes a full result (a list of statement
+// items, or one reader item); `row_open` decodes a single streamed row from `iter_next` as item 0, row 0;
+// `result_close` frees the view. A result is either a list of SQL statements (`result_is_statements`) or
+// one reader result; `result_len` counts the items and `result_item_kind` gives each item's ResultKind.
+// Sentinel-returning C accessors are optional here: invalid/null `result_is_statements` and
+// out-of-range `result_item_kind` return no value.
+// Select/Rows/Blame items expose `result_column_count`, `result_column_name`, `result_column_type`,
+// `result_row_count`, `result_row_len`, and `result_cell`; a Blame row also carries the commit that last
+// set it via `result_row_commit`. Count payloads (Insert/Delete/Update/DropTable) expose `result_count`.
+// CommitLog/ShowVariable/Merge expose a string list via `result_string_count` and `result_string`, plus
+// `result_variable_kind` and `result_merge_outcome`. Diff items expose `result_diff_count`,
+// `result_diff_change`, and, over a DiffSide, `result_diff_len` and `result_diff_cell`. SelectMap rows
+// expose `result_map_len` and `result_map_entry`. Cells decode as LoomValue.
+interface ResultViews {
+    ResultView result_open(bytes result);
+    ResultView row_open(bytes row);
+    void result_close(ResultView view);
+    u64 result_len(ResultView view);
+    optional bool result_is_statements(ResultView view);
+    optional ResultKind result_item_kind(ResultView view, u64 item);
+    u64 result_column_count(ResultView view, u64 item);
+    string result_column_name(ResultView view, u64 item, u64 col);
+    string result_column_type(ResultView view, u64 item, u64 col);
+    u64 result_row_count(ResultView view, u64 item);
+    u64 result_row_len(ResultView view, u64 item, u64 row);
+    LoomValue result_cell(ResultView view, u64 item, u64 row, u64 col);
+    string result_row_commit(ResultView view, u64 item, u64 row);
+    u64 result_count(ResultView view, u64 item);
+    u64 result_string_count(ResultView view, u64 item);
+    string result_string(ResultView view, u64 item, u64 i);
+    VariableKind result_variable_kind(ResultView view, u64 item);
+    MergeOutcome result_merge_outcome(ResultView view, u64 item);
+    u64 result_diff_count(ResultView view, u64 item);
+    DiffChange result_diff_change(ResultView view, u64 item, u64 entry);
+    u64 result_diff_len(ResultView view, u64 item, u64 entry, DiffSide side);
+    LoomValue result_diff_cell(ResultView view, u64 item, u64 entry, DiffSide side, u64 col);
+    u64 result_map_len(ResultView view, u64 item, u64 row);
+    MapEntry result_map_entry(ResultView view, u64 item, u64 row, u64 idx);
+}
+
+// ---- direct table and history readers ----
+// Table-model readers live on the concrete `Sql` interface and use the `sql_*` C ABI exports.
+// Additional table facets can add the same reader family when they are promoted.
+
+// ---- triggers ----
+// Durable trigger bindings on the Program facet. A trigger binds a stimulus (a cron/timezone time rule
+// or a change-watch selector) to a content-addressed program that fires under a budget and execution
+// mode. `workspace` selects by UUID or name; a `trigger_put` by name ensures a Program-facet workspace.
+// A binding and a fire record each cross as one Loom Canonical CBOR value: `trigger_put` takes a binding
+// carrying its own `id`, `trigger_get`/`trigger_enable` return the binding, `trigger_list` returns the
+// CBOR array of bindings in id order, and `trigger_history` returns the CBOR array of fire records
+// ordered by fire sequence, starting at `from_seq` and bounded by `limit`. `trigger_get` on an unknown
+// id is NOT_FOUND; `trigger_remove` returns whether a binding was present. Management requires Program
+// facet WRITE for mutations and READ for reads, enforced by the same access-control path as other
+// facets. Keeper due-evaluation and fire-record append are owned by the serving runtime and are not
+// client-callable methods.
+interface Triggers {
+    void trigger_put(LoomSession handle, string workspace, bytes binding);
+    bytes trigger_get(LoomSession handle, string workspace, Uuid id);
+    bytes trigger_list(LoomSession handle, string workspace);
+    bytes trigger_enable(LoomSession handle, string workspace, Uuid id, bool enabled);
+    bool trigger_remove(LoomSession handle, string workspace, Uuid id);
+    bytes trigger_history(LoomSession handle, string workspace, Uuid id, u64 from_seq, u64 limit);
+}
+
+// Byte-transfer interchange: the remote-capable import/export contract. The client owns all local
+// filesystem paths; the server sees only opaque bytes, the target workspace, the payload kind, and
+// integrity digests. Path-shaped import/export stays a local/admin surface (see FileSystem/Archive).
+interface Transfer {
+    TransferId transfer_import_open(LoomSession handle, string workspace, string kind, bytes opts);
+    TransferAccept transfer_import_write(LoomSession handle, TransferId transfer, bytes chunk, u64 seq, optional Digest digest);
+    bytes transfer_import_finish(LoomSession handle, TransferId transfer, bool commit, bool dry_run, Digest final_digest);
+    void transfer_import_cancel(LoomSession handle, TransferId transfer);
+    stream<bytes> transfer_export(LoomSession handle, string workspace, string kind, optional string revision, bytes opts);
+}
+
+// StoreAdmin: the server-owned store-administration contract (specs/0067 §13, task 640). Physical-store
+// operations (maintenance stats, store policy, DEK rekey) run on the served store under global-admin
+// authorization; the plaintext credential and the data-encryption key never cross the wire (rekey mints
+// all key material server-side). `store init`/`store hash` stay local, and raw global `store get`/`put`
+// are not exposed over remote (use workspace-scoped Cas or Transfer).
+struct StoreStat {
+    u64 object_count;
+    u64 generation;
+    u64 physical_page_count;
+    u64 physical_bytes;
+    u64 reusable_free_pages;
+    u64 candidate_dead_pages;
+    u64 last_validated_mark_epoch;
+    u64 touched_segments;
+    u64 candidate_segments;
+    u64 segment_overflow;
+}
+
+struct StorePolicyResult {
+    bool fips_required;
+    optional u64 audit_seq;
+}
+
+struct StoreRekeyResult {
+    u64 audit_seq;
+    bool resealed;
+    string suite;
+    optional u64 bytes_before;
+    optional u64 bytes_after;
+}
+
+interface StoreAdmin {
+    bytes store_stat(LoomSession handle);
+    bytes store_policy_get(LoomSession handle);
+    bytes store_policy_set(LoomSession handle, bool fips_required);
+    bytes store_rekey(LoomSession handle, bytes new_passphrase, bool reseal, optional string suite);
 }

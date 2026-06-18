@@ -1,0 +1,153 @@
+{
+  "$comment": [
+    "Cross-language result-payload conformance vectors (185c). The single source of truth is the",
+    "Rust engine: loom_sql::result_vector_payload / result_exec_vector and their pinned digests.",
+    "loom_sql's test `result_vectors_match_fixture` asserts the live engine bytes equal this file, so",
+    "it can never silently drift. Every language binding asserts that its OWN typed exec path",
+    "reproduces these exact bytes: identical canonical CBOR (0007 section 3, ADR-0010) means identical",
+    "typed values, because all eight bindings decode through the one shared decoder",
+    "(loom_sql::result_view) or the one bridge projection (loom_sql::bridge_json).",
+    "canonical_hex is lowercase hex of the canonical-CBOR result buffer; digest is its blake3 content",
+    "address; bridge_json is the lossless RN projection (the language-neutral expected typed shape)."
+  ],
+  "codec": "loom-canonical-cbor-v1",
+  "canonical_contract": {
+    "schema": "loom.canonical-contract.v1",
+    "positive": {
+      "codec-empty-map": {
+        "class": "canonical",
+        "input_hex": "a0",
+        "expected_canonical_hex": "a0",
+        "digest_profile": "blake3",
+        "expected_digest": "blake3:1f94cbf313b3ce23257a7251ea0fc95a24556ea611e4f8f475e549971baedb02",
+        "stable_failure_code": null
+      },
+      "codec-sorted-map": {
+        "class": "canonical",
+        "input_hex": "a2616101616202",
+        "expected_canonical_hex": "a2616101616202",
+        "digest_profile": "sha256",
+        "expected_digest": "sha256:a0d3af9e86e5517f729bad0657e2c6f3b7d03899894c8d6b33759074c893b5e3",
+        "stable_failure_code": null
+      },
+      "codec-f64": {
+        "class": "canonical",
+        "input_hex": "fb3ff8000000000000",
+        "expected_canonical_hex": "fb3ff8000000000000",
+        "digest_profile": "blake3",
+        "expected_digest": "blake3:02a6136608c9b30d4e355cf9cd9911808f3997eb4cc351c7e0d08f89a74f90c5",
+        "stable_failure_code": null
+      }
+    },
+    "negative": {
+      "codec-non-minimal-int": {
+        "class": "non_canonical",
+        "input_hex": "1801",
+        "expected_failure_code": "CORRUPT_OBJECT",
+        "owner_error": "NonMinimalInt"
+      },
+      "codec-duplicate-map-key": {
+        "class": "duplicate",
+        "input_hex": "a2616101616102",
+        "expected_failure_code": "CORRUPT_OBJECT",
+        "owner_error": "DuplicateMapKey"
+      },
+      "codec-indefinite-bytes": {
+        "class": "forbidden",
+        "input_hex": "5fff",
+        "expected_failure_code": "CORRUPT_OBJECT",
+        "owner_error": "IndefiniteLength"
+      },
+      "codec-trailing-bytes": {
+        "class": "ambiguous",
+        "input_hex": "0000",
+        "expected_failure_code": "CORRUPT_OBJECT",
+        "owner_error": "TrailingBytes"
+      },
+      "codec-negative-zero": {
+        "class": "non_canonical",
+        "input_hex": "fb8000000000000000",
+        "expected_failure_code": "CORRUPT_OBJECT",
+        "owner_error": "NonCanonicalFloat"
+      }
+    },
+    "migration": {
+      "codec-unsorted-map-refusal": {
+        "class": "migration-refusal",
+        "input_hex": "a2616202616101",
+        "expected_failure_code": "CORRUPT_OBJECT",
+        "owner_error": "UnsortedMapKeys"
+      },
+      "codec-owner-rewrite": {
+        "class": "migration-rewrite",
+        "input_hex": "a2616202616101",
+        "expected_canonical_hex": "a2616101616202"
+      }
+    }
+  },
+  "vectors": {
+    "result_reader_hard_types": {
+      "purpose": "A single-row reader result exercising every cell the old serde_json path broke: a 128-bit integer beyond u64, a NaN f64, an exact f32, an exact decimal, raw bytes, plus easy scalars.",
+      "shape": "reader",
+      "columns": [
+        { "name": "id", "type": "Int" },
+        { "name": "name", "type": "Text" },
+        { "name": "flag", "type": "Bool" },
+        { "name": "big", "type": "U128" },
+        { "name": "amount", "type": "Decimal" },
+        { "name": "raw", "type": "Bytes" },
+        { "name": "ratio", "type": "F32" },
+        { "name": "missing", "type": "Float" }
+      ],
+      "digest": "blake3:ca617610f7dbcc19baa690d54df723532529a075f2eb0c611b6dff360520feef",
+      "canonical_hex": "a3646b696e6464526f777364726f7773818882020182046268698201f5820e50000000000000000001000000000000008310503930000000000000000000000000000002820544000102ff820f1a3dcccccd82031b7ff800000000000067636f6c756d6e7388a2646e616d65626964647479706563496e74a2646e616d65646e616d6564747970656454657874a2646e616d6564666c6167647479706564426f6f6ca2646e616d656362696764747970656455313238a2646e616d6566616d6f756e74647479706567446563696d616ca2646e616d65637261776474797065654279746573a2646e616d6565726174696f647479706563463332a2646e616d65676d697373696e67647479706565466c6f6174",
+      "bridge_json": {
+        "kind": "rows",
+        "columns": [
+          { "name": "id", "type": "Int" },
+          { "name": "name", "type": "Text" },
+          { "name": "flag", "type": "Bool" },
+          { "name": "big", "type": "U128" },
+          { "name": "amount", "type": "Decimal" },
+          { "name": "raw", "type": "Bytes" },
+          { "name": "ratio", "type": "F32" },
+          { "name": "missing", "type": "Float" }
+        ],
+        "rows": [
+          [
+            { "$i64": "1" },
+            "hi",
+            true,
+            { "$u128": "18446744073709551616" },
+            { "$decimal": { "mantissa": "12345", "scale": 2 } },
+            { "$bytes": "AAEC/w==" },
+            { "$f32": 1036831949 },
+            { "$f64": "9221120237041090560" }
+          ]
+        ]
+      }
+    },
+    "result_exec_select": {
+      "purpose": "A portable exec result every binding can reproduce through its own typed exec (Int + Text + NULL - types every binding and GlueSQL handle identically).",
+      "shape": "statements",
+      "sql": [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT)",
+        "INSERT INTO t VALUES (1, 'hi'), (2, NULL)",
+        "SELECT id, n FROM t ORDER BY id"
+      ],
+      "exec_sql": "SELECT id, n FROM t ORDER BY id",
+      "digest": "blake3:170202a820f490f842846cb876d6ec29d0cbb45c7e2ff89cb54f0262ee613c52",
+      "canonical_hex": "81a3646b696e646653656c65637464726f777382828202018204626869828202028100666c6162656c7382626964616e",
+      "bridge_json": [
+        {
+          "kind": "select",
+          "columns": [{ "name": "id" }, { "name": "n" }],
+          "rows": [
+            [{ "$i64": "1" }, "hi"],
+            [{ "$i64": "2" }, null]
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "snapshot_version": 1,
+  "profile": "csv",
+  "source_system": "granola-csv",
+  "source_scope": "file:///imports/granola-notes.csv",
+  "observed_at": 1720000300000,
+  "coverage": "degraded",
+  "coverage_gaps": [
+    "csv:no-transcript",
+    "csv:no-attendees",
+    "csv:no-folders",
+    "csv:no-calendar-event"
+  ],
+  "resume_state": "csv:rows=2",
+  "items": [
+    {
+      "source_entity_id": "csv-row-1",
+      "source_digest": "blake3:9999999999999999999999999999999999999999999999999999999999999999",
+      "source_state": "active",
+      "source_sidecar": {
+        "row": 1,
+        "columns": {
+          "title": "CSV first note",
+          "summary": "CSV preserved only summary text."
+        }
+      },
+      "meeting_id": "meeting/csv-row-1",
+      "title": "CSV first note",
+      "summary_text": "CSV preserved only summary text."
+    },
+    {
+      "source_entity_id": "csv-row-2",
+      "source_digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "source_state": "retained_metadata_only",
+      "source_sidecar": {
+        "row": 2,
+        "columns": {
+          "title": "CSV second note",
+          "summary": ""
+        }
+      },
+      "meeting_id": "meeting/csv-row-2",
+      "title": "CSV second note"
+    }
+  ]
+}

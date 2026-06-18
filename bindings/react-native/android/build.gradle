@@ -1,6 +1,16 @@
 apply plugin: "com.android.library"
 apply plugin: "org.jetbrains.kotlin.android"
 
+def codegenDir = layout.buildDirectory.dir("generated/rn-codegen")
+
+tasks.register("generateReactNativeCodegen", Exec) {
+    inputs.file("../package.json")
+    inputs.dir("../src")
+    outputs.dir(codegenDir)
+    workingDir file("..")
+    commandLine "node", "node_modules/react-native/scripts/generate-codegen-artifacts.js", "-p", ".", "-o", codegenDir.get().asFile.absolutePath, "-t", "android"
+}
+
 android {
     namespace "ai.uldren.loom.rn"
     compileSdk 35
@@ -10,13 +20,31 @@ android {
         externalNativeBuild {
             cmake { cppFlags "-std=c++17" }
         }
-        // These ABIs must match what cargo-ndk builds (see README.md).
         ndk { abiFilters "arm64-v8a", "armeabi-v7a", "x86_64" }
     }
 
     externalNativeBuild {
         cmake { path "CMakeLists.txt" }
     }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main {
+            java.srcDir codegenDir.map { it.dir("android/app/build/generated/source/codegen/java") }
+        }
+    }
+}
+
+kotlin {
+    jvmToolchain(17)
+}
+
+tasks.named("preBuild") {
+    dependsOn "generateReactNativeCodegen"
 }
 
 dependencies {

@@ -1,0 +1,46 @@
+{
+  "workspace_id": "50505050-5050-5050-5050-505050505050",
+  "source_scope": "granola://account/acme/workspace/design",
+  "rows_imported": 3,
+  "sources": 3,
+  "meetings": 3,
+  "spans": 4,
+  "annotations": 10,
+  "import_runs": 1,
+  "payloads": {
+    "source_json": 3,
+    "summary_txt": 3,
+    "transcript_jsonl": 1
+  },
+  "coverage_gaps": [
+    "api-visibility:note-hidden-by-permissions",
+    "summary:note-not-yet-generated",
+    "transcript:local-cache-missing-audio-derived-turns",
+    "csv:attendees-and-folders-unavailable"
+  ],
+  "retry_windows": [
+    "after:2024-07-03T12:30:00Z:rate-limit",
+    "after:manual-cache-refresh"
+  ],
+  "resume_state": "granola-cache-v7/page=2/file-offset=24576",
+  "observed_ids": [
+    "granola-note-complete",
+    "granola-note-partial",
+    "granola-csv-row-legacy"
+  ],
+  "meeting_titles": [
+    "Design review",
+    "Partner sync",
+    "Legacy weekly notes"
+  ],
+  "annotation_kinds": [
+    "Artifact",
+    "Decision",
+    "Question",
+    "Reference",
+    "Risk",
+    "SourceObservation",
+    "Task",
+    "Topic"
+  ]
+}

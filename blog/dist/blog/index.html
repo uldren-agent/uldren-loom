@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Uldren Engineering Blog</title>
+  <meta name="description" content="Engineering notes from Uldren.">
+  <link rel="canonical" href="/blog/">
+  <link rel="stylesheet" href="/blog/assets/blog.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script defer src="/blog/assets/blog.js"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "neutral",
+      securityLevel: "strict",
+      flowchart: {
+        htmlLabels: true,
+        wrappingWidth: 180,
+      },
+    });
+  </script>
+</head>
+<body class="index">
+  <header class="site-bar">
+    <a class="site-mark" href="/blog/">Uldren</a>
+    <nav aria-label="Primary">
+      <a href="/blog/">Blog</a>
+      <a href="/">Home</a>
+    </nav>
+  </header>
+  <main>
+<section class="index-head">
+  <h1>Uldren Engineering Blog</h1>
+  <p>Technical notes on agent workflows, applied AI systems, and durable software interfaces.</p>
+</section>
+<ol class="post-list">
+<li class="post-list-item">
+  <a href="/blog/model-relay-cbor-example/">Model Relay In Practice: Choosing Canonical CBOR</a>
+  <time datetime="2026-06-25">June 25, 2026</time>
+  <p>A step-by-step example of Model Relay using a serialization decision: bespoke bytes, CBOR, transport formats, ABI shape, and proof gates.</p>
+</li>
+<li class="post-list-item">
+  <a href="/blog/oracle-executor-pattern/">The Oracle Executor Pattern</a>
+  <time datetime="2026-06-21">June 21, 2026</time>
+  <p>A pattern for separating model proposals from the authority that validates, measures, and applies state changes.</p>
+</li>
+<li class="post-list-item">
+  <a href="/blog/versioned-decisioning-pattern/">The Versioned Decisioning Pattern</a>
+  <time datetime="2026-06-20">June 20, 2026</time>
+  <p>A pattern for making model decisions durable, inspectable, reversible, and reusable across agent workflows.</p>
+</li>
+<li class="post-list-item">
+  <a href="/blog/model-relay-pattern/">The Model Relay Pattern</a>
+  <time datetime="2026-06-19">June 19, 2026</time>
+  <p>A pattern for passing one task through role-specific models before implementation is trusted.</p>
+</li>
+<li class="post-list-item">
+  <a href="/blog/loop-engineering/">Loop Engineering</a>
+  <time datetime="2026-06-18">June 18, 2026</time>
+  <p>An intro to loop engineering as the design of recurring agent workflows with goals, checks, memory, and human gates.</p>
+</li>
+<li class="post-list-item">
+  <a href="/blog/react-agent-pattern/">The ReAct Agent Pattern</a>
+  <time datetime="2026-06-17">June 17, 2026</time>
+  <p>An intro to ReAct, the reason-act-observe pattern behind many tool-using agents.</p>
+</li>
+</ol>
+  </main>
+  <footer class="site-footer">
+    <a href="/blog/">Index</a>
+    <span>Uldren Engineering</span>
+  </footer>
+</body>
+</html>

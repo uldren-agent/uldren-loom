@@ -1,0 +1,346 @@
+{
+  "source_scope": "jira://tenant/example",
+  "projects": [
+    {
+      "id": 10001,
+      "key": "CORE",
+      "name": "Core Platform",
+      "description": "Core product engineering project.",
+      "project_type_key": "software",
+      "style": "classic",
+      "simplified": false,
+      "archived": false,
+      "deleted": false,
+      "private": false,
+      "self_url": "https://example.atlassian.net/rest/api/3/project/CORE",
+      "avatar_urls": {
+        "16x16": "https://example.atlassian.net/secure/projectavatar?size=xsmall&pid=10001",
+        "48x48": "https://example.atlassian.net/secure/projectavatar?size=large&pid=10001"
+      },
+      "lead": {
+        "accountId": "acct-alice",
+        "displayName": "Alice Rivera",
+        "active": true
+      },
+      "project_category": {
+        "id": "cat-1",
+        "name": "Platform",
+        "description": "Platform engineering"
+      },
+      "insight": {
+        "totalIssueCount": 42,
+        "lastIssueUpdateTime": "2026-07-11T15:30:00.000+0000"
+      },
+      "issue_types": [
+        {
+          "id": "10003",
+          "name": "Story",
+          "subtask": false
+        },
+        {
+          "id": "10004",
+          "name": "Bug",
+          "subtask": false
+        }
+      ],
+      "components": [
+        {
+          "id": "20001",
+          "name": "Importer",
+          "description": "Import pipeline",
+          "lead": {
+            "accountId": "acct-alice",
+            "displayName": "Alice Rivera"
+          }
+        }
+      ],
+      "versions": [
+        {
+          "id": "30001",
+          "name": "2026.7",
+          "released": false,
+          "archived": false,
+          "releaseDate": "2026-07-31"
+        }
+      ],
+      "roles": {
+        "Administrators": "https://example.atlassian.net/rest/api/3/project/CORE/role/10002",
+        "Developers": "https://example.atlassian.net/rest/api/3/project/CORE/role/10003"
+      }
+    }
+  ],
+  "issues": [
+    {
+      "id": 10042,
+      "key": "CORE-42",
+      "project_key": "CORE",
+      "issue_type": "Story",
+      "summary": "Ship ticket importer",
+      "description": {
+        "type": "doc",
+        "version": 1,
+        "content": [
+          {
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "Normalize Jira issue data into Loom tickets."
+              }
+            ]
+          }
+        ]
+      },
+      "status": "In Progress",
+      "status_category": "In Progress",
+      "priority": "High",
+      "resolution": null,
+      "assignee": {
+        "accountId": "acct-alice",
+        "displayName": "Alice Rivera",
+        "active": true,
+        "emailAddress": "alice@example.com"
+      },
+      "reporter": {
+        "accountId": "acct-bob",
+        "displayName": "Bob Chen",
+        "active": true
+      },
+      "creator": {
+        "accountId": "acct-bob",
+        "displayName": "Bob Chen",
+        "active": true
+      },
+      "created_at": "2026-07-01T09:00:00.000Z",
+      "updated_at": "2026-07-11T15:30:00.000Z",
+      "due_date": "2026-07-31",
+      "environment": {
+        "type": "doc",
+        "version": 1,
+        "content": [
+          {
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "Production import cluster"
+              }
+            ]
+          }
+        ]
+      },
+      "parent": {
+        "id": "10001",
+        "key": "CORE-1",
+        "fields": {
+          "summary": "Importer epic"
+        }
+      },
+      "security": {
+        "id": "40001",
+        "name": "Engineering only"
+      },
+      "votes": {
+        "self": "https://example.atlassian.net/rest/api/3/issue/CORE-42/votes",
+        "votes": 3,
+        "hasVoted": true
+      },
+      "watches": {
+        "self": "https://example.atlassian.net/rest/api/3/issue/CORE-42/watchers",
+        "watchCount": 2,
+        "isWatching": true,
+        "watchers": [
+          {
+            "accountId": "acct-alice",
+            "displayName": "Alice Rivera"
+          },
+          {
+            "accountId": "acct-bob",
+            "displayName": "Bob Chen"
+          }
+        ]
+      },
+      "sprint": {
+        "id": 37,
+        "state": "active",
+        "name": "Import hardening",
+        "startDate": "2026-07-01T09:00:00.000Z",
+        "endDate": "2026-07-31T18:00:00.000Z",
+        "originBoardId": 5,
+        "goal": "Close importer fidelity gaps"
+      },
+      "labels": [
+        "customer-impact",
+        "backend"
+      ],
+      "custom_fields": {
+        "Story Points": 8,
+        "Severity": "High",
+        "Epic Link": "CORE-1",
+        "Business Owners": [
+          "Alice Rivera",
+          "Bob Chen"
+        ]
+      },
+      "components": [
+        {
+          "id": "20001",
+          "name": "Importer"
+        }
+      ],
+      "fix_versions": [
+        {
+          "id": "30001",
+          "name": "2026.7",
+          "released": false
+        }
+      ],
+      "affected_versions": [
+        {
+          "id": "30000",
+          "name": "2026.6",
+          "released": true
+        }
+      ],
+      "issue_links": [
+        {
+          "id": "50001",
+          "type": {
+            "id": "10000",
+            "name": "Blocks",
+            "inward": "is blocked by",
+            "outward": "blocks"
+          },
+          "outwardIssue": {
+            "id": "10050",
+            "key": "CORE-50",
+            "fields": {
+              "summary": "Deploy importer"
+            }
+          }
+        }
+      ],
+      "subtasks": [
+        {
+          "id": "10044",
+          "key": "CORE-44",
+          "fields": {
+            "summary": "Write fixture matrix"
+          }
+        }
+      ],
+      "transitions": [
+        {
+          "id": "31",
+          "name": "Done",
+          "to": {
+            "id": "10002",
+            "name": "Done",
+            "statusCategory": {
+              "key": "done",
+              "name": "Done"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "com.example.import": {
+          "batch": "fixture"
+        }
+      },
+      "development": {
+        "pullRequests": [
+          {
+            "id": "42",
+            "name": "Import Jira fixture"
+          }
+        ]
+      },
+      "changelog": {
+        "histories": [
+          {
+            "id": "9001",
+            "author": "Alice Rivera",
+            "created": "2026-07-04T10:00:00.000Z",
+            "items": [
+              {
+                "field": "status",
+                "fromString": "To Do",
+                "toString": "In Progress"
+              }
+            ]
+          }
+        ]
+      },
+      "comments": [
+        {
+          "id": "c-1",
+          "author": "Bob Chen",
+          "body": "Please keep the import deterministic."
+        }
+      ],
+      "attachments": [
+        {
+          "id": "a-1",
+          "filename": "design.md",
+          "mimeType": "text/markdown",
+          "size": 512,
+          "author": {
+            "accountId": "acct-bob",
+            "displayName": "Bob Chen"
+          },
+          "created": "2026-07-02T10:00:00.000+0000",
+          "content": "https://example.atlassian.net/secure/attachment/a-1/design.md",
+          "thumbnail": "https://example.atlassian.net/secure/thumbnail/a-1"
+        }
+      ],
+      "worklog": [
+        {
+          "id": "w-1",
+          "author": {
+            "accountId": "acct-alice",
+            "displayName": "Alice Rivera"
+          },
+          "comment": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+              {
+                "type": "paragraph",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Importer implementation."
+                  }
+                ]
+              }
+            ]
+          },
+          "started": "2026-07-08T09:00:00.000+0000",
+          "timeSpentSeconds": 3600,
+          "updated": "2026-07-08T10:00:00.000+0000"
+        }
+      ]
+    },
+    {
+      "id": "10043",
+      "key": "CORE-43",
+      "project_key": "CORE",
+      "issue_type": "Bug",
+      "summary": "Fix importer retry",
+      "description": "Retry should not duplicate issues.",
+      "status": "To Do",
+      "priority": "Medium",
+      "assignee": "Dana Singh",
+      "reporter": "Bob Chen",
+      "resolution": "Fixed",
+      "resolution_date": "2026-07-12T12:00:00.000Z",
+      "labels": [
+        "bug"
+      ],
+      "custom_fields": {
+        "Severity": "Medium"
+      }
+    }
+  ]
+}

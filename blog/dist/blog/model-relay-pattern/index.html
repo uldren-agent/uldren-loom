@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Model Relay Pattern | Uldren Engineering Blog</title>
+  <meta name="description" content="A pattern for passing one task through role-specific models before implementation is trusted.">
+  <link rel="canonical" href="/blog/model-relay-pattern/">
+  <link rel="stylesheet" href="/blog/assets/blog.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <script defer src="/blog/assets/blog.js"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "neutral",
+      securityLevel: "strict",
+      flowchart: {
+        htmlLabels: true,
+        wrappingWidth: 180,
+      },
+    });
+  </script>
+</head>
+<body class="post">
+  <header class="site-bar">
+    <a class="site-mark" href="/blog/">Uldren</a>
+    <nav aria-label="Primary">
+      <a href="/blog/">Blog</a>
+      <a href="/">Home</a>
+    </nav>
+  </header>
+  <main>
+<article class="markdown-page">
+  <header class="article-head">
+    <h1>The Model Relay Pattern</h1>
+    <div class="article-meta">
+      <time datetime="2026-06-19">June 19, 2026</time>
+      <span>Uldren</span>
+    </div>
+    <p>A pattern for passing one task through role-specific models before implementation is trusted.</p>
+  </header>
+  <div class="markdown-body">
+<p>Model Relay is what you use when one blended model answer is too much responsibility for one role.</p>
+<p>You ask Claude to make a task list. Then you ask Codex to review it. Codex finds gaps, asks for sharper acceptance criteria, and suggests a better order. Then you paste that back into Claude. Sometimes a third system executes the plan. Sometimes another model reviews the result.</p>
+<p>The manual copy-and-paste is implementation friction. The useful part is the role structure.</p>
+<p>The workflow is not really &quot;one AI assistant.&quot; It is one piece of work moving through several roles. Each role can be handled by the same model, a different model, a human, or a tool-backed agent. The important part is the handoff.</p>
+<p>That shape is the Model Relay Pattern.</p>
+<pre class="mermaid">flowchart TD
+  A[&quot;`**Proposer**`&quot;] --&gt; B{&quot;`**Critic**&lt;br/&gt;accepts plan?`&quot;}
+  B --&gt;|No| A
+  B --&gt;|Yes| C[&quot;`**Reconciler**`&quot;]
+  C --&gt; D[&quot;`**Executor**`&quot;]
+  D --&gt; E{&quot;`**Verifier**&lt;br/&gt;accepts result?`&quot;}
+  E --&gt;|Fix execution| D
+  E --&gt;|Revise plan| C
+  E --&gt;|Yes| F[&quot;`Accepted result`&quot;]</pre>
+<h2 id="the-short-version">The Short Version</h2>
+<p>Model Relay is a collaborative AI workflow where a task moves through role-specific phases before the result is accepted.</p>
+<p>One model may propose. Another may critique. Another may reconcile the plan. Another may execute. Another may verify. A small task may use only one or two phases. A risky task may use all five.</p>
+<p>The pattern is not &quot;use more agents.&quot; It is &quot;separate the jobs that should not be collapsed into one model response.&quot;</p>
+<p>For a concrete walkthrough of the pattern applied to a real architecture decision, read <a href="/blog/model-relay-cbor-example/">Model Relay In Practice: Choosing Canonical CBOR</a>.</p>
+<h2 id="the-five-roles">The Five Roles</h2>
+<h3 id="1-proposer">1. Proposer</h3>
+<p>The Proposer turns intent into a plan.</p>
+<p>Its output should not be code first. It should be a work artifact:</p>
+<ul>
+<li>Goal</li>
+<li>Assumptions</li>
+<li>Task list</li>
+<li>Acceptance criteria</li>
+<li>Test or verification plan</li>
+<li>Known risks</li>
+<li>Questions that need a human answer</li>
+</ul>
+<p>The Proposer is useful when the user has an idea but the work is still soft around the edges.</p>
+<h3 id="2-critic">2. Critic</h3>
+<p>The Critic reviews the proposal before execution.</p>
+<p>This is the first important split. The model that generated a plan is usually too committed to it. A Critic should be instructed to look for ambiguity, missing tests, bad sequencing, hidden dependencies, unsafe assumptions, and cases where the plan is bigger than the prompt actually justified.</p>
+<p>The Critic does not execute. Its job is to improve the plan.</p>
+<h3 id="3-reconciler">3. Reconciler</h3>
+<p>The Reconciler turns proposal plus critique into a revised plan.</p>
+<p>This role matters because criticism is not the same thing as a decision. A good critique can contain five suggestions, only three of which should be accepted. The Reconciler creates the actual handoff packet:</p>
+<ul>
+<li>Accepted changes</li>
+<li>Rejected changes, with reasons</li>
+<li>Revised task order</li>
+<li>Final acceptance criteria</li>
+<li>Open questions</li>
+</ul>
+<p>Without this step, the workflow often becomes a pile of comments that the next model has to interpret from scratch.</p>
+<h3 id="4-executor">4. Executor</h3>
+<p>The Executor does the work.</p>
+<p>In coding systems, this may mean editing files, running tests, opening a pull request, or producing a patch. In non-coding workflows, it may mean writing the document, filling a spreadsheet, creating a report, or calling external tools.</p>
+<p>The Executor should work from the reconciled plan, not from the original prompt. That is the main discipline of the relay.</p>
+<h3 id="5-verifier">5. Verifier</h3>
+<p>The Verifier checks the result against the approved plan.</p>
+<p>This is different from a generic review. The Verifier should not ask, &quot;does this look good?&quot; It should ask:</p>
+<ul>
+<li>Did the Executor do what the reconciled plan said?</li>
+<li>Are the acceptance criteria satisfied?</li>
+<li>Were the agreed checks actually run?</li>
+<li>Did the work introduce new risk?</li>
+<li>Is there evidence, such as logs, tests, screenshots, or diffs?</li>
+</ul>
+<p>The Verifier may be deterministic, such as a test runner. It may be a model with a rubric. It may be a human. For important work, it is often more than one of these.</p>
+<h2 id="why-this-is-not-just-multi-agent">Why This Is Not Just Multi-Agent</h2>
+<p>Multi-agent is an implementation strategy. Model Relay is a workflow pattern.</p>
+<p>You can implement Model Relay with five autonomous agents talking to each other. You can also implement it with one desktop app, three model providers, a local worktree, and a human clicking approve between phases.</p>
+<p>The pattern is about role separation and handoff state. The agents are optional.</p>
+<p>That distinction matters because many useful workflows are not fully autonomous. A developer may want to choose Claude for proposal, Codex for critique, a local model for cheap summarization, and a high-capability model for verification. The human remains the orchestrator. The desktop app keeps the state.</p>
+<h2 id="pattern-composition">Pattern Composition</h2>
+<p>Model Relay describes how one unit of work moves through accountable roles. It does not require every surrounding workflow to be part of the pattern.</p>
+<p>Other agent patterns can sit below or above it.</p>
+<p>A lower-level pattern can describe how a single role does its work. An outer-loop pattern can describe when relay runs start, repeat, stop, and escalate. That distinction keeps Model Relay narrow: it is the handoff model, not the whole automation stack.</p>
+<h2 id="example-below-react-inside-a-relay-phase">Example Below: ReAct Inside A Relay Phase</h2>
+<p>ReAct can sit inside one phase of the relay.</p>
+<p>The original ReAct work combined reasoning and acting in an interleaved trajectory: reason about the next step, take an action, observe the result, and continue. That is a good shape for an Executor. It can also be useful for a Critic that needs to inspect files or a Verifier that needs to gather evidence.</p>
+<p>But ReAct does not decide which model should propose, which model should critique, or how the handoff artifact should be versioned. Those are Model Relay concerns.</p>
+<p>Read the companion intro: <a href="/blog/react-agent-pattern/">The ReAct Agent Pattern</a>.</p>
+<h2 id="example-above-loop-engineering-around-a-relay">Example Above: Loop Engineering Around A Relay</h2>
+<p>Loop engineering can sit around the relay.</p>
+<p>A loop decides when work is selected, how often the workflow runs, what counts as done, and when a human should be alerted. The relay decides how each selected unit of work moves through roles.</p>
+<p>For example:</p>
+<pre class="mermaid">flowchart TD
+  A[&quot;`Build a billing&lt;br/&gt;export feature`&quot;] --&gt; B[&quot;`**Proposer**&lt;br/&gt;drafts scope, API shape,&lt;br/&gt;risks, and acceptance criteria`&quot;]
+  B --&gt; C{&quot;`**Critic**&lt;br/&gt;is the plan strong?`&quot;}
+  C --&gt;|No| B
+  C --&gt;|Yes| D[&quot;`**Reconciler**&lt;br/&gt;produces the implementation plan`&quot;]
+  D --&gt; E[&quot;`**Executor**&lt;br/&gt;changes code and runs checks`&quot;]
+  E --&gt; F{&quot;`**Verifier**&lt;br/&gt;does it satisfy the plan?`&quot;}
+  F --&gt;|Execution issue| E
+  F --&gt;|Plan issue| D
+  F --&gt;|Yes| G[&quot;`Open the feature PR`&quot;]</pre>
+<p>The outer loop chooses and repeats the work. Model Relay makes the feature path accountable: proposal, critique, reconciliation, execution, verification, and revision are separate handoff states instead of one blended model response.</p>
+<p>Read the companion intro: <a href="/blog/loop-engineering/">Loop Engineering</a>.</p>
+<h2 id="should-versioning-be-part-of-the-pattern">Should Versioning Be Part Of The Pattern?</h2>
+<p>The base pattern should be generic.</p>
+<p>Model Relay should not require a content-addressed filesystem, a version-control backend, or any specific product. If the pattern is useful, it should be explainable with a whiteboard, a folder of Markdown files, or a spreadsheet.</p>
+<p>But versioning is not incidental. It is what makes the pattern safer and easier to trust once the workflow becomes more than a whiteboard.</p>
+<p>Model Relay explains the role handoff. <a href="/blog/versioned-decisioning-pattern/">Versioned Decisioning</a> explains how those handoffs become durable decision state.</p>
+<h2 id="failure-modes">Failure Modes</h2>
+<p>The pattern can fail in boring ways.</p>
+<p>Too many phases for small work. If the task is trivial, a relay is ceremony.</p>
+<p>Weak handoff artifacts. If each phase returns prose with no structure, the next phase has to guess.</p>
+<p>Verifier theater. A second model saying &quot;looks good&quot; is not verification. Verification needs criteria and evidence.</p>
+<p>No human gates. Some tasks need approval before execution, not after.</p>
+<p>Model monoculture. Running the same model five times with similar instructions may add cost without adding perspective.</p>
+<h2 id="a-practical-starting-point">A Practical Starting Point</h2>
+<p>Start with three phases:</p>
+<pre><code class="language-text">Proposer -&gt; Critic -&gt; Reconciler</code></pre>
+<p>Use that for planning before execution. It removes the manual copy and paste loop while keeping the human in control.</p>
+<p>Then add Executor when the plan is concrete enough to run.</p>
+<p>Then add Verifier when the output has real cost if it is wrong.</p>
+<p>That is the practical version of the pattern: a clean relay of responsibility from one role to the next.</p>
+<h2 id="teach-your-agent-harness-model-relay">Teach Your Agent Harness Model Relay</h2>
+<p>The pattern is meant to be executable.</p>
+<p>Use these AGENTS.md files to teach an agent harness how to run Model Relay with subagents, model profiles, or human gates:</p>
+<ul>
+<li><a href="/blog/model-relay-pattern/AGENTS.md">Model Relay AGENTS.md</a></li>
+<li><a href="/blog/model-relay-pattern/proposer/AGENTS.md">Proposer AGENTS.md</a></li>
+<li><a href="/blog/model-relay-pattern/critic/AGENTS.md">Critic AGENTS.md</a></li>
+<li><a href="/blog/model-relay-pattern/reconciler/AGENTS.md">Reconciler AGENTS.md</a></li>
+<li><a href="/blog/model-relay-pattern/executor/AGENTS.md">Executor AGENTS.md</a></li>
+<li><a href="/blog/model-relay-pattern/verifier/AGENTS.md">Verifier AGENTS.md</a></li>
+</ul>
+<p>Hermes and OpenClaw can map these roles to different subagents or LLM providers. Claude and Codex can map them to different model settings, tools, or thinking budgets. The important part is that each role has a separate instruction surface and a durable handoff packet.</p>
+<h2 id="sources">Sources</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2210.03629">ReAct: Synergizing Reasoning and Acting in Language Models</a></li>
+<li><a href="https://react-lm.github.io/">ReAct project page</a></li>
+<li><a href="https://research.google/blog/react-synergizing-reasoning-and-acting-in-language-models/">Google Research ReAct blog</a></li>
+<li><a href="https://addyosmani.com/blog/loop-engineering/">Loop Engineering, Addy Osmani</a></li>
+<li><a href="https://www.langchain.com/blog/the-art-of-loop-engineering">The Art of Loop Engineering, LangChain</a></li>
+<li><a href="https://www.mindstudio.ai/blog/what-is-loop-engineering-ai-coding-agents">What Is Loop Engineering?, MindStudio</a></li>
+</ul>
+  </div>
+</article>
+  </main>
+  <footer class="site-footer">
+    <a href="/blog/">Index</a>
+    <span>Uldren Engineering</span>
+  </footer>
+</body>
+</html>

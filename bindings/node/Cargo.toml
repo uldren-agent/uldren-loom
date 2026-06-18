@@ -5,18 +5,41 @@ edition = "2024"
 license = "BUSL-1.1"
 name = "loom-node"
 publish = false
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
 loom-core = { package = "uldren-loom-core", path = "../../crates/loom-core" }
+loom-compute = { package = "uldren-loom-compute", path = "../../crates/loom-compute", features = ["guards", "sql-state-access"] }
+loom-chat = { package = "uldren-loom-chat", path = "../../crates/loom-chat" }
+loom-codec = { package = "uldren-loom-codec", path = "../../crates/loom-codec" }
+loom-drive = { package = "uldren-loom-drive", path = "../../crates/loom-drive" }
+loom-interchange = { package = "uldren-loom-interchange", path = "../../crates/loom-interchange" }
+loom-interchange-io = { package = "uldren-loom-interchange-io", path = "../../crates/loom-interchange-io" }
+loom-lanes = { package = "uldren-loom-lanes", path = "../../crates/loom-lanes" }
+loom-pages = { package = "uldren-loom-pages", path = "../../crates/loom-pages" }
+loom-result = { package = "uldren-loom-result", path = "../../crates/loom-result" }
+loom-sql = { package = "uldren-loom-sql", path = "../../crates/loom-sql" }
+loom-substrate = { package = "uldren-loom-substrate", path = "../../crates/loom-substrate", features = ["studio-surfaces"] }
+loom-store = { package = "uldren-loom-store", path = "../../crates/loom-store" }
+loom-tickets = { package = "uldren-loom-tickets", path = "../../crates/loom-tickets" }
+loom-types = { package = "uldren-loom-types", path = "../../crates/loom-types" }
+loom-wire = { package = "uldren-loom-wire", path = "../../crates/loom-wire" }
+getrandom = "0.2"
 napi = { version = "3", default-features = false, features = ["napi8"] }
 napi-derive = "3"
+serde = "1"
+serde_json = "1"
 
 [build-dependencies]
 napi-build = "2"
+
+[features]
+default = []
+fips = ["loom-core/fips"]
+remote = []
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

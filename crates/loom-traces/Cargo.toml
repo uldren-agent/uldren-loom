@@ -1,0 +1,19 @@
+[package]
+authors.workspace = true
+description = "Native traces contracts for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-traces"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_traces"
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-codec.workspace = true
+loom-types.workspace = true

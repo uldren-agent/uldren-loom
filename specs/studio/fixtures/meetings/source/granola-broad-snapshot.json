@@ -1,0 +1,248 @@
+{
+  "snapshot_version": 1,
+  "profile": "granola-app",
+  "source_system": "granola",
+  "source_scope": "granola://account/acme/workspace/design",
+  "observed_at": 1720000000000,
+  "coverage": "partial",
+  "source_cursor": "cursor-page-2",
+  "source_sidecar_digest": "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+  "coverage_gaps": [
+    "api-visibility:note-hidden-by-permissions",
+    "summary:note-not-yet-generated",
+    "transcript:local-cache-missing-audio-derived-turns",
+    "csv:attendees-and-folders-unavailable"
+  ],
+  "retry_windows": [
+    "after:2024-07-03T12:30:00Z:rate-limit",
+    "after:manual-cache-refresh"
+  ],
+  "resume_state": "granola-cache-v7/page=2/file-offset=24576",
+  "items": [
+    {
+      "source_entity_id": "granola-note-complete",
+      "source_digest": "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+      "source_sidecar_digest": "blake3:2222222222222222222222222222222222222222222222222222222222222222",
+      "source_created_at": 1719990000000,
+      "source_updated_at": 1720000000000,
+      "source_state": "active",
+      "source_sidecar": {
+        "profile": "granola-app",
+        "id": "granola-note-complete",
+        "api_url": "https://app.granola.ai/notes/granola-note-complete",
+        "folder": {
+          "id": "folder-design",
+          "parent_id": "folder-root",
+          "name": "Design Reviews"
+        },
+        "owner_email": "alice@example.com",
+        "attendees": [
+          {
+            "email": "bob@example.com",
+            "display_name": "Bob Example",
+            "response": "accepted"
+          },
+          {
+            "email": "carol@example.com",
+            "display_name": "Carol Example",
+            "response": "tentative"
+          }
+        ],
+        "calendar_event": {
+          "id": "cal-design-1720",
+          "starts_at": "2024-07-03T10:00:00Z",
+          "ends_at": "2024-07-03T10:45:00Z"
+        },
+        "raw_cache_key": "documents/granola-note-complete"
+      },
+      "meeting_id": "meeting/granola-note-complete",
+      "title": "Design review",
+      "owner": "principal:alice@example.com",
+      "calendar_event": "calendar:cal-design-1720",
+      "attendees": [
+        "principal:bob@example.com",
+        "principal:carol@example.com"
+      ],
+      "folder_refs": [
+        "granola-folder:folder-design",
+        "granola-folder:folder-root"
+      ],
+      "summary_text": "The team chose normalized meeting imports and retained raw Granola sidecars.",
+      "summary_markdown_digest": "blake3:3333333333333333333333333333333333333333333333333333333333333333",
+      "transcript_spans": [
+        {
+          "span_id": "span/granola-note-complete/0",
+          "locator": "transcript/00:00:03.200",
+          "speaker": "Alice",
+          "language": "en",
+          "text": "We need the importer to keep the original note."
+        },
+        {
+          "span_id": "span/granola-note-complete/1",
+          "locator": "transcript/00:00:11.500",
+          "speaker": "Bob",
+          "language": "en",
+          "text": "The normalized model should expose tasks and decisions."
+        },
+        {
+          "span_id": "span/granola-note-complete/2",
+          "locator": "transcript/00:00:19.100",
+          "speaker": "Carol",
+          "language": "en",
+          "text": "Calendar metadata should survive even when it is not first-class yet."
+        }
+      ],
+      "annotations": [
+        {
+          "annotation_id": "annotation/granola-note-complete/source",
+          "kind": "SourceObservation",
+          "label": "Granola app cache v7 observation",
+          "source_span_ids": [
+            "span/granola-note-complete/0"
+          ],
+          "normalized_id": "source-observation:granola-cache-v7",
+          "confidence_ppm": 1000000,
+          "extractor": "granola-cache-import.py"
+        }
+      ],
+      "tasks": [
+        {
+          "id": "task/granola-note-complete/0",
+          "label": "Publish the normalized meeting import contract.",
+          "source_span_ids": [
+            "span/granola-note-complete/1"
+          ],
+          "normalized_id": "ticket:MEET-101",
+          "confidence_ppm": 920000,
+          "extractor": "granola-cache-import.py"
+        }
+      ],
+      "action_items": [
+        {
+          "id": "action/granola-note-complete/0",
+          "label": "Retain the original source sidecar by digest.",
+          "source_span_ids": [
+            "span/granola-note-complete/0"
+          ],
+          "confidence_ppm": 970000,
+          "extractor": "granola-cache-import.py"
+        }
+      ],
+      "topics": [
+        {
+          "id": "topic/granola-note-complete/0",
+          "label": "Import fidelity",
+          "source_span_ids": [
+            "span/granola-note-complete/1"
+          ],
+          "confidence_ppm": 990000,
+          "extractor": "granola-cache-import.py"
+        }
+      ],
+      "decisions": [
+        {
+          "id": "decision/granola-note-complete/0",
+          "label": "Use normalized imports as the stable Loom-owned boundary.",
+          "source_span_ids": [
+            "span/granola-note-complete/1"
+          ],
+          "normalized_id": "decision:meetings-normalized-import",
+          "confidence_ppm": 980000,
+          "extractor": "granola-cache-import.py"
+        }
+      ],
+      "questions": [
+        {
+          "id": "question/granola-note-complete/0",
+          "label": "Which source fields remain retained-only?",
+          "source_span_ids": [
+            "span/granola-note-complete/2"
+          ],
+          "confidence_ppm": 910000,
+          "extractor": "granola-cache-import.py"
+        }
+      ],
+      "risks": [
+        {
+          "id": "risk/granola-note-complete/0",
+          "label": "A source API omission must not be interpreted as deletion.",
+          "source_span_ids": [
+            "span/granola-note-complete/2"
+          ],
+          "confidence_ppm": 930000,
+          "extractor": "granola-cache-import.py"
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "artifact/granola-note-complete/0",
+          "label": "Granola source note payload",
+          "source_span_ids": [
+            "span/granola-note-complete/0"
+          ],
+          "normalized_id": "artifact:granola-note-complete",
+          "confidence_ppm": 1000000,
+          "extractor": "granola-cache-import.py"
+        }
+      ],
+      "references": [
+        {
+          "id": "reference/granola-note-complete/0",
+          "label": "https://app.granola.ai/notes/granola-note-complete",
+          "source_span_ids": [
+            "span/granola-note-complete/2"
+          ],
+          "confidence_ppm": 1000000,
+          "extractor": "granola-cache-import.py"
+        }
+      ]
+    },
+    {
+      "source_entity_id": "granola-note-partial",
+      "source_digest": "blake3:4444444444444444444444444444444444444444444444444444444444444444",
+      "source_created_at": 1719995000000,
+      "source_updated_at": 1719996000000,
+      "source_state": "active",
+      "source_sidecar": {
+        "profile": "granola-mcp",
+        "id": "granola-note-partial",
+        "visibility": "summary-only",
+        "coverage_gap": "transcript withheld by connector"
+      },
+      "meeting_id": "meeting/granola-note-partial",
+      "title": "Partner sync",
+      "owner": "principal:dana@example.com",
+      "attendees": [
+        "principal:erin@example.com"
+      ],
+      "folder_refs": [
+        "granola-folder:partners"
+      ],
+      "summary_text": "Summary arrived through an assistant session, but transcript turns were not visible.",
+      "questions": [
+        {
+          "id": "question/granola-note-partial/0",
+          "label": "When can the connector retry transcript access?",
+          "confidence_ppm": 760000,
+          "extractor": "granola-mcp"
+        }
+      ]
+    },
+    {
+      "source_entity_id": "granola-csv-row-legacy",
+      "source_digest": "blake3:5555555555555555555555555555555555555555555555555555555555555555",
+      "source_state": "retained_metadata_only",
+      "source_sidecar": {
+        "profile": "csv",
+        "row": 17,
+        "columns": {
+          "title": "Legacy weekly notes",
+          "summary": "CSV retained only a title and summary."
+        }
+      },
+      "meeting_id": "meeting/granola-csv-row-legacy",
+      "title": "Legacy weekly notes",
+      "summary_text": "CSV retained only a title and summary."
+    }
+  ]
+}

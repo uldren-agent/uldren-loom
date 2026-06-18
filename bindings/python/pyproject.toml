@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "uldrenai-loom"
+version = "0.1.0-alpha.1"
+description = "Python binding for Uldren Loom - a universal, content-addressed, versioned filesystem."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "BUSL-1.1" }
+authors = [{ name = "Uldren Technologies LLC" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Homepage = "https://uldren.com"
+Repository = "https://github.com/uldrenai/uldren-loom"
+
+[tool.maturin]
+python-source = "python"
+module-name = "uldrenai_loom._native"

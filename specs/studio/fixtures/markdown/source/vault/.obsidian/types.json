@@ -1,0 +1,6 @@
+{
+  "types": {
+    "created": "date",
+    "published": "boolean"
+  }
+}

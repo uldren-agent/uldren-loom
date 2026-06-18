@@ -1,0 +1,41 @@
+[package]
+authors.workspace = true
+description = "Reusable operation-substrate contracts for Uldren Loom."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-substrate"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "loom_substrate"
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+loom-codec.workspace = true
+loom-types.workspace = true
+serde_json.workspace = true
+unicode-normalization.workspace = true
+
+[features]
+default = []
+studio = [
+    "studio-driveish",
+    "studio-lifecycle",
+    "studio-meetings",
+    "studio-pages",
+    "studio-slackish",
+    "studio-surfaces",
+    "studio-webish",
+]
+studio-driveish = []
+studio-lifecycle = []
+studio-meetings = []
+studio-pages = []
+studio-slackish = []
+studio-surfaces = []
+studio-webish = []

@@ -1,0 +1,44 @@
+[package]
+name = "vector-tradeoff"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate: the empty [workspace] table stops cargo from attaching this
+# crate to any parent workspace it may find by walking up the directory tree.
+[workspace]
+
+[[bin]]
+name = "vector-tradeoff"
+path = "src/main.rs"
+
+# Second binary: the three-strategy (EXACT vs HNSW vs LEANN) evidence benchmark.
+[[bin]]
+name = "strategies"
+path = "src/bin/strategies.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[dependencies]
+# candle is the prototype's GPU-comparison lane AND the product's real embedding runtime. It is
+# built on every target (CPU matmul via `gemm`); the Metal (Apple GPU) backend is added on macOS by
+# the target block below, so on a Mac the GPU lane is a REAL candle-Metal run and on Linux/CI it is
+# candle-CPU. This is the GPU support the prototype keeps (MLX is removed from the product).
+candle-core = "0.8"
+
+# On macOS, add candle's Metal (Apple GPU) backend so the candle GPU lane runs on the Apple GPU.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.8", features = ["metal"] }
+
+# On Apple Silicon ONLY, the real mlx-rs lane is compiled in by default (NO cargo feature / flag): just
+# `cargo run --bin strategies` runs it on the GPU. It is a target dependency, so it is simply absent on
+# Linux/CI/x86 (the strategies bin prints the CPU/factor MODEL there via cfg). It stays here as the
+# ~4320x matmul artifact; it is NOT in the product.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlx-rs = "0.25"
+
+# Note: on Linux/aarch64, candle's `gemm-f16` needs the fp16 target feature to assemble its NEON -
+# build with `RUSTFLAGS="-C target-feature=+fp16"`. Not needed on Apple Silicon (fp16 is baseline) or
+# on x86_64. This only affects this prototype; it is standalone and not part of the workspace/CI.

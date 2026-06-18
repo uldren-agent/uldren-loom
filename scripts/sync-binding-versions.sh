@@ -26,10 +26,12 @@ set_json_version() {
     echo "  updated $1"
 }
 
-set_manifest_version bindings/node/Cargo.toml
-set_manifest_version bindings/wasm/Cargo.toml
+set_manifest_version bindings/android/build.gradle.kts
 set_manifest_version bindings/jvm/build.gradle.kts
-set_manifest_version bindings/kotlin/build.gradle.kts
+set_manifest_version bindings/node/Cargo.toml
+set_manifest_version bindings/python/Cargo.toml
+set_manifest_version bindings/python/pyproject.toml
+set_manifest_version bindings/wasm/Cargo.toml
 set_json_version bindings/node/package.json
 set_json_version bindings/react-native/package.json
 

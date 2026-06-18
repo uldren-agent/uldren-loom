@@ -1,0 +1,96 @@
+{
+  "snapshot_version": 1,
+  "profile": "granola-api",
+  "source_system": "granola-api",
+  "source_scope": "granola-api://account/acme/filter/updated-since-2024-07-01",
+  "observed_at": 1720000100000,
+  "coverage": "partial",
+  "source_cursor": "api-cursor-42",
+  "coverage_gaps": [
+    "api-note:not-visible:not-hidden-by-permissions",
+    "api-note:not-ready:summary-generation-pending"
+  ],
+  "retry_windows": [
+    "after:2024-07-03T12:45:00Z:api-rate-limit"
+  ],
+  "resume_state": "granola-api:cursor=api-cursor-42",
+  "items": [
+    {
+      "source_entity_id": "api-note-visible",
+      "source_digest": "blake3:6666666666666666666666666666666666666666666666666666666666666666",
+      "source_created_at": 1720000000000,
+      "source_updated_at": 1720000100000,
+      "source_state": "active",
+      "source_sidecar": {
+        "api": {
+          "note_id": "api-note-visible",
+          "self": "https://api.granola.ai/v1/notes/api-note-visible",
+          "folder_id": "api-folder-design",
+          "visibility": "visible"
+        },
+        "filters": {
+          "updated_since": "2024-07-01T00:00:00Z"
+        }
+      },
+      "meeting_id": "meeting/api-note-visible",
+      "title": "API visible note",
+      "owner": "principal:api-owner@example.com",
+      "calendar_event": "calendar:api-event-1",
+      "attendees": [
+        "principal:api-attendee@example.com"
+      ],
+      "folder_refs": [
+        "granola-folder:api-folder-design"
+      ],
+      "summary_text": "API summary was visible for this note.",
+      "transcript_spans": [
+        {
+          "span_id": "span/api-note-visible/0",
+          "locator": "transcript/00:00:02.000",
+          "speaker": "API Owner",
+          "language": "en",
+          "text": "This note came from the Granola API path."
+        }
+      ],
+      "decisions": [
+        {
+          "id": "decision/api-note-visible/0",
+          "label": "Treat API omissions as coverage gaps, not deletes.",
+          "source_span_ids": [
+            "span/api-note-visible/0"
+          ],
+          "confidence_ppm": 940000,
+          "extractor": "granola-api-normalizer"
+        }
+      ]
+    },
+    {
+      "source_entity_id": "api-note-summary-pending",
+      "source_digest": "blake3:7777777777777777777777777777777777777777777777777777777777777777",
+      "source_state": "active",
+      "source_sidecar": {
+        "api": {
+          "note_id": "api-note-summary-pending",
+          "visibility": "visible",
+          "processing_state": "summary_pending"
+        }
+      },
+      "meeting_id": "meeting/api-note-summary-pending",
+      "title": "Summary pending note"
+    },
+    {
+      "source_entity_id": "api-note-deleted",
+      "source_digest": "blake3:7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d",
+      "source_state": "deleted_at_source",
+      "source_sidecar": {
+        "api": {
+          "note_id": "api-note-deleted",
+          "visibility": "deleted",
+          "deleted_at": "2024-07-03T12:00:00Z"
+        }
+      },
+      "meeting_id": "meeting/api-note-deleted",
+      "title": "Deleted API note"
+    }
+  ]
+}

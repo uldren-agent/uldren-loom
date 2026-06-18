@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package loom.hosted.v1;
+
+service Cas {
+  rpc Put(CasPutRequest) returns (CasDigestResponse);
+  rpc Get(CasDigestRequest) returns (CasGetResponse);
+  rpc Has(CasDigestRequest) returns (CasHasResponse);
+  rpc List(CasListRequest) returns (CasListResponse);
+  rpc Delete(CasDigestRequest) returns (CasDeleteResponse);
+}
+
+message CasPutRequest {
+  bytes bytes = 1;
+}
+
+message CasDigestRequest {
+  string digest = 1;
+}
+
+message CasListRequest {}
+
+message CasDigestResponse {
+  string digest = 1;
+}
+
+message CasGetResponse {
+  bool found = 1;
+  bytes bytes = 2;
+}
+
+message CasHasResponse {
+  bool present = 1;
+}
+
+message CasListResponse {
+  repeated string digests = 1;
+}
+
+message CasDeleteResponse {
+  bool deleted = 1;
+}

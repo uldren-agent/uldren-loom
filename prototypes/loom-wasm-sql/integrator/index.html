@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Integrator (origin Y) - Uldren Loom loaded from vendor CDN X</title>
+    <style>
+      body { font: 14px/1.5 ui-monospace, monospace; margin: 2rem; max-width: 64rem; }
+      button, select { font: inherit; padding: 0.3rem 0.6rem; margin-right: 0.4rem; }
+      pre { white-space: pre-wrap; background: #f5f5f5; padding: 1rem; border-radius: 6px; }
+      #status { background: #efe; padding: 0.5rem 0.8rem; border-radius: 6px; }
+      .err { color: #b00020; }
+      code { background:#f0f0f0; padding:0 3px; }
+    </style>
+  </head>
+  <body>
+    <h1>Integrator site (origin Y)</h1>
+    <p>
+      This page is served by the <strong>integrator's</strong> origin (Y). It loads the Uldren Loom
+      <code>loom.js</code>, engine, coordinator, and wasm from the <strong>vendor CDN (origin X)</strong>.
+      The workers it spawns run in <em>this</em> origin, so the OPFS data lives in Y's own
+      origin-private filesystem - isolated from any other integrator. Y hosts only this page and a
+      one-line <code>loom-coordinator.js</code> stub; everything else comes from X.
+    </p>
+    <p>
+      <label>Source: <select id="source">
+        <option value="demo.loom">demo.loom</option>
+        <option value="alpha.loom">alpha.loom</option>
+        <option value="beta.loom">beta.loom</option>
+      </select></label>
+    </p>
+    <p id="status">connecting…</p>
+    <p>
+      <button id="seed">Create + insert + select</button>
+      <button id="select">Select</button>
+      <button id="commit">Commit</button>
+      <button id="reset">Reset OPFS</button>
+      <button id="conformance">Run conformance</button>
+    </p>
+    <pre id="out">loading…</pre>
+
+    <script type="module">
+      // The vendor CDN base (origin X). An integrator hardcodes their vendor URL; here it defaults to the
+      // local X server and is overridable with ?cdn=... for testing. Must match the URL in loom-coordinator.js.
+      const CDN = new URLSearchParams(location.search).get("cdn") || "http://localhost:8000";
+      const SOURCE = new URLSearchParams(location.search).get("source") || "demo.loom";
+
+      const out = document.getElementById("out");
+      const statusEl = document.getElementById("status");
+      const log = (s) => { out.className = ""; out.textContent = s; };
+      const fail = (e) => { out.className = "err"; out.textContent = "error: " + (e && e.message ? e.message : e); };
+
+      const sel = document.getElementById("source");
+      sel.value = [...sel.options].some((o) => o.value === SOURCE) ? SOURCE : "demo.loom";
+      sel.onchange = () => { const p = new URLSearchParams(location.search); p.set("source", sel.value); location.search = p; };
+
+      try {
+        const { createLoomClient } = await import(CDN + "/loom.js"); // cross-origin module import from X (CORS)
+        const loom = createLoomClient({
+          source: SOURCE,
+          coordinatorUrl: "./loom-coordinator.js", // Y-hosted stub (must be same-origin); it importScripts X
+          onStatus: (t) => (statusEl.textContent = t),
+        });
+        log(`ready - loaded from CDN ${CDN}. Open this page in two tabs for shared read+write.`);
+
+        document.getElementById("seed").onclick = async () => {
+          try {
+            await loom.exec("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT)");
+            await loom.exec("INSERT INTO t VALUES (1, 'hello'), (2, 'world')");
+            log("seeded + selected:\n" + await loom.exec("SELECT id, v FROM t"));
+          } catch (e) { fail(e); }
+        };
+        document.getElementById("select").onclick = async () => {
+          try { log("rows:\n" + await loom.exec("SELECT id, v FROM t")); } catch (e) { fail(e); }
+        };
+        document.getElementById("commit").onclick = async () => {
+          try { log("committed: " + await loom.commit("seed", "integrator@Y")); } catch (e) { fail(e); }
+        };
+        document.getElementById("reset").onclick = () => { log(`reset requested for '${SOURCE}'…`); loom.reset(); };
+        document.getElementById("conformance").onclick = async () => {
+          try {
+            const { got, expected } = await loom.conformance();
+            const pass = got === expected;
+            out.className = pass ? "" : "err";
+            out.textContent = `conformance ${pass ? "PASS ✓" : "FAIL ✗"} (OPFS digest == native)\n  wasm32 (OPFS): ${got}\n  native pin   : ${expected}`;
+          } catch (e) { fail(e); }
+        };
+      } catch (e) {
+        fail(new Error("failed to load loom.js from " + CDN + " - is the CDN server (X) running with CORS? " + (e.message || e)));
+      }
+    </script>
+  </body>
+</html>

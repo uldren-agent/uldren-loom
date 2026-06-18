@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map Server</title>
+<style>
+:root {
+  color-scheme: light;
+  --ink: #17202a;
+  --muted: #5d6975;
+  --panel: #f8fafc;
+  --line: #d8dee7;
+  --water: #cfe6f3;
+  --land: #e6ead9;
+  --land-2: #d5e2c5;
+  --accent: #0f766e;
+  --warn: #b45309;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #eef2f6;
+}
+.app {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(260px, 330px) 1fr;
+}
+aside {
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+  padding: 18px;
+  display: grid;
+  align-content: start;
+  gap: 16px;
+}
+h1 {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: 0;
+}
+.subtle {
+  color: var(--muted);
+  margin: 3px 0 0;
+}
+.toolbar {
+  display: grid;
+  gap: 10px;
+}
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+button {
+  appearance: none;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: white;
+  color: var(--ink);
+  min-height: 36px;
+  cursor: pointer;
+}
+button:last-child { border-right: 0; }
+button[aria-pressed="true"] {
+  background: var(--accent);
+  color: white;
+}
+label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+input[type="range"] { width: 100%; }
+.stats {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+.stat {
+  border: 1px solid var(--line);
+  background: white;
+  border-radius: 8px;
+  padding: 10px;
+}
+.stat strong {
+  display: block;
+  font-size: 20px;
+}
+.places {
+  display: grid;
+  gap: 8px;
+}
+.place {
+  border: 1px solid var(--line);
+  background: white;
+  border-radius: 8px;
+  padding: 10px;
+}
+.place b { display: block; }
+main {
+  min-width: 0;
+  position: relative;
+}
+canvas {
+  display: block;
+  width: 100%;
+  height: 100vh;
+  background: var(--water);
+}
+.readout {
+  position: absolute;
+  left: 18px;
+  bottom: 18px;
+  background: rgba(255,255,255,.92);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-width: 190px;
+}
+@media (max-width: 760px) {
+  .app { grid-template-columns: 1fr; }
+  aside { border-right: 0; border-bottom: 1px solid var(--line); }
+  canvas { height: calc(100vh - 355px); min-height: 340px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <header>
+      <h1>Map Server</h1>
+      <p class="subtle">Regional operations map</p>
+    </header>
+    <section class="toolbar">
+      <div class="segmented" aria-label="Layer">
+        <button data-layer="traffic" aria-pressed="true">Traffic</button>
+        <button data-layer="weather" aria-pressed="false">Weather</button>
+        <button data-layer="risk" aria-pressed="false">Risk</button>
+      </div>
+      <label>
+        Detail
+        <input id="detail" type="range" min="1" max="5" value="3">
+      </label>
+    </section>
+    <section class="stats">
+      <div class="stat"><strong id="active">8</strong><span>Active hubs</span></div>
+      <div class="stat"><strong id="eta">24m</strong><span>Median ETA</span></div>
+    </section>
+    <section class="places" id="places"></section>
+  </aside>
+  <main>
+    <canvas id="map"></canvas>
+    <div class="readout" id="readout">Hover the map</div>
+  </main>
+</div>
+<script>
+(() => {
+const canvas = document.getElementById("map");
+const ctx = canvas.getContext("2d");
+const readout = document.getElementById("readout");
+const placesEl = document.getElementById("places");
+const detail = document.getElementById("detail");
+let layer = "traffic";
+let hover = null;
+const hubs = [
+  {name:"Seattle", x:.22, y:.23, load:72, eta:18},
+  {name:"Denver", x:.48, y:.43, load:51, eta:27},
+  {name:"Chicago", x:.63, y:.31, load:64, eta:22},
+  {name:"Atlanta", x:.70, y:.61, load:43, eta:31},
+  {name:"Dallas", x:.52, y:.66, load:58, eta:25},
+  {name:"Phoenix", x:.33, y:.68, load:39, eta:35},
+  {name:"New York", x:.82, y:.34, load:81, eta:16},
+  {name:"Miami", x:.78, y:.80, load:47, eta:29}
+];
+const routes = [[0,2],[2,6],[1,2],[1,4],[4,3],[3,7],[5,4],[0,5],[6,3]];
+function resize() {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.floor(rect.width * dpr);
+  canvas.height = Math.floor(rect.height * dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  draw();
+}
+function landPath(w,h) {
+  ctx.beginPath();
+  ctx.moveTo(w*.10,h*.20); ctx.bezierCurveTo(w*.27,h*.04,w*.45,h*.12,w*.57,h*.19);
+  ctx.bezierCurveTo(w*.72,h*.26,w*.86,h*.18,w*.93,h*.35);
+  ctx.bezierCurveTo(w*.99,h*.54,w*.87,h*.72,w*.75,h*.83);
+  ctx.bezierCurveTo(w*.58,h*.96,w*.37,h*.88,w*.21,h*.78);
+  ctx.bezierCurveTo(w*.06,h*.69,w*.02,h*.43,w*.10,h*.20);
+  ctx.closePath();
+}
+function colorFor(value) {
+  if (layer === "weather") return value > 65 ? "#2563eb" : value > 48 ? "#0891b2" : "#65a30d";
+  if (layer === "risk") return value > 65 ? "#b91c1c" : value > 48 ? "#b45309" : "#15803d";
+  return value > 65 ? "#dc2626" : value > 48 ? "#d97706" : "#0f766e";
+}
+function draw() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = "#cfe6f3"; ctx.fillRect(0,0,w,h);
+  landPath(w,h); ctx.fillStyle = "#e6ead9"; ctx.fill();
+  landPath(w,h); ctx.strokeStyle = "#b7c7b5"; ctx.lineWidth = 1.5; ctx.stroke();
+  const grid = Number(detail.value);
+  ctx.strokeStyle = "rgba(82,97,111,.16)";
+  for (let i=1;i<grid*4;i++) {
+    ctx.beginPath(); ctx.moveTo((w*i)/(grid*4),0); ctx.lineTo((w*i)/(grid*4),h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,(h*i)/(grid*4)); ctx.lineTo(w,(h*i)/(grid*4)); ctx.stroke();
+  }
+  ctx.lineWidth = 3;
+  for (const [a,b] of routes) {
+    const A = hubs[a], B = hubs[b];
+    const metric = (A.load + B.load) / 2;
+    ctx.strokeStyle = colorFor(metric);
+    ctx.globalAlpha = .58;
+    ctx.beginPath();
+    ctx.moveTo(A.x*w,A.y*h);
+    ctx.quadraticCurveTo((A.x+B.x)*w/2,(A.y+B.y)*h/2 - 35,B.x*w,B.y*h);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  for (const hub of hubs) {
+    const x = hub.x*w, y = hub.y*h;
+    ctx.fillStyle = colorFor(hub.load);
+    ctx.beginPath(); ctx.arc(x,y,9 + hub.load/18,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle = "white"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.fillStyle = "#17202a"; ctx.font = "12px system-ui"; ctx.fillText(hub.name, x+14, y+4);
+  }
+  if (hover) {
+    ctx.strokeStyle = "#111827"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(hover.x*w,hover.y*h,22,0,Math.PI*2); ctx.stroke();
+  }
+}
+function renderList() {
+  placesEl.innerHTML = hubs.slice().sort((a,b)=>b.load-a.load).slice(0,5).map(h =>
+    `<div class="place"><b>${h.name}</b><span>${h.load}% load, ${h.eta}m ETA</span></div>`
+  ).join("");
+}
+canvas.addEventListener("mousemove", event => {
+  const rect = canvas.getBoundingClientRect();
+  const px = (event.clientX - rect.left) / rect.width;
+  const py = (event.clientY - rect.top) / rect.height;
+  hover = hubs.find(h => Math.hypot(h.x-px,h.y-py) < .045) || null;
+  readout.textContent = hover ? `${hover.name}: ${hover.load}% load, ${hover.eta}m ETA` : `${Math.round(px*100)} / ${Math.round(py*100)}`;
+  draw();
+});
+canvas.addEventListener("mouseleave", () => { hover = null; readout.textContent = "Hover the map"; draw(); });
+document.querySelectorAll("[data-layer]").forEach(button => {
+  button.addEventListener("click", () => {
+    layer = button.dataset.layer;
+    document.querySelectorAll("[data-layer]").forEach(b => b.setAttribute("aria-pressed", String(b === button)));
+    document.getElementById("eta").textContent = layer === "weather" ? "31m" : layer === "risk" ? "19m" : "24m";
+    draw();
+  });
+});
+detail.addEventListener("input", draw);
+window.addEventListener("resize", resize);
+renderList();
+resize();
+})();
+</script>
+</body>
+</html>

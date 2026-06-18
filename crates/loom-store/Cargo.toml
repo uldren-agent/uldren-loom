@@ -1,0 +1,45 @@
+[package]
+authors.workspace = true
+description = "Persistent single-file (.loom) object store for Uldren Loom; the on-disk ObjectStore backend."
+edition.workspace = true
+license.workspace = true
+name = "uldren-loom-store"
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "loom_store"
+
+[features]
+integration-tests = []
+
+[dependencies]
+# On-disk (`std::fs`) ObjectStore backend. CRC-32C is inline; the only third-party deps are the two
+# per-object compression codecs, both pure-Rust and wasm32-clean so the same frame
+# codec serves a browser-backed store, not just this native one.
+loom-core.workspace = true
+lz4_flex = "0.13"     # LZ4 frame 0x02 (fast; write-heavy default)
+miniz_oxide = "0.8"   # DEFLATE frame 0x01 (best pure-Rust ratio; read-heavy default)
+# Fresh per-object AEAD nonces for sealed frames. The key layer (loom-core) takes
+# randomness as input; the store, which owns the write path, supplies the nonce from the OS CSPRNG.
+getrandom.workspace = true
+
+# The browser store needs getrandom routed through the Web Crypto API (there is no OS CSPRNG on wasm32).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["fs", "socket"] }
+
+[target.'cfg(windows)'.dependencies]
+interprocess = { version = "2.4.2", default-features = false }
+winapi-util = "0.1"
+
+[dev-dependencies]
+# Run the canonical conformance vectors (generic over any ObjectStore) against the file backend.
+uldren-loom-conformance = { path = "../loom-conformance" }

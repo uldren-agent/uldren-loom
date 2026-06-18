@@ -1,0 +1,19 @@
+# Page-size analysis for the page-allocator `.loom` layout. The production
+# store keeps PAGE_SIZE fixed at 4096 for format stability; this standalone prototype owns the tunable
+# LOOM_PAGE_SIZE model used to compare candidate sizes.
+#
+# Run the full sweep:  ./run.sh        (or:  ./run.sh 4096 8192 16384)
+[workspace]
+
+[package]
+name = "page-size-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+loom-core = { package = "uldren-loom-core", path = "../../crates/loom-core" }
+
+[[bin]]
+name = "page-size-bench"
+path = "src/main.rs"
