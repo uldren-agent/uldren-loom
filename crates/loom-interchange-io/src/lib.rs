@@ -22,8 +22,8 @@ use loom_substrate::meetings::{
     meetings_profile_key,
 };
 use loom_substrate::versioning::{
-    BodyRef, ProfileRevisionUpdate, ProfileTransaction, ProfileTransactionState,
-    REVISION_INDEX_DIR, RevisionIndex, revision_index_path,
+    BodyRef, ProfileRevisionUpdate, ProfileTransaction, ProfileTransactionState, RevisionIndex,
+    load_current_revision_index, persist_current_revision_index_with_owner_state,
 };
 use loom_types::{Algo, Code, Digest, LoomError, Result, WorkspaceId};
 use zip::result::ZipError;
@@ -1106,14 +1106,7 @@ pub fn import_meetings_bytes(
         materialize_meetings_import_payloads(loom, workspace_id, &payloads)?
     };
     if !dry_run && changed {
-        loom.store().control_set_audited(
-            &key,
-            encoded.clone(),
-            Some(workspace_id),
-            "meetings.import",
-            Some(&profile_id),
-        )?;
-        update_meetings_revision_index(
+        let revision_index = next_meetings_revision_index(
             loom,
             workspace_id,
             &profile_id,
@@ -1121,15 +1114,45 @@ pub fn import_meetings_bytes(
             &next,
             &encoded,
         )?;
-        loom.store().control_set_audited(
-            &meetings_import_checkpoint_key(&profile_id, &imported_checkpoint.checkpoint_id),
-            checkpoint_encoded,
-            Some(workspace_id),
-            "meetings.import.checkpoint",
-            Some(&imported_checkpoint.checkpoint_id),
+        let (reference_root, objects) = loom.save_state_objects()?;
+        persist_current_revision_index_with_owner_state(
+            loom,
+            workspace_id,
+            &profile_id,
+            FacetKind::Document,
+            &revision_index,
+            loom_core::WorkflowOwnerState {
+                objects,
+                reference: loom_core::WorkflowReferenceUpdate::Set(Some(reference_root)),
+                controls: vec![
+                    loom_core::WorkflowControlWrite::Put {
+                        key,
+                        payload: encoded.clone(),
+                    },
+                    loom_core::WorkflowControlWrite::Put {
+                        key: meetings_import_checkpoint_key(
+                            &profile_id,
+                            &imported_checkpoint.checkpoint_id,
+                        ),
+                        payload: checkpoint_encoded,
+                    },
+                ],
+                audits: vec![
+                    loom_core::WorkflowAuditWrite {
+                        principal: Some(workspace_id),
+                        action: "meetings.import".to_string(),
+                        target: Some(profile_id.clone()),
+                    },
+                    loom_core::WorkflowAuditWrite {
+                        principal: Some(workspace_id),
+                        action: "meetings.import.checkpoint".to_string(),
+                        target: Some(imported_checkpoint.checkpoint_id.clone()),
+                    },
+                ],
+            },
         )?;
     }
-    if !dry_run && (changed || payload_bytes > 0) {
+    if !dry_run && !changed && payload_bytes > 0 {
         save_loom(loom)?;
     }
     let mut report = ImportReport::new(ImportReportInput {
@@ -1734,14 +1757,14 @@ fn merge_meetings_snapshot(
     )
 }
 
-fn update_meetings_revision_index(
-    loom: &mut Loom<FileStore>,
-    workspace_id: WorkspaceId,
+fn next_meetings_revision_index(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
     profile_id: &str,
     previous: Option<&MeetingsProfileSnapshot>,
     next: &MeetingsProfileSnapshot,
     snapshot_bytes: &[u8],
-) -> Result<()> {
+) -> Result<RevisionIndex> {
     let previous_meetings = previous
         .map(|snapshot| {
             snapshot
@@ -1752,12 +1775,7 @@ fn update_meetings_revision_index(
         })
         .transpose()?
         .unwrap_or_default();
-    let index_path = revision_index_path(profile_id)?;
-    let index = match loom.read_file_reserved(workspace_id, &index_path) {
-        Ok(bytes) => RevisionIndex::decode(&bytes)?,
-        Err(err) if err.code == Code::NotFound => RevisionIndex::new(),
-        Err(err) => return Err(err),
-    };
+    let index = load_current_revision_index(loom, workspace, profile_id)?;
     let root = Digest::hash(loom.store().digest_algo(), snapshot_bytes);
     let mut state = ProfileTransactionState::new(root, index);
     let mut updates = Vec::new();
@@ -1795,11 +1813,8 @@ fn update_meetings_revision_index(
     }
     if changed {
         state.apply(ProfileTransaction::new(profile_id, None, root, updates)?)?;
-        loom.create_directory_reserved(workspace_id, REVISION_INDEX_DIR, true)?;
-        let index_bytes = state.into_revision_index().encode()?;
-        loom.write_file_reserved(workspace_id, &index_path, &index_bytes, 0o100644)?;
     }
-    Ok(())
+    Ok(state.into_revision_index())
 }
 
 fn merge_by<T, F>(existing: Vec<T>, incoming: Vec<T>, id: F) -> Vec<T>
@@ -3031,70 +3046,28 @@ fn archive_source_entries<S: ObjectStore>(
     revision: Option<&str>,
 ) -> Result<Vec<ArchiveSourceEntry>> {
     let mut entries = Vec::new();
-    if let Some(revision) = revision {
-        for entry in loom.committed_fs_entries(ns, revision)? {
-            match entry.kind {
-                FileKind::Directory => entries.push(ArchiveSourceEntry {
-                    path: entry.path,
-                    kind: ArchiveEntryKind::Directory,
-                    bytes: Vec::new(),
-                }),
-                FileKind::File => entries.push(ArchiveSourceEntry {
-                    path: entry.path,
-                    kind: ArchiveEntryKind::File,
-                    bytes: entry.bytes,
-                }),
-                FileKind::Symlink => {
-                    return Err(LoomError::unsupported(format!(
-                        "archive export does not support symlink {}",
-                        entry.path
-                    )));
-                }
-            }
-        }
-    } else {
-        collect_archive_source_entries(loom, ns, "", &mut entries)?;
-    }
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(entries)
-}
-
-fn collect_archive_source_entries<S: ObjectStore>(
-    loom: &Loom<S>,
-    ns: WorkspaceId,
-    dir: &str,
-    out: &mut Vec<ArchiveSourceEntry>,
-) -> Result<()> {
-    let mut children = loom.list_directory(ns, dir)?;
-    children.sort_by(|left, right| left.name.cmp(&right.name));
-    for child in children {
-        let path = if dir.is_empty() {
-            child.name
-        } else {
-            format!("{dir}/{}", child.name)
-        };
-        match child.kind {
-            FileKind::Directory => {
-                out.push(ArchiveSourceEntry {
-                    path: path.clone(),
-                    kind: ArchiveEntryKind::Directory,
-                    bytes: Vec::new(),
-                });
-                collect_archive_source_entries(loom, ns, &path, out)?;
-            }
-            FileKind::File => out.push(ArchiveSourceEntry {
-                bytes: loom.read_file(ns, &path)?,
-                path,
+    for entry in promoted_fs_entries(loom, ns, revision)? {
+        match entry.kind {
+            FileKind::Directory => entries.push(ArchiveSourceEntry {
+                path: entry.path,
+                kind: ArchiveEntryKind::Directory,
+                bytes: Vec::new(),
+            }),
+            FileKind::File => entries.push(ArchiveSourceEntry {
+                path: entry.path,
                 kind: ArchiveEntryKind::File,
+                bytes: entry.bytes,
             }),
             FileKind::Symlink => {
                 return Err(LoomError::unsupported(format!(
-                    "archive export does not support symlink {path}"
+                    "archive export does not support symlink {}",
+                    entry.path
                 )));
             }
         }
     }
-    Ok(())
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
 }
 
 fn export_tar_bytes(entries: &[ArchiveSourceEntry]) -> Result<Vec<u8>> {
@@ -3187,90 +3160,10 @@ pub fn export_fs<S: ObjectStore>(
     options: &FsExportOptions,
 ) -> Result<ExportReport> {
     loom.authorize(ns, FacetKind::Files, AclRight::Read)?;
-    if let Some(revision) = &options.revision {
-        return export_fs_revision(loom, ns, revision, dst, options);
-    }
-    let mut report = ExportReport::new(&options.profile, &options.destination_scope)?;
-    report.dry_run = options.dry_run;
-    let mut stack = vec![String::new()];
-
-    while let Some(dir) = stack.pop() {
-        let target_dir = if dir.is_empty() {
-            dst.to_path_buf()
-        } else {
-            safe_join(dst, &dir)?
-        };
-        if !options.dry_run {
-            fs::create_dir_all(&target_dir).map_err(|e| {
-                LoomError::new(
-                    Code::Io,
-                    format!("create export directory {}: {e}", target_dir.display()),
-                )
-            })?;
-        }
-
-        for entry in loom.list_directory(ns, &dir)? {
-            let child = if dir.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{dir}/{}", entry.name)
-            };
-            match entry.kind {
-                FileKind::Directory => stack.push(child),
-                FileKind::File => {
-                    let bytes = loom.read_file(ns, &child)?;
-                    let target = safe_join(dst, &child)?;
-                    if !options.dry_run {
-                        if let Some(parent) = target.parent() {
-                            fs::create_dir_all(parent).map_err(|e| {
-                                LoomError::new(
-                                    Code::Io,
-                                    format!("create export directory {}: {e}", parent.display()),
-                                )
-                            })?;
-                        }
-                        fs::write(&target, &bytes).map_err(|e| {
-                            LoomError::new(
-                                Code::Io,
-                                format!("write export file {}: {e}", target.display()),
-                            )
-                        })?;
-                    }
-                    report.files_written += u64::from(!options.dry_run);
-                    report.bytes_out += bytes.len() as u64;
-                }
-                FileKind::Symlink => {
-                    report.fidelity_issues.push(FidelityIssue::new(
-                        FidelitySeverity::Error,
-                        child,
-                        "symlink",
-                        "filesystem export does not materialize symlinks yet",
-                    )?);
-                }
-            }
-        }
-    }
-
-    if !report.fidelity_issues.is_empty() {
-        return Err(LoomError::unsupported(
-            "filesystem export encountered unsupported symlinks",
-        ));
-    }
-
-    Ok(report)
-}
-
-fn export_fs_revision<S: ObjectStore>(
-    loom: &Loom<S>,
-    ns: WorkspaceId,
-    revision: &str,
-    dst: &Path,
-    options: &FsExportOptions,
-) -> Result<ExportReport> {
     let mut report = ExportReport::new(&options.profile, &options.destination_scope)?;
     report.dry_run = options.dry_run;
 
-    for entry in loom.committed_fs_entries(ns, revision)? {
+    for entry in promoted_fs_entries(loom, ns, options.revision.as_deref())? {
         let target = safe_join(dst, &entry.path)?;
         match entry.kind {
             FileKind::Directory => {
@@ -3321,6 +3214,23 @@ fn export_fs_revision<S: ObjectStore>(
     }
 
     Ok(report)
+}
+
+fn promoted_fs_entries<S: ObjectStore>(
+    loom: &Loom<S>,
+    ns: WorkspaceId,
+    revision: Option<&str>,
+) -> Result<Vec<loom_core::fs::CommittedFsEntry>> {
+    match revision {
+        Some(revision) => loom.committed_fs_entries(ns, revision),
+        None => {
+            let head = loom.registry().head_branch(ns)?;
+            match loom.registry().branch_tip(ns, &head)? {
+                Some(tip) => loom.committed_fs_entries(ns, &tip.to_string()),
+                None => Ok(Vec::new()),
+            }
+        }
+    }
 }
 
 fn import_zip_archive_reader<S: ObjectStore, R: Read + Seek>(
@@ -4831,12 +4741,9 @@ mod tests {
             .unwrap(),
             b"Planning summary"
         );
-        let index = RevisionIndex::decode(
-            &loom
-                .read_file_reserved(workspace, &revision_index_path(&profile_id).unwrap())
-                .unwrap(),
-        )
-        .unwrap();
+        let index =
+            loom_substrate::versioning::load_current_revision_index(&loom, workspace, &profile_id)
+                .unwrap();
         assert_eq!(index.history("meeting:meeting/note-1").len(), 1);
 
         fs::remove_dir_all(temp).unwrap();
@@ -4918,13 +4825,20 @@ mod tests {
         let snapshot = load_meetings_snapshot(&loom, &profile_id).unwrap().unwrap();
         assert_eq!(snapshot.meetings.len(), 1);
         assert_eq!(snapshot.meetings[0].title, "Planning updated");
-        let index = RevisionIndex::decode(
-            &loom
-                .read_file_reserved(workspace, &revision_index_path(&profile_id).unwrap())
-                .unwrap(),
+        let index =
+            loom_substrate::versioning::load_current_revision_index(&loom, workspace, &profile_id)
+                .unwrap();
+        assert_eq!(index.history("meeting:meeting/note-1").len(), 2);
+        drop(loom);
+        let reopened = Loom::new(FileStore::open(&store_path).unwrap());
+        let index = loom_substrate::versioning::load_current_revision_index(
+            &reopened,
+            workspace,
+            &profile_id,
         )
         .unwrap();
         assert_eq!(index.history("meeting:meeting/note-1").len(), 2);
+        drop(reopened);
 
         fs::remove_dir_all(temp).unwrap();
     }
@@ -5825,12 +5739,14 @@ mod tests {
     }
 
     #[test]
-    fn export_fs_materializes_files() {
+    fn export_fs_materializes_head_without_uncommitted_current_state() {
         let temp = std::env::temp_dir().join(format!("loom-interchange-export-{}", now_ms()));
         let mut loom = Loom::new(MemoryStore::new());
         let ns = create_test_workspace(&mut loom, 2);
         loom.create_directory(ns, "docs", true).unwrap();
         loom.write_file(ns, "docs/a.txt", b"a", 0o100644).unwrap();
+        loom.commit(ns, "nas", "snapshot", 1).unwrap();
+        loom.write_file(ns, "docs/a.txt", b"hot", 0o100644).unwrap();
 
         let report = export_fs(&loom, ns, &temp, &FsExportOptions::new("temp")).unwrap();
         assert_eq!(report.files_written, 1);
@@ -5861,6 +5777,31 @@ mod tests {
         assert_eq!(loom.read_file(ns, "note.txt").unwrap(), b"v2");
 
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn archive_export_materializes_head_without_uncommitted_current_state() {
+        let mut loom = Loom::new(MemoryStore::new());
+        let ns = create_test_workspace(&mut loom, 20);
+        loom.create_directory(ns, "docs", true).unwrap();
+        loom.write_file(ns, "docs/a.txt", b"a", 0o100644).unwrap();
+        loom.commit(ns, "nas", "snapshot", 1).unwrap();
+        loom.write_file(ns, "docs/a.txt", b"hot", 0o100644).unwrap();
+
+        let result = export_archive_bytes(
+            &loom,
+            ns,
+            ArchiveKind::Zip,
+            &ArchiveExportOptions::new("out.zip"),
+        )
+        .unwrap();
+        let entry = result
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "docs/a.txt")
+            .unwrap();
+        assert_eq!(entry.digest, Some(Digest::blake3(b"a")));
     }
 
     #[test]
@@ -6186,6 +6127,7 @@ mod tests {
         src.create_directory(ns, "docs", true).unwrap();
         src.write_file(ns, "docs/a.txt", b"alpha", 0o100644)
             .unwrap();
+        src.commit(ns, "test", "promote archive source", 1).unwrap();
 
         let first = export_archive(
             &src,

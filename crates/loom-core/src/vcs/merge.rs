@@ -96,8 +96,13 @@ impl<S: ObjectStore> Loom<S> {
             );
         }
 
-        let staged: WorkTree = merged;
-        let root = self.build_subtree(&staged, &merged_dirs, "")?;
+        self.work.insert(ns, merged);
+        self.dirs.insert(ns, merged_dirs);
+        crate::document::materialize_document_current_overlays_for_commit(self, ns)?;
+        let files = self.work.get(&ns).cloned().unwrap_or_default();
+        let dirs = self.dirs.get(&ns).cloned().unwrap_or_default();
+        self.validate_vcs_namespace_preflight(&files, &dirs)?;
+        let root = self.build_subtree(&files, &dirs, "")?;
         let commit = Object::Commit(Commit {
             tree: root,
             parents: vec![ours, theirs],
@@ -310,8 +315,10 @@ impl<S: ObjectStore> Loom<S> {
         let message = m.message.clone();
 
         let head = self.registry.head_branch(ns)?;
+        crate::document::materialize_document_current_overlays_for_commit(self, ns)?;
         let files = self.work.get(&ns).cloned().unwrap_or_default();
         let dirs = self.dirs.get(&ns).cloned().unwrap_or_default();
+        self.validate_vcs_namespace_preflight(&files, &dirs)?;
         let root = self.build_subtree(&files, &dirs, "")?;
         let commit = Object::Commit(Commit {
             tree: root,

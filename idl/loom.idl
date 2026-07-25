@@ -1213,6 +1213,7 @@ interface Document {
     bytes list_binary(LoomSession handle, string workspace, string collection);
     void put_binary_indexed(LoomSession handle, string workspace, string collection, string id, bytes bytes);
     bool delete(LoomSession handle, string workspace, string collection, string id);
+    bool delete_collection(LoomSession handle, string workspace, string collection);
     bool delete_indexed(LoomSession handle, string workspace, string collection, string id);
     DocumentReplaceTextResult replace_text_indexed(LoomSession handle, string workspace, string collection, string id, string find, string replace, bool replace_all, Digest base_digest);
     // The collection names present in the workspace, canonical CBOR array of strings.

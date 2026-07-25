@@ -6,7 +6,7 @@
 This spec defines the document facet: versioned collections of id-keyed opaque documents, commonly
 JSON or CBOR bytes. Current source implements the Rust substrate in `loom-core::document`, the
 workspace-scoped public facade (`document_put_text`/`document_get_text`/`document_put_binary`/
-`document_get_binary`/`document_list_binary`/`doc_delete`), the language-neutral IDL
+`document_get_binary`/`document_list_binary`/`doc_delete`/`doc_delete_collection`), the language-neutral IDL
 shape, the C ABI and C header projection, all eight language bindings, C ABI tests, native
 index/query projection, hosted REST/JSON-RPC/gRPC native routes, and an executable facade behavior
 runner in `loom-conformance`. The structured document canonical root (collection manifest, a prolly-tree document-identifier map of canonical
@@ -71,6 +71,7 @@ The target public operation family is:
 | `document_get_binary` | Returns raw document bytes, content digest, and `entity_tag`. | Intentionally non-text payloads such as CBOR vectors, archives, image fixtures, and protocol payloads. |
 | `document_put_binary` | Accepts raw document bytes and returns digest plus `entity_tag`. `expected_entity_tag` is optional. | Intentionally non-text payloads. |
 | `document_list_binary` | Returns the canonical byte-oriented collection representation. | Binary collection export and low-level tooling. |
+| `document_delete_collection` | Removes one document collection root plus its structured map, body, chunk, tombstone, index catalog, and index-state roots. | Active-format-safe cleanup of whole document collections. |
 
 The ambiguous public raw names `document_get`, `document_put`, and `document_list` have been removed
 in favor of their explicit `*_binary` forms across the IDL, C ABI, CLI, MCP, client, generated remote,
@@ -247,8 +248,8 @@ The native document index/query plan is the next reusable substrate before any M
 compatibility work. It must be useful without those product surfaces.
 
 Current source-backed behavior: document collections can declare single-field exact-match indexes over
-dotted JSON scalar paths; index creation backfills existing documents; `document_put_binary` and `doc_delete`
-maintain index state; unique indexes reject duplicate scalar keys before writing the new document;
+dotted JSON scalar paths; index creation backfills existing documents; `document_put_binary`, `doc_delete`,
+and `doc_delete_collection` maintain index and collection visibility state; unique indexes reject duplicate scalar keys before writing the new document;
 readiness/status, rebuild, drop cleanup, and exact-match `document.find` are available in core,
 hosted REST/JSON-RPC, MCP `document_query`, CLI, C ABI/IDL/header, C++, iOS, JVM, Android KMP, React
 Native, Node, Python, and WASM. The native query AST is also source-backed in core, hosted
@@ -354,7 +355,7 @@ Promotion scope: the native document facet structured storage root for a named c
 
 The id-keyed document facade is source-backed end to end (engine portion of the Document + Time-series +
 Ledger batch): `loom-core::document` adds explicit text and binary document functions plus `doc_delete` (string id, absent
-reads as empty/None); projected to IDL `interface Document`, C ABI `loom_doc_*` (with a round-trip
+reads as empty/None) and `doc_delete_collection` (whole collection, absent reads as empty/None); projected to IDL `interface Document`, C ABI `loom_doc_*` (with a round-trip
 test), the C header, and all eight bindings; covered by the executable `run_document_facade_behavior`
 runner (put/get/replace/delete, commit/checkout versioning, clone reachability) wired into
 `certify_memory_store`, with the `document` capability flipped from `scenario` to `executable` (registry

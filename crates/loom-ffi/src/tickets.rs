@@ -254,13 +254,6 @@ fn board_scope(kind: &str, project_id: &str) -> LoomResult<BoardScope> {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn ticket_read_loom<T>(
     h: &LoomSession,
     workspace: &str,
@@ -281,35 +274,6 @@ fn ticket_write_loom<T>(
     let result = f(&mut loom, ns)?;
     save_loom(&mut loom)?;
     Ok(result)
-}
-
-fn sync_ticket_references(
-    loom: &mut Loom<FileStore>,
-    workspace: WorkspaceId,
-    ticket: &TicketSummary,
-) -> LoomResult<()> {
-    loom_tickets::update_ticket_field_references(
-        loom,
-        workspace,
-        &ticket.workspace_id,
-        &ticket.ticket_id,
-        &ticket.fields,
-    )?;
-    if let Some(operation_id) = ticket.operation_id.as_deref() {
-        loom_tickets::enqueue_ticket_reference_candidates(
-            loom,
-            workspace,
-            loom_tickets::TicketReferenceCandidateRequest {
-                workspace_id: &ticket.workspace_id,
-                ticket_id: &ticket.ticket_id,
-                operation_id,
-                source_root: Digest::parse(&ticket.profile_root)?,
-                fields: &ticket.fields,
-                now_ms: now_ms(),
-            },
-        )?;
-    }
-    Ok(())
 }
 
 fn json_result<T: Serialize>(result: LoomResult<T>) -> LoomResult<String> {
@@ -884,7 +848,6 @@ pub unsafe extern "C" fn loom_tickets_create_json(
                     expected_root,
                 },
             )?;
-            sync_ticket_references(loom, ns, &ticket)?;
             ticket_mutation_json(
                 ticket,
                 "ticket.created",
@@ -1115,7 +1078,6 @@ pub unsafe extern "C" fn loom_tickets_update_json(
                     relation_removes: &relation_removes,
                 },
             )?;
-            sync_ticket_references(loom, ns, &ticket)?;
             ticket_mutation_json(ticket, "ticket.updated", expected_root, changes)
         })
     )
@@ -1152,7 +1114,6 @@ pub unsafe extern "C" fn loom_tickets_delete_json(
                     expected_root,
                 },
             )?;
-            sync_ticket_references(loom, ns, &ticket)?;
             ticket_mutation_json(
                 ticket,
                 "ticket.deleted",
@@ -1245,7 +1206,6 @@ pub unsafe extern "C" fn loom_tickets_comment_add_json(
                     expected_root,
                 },
             )?;
-            sync_ticket_references(loom, ns, &ticket)?;
             ticket_mutation_json(ticket, "ticket.comment_added", expected_root, changes)
         })
     )
@@ -1306,7 +1266,6 @@ pub unsafe extern "C" fn loom_tickets_comment_update_json(
                     expected_root,
                 },
             )?;
-            sync_ticket_references(loom, ns, &ticket)?;
             ticket_mutation_json(ticket, "ticket.comment_updated", expected_root, changes)
         })
     )
@@ -1346,7 +1305,6 @@ pub unsafe extern "C" fn loom_tickets_comment_delete_json(
                     expected_root,
                 },
             )?;
-            sync_ticket_references(loom, ns, &ticket)?;
             ticket_mutation_json(
                 ticket,
                 "ticket.comment_deleted",

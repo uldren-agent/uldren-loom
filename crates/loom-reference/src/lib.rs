@@ -1,12 +1,13 @@
 //! Durable reference-reconciliation records and bounded scheduling.
 
 use loom_core::acl::{AclResource, AclResourceScope, AclScopeKind};
-use loom_core::document::{doc_get, doc_list, doc_put};
+use loom_core::document::{doc_get, doc_list, doc_list_collections, doc_put};
 use loom_core::error::{Code, LoomError, Result};
 use loom_core::tabular::{ColumnType, Predicate, RowCursor, Schema, Table, Value as TableValue};
 use loom_core::workspace::{FacetKind, WorkspaceId};
 use loom_core::{
-    AclRight, Digest, GraphValue, Loom, Props, doc_delete, graph_edges, graph_remove_edge,
+    AclRight, BoundedEnginePlanner, Digest, EnginePathSelector, EnginePlanningScope, GraphValue,
+    Loom, MutableOverlay, ObjectStore, Props, doc_delete, graph_edges, graph_remove_edge,
     graph_upsert_edge, graph_upsert_node,
 };
 use loom_store::FileStore;
@@ -105,6 +106,35 @@ pub fn create_reference_artifact(
     workspace: WorkspaceId,
     request: ReferenceArtifactCreateRequest<'_>,
 ) -> Result<ReferenceArtifactSummary> {
+    let prepared = prepare_reference_artifact(loom, workspace, request)?;
+    match &prepared.control {
+        loom_core::WorkflowControlWrite::Put { key, payload } => {
+            loom.store().control_set(key, payload.clone())?;
+        }
+        loom_core::WorkflowControlWrite::Delete { .. } => {
+            return Err(LoomError::corrupt(
+                "prepared reference artifact cannot be a delete",
+            ));
+        }
+        loom_core::WorkflowControlWrite::AppendRetained { .. } => {
+            return Err(LoomError::corrupt(
+                "prepared reference artifact cannot be retained history",
+            ));
+        }
+    }
+    Ok(prepared.summary)
+}
+
+pub struct PreparedReferenceArtifact {
+    pub summary: ReferenceArtifactSummary,
+    pub control: loom_core::WorkflowControlWrite,
+}
+
+pub fn prepare_reference_artifact(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    request: ReferenceArtifactCreateRequest<'_>,
+) -> Result<PreparedReferenceArtifact> {
     loom.authorize(workspace, FacetKind::Vcs, AclRight::Write)?;
     let source_ref = EntityRef::parse(request.source_ref)?;
     let target_ref = request.target_ref.map(EntityRef::parse).transpose()?;
@@ -126,8 +156,11 @@ pub fn create_reference_artifact(
         ));
     }
     let body = record.encode()?;
-    loom.store().control_set(&key, body.clone())?;
-    reference_artifact_summary(request.workspace_id, record, body)
+    let summary = reference_artifact_summary(request.workspace_id, record, body.clone())?;
+    Ok(PreparedReferenceArtifact {
+        summary,
+        control: loom_core::WorkflowControlWrite::Put { key, payload: body },
+    })
 }
 
 pub fn get_reference_artifact(
@@ -148,8 +181,8 @@ pub fn get_reference_artifact(
         .transpose()
 }
 
-pub fn load_index(
-    loom: &Loom<FileStore>,
+pub fn load_index<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
 ) -> Result<Option<ReferenceIndex>> {
     loom.authorize_file_path(workspace, INDEX_PATH, AclRight::Read)?;
@@ -160,8 +193,8 @@ pub fn load_index(
     }
 }
 
-pub fn save_index(
-    loom: &mut Loom<FileStore>,
+pub fn save_index<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     index: &ReferenceIndex,
 ) -> Result<()> {
@@ -214,8 +247,8 @@ pub fn references_from(
     Ok(load_or_rebuild_index(loom, workspace)?.outbound(source))
 }
 
-pub fn project_reference_index_edges(
-    loom: &mut Loom<FileStore>,
+pub fn project_reference_index_edges<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     index: &ReferenceIndex,
 ) -> Result<()> {
@@ -309,38 +342,81 @@ pub struct ReplaceTextOutcome {
 
 /// `document.put` + overlay: store `doc` at `id` in `collection`, then refresh the document's outgoing
 /// references from its (UTF-8) body text.
-pub fn put_document_indexed(
-    loom: &mut Loom<FileStore>,
+pub fn put_document_indexed<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     collection: &str,
     id: &str,
     doc: Vec<u8>,
 ) -> Result<()> {
+    let state_before = (!loom.is_bounded_planner()).then(|| loom.export_state());
+    let existing = match doc_list(loom, workspace, collection) {
+        Ok(collection) => collection,
+        Err(error) if error.code == Code::NotFound => loom_core::document::Collection::new(),
+        Err(error) => return Err(error),
+    };
     let text = std::str::from_utf8(&doc).ok().map(str::to_string);
-    doc_put(loom, workspace, collection, id, doc)?;
-    update_document_refs(loom, workspace, collection, id, text.as_deref())
+    let result = (|| {
+        let mut index = load_or_rebuild_index(loom, workspace)?;
+        for (existing_id, existing_doc) in existing.iter() {
+            let source = ReferenceSource::new("document", collection, existing_id, "body")?;
+            index.remove_source(&source);
+            if existing_id != id
+                && let Ok(existing_text) = std::str::from_utf8(existing_doc)
+            {
+                index.add_text_refs(source, "refers_to", existing_text)?;
+            }
+        }
+        let source = ReferenceSource::new("document", collection, id, "body")?;
+        index.remove_source(&source);
+        if let Some(text) = text {
+            index.add_text_refs(source, "refers_to", &text)?;
+        }
+        save_index(loom, workspace, &index)?;
+        project_reference_index_edges(loom, workspace, &index)?;
+        doc_put(loom, workspace, collection, id, doc)
+    })();
+    if let Err(error) = result {
+        if let Some(state_before) = state_before {
+            loom.import_state(&state_before)?;
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// `document.delete` + overlay: remove `id`; if it was present, drop its reference-index source. Returns
 /// whether the document existed.
-pub fn delete_document_indexed(
-    loom: &mut Loom<FileStore>,
+pub fn delete_document_indexed<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     collection: &str,
     id: &str,
 ) -> Result<bool> {
-    let deleted = doc_delete(loom, workspace, collection, id)?;
-    if deleted {
-        update_document_refs(loom, workspace, collection, id, None)?;
+    if doc_get(loom, workspace, collection, id)?.is_none() {
+        return Ok(false);
     }
-    Ok(deleted)
+    let state_before = (!loom.is_bounded_planner()).then(|| loom.export_state());
+    let result = (|| {
+        update_document_refs(loom, workspace, collection, id, None)?;
+        doc_delete(loom, workspace, collection, id)
+    })();
+    match result {
+        Ok(deleted) => Ok(deleted),
+        Err(error) => {
+            if let Some(state_before) = state_before {
+                loom.import_state(&state_before)?;
+            }
+            Err(error)
+        }
+    }
 }
 
 /// `document.replace_text` + overlay: verify `base_digest` matches the current document, apply the
 /// find/replace (all occurrences when `replace_all`, else the first), store the result, and refresh the
 /// document's references from the new text. Returns the replacement count and the new content address.
-pub fn replace_text_indexed(
-    loom: &mut Loom<FileStore>,
+pub fn replace_text_indexed<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     collection: &str,
     id: &str,
@@ -380,8 +456,17 @@ pub fn replace_text_indexed(
     let new_text = std::str::from_utf8(&bytes)
         .map_err(|_| LoomError::invalid("updated document is not utf-8 text"))?
         .to_string();
-    doc_put(loom, workspace, collection, id, bytes)?;
-    update_document_refs(loom, workspace, collection, id, Some(&new_text))?;
+    let state_before = (!loom.is_bounded_planner()).then(|| loom.export_state());
+    let result = (|| {
+        update_document_refs(loom, workspace, collection, id, Some(&new_text))?;
+        doc_put(loom, workspace, collection, id, bytes)
+    })();
+    if let Err(error) = result {
+        if let Some(state_before) = state_before {
+            loom.import_state(&state_before)?;
+        }
+        return Err(error);
+    }
     Ok(ReplaceTextOutcome {
         replacements: replacements as u64,
         digest: digest.to_string(),
@@ -421,8 +506,8 @@ pub fn remove_graph_edge_indexed(
 
 /// Refresh the reference-index entries whose source is document `collection`/`id` body: drop the old
 /// entries and, when `text` is present, re-extract markdown references from it.
-pub fn update_document_refs(
-    loom: &mut Loom<FileStore>,
+pub fn update_document_refs<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     collection: &str,
     id: &str,
@@ -440,8 +525,8 @@ pub fn update_document_refs(
 
 /// Refresh the reference-index entry for graph edge `collection`/`edge_id`: drop the old source and, when
 /// `dst` parses as an entity reference, add an edge from the `"{src} {label} {dst}"` evidence.
-pub fn update_graph_edge_refs(
-    loom: &mut Loom<FileStore>,
+pub fn update_graph_edge_refs<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     collection: &str,
     edge_id: &str,
@@ -466,8 +551,8 @@ pub fn update_graph_edge_refs(
 }
 
 /// Drop the reference-index source for graph edge `collection`/`edge_id`.
-pub fn remove_graph_edge_refs(
-    loom: &mut Loom<FileStore>,
+pub fn remove_graph_edge_refs<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     collection: &str,
     edge_id: &str,
@@ -481,8 +566,8 @@ pub fn remove_graph_edge_refs(
 
 /// Load the workspace's reference index, or rebuild it from the document/graph facets when absent. Shared
 /// by the indexed writes and by the reconciliation/alias paths so they see one index-materialization rule.
-pub fn load_or_rebuild_index(
-    loom: &Loom<FileStore>,
+pub fn load_or_rebuild_index<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
 ) -> Result<ReferenceIndex> {
     match load_index(loom, workspace)? {
@@ -491,12 +576,33 @@ pub fn load_or_rebuild_index(
     }
 }
 
-fn rebuild_reference_index(
-    loom: &Loom<FileStore>,
+pub fn bounded_planner_with_reference_index<'a, S: ObjectStore>(
+    loom: &'a Loom<S>,
+    scope: EnginePlanningScope,
+    base_root: Digest,
+    overlay: MutableOverlay,
+) -> Result<(BoundedEnginePlanner<'a, S>, ReferenceIndex)> {
+    let workspace = scope.workspace;
+    let planner = loom.bounded_engine_planner(scope.clone(), base_root, overlay.clone())?;
+    if let Some(index) = load_index(planner.engine(), workspace)? {
+        return Ok((planner, index));
+    }
+
+    let scope = scope.with_read_paths([
+        EnginePathSelector::Prefix(loom_core::workspace::facet_root(FacetKind::Document)),
+        EnginePathSelector::Prefix(loom_core::workspace::facet_root(FacetKind::Graph)),
+    ])?;
+    let planner = loom.bounded_engine_planner(scope, base_root, overlay)?;
+    let index = rebuild_reference_index(planner.engine(), workspace)?;
+    Ok((planner, index))
+}
+
+fn rebuild_reference_index<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
 ) -> Result<ReferenceIndex> {
     let mut index = ReferenceIndex::new();
-    for collection in loom.list_collections(workspace, FacetKind::Document) {
+    for collection in doc_list_collections(loom, workspace)? {
         let documents = match doc_list(loom, workspace, &collection) {
             Ok(documents) => documents,
             Err(e) if matches!(e.code, Code::PermissionDenied | Code::NotFound) => continue,
@@ -1256,6 +1362,7 @@ fn authorize_table(
 mod tests {
     use super::*;
     use loom_core::Algo;
+    use loom_store::open_loom_unlocked;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_loom() -> (String, Loom<FileStore>, WorkspaceId) {
@@ -1401,9 +1508,9 @@ mod tests {
         assert_eq!(inbound[0].source.entity_id, "decision");
         assert_eq!(inbound[0].relation, "refers_to");
 
-        let graph_edges = graph_edges(&loom, workspace, REFERENCE_GRAPH).unwrap();
-        assert_eq!(graph_edges.len(), 1);
-        let (_, edge) = graph_edges.into_iter().next().unwrap();
+        let projected_edges = graph_edges(&loom, workspace, REFERENCE_GRAPH).unwrap();
+        assert_eq!(projected_edges.len(), 1);
+        let (_, edge) = projected_edges.into_iter().next().unwrap();
         assert_eq!(edge.src, "document:notes:decision");
         assert_eq!(edge.dst, "ticket:ticket-1");
         assert_eq!(edge.label, "refers_to");
@@ -1411,6 +1518,78 @@ mod tests {
             edge.props.get("derived_from"),
             Some(&GraphValue::Text("references".to_string()))
         );
+        drop(loom);
+
+        let reopened = open_loom_unlocked(std::path::Path::new(&path), None).unwrap();
+        assert_eq!(
+            doc_get(&reopened, workspace, "notes", "decision")
+                .unwrap()
+                .as_deref(),
+            Some(b"See !ticket:ticket-1 for ownership.".as_slice())
+        );
+        assert_eq!(
+            references_to(&reopened, workspace, &target).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            graph_edges(&reopened, workspace, REFERENCE_GRAPH)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bounded_reference_rebuild_reads_pinned_sources_without_emitting_source_writes() {
+        let (path, mut loom, workspace) = test_loom();
+        doc_put(
+            &mut loom,
+            workspace,
+            "notes",
+            "decision",
+            b"See !ticket:ticket-1 for ownership.".to_vec(),
+        )
+        .unwrap();
+        loom_store::save_loom(&mut loom).unwrap();
+        assert_eq!(
+            doc_list_collections(&loom, workspace).unwrap(),
+            vec!["notes".to_string()]
+        );
+        assert!(load_index(&loom, workspace).unwrap().is_none());
+
+        let snapshot =
+            loom_core::WorkflowPlanningSnapshot::open(loom.store(), Some("reference.rebuild.plan"))
+                .unwrap();
+        let base_root = snapshot.immutable_base_root().unwrap();
+        let scope = EnginePlanningScope::new(
+            workspace,
+            [
+                EnginePathSelector::Exact(INDEX_PATH.to_string()),
+                EnginePathSelector::Exact(loom_core::workspace::facet_path(
+                    FacetKind::Graph,
+                    REFERENCE_GRAPH,
+                )),
+            ],
+        )
+        .unwrap();
+        let io_before = loom.engine_state_io_counts();
+        let (planner, index) =
+            bounded_planner_with_reference_index(&loom, scope, base_root, snapshot.fork_overlay())
+                .unwrap();
+        assert_eq!(
+            doc_list_collections(planner.engine(), workspace).unwrap(),
+            vec!["notes".to_string()]
+        );
+        let target = EntityRef::parse("ticket:ticket-1").unwrap();
+        assert_eq!(index.inbound(&target).len(), 1);
+        let (delta, _) = planner.finish().unwrap();
+        assert_eq!(delta.changed_path_count(), 0);
+        let io_after = loom.engine_state_io_counts();
+        assert_eq!(io_after.full_exports, io_before.full_exports);
+        assert_eq!(io_after.full_imports, io_before.full_imports);
+        assert_eq!(io_after.unrelated_section_rewrites, 0);
         let _ = std::fs::remove_file(path);
     }
 

@@ -387,6 +387,7 @@ catalog-only, with no served-store state to project, so they reject remote perma
 | document | `document_query` | Document | query_json | read | HOST COMPOSITE | SHIPPED (task 397): host-assembled over remote primitives (`document_list_binary` + `query_json`/`find_json` + `Store.digest_algo`), byte parity to local incl. per-item digest |
 | document | `document_replace_text` | Document | replace_text_indexed | write | IDL unary + overlay | SHIPPED (395): forwards to `Document::replace_text_indexed` (find/replace + ref-index overlay in loom-reference; `{replacements,digest}` via `loom_wire::document`) |
 | document | `document_delete` | Document | delete | write | IDL unary + overlay | SHIPPED (395): forwards to `Document::delete_indexed` (engine delete + ref-index overlay) |
+| document | `document_delete_collection` | Document | delete_collection | write | IDL unary | SHIPPED (MX-390): removes the document collection plus structured roots; local MCP also clears ref-index sources for deleted documents |
 | document | `document_list_binary` | Document | list_binary | read | IDL unary | SHIPPED: forwards collection bytes from `LoomClient::Document::list` under the explicit binary MCP name |
 | document | `document_list_collections` | Document | list_collections | read | IDL unary | Implement over remote (forward to `LoomClient::Document::list_collections`) |
 | drive | `drive_list` | Store | - | read | HOST/COMPOSITE (server-executed) | Execute server-side beside the served store; result byte-compatible with the local MCP path |

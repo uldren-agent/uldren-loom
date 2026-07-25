@@ -159,6 +159,23 @@ impl LoomSql {
         Ok(present)
     }
 
+    /// Remove collection `collection` and its structured roots; returns whether it was present.
+    pub fn doc_delete_collection(
+        &mut self,
+        workspace: String,
+        collection: String,
+    ) -> Result<bool, JsError> {
+        if self.readonly {
+            return Err(JsError::new("this session is a read-only snapshot"));
+        }
+        let ns = resolve_workspace_arg(&self.loom, &workspace)?;
+        let present = doc_delete_collection(&mut self.loom, ns, &collection).map_err(le)?;
+        if present {
+            save_loom(&mut self.loom).map_err(le)?;
+        }
+        Ok(present)
+    }
+
     /// List collection `collection` as its canonical binary representation.
     pub fn doc_list_binary(
         &self,

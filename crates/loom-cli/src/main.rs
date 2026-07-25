@@ -43,9 +43,7 @@ use loom_interchange_io::{
     parse_meetings_input_profile, persist_import_checkpoint, retain_import_input,
     validate_meetings_source_payload_leaf,
 };
-use loom_lanes::{
-    Lane, LaneDecodeDiagnostic, LaneInput, LaneKind, LaneStatus, LaneTicketView, LaneView,
-};
+use loom_lanes::{Lane, LaneDecodeDiagnostic, LaneInput, LaneKind, LaneStatus, LaneView};
 use loom_sql::LoomSqlStore;
 use loom_store::{
     AuditConfig, DerivedArtifactRebuild, DerivedArtifactRecord, DerivedArtifactStatus, FileStore,
@@ -72,6 +70,7 @@ use loom_substrate::meetings::{
     Coverage as MeetingsCoverage, InputProfile, MeetingRecordInput, MeetingsProfileSnapshotParts,
     SourceRecord, SourceRecordInput, SpanKind, SpanRecord,
 };
+#[cfg(test)]
 use loom_substrate::pages::{PageOperationLog, page_profile_operation_log_key};
 use loom_substrate::search::{
     EMBEDDING_PROJECTION_JOBS_DIR, EmbeddingProjectionJob, EmbeddingProjectionKey,
@@ -82,7 +81,8 @@ use loom_substrate::surfaces::{
     surface_app_catalog, surface_catalog_json,
 };
 use loom_substrate::versioning::{
-    BodyRef, REVISION_INDEX_DIR, RevisionBackfillUpdate, RevisionIndex, revision_index_path,
+    BodyRef, RevisionBackfillUpdate, RevisionIndex, load_optional_current_revision_index,
+    persist_current_revision_index,
 };
 use loom_types::{
     InferenceModelKind, ModelFitReport, ModelRef, MutationChange, MutationEnvelope,
@@ -2375,6 +2375,16 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             println!("{present}");
             Ok(())
         }
+        DocumentCmd::DeleteCollection {
+            store,
+            workspace,
+            collection,
+        } => {
+            let client = remote::open_store_client(&store)?;
+            let present = client.doc_delete_collection(keys, &workspace, &collection)?;
+            println!("{present}");
+            Ok(())
+        }
         DocumentCmd::GetText {
             store,
             workspace,
@@ -3165,6 +3175,12 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             } else {
                 None
             };
+            // Contract summaries/details accept `@path` to load the value from a file (markdown/text
+            // can be large); `@@` escapes a literal leading `@`.
+            let owner_contract_summary = expand_at_file_opt(owner_contract_summary)?;
+            let owner_contract_details = expand_at_file_opt(owner_contract_details)?;
+            let worker_contract_summary = expand_at_file_opt(worker_contract_summary)?;
+            let worker_contract_details = expand_at_file_opt(worker_contract_details)?;
             let mut loom = cli_open_loom(&store, keys)?;
             let workspace_id = resolve_ns(&loom, &workspace)?;
             let profile_id = workspace_id.to_string();
@@ -3415,7 +3431,6 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
                 },
             )
             .map_err(|e| e.to_string())?;
-            update_ticket_reference_index(&mut loom, workspace_id, &ticket)?;
             save_loom(&mut loom).map_err(|e| e.to_string())?;
             let envelope = ticket_mutation_envelope(
                 ticket,
@@ -3561,6 +3576,10 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
                     relation_id: &relation.relation_id,
                 })
                 .collect::<Vec<_>>();
+            let overlay_only_update = comment.is_none()
+                && comments.is_empty()
+                && relation_sets.is_empty()
+                && relation_removes.is_empty();
             let ticket = loom_tickets::update_ticket(
                 &mut loom,
                 workspace_id,
@@ -3582,8 +3601,9 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
                 },
             )
             .map_err(|e| e.to_string())?;
-            update_ticket_reference_index(&mut loom, workspace_id, &ticket)?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            if !overlay_only_update {
+                save_loom(&mut loom).map_err(|e| e.to_string())?;
+            }
             let envelope = ticket_mutation_envelope(
                 ticket,
                 "ticket.updated",
@@ -3612,7 +3632,6 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
                 },
             )
             .map_err(|e| e.to_string())?;
-            update_ticket_reference_index(&mut loom, workspace_id, &ticket)?;
             save_loom(&mut loom).map_err(|e| e.to_string())?;
             let envelope = ticket_mutation_envelope(
                 ticket,
@@ -3669,7 +3688,6 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
                 },
             )
             .map_err(|e| e.to_string())?;
-            update_ticket_reference_index(&mut loom, workspace_id, &ticket)?;
             save_loom(&mut loom).map_err(|e| e.to_string())?;
             let envelope = ticket_mutation_envelope(
                 ticket,
@@ -3712,7 +3730,6 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
                 },
             )
             .map_err(|e| e.to_string())?;
-            update_ticket_reference_index(&mut loom, workspace_id, &ticket)?;
             save_loom(&mut loom).map_err(|e| e.to_string())?;
             let envelope = ticket_mutation_envelope(
                 ticket,
@@ -3748,7 +3765,6 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
                 },
             )
             .map_err(|e| e.to_string())?;
-            update_ticket_reference_index(&mut loom, workspace_id, &ticket)?;
             save_loom(&mut loom).map_err(|e| e.to_string())?;
             let envelope = ticket_mutation_envelope(
                 ticket,
@@ -4124,6 +4140,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             ticket_id,
             projection,
             detailed,
+            compact,
             format,
         } => {
             let loom = cli_open_loom_read(&store, keys)?;
@@ -4145,7 +4162,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             let comments =
                 loom_tickets::list_ticket_comments(&loom, workspace_id, &profile_id, &ticket_id)
                     .map_err(|e| e.to_string())?;
-            print_ticket_detail(&ticket, &history, &comments, detailed, &format)
+            print_ticket_detail(&ticket, &history, &comments, detailed, compact, &format)
         }
         TicketsCmd::History {
             store,
@@ -4190,6 +4207,10 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             let actor = resolve_lane_actor(&loom, workspace_id, updated_by.as_deref())?;
             let lane_tickets =
                 loom_lanes::lane_tickets_from_order(&tickets).map_err(|e| e.to_string())?;
+            // Large-text lane fields accept `@path` to load from a file (`@@` escapes a literal @).
+            let description = expand_at_file(&description)?;
+            let status_report = expand_at_file(&status_report)?;
+            let reviewer_feedback = expand_at_file(&reviewer_feedback)?;
             let lane = Lane::new(LaneInput {
                 lane_id: &lane_id,
                 lane_key: &lane_key,
@@ -4226,7 +4247,13 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "lane not found".to_string())?;
             if detailed {
-                let view = build_lane_view(&loom, workspace_id, &workspace, &lane);
+                let workspace_id_text = workspace_id.to_string();
+                let view = loom_client::local::build_lane_view(
+                    &loom,
+                    workspace_id,
+                    &workspace_id_text,
+                    &lane,
+                );
                 print_lane_view(&view, &format, true)
             } else {
                 print_lane(&lane, &format)
@@ -4242,9 +4269,17 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             let workspace_id = resolve_ns(&loom, &workspace)?;
             let (lanes, diagnostics) = loom_lanes::list_lanes_with_diagnostics(&loom, workspace_id)
                 .map_err(|e| e.to_string())?;
+            let workspace_id_text = workspace_id.to_string();
             let views = lanes
                 .iter()
-                .map(|lane| build_lane_view(&loom, workspace_id, &workspace, lane))
+                .map(|lane| {
+                    loom_client::local::build_lane_view(
+                        &loom,
+                        workspace_id,
+                        &workspace_id_text,
+                        lane,
+                    )
+                })
                 .collect::<Vec<_>>();
             print_lane_views(&views, &diagnostics, &format, detailed)
         }
@@ -4268,6 +4303,10 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             {
                 return Err("lane update requires at least one field option".to_string());
             }
+            // Large-text lane fields accept `@path` to load from a file (`@@` escapes a literal @).
+            let description = expand_at_file_opt(description)?;
+            let status_report = expand_at_file_opt(status_report)?;
+            let reviewer_feedback = expand_at_file_opt(reviewer_feedback)?;
             let mut changes = Vec::new();
             if let Some(title) = title.as_ref() {
                 changes.push(MutationChange::field_set("title", title.clone()));
@@ -4328,6 +4367,67 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
                     Ok(())
                 },
             )
+        }
+        LanesCmd::Closeout {
+            store,
+            workspace,
+            lane_id,
+            ticket_workspace_id,
+            ticket_id,
+            comment_type,
+            comment_body,
+            evidence,
+            status_report,
+            updated_by,
+            format,
+        } => {
+            // Comment body and status summary accept `@path` to load from a file (`@@` escapes @).
+            let comment_body = expand_at_file(&comment_body)?;
+            let status_report = expand_at_file(&status_report)?;
+            if comment_body.trim().is_empty() {
+                return Err("lane closeout requires a non-empty comment body".to_string());
+            }
+            let evidence = match evidence {
+                Some(json) => Some(
+                    loom_tickets::TicketCommentEvidence::from_json(
+                        &serde_json::from_str(&json)
+                            .map_err(|e| format!("invalid --evidence json: {e}"))?,
+                    )
+                    .map_err(|e| e.to_string())?,
+                ),
+                None => None,
+            };
+            let mut loom = cli_open_loom(&store, keys)?;
+            let workspace_id = resolve_ns(&loom, &workspace)?;
+            loom_tickets::add_ticket_comment(
+                &mut loom,
+                workspace_id,
+                loom_tickets::TicketCommentRequest {
+                    workspace_id: &ticket_workspace_id,
+                    ticket_id: &ticket_id,
+                    comment_id: None,
+                    comment_type: Some(&comment_type),
+                    body: &comment_body,
+                    evidence,
+                    expected_root: None,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let mut lane = loom_lanes::get_lane(&loom, workspace_id, &lane_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "lane not found".to_string())?;
+            lane.status_report = status_report.clone();
+            let actor = resolve_lane_actor(&loom, workspace_id, updated_by.as_deref())?;
+            apply_lane_update_metadata(&mut lane, &actor)?;
+            let lane =
+                loom_lanes::put_lane(&mut loom, workspace_id, lane).map_err(|e| e.to_string())?;
+            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let changes = vec![
+                MutationChange::field_set("comment_type", comment_type),
+                MutationChange::field_set("status_report", status_report),
+            ];
+            let envelope = lane_mutation_envelope(lane, "lane.closeout", changes);
+            print_lane_mutation(&envelope, &format)
         }
         LanesCmd::TicketAdd {
             store,
@@ -4455,7 +4555,166 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
                 lane_mutation_envelope(lane, "lane.deleted", vec![MutationChange::ResourceDeleted]);
             print_lane_mutation(&envelope, &format)
         }
+        LanesCmd::Cleanup {
+            store,
+            workspace,
+            lane,
+            apply,
+            updated_by,
+            format,
+        } => {
+            if apply {
+                let mut loom = cli_open_loom(&store, keys)?;
+                let workspace_id = resolve_ns(&loom, &workspace)?;
+                let workspace_id_text = workspace_id.to_string();
+                let target_ids = cleanup_target_lane_ids(&loom, workspace_id, lane.as_deref())?;
+                let mut reports = Vec::new();
+                for lane_id in target_ids {
+                    let mut lane_rec = loom_lanes::get_lane(&loom, workspace_id, &lane_id)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "lane not found".to_string())?;
+                    let view = loom_client::local::build_lane_view(
+                        &loom,
+                        workspace_id,
+                        &workspace_id_text,
+                        &lane_rec,
+                    );
+                    let terminal_ids = loom_lanes::terminal_lane_ticket_ids(&view.lane_tickets);
+                    let (remaining_count, status_counts) =
+                        cleanup_remaining_summary(&view, &terminal_ids);
+                    let removed = loom_lanes::remove_lane_tickets(&mut lane_rec, &terminal_ids);
+                    if !removed.is_empty() {
+                        let actor = resolve_lane_actor(&loom, workspace_id, updated_by.as_deref())?;
+                        apply_lane_update_metadata(&mut lane_rec, &actor)?;
+                        loom_lanes::put_lane(&mut loom, workspace_id, lane_rec)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    reports.push(LaneCleanupReport {
+                        lane_id: view.lane_id.clone(),
+                        would_remove: Vec::new(),
+                        removed,
+                        remaining_count,
+                        status_counts,
+                    });
+                }
+                save_loom(&mut loom).map_err(|e| e.to_string())?;
+                print_lane_cleanup_reports(&reports, &format)
+            } else {
+                let loom = cli_open_loom_read(&store, keys)?;
+                let workspace_id = resolve_ns(&loom, &workspace)?;
+                let workspace_id_text = workspace_id.to_string();
+                let target_ids = cleanup_target_lane_ids(&loom, workspace_id, lane.as_deref())?;
+                let mut reports = Vec::new();
+                for lane_id in target_ids {
+                    let lane_rec = loom_lanes::get_lane(&loom, workspace_id, &lane_id)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "lane not found".to_string())?;
+                    let view = loom_client::local::build_lane_view(
+                        &loom,
+                        workspace_id,
+                        &workspace_id_text,
+                        &lane_rec,
+                    );
+                    let terminal_ids = loom_lanes::terminal_lane_ticket_ids(&view.lane_tickets);
+                    let (remaining_count, status_counts) =
+                        cleanup_remaining_summary(&view, &terminal_ids);
+                    reports.push(LaneCleanupReport {
+                        lane_id: view.lane_id.clone(),
+                        would_remove: terminal_ids,
+                        removed: Vec::new(),
+                        remaining_count,
+                        status_counts,
+                    });
+                }
+                print_lane_cleanup_reports(&reports, &format)
+            }
+        }
     }
+}
+
+/// A per-lane `lanes cleanup` report mirroring the MCP `lanes_cleanup` shape: in dry-run mode
+/// `would_remove` lists the terminal members an apply would drop; in apply mode `removed` lists the
+/// members actually dropped. `remaining_count`/`status_counts` describe the members that remain,
+/// derived from live ticket statuses. Tickets and their history are never mutated.
+#[derive(serde::Serialize)]
+struct LaneCleanupReport {
+    lane_id: String,
+    would_remove: Vec<String>,
+    removed: Vec<String>,
+    remaining_count: usize,
+    status_counts: loom_lanes::LaneStatusCounts,
+}
+
+/// Resolve the lanes a `lanes cleanup` targets: the single named lane, or every assignment lane when
+/// no id is given.
+fn cleanup_target_lane_ids(
+    loom: &Loom<FileStore>,
+    workspace_id: WorkspaceId,
+    lane_id: Option<&str>,
+) -> Result<Vec<String>, String> {
+    match lane_id {
+        Some(lane_id) => Ok(vec![lane_id.to_string()]),
+        None => Ok(loom_lanes::list_lanes(loom, workspace_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|lane| lane.lane_kind == LaneKind::Assignment.as_str())
+            .map(|lane| lane.lane_id)
+            .collect()),
+    }
+}
+
+/// The post-cleanup remaining member count and status counts for a lane: the members whose ids are not
+/// in `terminal_ids`, with counts recomputed over their live statuses. Identical for dry-run and apply.
+fn cleanup_remaining_summary(
+    view: &LaneView,
+    terminal_ids: &[String],
+) -> (usize, loom_lanes::LaneStatusCounts) {
+    let remaining: Vec<loom_lanes::LaneTicketView> = view
+        .lane_tickets
+        .iter()
+        .filter(|ticket| !terminal_ids.iter().any(|id| id == &ticket.ticket_id))
+        .cloned()
+        .collect();
+    let counts = loom_lanes::lane_status_counts(&remaining);
+    (remaining.len(), counts)
+}
+
+fn print_lane_cleanup_reports(reports: &[LaneCleanupReport], format: &str) -> Result<(), String> {
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(reports).map_err(|e| e.to_string())?
+        );
+    } else {
+        for report in reports {
+            println!(
+                "{}\twould_remove={}\tremoved={}\tremaining={}",
+                report.lane_id,
+                report.would_remove.join(","),
+                report.removed.join(","),
+                report.remaining_count
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Expand a CLI text argument that may reference a file: `@<path>` reads the file's contents, `@@...`
+/// is an escaped literal beginning with `@`, and any other value is returned unchanged. Used for
+/// flags that accept large markdown/text/JSON so callers can pass `@path` instead of inlining.
+fn expand_at_file(value: &str) -> Result<String, String> {
+    if let Some(rest) = value.strip_prefix("@@") {
+        return Ok(format!("@{rest}"));
+    }
+    if let Some(path) = value.strip_prefix('@') {
+        return std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"));
+    }
+    Ok(value.to_string())
+}
+
+/// Apply [`expand_at_file`] to an optional CLI text argument.
+fn expand_at_file_opt(value: Option<String>) -> Result<Option<String>, String> {
+    value.map(|value| expand_at_file(&value)).transpose()
 }
 
 fn mutate_lane<F>(
@@ -4476,9 +4735,18 @@ where
     let mut lane = loom_lanes::get_lane(&loom, workspace_id, lane_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "lane not found".to_string())?;
+    let prior_lane = lane.clone();
     mutate(&mut lane, &loom, workspace_id)?;
-    let lane = loom_lanes::put_lane(&mut loom, workspace_id, lane).map_err(|e| e.to_string())?;
-    save_loom(&mut loom).map_err(|e| e.to_string())?;
+    let lane = if operation == "lane.updated" {
+        loom_lanes::put_lane_current_record(&mut loom, workspace_id, &lane, Some(&prior_lane))
+            .map_err(|e| e.to_string())?;
+        lane
+    } else {
+        let lane =
+            loom_lanes::put_lane(&mut loom, workspace_id, lane).map_err(|e| e.to_string())?;
+        save_loom(&mut loom).map_err(|e| e.to_string())?;
+        lane
+    };
     let envelope = lane_mutation_envelope(lane, operation, changes);
     print_lane_mutation(&envelope, format)
 }
@@ -4658,7 +4926,6 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
                 expected_root.as_deref(),
             )
             .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
             print_page_update(&update, &format)
         }
         PagesCmd::Publish {
@@ -4680,7 +4947,6 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
                 expected_root.as_deref(),
             )
             .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
             print_page_publish(&publish, &format)
         }
         PagesCmd::Get {
@@ -5831,42 +6097,43 @@ fn ticket_update_request_from_parts(
     Ok(direct_request)
 }
 
-fn update_ticket_reference_index(
-    loom: &mut Loom<FileStore>,
-    workspace: WorkspaceId,
-    ticket: &loom_tickets::TicketSummary,
-) -> Result<(), String> {
-    loom_tickets::update_ticket_field_references(
-        loom,
-        workspace,
-        &ticket.workspace_id,
-        &ticket.ticket_id,
-        &ticket.fields,
-    )
-    .map_err(|e| e.to_string())?;
-    let Some(operation_id) = ticket.operation_id.as_deref() else {
-        return Ok(());
-    };
-    let source_root = Digest::parse(&ticket.profile_root).map_err(|e| e.to_string())?;
-    loom_tickets::enqueue_ticket_reference_candidates(
-        loom,
-        workspace,
-        loom_tickets::TicketReferenceCandidateRequest {
-            workspace_id: &ticket.workspace_id,
-            ticket_id: &ticket.ticket_id,
-            operation_id,
-            source_root,
-            fields: &ticket.fields,
-            now_ms: current_time_ms()?,
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod ticket_update_cli_tests {
     use super::*;
+
+    #[test]
+    fn at_file_expansion_reads_file_escapes_and_passes_through() {
+        // Plain values pass through unchanged (both owner/worker contract flags route through this).
+        assert_eq!(expand_at_file("inline value").unwrap(), "inline value");
+        // `@@` escapes a literal leading `@`.
+        assert_eq!(expand_at_file("@@literal").unwrap(), "@literal");
+        // `@path` loads the file contents (the bug: previously the literal `@path` was stored).
+        let path = std::env::temp_dir().join(format!("mx438-contract-{}.md", std::process::id()));
+        std::fs::write(&path, "# Worker Contract\n\nloaded from file").unwrap();
+        let arg = format!("@{}", path.display());
+        assert_eq!(
+            expand_at_file(&arg).unwrap(),
+            "# Worker Contract\n\nloaded from file"
+        );
+        let _ = std::fs::remove_file(&path);
+        // Representative JSON field: `@path` loads JSON text verbatim for downstream parsing.
+        let json_path =
+            std::env::temp_dir().join(format!("mx439-evidence-{}.json", std::process::id()));
+        std::fs::write(&json_path, "{\"checks_run\":[\"cargo test\"]}").unwrap();
+        assert_eq!(
+            expand_at_file(&format!("@{}", json_path.display())).unwrap(),
+            "{\"checks_run\":[\"cargo test\"]}"
+        );
+        let _ = std::fs::remove_file(&json_path);
+        // A missing file is a clear error, not a silent literal.
+        assert!(expand_at_file("@/no/such/mx438/contract").is_err());
+        // The optional wrapper used for owner/worker contract summary+details.
+        assert_eq!(expand_at_file_opt(None).unwrap(), None);
+        assert_eq!(
+            expand_at_file_opt(Some("plain".to_string())).unwrap(),
+            Some("plain".to_string())
+        );
+    }
 
     #[test]
     fn ticket_update_direct_flags_build_typed_request() {
@@ -6061,57 +6328,6 @@ fn print_lane_mutation(
     Ok(())
 }
 
-fn build_lane_view(
-    loom: &Loom<FileStore>,
-    workspace: WorkspaceId,
-    ticket_workspace_id: &str,
-    lane: &Lane,
-) -> LaneView {
-    let ticket_views = lane
-        .lane_tickets
-        .iter()
-        .map(|lane_ticket| {
-            let ticket = loom_tickets::get_ticket(
-                loom,
-                workspace,
-                ticket_workspace_id,
-                &lane_ticket.ticket_id,
-            )
-            .ok()
-            .flatten();
-            LaneTicketView {
-                ticket_id: lane_ticket.ticket_id.clone(),
-                status: ticket
-                    .as_ref()
-                    .and_then(|ticket| ticket_field_text(ticket, "status")),
-                priority: ticket
-                    .as_ref()
-                    .and_then(|ticket| ticket_field_text(ticket, "priority")),
-                title: ticket.as_ref().and_then(ticket_title_text),
-            }
-        })
-        .collect();
-    let mut view = loom_lanes::lane_view(lane, ticket_views);
-    // resolve the lane owner's display alias at the projection layer using the shared
-    // ticket-service resolver (loom-lanes cannot see the identity store).
-    view.owner_display = view
-        .owner_principal
-        .as_deref()
-        .map(|id| loom_tickets::resolve_principal_display(loom.identity_store(), id));
-    view
-}
-
-fn ticket_field_text(ticket: &loom_tickets::TicketSummary, field: &str) -> Option<String> {
-    ticket.fields.get(field).and_then(|value| match value {
-        serde_json::Value::String(value) => Some(value.clone()),
-        _ => None,
-    })
-}
-
-fn ticket_title_text(ticket: &loom_tickets::TicketSummary) -> Option<String> {
-    ticket_field_text(ticket, "title").or_else(|| ticket_field_text(ticket, "summary"))
-}
-
 fn print_lane_view(view: &LaneView, format: &str, detailed: bool) -> Result<(), String> {
     if format == "json" {
         println!(
@@ -6247,13 +6463,30 @@ fn print_ticket_comments(
     Ok(())
 }
 
+fn ticket_field_text(ticket: &loom_tickets::TicketSummary, field: &str) -> Option<String> {
+    match ticket.fields.get(field)? {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Object(map) => map
+            .get("String")
+            .or_else(|| map.get("Text"))
+            .or_else(|| map.get("EnumOption"))
+            .or_else(|| map.get("Principal"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
 fn print_ticket_detail(
     ticket: &loom_tickets::TicketSummary,
     history: &[loom_tickets::TicketHistoryRecord],
     comments: &[loom_tickets::TicketComment],
     detailed: bool,
+    compact: bool,
     format: &str,
 ) -> Result<(), String> {
+    // `--detailed` wins over `--compact`, matching the MCP `tickets_get` precedence.
+    let compact = compact && !detailed;
     if format == "json" {
         if detailed {
             println!(
@@ -6264,6 +6497,41 @@ fn print_ticket_detail(
                     "history": history
                 }))
                 .map_err(|e| e.to_string())?
+            );
+            return Ok(());
+        }
+        if compact {
+            let latest = latest_ticket_update(history);
+            let value = serde_json::json!({
+                "primary_key": ticket.primary_key,
+                "title": ticket_field_text(ticket, "title"),
+                "status": ticket_field_text(ticket, "status"),
+                "priority": ticket_field_text(ticket, "priority"),
+                "type": ticket.ticket_type,
+                "assignee": ticket_field_text(ticket, "assignee"),
+                "assignee_display": ticket_field_text(ticket, "assignee_display"),
+                "project": ticket.project_id,
+                "dependencies": {
+                    "depends_on": ticket.depends_on,
+                    "blocks": ticket.blocks,
+                    "relations": ticket.relations.iter().map(|relation| {
+                        serde_json::json!({
+                            "kind": relation.kind,
+                            "target_id": relation.target_id
+                        })
+                    }).collect::<Vec<_>>()
+                },
+                "comment_count": comments.len(),
+                "latest_update": latest.map(|latest| serde_json::json!({
+                    "actor": latest.actor,
+                    "timestamp_ms": latest.timestamp_ms,
+                    "operation_kind": latest.operation_kind,
+                    "sequence": latest.sequence
+                }))
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
             );
             return Ok(());
         }
@@ -6304,10 +6572,13 @@ fn print_ticket_detail(
         _ => println!("assignee\t{assignee}"),
     }
     println!("project\t{}", ticket.project_id);
-    println!(
-        "description\t{}",
-        ticket_field_text(ticket, "description").unwrap_or_default()
-    );
+    // The compact projection deliberately omits the heavy `description` field.
+    if !compact {
+        println!(
+            "description\t{}",
+            ticket_field_text(ticket, "description").unwrap_or_default()
+        );
+    }
     println!("depends_on\t{}", compact_string_list(&ticket.depends_on));
     println!("blocks\t{}", compact_string_list(&ticket.blocks));
     println!("relations\t{}", compact_relation_summary(&ticket.relations));
@@ -6701,11 +6972,12 @@ fn print_ticket_field_catalog(
         );
     } else {
         println!(
-            "projection\t{}\noperation\t{}\nstrict_unknown_fields\t{}\ncustom_fields_source\t{}",
+            "projection\t{}\noperation\t{}\nstrict_unknown_fields\t{}\ncustom_fields_source\t{}\nunknown_field_write_behavior\t{}",
             catalog.projection_profile,
             catalog.operation,
             catalog.strict_unknown_fields,
-            catalog.custom_fields_source
+            catalog.custom_fields_source,
+            catalog.unknown_field_write_behavior
         );
         for field in &catalog.fields {
             println!(
@@ -8147,6 +8419,58 @@ fn store_doctor_json_value(store: &str, keys: &KeyOpts) -> Result<serde_json::Va
             body["control_plane"] = serde_json::json!(["lock_fences", "identity_acl", "audit"]);
             body["maintenance"] = match fs.store_maintenance_report(now_ms()) {
                 Ok(report) => {
+                    let overlay = serde_json::json!({
+                        "generation": report.overlay_health.current_generation,
+                        "current_records": report.overlay_health.current_record_count,
+                        "tombstones": report.overlay_health.tombstone_count,
+                        "obsolete_records": report.overlay_obsolete_record_count,
+                        "live_checkpoint_references": report.overlay_health.live_checkpoint_references,
+                        "reclaimable_pages": report.overlay_health.reclaimable_overlay_pages,
+                        "obsolete_pages": report.overlay_obsolete_page_count,
+                        "blocked_reclamation_reasons": report.overlay_health.blocked_reclamation_reasons,
+                        "retained_checkpoint_blockers": report.overlay_health.blocked_reclamation_reasons,
+                        "hot_write_count": report.overlay_health.hot_write_count,
+                        "active_writer_contention_indicators": report.overlay_health.active_writer_contention_indicators,
+                    });
+                    let mvcc_pins = report
+                        .mvcc_snapshots
+                        .pins
+                        .iter()
+                        .map(|pin| {
+                            serde_json::json!({
+                                "pin_id": pin.pin_id,
+                                "overlay_generation": pin.identity.overlay_generation.as_u64(),
+                                "base_root": pin
+                                    .identity
+                                    .immutable_base_root
+                                    .as_ref()
+                                    .map(|root| root.to_string()),
+                                "owner": pin.owner,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let mvcc = serde_json::json!({
+                        "active_snapshots": report.mvcc_snapshots.active_snapshot_count,
+                        "oldest_pinned_generation": report
+                            .mvcc_snapshots
+                            .oldest_pinned_overlay_generation
+                            .map(|generation| generation.as_u64()),
+                        "pinned_reader_reclaim_pressure": report.mvcc_snapshots.active_snapshot_count > 0
+                            && report.overlay_obsolete_record_count > 0,
+                        "pins": mvcc_pins,
+                    });
+                    let group_commit = serde_json::json!({
+                        "group_commit_batches_total": report.status.group_commit.group_commit_batches_total,
+                        "group_commit_transactions_total": report.status.group_commit.group_commit_transactions_total,
+                        "group_commit_records_total": report.status.group_commit.group_commit_records_total,
+                        "fsync_total_micros": report.status.group_commit.fsync_total_micros,
+                        "fsync_count": report.status.group_commit.fsync_count,
+                        "write_lock_wait_total_micros": report.status.group_commit.write_lock_wait_total_micros,
+                        "write_lock_wait_count": report.status.group_commit.write_lock_wait_count,
+                        "pending_durable_window_transactions": report.status.group_commit.pending_durable_window_transactions,
+                        "pending_durable_window_records": report.status.group_commit.pending_durable_window_records,
+                        "pinned_reader_blockers": report.status.group_commit.pinned_reader_blockers,
+                    });
                     let mut maintenance = serde_json::json!({
                         "state": "ok",
                         "eligible": report.eligible,
@@ -8177,6 +8501,9 @@ fn store_doctor_json_value(store: &str, keys: &KeyOpts) -> Result<serde_json::Va
                         "mark_epoch": report.mark_epoch,
                         "mark_completed": report.mark_completed,
                         "last_validated_mark_epoch": report.status.last_validated_mark_epoch,
+                        "overlay": overlay,
+                        "mvcc": mvcc,
+                        "group_commit": group_commit,
                     });
                     if let Ok(loom) = store_doctor_diagnostics_loom(&paths.store, &fs, keys)
                         && let Ok(diagnostics) = cli_live_root_diagnostics(&loom)
@@ -9458,11 +9785,10 @@ fn rebuild_pages_revision_index(
 ) -> Result<RevisionRebuildReport, String> {
     loom.authorize(workspace, FacetKind::Vcs, AclRight::Write)
         .map_err(|e| e.to_string())?;
-    let key = page_profile_operation_log_key(scope_id).map_err(|e| e.to_string())?;
-    let Some(bytes) = loom.store().control_get(&key).map_err(|e| e.to_string())? else {
+    let log = loom_pages::page_operation_log(loom.store(), scope_id).map_err(|e| e.to_string())?;
+    if log.records.is_empty() {
         return Err("pages operation log not found".to_string());
-    };
-    let log = PageOperationLog::decode(&bytes).map_err(|e| e.to_string())?;
+    }
     let mut latest = BTreeMap::new();
     for record in log.records.iter().rev() {
         let Some(target) = record.target_entity_id.as_deref() else {
@@ -9583,24 +9909,19 @@ fn apply_revision_backfill(
     dry_run: bool,
     updates: Vec<RevisionBackfillUpdate>,
 ) -> Result<RevisionRebuildReport, String> {
-    let index_path = revision_index_path(scope_id).map_err(|e| e.to_string())?;
-    let (mut index, index_present_before) = match loom.read_file_reserved(workspace, &index_path) {
-        Ok(bytes) => (
-            RevisionIndex::decode(&bytes).map_err(|e| e.to_string())?,
-            true,
-        ),
-        Err(err) if err.code == Code::NotFound => (RevisionIndex::new(), false),
-        Err(err) => return Err(err.to_string()),
-    };
+    let (mut index, index_present_before) =
+        match load_optional_current_revision_index(loom, workspace, scope_id)
+            .map_err(|e| e.to_string())?
+        {
+            Some(index) => (index, true),
+            None => (RevisionIndex::new(), false),
+        };
     let candidates = updates.len() as u64;
     let backfill = index
         .backfill_missing_current(scope_id, updates)
         .map_err(|e| e.to_string())?;
     if !dry_run && backfill.inserted > 0 {
-        loom.create_directory_reserved(workspace, REVISION_INDEX_DIR, true)
-            .map_err(|e| e.to_string())?;
-        let encoded = index.encode().map_err(|e| e.to_string())?;
-        loom.write_file_reserved(workspace, &index_path, &encoded, 0o100644)
+        persist_current_revision_index(loom, workspace, scope_id, FacetKind::Document, &index)
             .map_err(|e| e.to_string())?;
     }
     Ok(RevisionRebuildReport {
@@ -11930,6 +12251,7 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
             let source = cli_open_loom_read(&src, keys)?;
             let source_encrypted = source.store().is_encrypted();
             let workspace_count = source.registry().list(None).len();
+            let freshness_watermark = store_copy_freshness_watermark(&source);
             let listener_count = source
                 .store()
                 .served_listeners()
@@ -11947,6 +12269,7 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
                     source_encrypted,
                     destination_encrypted: source_encrypted,
                     dry_run: true,
+                    freshness_watermark: freshness_watermark.clone(),
                 });
                 report
                     .warnings
@@ -11968,6 +12291,7 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
                     source_encrypted,
                     destination_encrypted: source_encrypted,
                     dry_run: false,
+                    freshness_watermark: freshness_watermark.clone(),
                 });
                 if modifiers.compacted {
                     let mut copied = cli_open_loom(&dst, keys)?;
@@ -12022,6 +12346,7 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
                 source_encrypted,
                 destination_encrypted: source_encrypted,
                 dry_run: false,
+                freshness_watermark,
             });
             report.objects_written = objects_written;
             report.content_written = content_written;
@@ -12204,9 +12529,21 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
         StoreCmd::Policy {
             store,
             fips_required,
+            default_durability,
+            facet_durability,
+            clear_facet_durability,
         } => {
+            let durability_update_requested = default_durability.is_some()
+                || !facet_durability.is_empty()
+                || !clear_facet_durability.is_empty();
             let client = remote::open_store_client(&store)?;
             if client.is_remote() {
+                if durability_update_requested {
+                    return Err(
+                        "remote `store policy` durability updates are not available through the current StoreAdmin wire method"
+                            .to_string(),
+                    );
+                }
                 let json = match fips_required {
                     Some(f) => client.admin_policy_set_json(f)?,
                     None => client.admin_policy_get_json()?,
@@ -12214,11 +12551,18 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
                 println!("{json}");
                 return Ok(());
             }
-            if let Some(fips_required) = fips_required {
+            if fips_required.is_some() || durability_update_requested {
                 let fs = cli_open_store_for_write(&store)?;
                 unlock_if_encrypted(&fs, keys)?;
-                let policy = StorePolicy { fips_required };
-                let target = format!("fips_required={fips_required}");
+                let mut policy = fs.store_policy().map_err(|e| e.to_string())?;
+                apply_store_policy_cli_updates(
+                    &mut policy,
+                    fips_required,
+                    default_durability.as_deref(),
+                    facet_durability,
+                    clear_facet_durability,
+                )?;
+                let target = store_policy_audit_target(&policy);
                 let seq = fs
                     .save_store_policy_audited(policy, None, "store.policy.set", Some(&target))
                     .map_err(|e| e.to_string())?;
@@ -12347,22 +12691,402 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
                 status.candidate_segments.len(),
                 status.segment_overflow
             );
+            let gc = &status.group_commit;
+            println!(
+                "group_commit: batches_total={} transactions_total={} records_total={} fsync_total_micros={} fsync_count={} write_lock_wait_total_micros={} write_lock_wait_count={} pending_durable_window_transactions={} pending_durable_window_records={} pinned_reader_blockers={}",
+                gc.group_commit_batches_total,
+                gc.group_commit_transactions_total,
+                gc.group_commit_records_total,
+                gc.fsync_total_micros,
+                gc.fsync_count,
+                gc.write_lock_wait_total_micros,
+                gc.write_lock_wait_count,
+                gc.pending_durable_window_transactions,
+                gc.pending_durable_window_records,
+                gc.pinned_reader_blockers
+                    .map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
+            );
             Ok(())
         }
+        StoreCmd::Attribution {
+            store,
+            workspace,
+            max_objects,
+            examples,
+            format,
+        } => run_store_attribution(&store, &workspace, max_objects, examples, &format, keys),
         StoreCmd::PreflightReplacement {
             store,
             workspace,
+            live_store,
+            candidate_report,
+            force_owner_approval,
+            backup_store,
             format,
-        } => run_store_replacement_preflight(&store, &workspace, &format, keys),
+        } => run_store_replacement_preflight(
+            &store,
+            &workspace,
+            live_store.as_deref(),
+            candidate_report.as_deref(),
+            force_owner_approval.as_deref(),
+            backup_store.as_deref(),
+            &format,
+            keys,
+        ),
+        StoreCmd::Replace {
+            active_store,
+            candidate_store,
+            workspace,
+            candidate_report,
+            backup_store,
+            report_file,
+            force_owner_approval,
+            dry_run,
+            format,
+        } => run_store_replacement_activation(
+            StoreReplacementActivation {
+                active_store: &active_store,
+                candidate_store: &candidate_store,
+                workspace: &workspace,
+                candidate_report: &candidate_report,
+                backup_store: &backup_store,
+                report_file: report_file.as_deref(),
+                force_owner_approval: force_owner_approval.as_deref(),
+                dry_run,
+                format: &format,
+            },
+            keys,
+        ),
+    }
+}
+
+#[derive(Clone)]
+struct AttributionClass {
+    class: String,
+    count: u64,
+    bytes: u64,
+    examples: Vec<String>,
+}
+
+#[derive(Clone)]
+struct StoreAttributionReport {
+    store: String,
+    workspace: String,
+    physical_bytes: u64,
+    live_bytes: u64,
+    reusable_free_bytes: u64,
+    candidate_reclaimable_bytes: u64,
+    tail_free_bytes: u64,
+    byte_attribution_mode: &'static str,
+    page_class_bytes: Vec<loom_store::StorePageClass>,
+    path_total: usize,
+    sampled_paths: usize,
+    path_sample_truncated: bool,
+    sampled_path_byte_classes: Vec<AttributionClass>,
+    path_classes: Vec<AttributionClass>,
+    live_root_classes: Vec<AttributionClass>,
+}
+
+fn run_store_attribution(
+    store: &str,
+    workspace: &str,
+    max_objects: usize,
+    examples: usize,
+    format: &str,
+    keys: &KeyOpts,
+) -> Result<(), String> {
+    let loom = cli_open_loom_read(store, keys)?;
+    let workspace_id = resolve_ns(&loom, workspace)?;
+    let report = build_store_attribution_report(
+        store,
+        workspace,
+        &loom,
+        workspace_id,
+        max_objects,
+        examples,
+    )?;
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store_attribution_json(&report))
+                    .map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        "text" => {
+            print_store_attribution_text(&report);
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown attribution output format {other:?} (expected text or json)"
+        )),
+    }
+}
+
+fn build_store_attribution_report(
+    store: &str,
+    workspace: &str,
+    loom: &Loom<FileStore>,
+    workspace_id: WorkspaceId,
+    max_objects: usize,
+    examples: usize,
+) -> Result<StoreAttributionReport, String> {
+    let maintenance = loom
+        .store()
+        .store_maintenance_report(now_ms())
+        .map_err(|e| e.to_string())?;
+    let page_class = loom
+        .store()
+        .page_class_attribution(examples)
+        .map_err(|e| e.to_string())?;
+    let mut sampled_path_byte_classes =
+        std::collections::BTreeMap::<String, AttributionClass>::new();
+    let mut path_classes = std::collections::BTreeMap::<String, AttributionClass>::new();
+    let paths = loom.walk(workspace_id, "").map_err(|e| e.to_string())?;
+    for path in &paths {
+        let class = store_attribution_path_class(path);
+        add_attribution_class(&mut path_classes, &class, 0, path.clone(), examples);
+    }
+    for path in paths.iter().take(max_objects) {
+        let class = format!("sampled_{}", store_attribution_path_class(path));
+        let bytes = loom
+            .read_file(workspace_id, path)
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or(0);
+        add_attribution_class(
+            &mut sampled_path_byte_classes,
+            &class,
+            bytes,
+            path.clone(),
+            examples,
+        );
+    }
+    let diagnostics = cli_live_root_diagnostics(loom)?;
+    let mut live_root_classes = Vec::new();
+    for class in diagnostics.classes {
+        live_root_classes.push(AttributionClass {
+            class: class.class.to_string(),
+            count: class.count,
+            bytes: 0,
+            examples: class
+                .examples
+                .into_iter()
+                .map(|example| format!("{}={}", example.id, example.digest))
+                .collect(),
+        });
+    }
+    Ok(StoreAttributionReport {
+        store: store.to_string(),
+        workspace: workspace.to_string(),
+        physical_bytes: maintenance.status.physical_bytes,
+        live_bytes: maintenance.live_bytes,
+        reusable_free_bytes: maintenance.reusable_free_bytes,
+        candidate_reclaimable_bytes: maintenance.candidate_reclaimable_bytes,
+        tail_free_bytes: maintenance.tail_free_bytes,
+        byte_attribution_mode: "page_class_with_bounded_path_sample",
+        page_class_bytes: page_class.classes,
+        path_total: paths.len(),
+        sampled_paths: paths.len().min(max_objects),
+        path_sample_truncated: paths.len() > max_objects,
+        sampled_path_byte_classes: attribution_classes_sorted(sampled_path_byte_classes),
+        path_classes: attribution_classes_sorted(path_classes),
+        live_root_classes,
+    })
+}
+
+fn add_attribution_class(
+    classes: &mut std::collections::BTreeMap<String, AttributionClass>,
+    class: &str,
+    bytes: u64,
+    example: String,
+    max_examples: usize,
+) {
+    let entry = classes
+        .entry(class.to_string())
+        .or_insert(AttributionClass {
+            class: class.to_string(),
+            count: 0,
+            bytes: 0,
+            examples: Vec::new(),
+        });
+    entry.count += 1;
+    entry.bytes = entry.bytes.saturating_add(bytes);
+    if entry.examples.len() < max_examples {
+        entry.examples.push(example);
+    }
+}
+
+fn attribution_classes_sorted(
+    classes: std::collections::BTreeMap<String, AttributionClass>,
+) -> Vec<AttributionClass> {
+    let mut classes = classes.into_values().collect::<Vec<_>>();
+    classes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| b.count.cmp(&a.count)));
+    classes
+}
+
+fn store_attribution_path_class(path: &str) -> String {
+    if path.starts_with(".loom/facets/cas/") {
+        "path.cas".to_string()
+    } else if let Some(rest) = path.strip_prefix(".loom/facets/document/.bodies/") {
+        let collection = rest.split('/').next().unwrap_or("");
+        let collection = hex::decode(collection)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_else(|| collection.to_string());
+        format!("path.document_body.{collection}")
+    } else if path.starts_with(".loom/facets/document/.maps/") {
+        "path.document_map".to_string()
+    } else if path.starts_with(".loom/facets/document/") {
+        "path.document_collection_root".to_string()
+    } else if path.starts_with(".loom/substrate/tickets/") {
+        "path.ticket_substrate".to_string()
+    } else if path.starts_with(".loom/facets/queue/") {
+        "path.queue_stream".to_string()
+    } else if path.starts_with(".loom/facets/graph/") {
+        "path.graph".to_string()
+    } else if path.starts_with(".loom/facets/vector/") {
+        "path.vector".to_string()
+    } else if path.starts_with("results/") {
+        "path.legacy_results".to_string()
+    } else if path.starts_with("decisions/") {
+        "path.legacy_decisions".to_string()
+    } else {
+        "path.other".to_string()
+    }
+}
+
+fn store_attribution_json(report: &StoreAttributionReport) -> serde_json::Value {
+    serde_json::json!({
+        "store": report.store,
+        "workspace": report.workspace,
+        "physical_bytes": report.physical_bytes,
+        "live_bytes": report.live_bytes,
+        "reusable_free_bytes": report.reusable_free_bytes,
+        "candidate_reclaimable_bytes": report.candidate_reclaimable_bytes,
+        "tail_free_bytes": report.tail_free_bytes,
+        "byte_attribution_mode": report.byte_attribution_mode,
+        "page_class_bytes": page_classes_json(&report.page_class_bytes),
+        "path_total": report.path_total,
+        "sampled_paths": report.sampled_paths,
+        "path_sample_truncated": report.path_sample_truncated,
+        "sampled_path_byte_classes": attribution_classes_json(&report.sampled_path_byte_classes),
+        "path_classes": attribution_classes_json(&report.path_classes),
+        "live_root_classes": attribution_classes_json(&report.live_root_classes),
+    })
+}
+
+fn attribution_classes_json(classes: &[AttributionClass]) -> serde_json::Value {
+    serde_json::Value::Array(
+        classes
+            .iter()
+            .map(|class| {
+                serde_json::json!({
+                    "class": class.class,
+                    "count": class.count,
+                    "bytes": class.bytes,
+                    "examples": class.examples,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn page_classes_json(classes: &[loom_store::StorePageClass]) -> serde_json::Value {
+    serde_json::Value::Array(
+        classes
+            .iter()
+            .map(|class| {
+                serde_json::json!({
+                    "class": class.class,
+                    "pages": class.pages,
+                    "bytes": class.bytes,
+                    "examples": class.examples,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn print_store_attribution_text(report: &StoreAttributionReport) {
+    println!("store attribution");
+    println!("store\t{}", report.store);
+    println!("workspace\t{}", report.workspace);
+    println!("physical_bytes\t{}", report.physical_bytes);
+    println!("live_bytes\t{}", report.live_bytes);
+    println!("reusable_free_bytes\t{}", report.reusable_free_bytes);
+    println!(
+        "candidate_reclaimable_bytes\t{}",
+        report.candidate_reclaimable_bytes
+    );
+    println!("tail_free_bytes\t{}", report.tail_free_bytes);
+    println!("byte_attribution_mode\t{}", report.byte_attribution_mode);
+    for class in &report.page_class_bytes {
+        println!(
+            "page_class\t{}\tpages={}\tbytes={}\texamples={}",
+            class.class,
+            class.pages,
+            class.bytes,
+            class.examples.join(",")
+        );
+    }
+    println!(
+        "paths\ttotal={}\tsampled={}\ttruncated={}",
+        report.path_total, report.sampled_paths, report.path_sample_truncated
+    );
+    print_attribution_classes("sampled_path_byte_class", &report.sampled_path_byte_classes);
+    print_attribution_classes("path_class", &report.path_classes);
+    print_attribution_classes("live_root_class", &report.live_root_classes);
+}
+
+fn print_attribution_classes(label: &str, classes: &[AttributionClass]) {
+    for class in classes {
+        println!(
+            "{label}\t{}\tcount={}\tbytes={}\texamples={}",
+            class.class,
+            class.count,
+            class.bytes,
+            class.examples.join(",")
+        );
     }
 }
 
 fn run_store_replacement_preflight(
     store: &str,
     workspace: &str,
+    live_store: Option<&str>,
+    candidate_report: Option<&str>,
+    force_owner_approval: Option<&str>,
+    backup_store: Option<&str>,
     format: &str,
     keys: &KeyOpts,
 ) -> Result<(), String> {
+    let report = build_store_replacement_preflight_report(
+        store,
+        workspace,
+        live_store,
+        candidate_report,
+        force_owner_approval,
+        backup_store,
+        keys,
+    );
+    print_store_replacement_preflight_report(&report, format)?;
+    if report["ok"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        Err("store replacement preflight failed; do not replace the active store".to_string())
+    }
+}
+
+fn build_store_replacement_preflight_report(
+    store: &str,
+    workspace: &str,
+    live_store: Option<&str>,
+    candidate_report: Option<&str>,
+    force_owner_approval: Option<&str>,
+    backup_store: Option<&str>,
+    keys: &KeyOpts,
+) -> serde_json::Value {
     let mut checks = Vec::new();
     let mut store_opened = None;
     match FileStore::open_read(store) {
@@ -12476,6 +13200,33 @@ fn run_store_replacement_preflight(
                         ));
                     }
                 }
+                match loom.vcs_namespace_preflight(workspace_id) {
+                    Ok(report) if report.is_clean() => checks.push(store_preflight_check(
+                        "vcs_namespace_preflight",
+                        true,
+                        "no VCS namespace collisions from legacy projections",
+                    )),
+                    Ok(report) => {
+                        let collisions = report
+                            .conflicts
+                            .iter()
+                            .map(|conflict| {
+                                format!("{} -> {}", conflict.leaf_path, conflict.child_path)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        checks.push(store_preflight_check(
+                            "vcs_namespace_preflight",
+                            false,
+                            format!("legacy projection collisions: {collisions}"),
+                        ));
+                    }
+                    Err(error) => checks.push(store_preflight_check(
+                        "vcs_namespace_preflight",
+                        false,
+                        error.to_string(),
+                    )),
+                }
             }
             Err(error) => checks.push(store_preflight_check(
                 "workspace_resolve",
@@ -12503,21 +13254,42 @@ fn run_store_replacement_preflight(
         }
     }
 
+    push_store_replacement_freshness_checks(
+        &mut checks,
+        store,
+        workspace,
+        live_store,
+        candidate_report,
+        force_owner_approval,
+        backup_store,
+        keys,
+    );
+
     let ok = checks
         .iter()
         .all(|check| check["ok"].as_bool() == Some(true));
+    store_replacement_preflight_report(
+        store,
+        workspace,
+        ok,
+        &checks,
+        live_store,
+        candidate_report,
+        force_owner_approval,
+        backup_store,
+    )
+}
+
+fn print_store_replacement_preflight_report(
+    report: &serde_json::Value,
+    format: &str,
+) -> Result<(), String> {
     match format {
-        "text" => print_store_replacement_preflight_text(store, workspace, ok, &checks),
+        "text" => print_store_replacement_preflight_text(report),
         "json" => {
-            let body = serde_json::json!({
-                "store": store,
-                "workspace": workspace,
-                "ok": ok,
-                "checks": checks,
-            });
             println!(
                 "{}",
-                serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
             );
         }
         other => {
@@ -12526,11 +13298,508 @@ fn run_store_replacement_preflight(
             ));
         }
     }
-    if ok {
+    Ok(())
+}
+
+struct StoreReplacementActivation<'a> {
+    active_store: &'a str,
+    candidate_store: &'a str,
+    workspace: &'a str,
+    candidate_report: &'a str,
+    backup_store: &'a str,
+    report_file: Option<&'a str>,
+    force_owner_approval: Option<&'a str>,
+    dry_run: bool,
+    format: &'a str,
+}
+
+fn run_store_replacement_activation(
+    options: StoreReplacementActivation<'_>,
+    keys: &KeyOpts,
+) -> Result<(), String> {
+    let StoreReplacementActivation {
+        active_store,
+        candidate_store,
+        workspace,
+        candidate_report,
+        backup_store,
+        report_file,
+        force_owner_approval,
+        dry_run,
+        format,
+    } = options;
+    let mut steps = Vec::new();
+    let active_path = std::path::Path::new(active_store);
+    let candidate_path = std::path::Path::new(candidate_store);
+    let backup_path = std::path::Path::new(backup_store);
+    if !active_path.exists() {
+        steps.push(store_preflight_check(
+            "active_store_exists",
+            false,
+            "active store does not exist",
+        ));
+        let report = store_replacement_activation_report(
+            active_store,
+            candidate_store,
+            workspace,
+            backup_store,
+            dry_run,
+            steps,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+        emit_store_replacement_activation_report(&report, format, report_file)?;
+        return Err("store replacement activation failed".to_string());
+    }
+    if !candidate_path.exists() {
+        steps.push(store_preflight_check(
+            "candidate_store_exists",
+            false,
+            "candidate store does not exist",
+        ));
+        let report = store_replacement_activation_report(
+            active_store,
+            candidate_store,
+            workspace,
+            backup_store,
+            dry_run,
+            steps,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+        emit_store_replacement_activation_report(&report, format, report_file)?;
+        return Err("store replacement activation failed".to_string());
+    }
+    if backup_path.exists() {
+        steps.push(store_preflight_check(
+            "backup_store_available",
+            false,
+            "backup store already exists; choose a new rollback artifact path",
+        ));
+        let report = store_replacement_activation_report(
+            active_store,
+            candidate_store,
+            workspace,
+            backup_store,
+            dry_run,
+            steps,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+        emit_store_replacement_activation_report(&report, format, report_file)?;
+        return Err("store replacement activation failed".to_string());
+    }
+    steps.push(store_preflight_check(
+        "input_paths",
+        true,
+        "active and candidate stores exist and backup path is unused",
+    ));
+
+    if dry_run {
+        steps.push(store_preflight_check(
+            "backup_store",
+            true,
+            "dry run; active store backup was not written",
+        ));
+    } else {
+        std::fs::copy(active_path, backup_path)
+            .map_err(|e| format!("copy active store to backup: {e}"))?;
+        steps.push(store_preflight_check(
+            "backup_store",
+            true,
+            format!("active store copied to {backup_store}"),
+        ));
+    }
+
+    let preflight = build_store_replacement_preflight_report(
+        candidate_store,
+        workspace,
+        Some(active_store),
+        Some(candidate_report),
+        force_owner_approval,
+        Some(backup_store),
+        keys,
+    );
+    if preflight["ok"].as_bool() != Some(true) {
+        steps.push(store_preflight_check(
+            "preflight",
+            false,
+            "candidate failed replacement preflight",
+        ));
+        let report = store_replacement_activation_report(
+            active_store,
+            candidate_store,
+            workspace,
+            backup_store,
+            dry_run,
+            steps,
+            preflight,
+            serde_json::Value::Null,
+        );
+        emit_store_replacement_activation_report(&report, format, report_file)?;
+        return Err("store replacement activation failed".to_string());
+    }
+    steps.push(store_preflight_check(
+        "preflight",
+        true,
+        "candidate passed replacement preflight",
+    ));
+
+    let mut post_replacement = serde_json::Value::Null;
+    if dry_run {
+        steps.push(store_preflight_check(
+            "replace_active_store",
+            true,
+            "dry run; active store was not replaced",
+        ));
+    } else {
+        let temp_store = store_replacement_temp_path(active_path);
+        if temp_store.exists() {
+            return Err(format!(
+                "temporary replacement path {} already exists",
+                temp_store.display()
+            ));
+        }
+        std::fs::copy(candidate_path, &temp_store)
+            .map_err(|e| format!("copy candidate store to temporary replacement: {e}"))?;
+        FileStore::open_read(&temp_store)
+            .map_err(|e| format!("temporary replacement is not readable: {e}"))?;
+        std::fs::rename(&temp_store, active_path)
+            .map_err(|e| format!("replace active store with candidate: {e}"))?;
+        steps.push(store_preflight_check(
+            "replace_active_store",
+            true,
+            "active store path replaced with candidate bytes",
+        ));
+        post_replacement = build_store_replacement_preflight_report(
+            active_store,
+            workspace,
+            None,
+            None,
+            None,
+            Some(backup_store),
+            keys,
+        );
+        steps.push(store_preflight_check(
+            "post_replacement_surface_checks",
+            post_replacement["ok"].as_bool() == Some(true),
+            "post-replacement store open, workspace, lane, ticket, maintenance, and VCS checks completed",
+        ));
+    }
+
+    let report = store_replacement_activation_report(
+        active_store,
+        candidate_store,
+        workspace,
+        backup_store,
+        dry_run,
+        steps,
+        preflight,
+        post_replacement,
+    );
+    emit_store_replacement_activation_report(&report, format, report_file)?;
+    if report["ok"].as_bool() == Some(true) {
         Ok(())
     } else {
-        Err("store replacement preflight failed; do not replace the active store".to_string())
+        Err("store replacement activation failed".to_string())
     }
+}
+
+fn store_replacement_activation_report(
+    active_store: &str,
+    candidate_store: &str,
+    workspace: &str,
+    backup_store: &str,
+    dry_run: bool,
+    steps: Vec<serde_json::Value>,
+    preflight: serde_json::Value,
+    post_replacement: serde_json::Value,
+) -> serde_json::Value {
+    let ok = steps.iter().all(|step| step["ok"].as_bool() == Some(true));
+    serde_json::json!({
+        "active_store": active_store,
+        "candidate_store": candidate_store,
+        "workspace": workspace,
+        "backup_store": backup_store,
+        "dry_run": dry_run,
+        "ok": ok,
+        "safe_to_keep_replacement": ok,
+        "rollback_artifacts": {
+            "backup_store": backup_store,
+            "candidate_store": candidate_store,
+        },
+        "preflight": preflight,
+        "post_replacement": post_replacement,
+        "steps": steps,
+    })
+}
+
+fn emit_store_replacement_activation_report(
+    report: &serde_json::Value,
+    format: &str,
+    report_file: Option<&str>,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(report).map_err(|e| e.to_string())?;
+    if let Some(path) = report_file {
+        std::fs::write(path, &json).map_err(|e| format!("write report file {path}: {e}"))?;
+    }
+    match format {
+        "json" => println!("{json}"),
+        "text" => print_store_replacement_activation_text(report),
+        other => {
+            return Err(format!(
+                "unknown replacement output format {other:?} (expected text or json)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn print_store_replacement_activation_text(report: &serde_json::Value) {
+    println!("store replacement activation");
+    println!(
+        "active_store\t{}",
+        report["active_store"].as_str().unwrap_or("")
+    );
+    println!(
+        "candidate_store\t{}",
+        report["candidate_store"].as_str().unwrap_or("")
+    );
+    println!("workspace\t{}", report["workspace"].as_str().unwrap_or(""));
+    println!(
+        "backup_store\t{}",
+        report["backup_store"].as_str().unwrap_or("")
+    );
+    println!(
+        "status\t{}",
+        if report["ok"].as_bool() == Some(true) {
+            "ok"
+        } else {
+            "blocked"
+        }
+    );
+    if let Some(steps) = report["steps"].as_array() {
+        for step in steps {
+            println!(
+                "{}\t{}\t{}",
+                step["name"].as_str().unwrap_or("unknown"),
+                if step["ok"].as_bool() == Some(true) {
+                    "ok"
+                } else {
+                    "blocked"
+                },
+                step["message"].as_str().unwrap_or("")
+            );
+        }
+    }
+}
+
+fn store_replacement_temp_path(active_path: &std::path::Path) -> std::path::PathBuf {
+    let mut file_name = active_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("active.loom"));
+    file_name.push(format!(".replacement-{}.tmp", std::process::id()));
+    active_path.with_file_name(file_name)
+}
+
+fn push_store_replacement_freshness_checks(
+    checks: &mut Vec<serde_json::Value>,
+    store: &str,
+    workspace: &str,
+    live_store: Option<&str>,
+    candidate_report: Option<&str>,
+    force_owner_approval: Option<&str>,
+    backup_store: Option<&str>,
+    keys: &KeyOpts,
+) {
+    let Some(report_path) = candidate_report else {
+        checks.push(store_preflight_check(
+            "freshness_watermark",
+            true,
+            "no candidate report supplied; live rollback freshness was not checked",
+        ));
+        return;
+    };
+    let Some(live_store) = live_store else {
+        checks.push(store_preflight_check(
+            "freshness_watermark",
+            false,
+            "candidate report requires --live-store to check rollback freshness",
+        ));
+        return;
+    };
+    let report = match read_store_copy_report(report_path) {
+        Ok(report) => report,
+        Err(error) => {
+            checks.push(store_preflight_check(
+                "freshness_watermark",
+                false,
+                format!("candidate report is not readable: {error}"),
+            ));
+            return;
+        }
+    };
+    if report
+        .get("destination")
+        .and_then(serde_json::Value::as_str)
+        != Some(store)
+    {
+        checks.push(store_preflight_check(
+            "freshness_candidate",
+            false,
+            "candidate report destination does not match the candidate store path",
+        ));
+    }
+    if report.get("source").and_then(serde_json::Value::as_str) != Some(live_store) {
+        checks.push(store_preflight_check(
+            "freshness_source",
+            false,
+            "candidate report source does not match --live-store",
+        ));
+    }
+    let Some(watermark) = report.get("freshness_watermark") else {
+        checks.push(store_preflight_check(
+            "freshness_watermark",
+            false,
+            "candidate report has no freshness_watermark",
+        ));
+        return;
+    };
+    let mut lost = Vec::new();
+    let live = match cli_open_loom_read(live_store, keys) {
+        Ok(live) => live,
+        Err(error) => {
+            checks.push(store_preflight_check(
+                "freshness_live_open",
+                false,
+                format!("live store is not readable: {error}"),
+            ));
+            return;
+        }
+    };
+    compare_watermark_root(
+        &mut lost,
+        "reference_root",
+        watermark.get("source_reference_root"),
+        live.store().reference_root(),
+    );
+    compare_watermark_root(
+        &mut lost,
+        "control_root",
+        watermark.get("source_control_root"),
+        live.store().control_root(),
+    );
+    match resolve_ns(&live, workspace) {
+        Ok(workspace_id) => {
+            let profile_id = workspace_id.to_string();
+            let live_latest =
+                ticket_profile_latest_operation(&live, workspace_id, &profile_id).unwrap_or(None);
+            let recorded_latest = watermark
+                .get("workspaces")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|workspaces| {
+                    workspaces.iter().find(|entry| {
+                        entry
+                            .get("workspace_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(profile_id.as_str())
+                    })
+                })
+                .and_then(|entry| entry.get("latest_ticket_operation"));
+            let recorded_sequence = recorded_latest
+                .and_then(|latest| latest.get("sequence"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let recorded_operation_id = recorded_latest
+                .and_then(|latest| latest.get("operation_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if let Some(live_latest) = live_latest
+                && live_latest.sequence > recorded_sequence
+            {
+                lost.push(format!(
+                    "ticket_operation sequence {} operation_id {} is newer than candidate watermark sequence {} operation_id {}",
+                    live_latest.sequence,
+                    live_latest.operation_id,
+                    recorded_sequence,
+                    recorded_operation_id
+                ));
+            }
+        }
+        Err(error) => lost.push(format!(
+            "workspace {workspace:?} no longer resolves: {error}"
+        )),
+    }
+    if lost.is_empty() {
+        checks.push(store_preflight_check(
+            "freshness_watermark",
+            true,
+            "candidate freshness watermark matches the live store",
+        ));
+        return;
+    }
+    if force_owner_approval.is_some_and(|approval| !approval.trim().is_empty())
+        && backup_store.is_some_and(|backup| std::path::Path::new(backup).exists())
+    {
+        checks.push(store_preflight_check(
+            "freshness_watermark",
+            true,
+            format!(
+                "owner-approved force accepted with backup {}; lost_mutations={}",
+                backup_store.unwrap_or(""),
+                lost.join("; ")
+            ),
+        ));
+    } else {
+        checks.push(store_preflight_check(
+            "freshness_watermark",
+            false,
+            format!(
+                "candidate is stale relative to live store; lost_mutations={}; rerun copy or provide --force-owner-approval and --backup-store",
+                lost.join("; ")
+            ),
+        ));
+    }
+}
+
+fn read_store_copy_report(path: &str) -> Result<serde_json::Value, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+fn compare_watermark_root(
+    lost: &mut Vec<String>,
+    name: &str,
+    recorded: Option<&serde_json::Value>,
+    live: Option<Digest>,
+) {
+    let recorded = recorded.and_then(serde_json::Value::as_str).unwrap_or("");
+    let live = live.map(|root| root.to_string()).unwrap_or_default();
+    if recorded != live {
+        lost.push(format!("{name} advanced from {recorded} to {live}"));
+    }
+}
+
+#[derive(Clone)]
+struct TicketOperationWatermark {
+    sequence: u64,
+    operation_id: String,
+}
+
+fn ticket_profile_latest_operation(
+    loom: &Loom<FileStore>,
+    workspace_id: WorkspaceId,
+    profile_id: &str,
+) -> Result<Option<TicketOperationWatermark>, String> {
+    Ok(loom_tickets::history(loom, workspace_id, profile_id, None)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .max_by_key(|record| record.sequence)
+        .map(|record| TicketOperationWatermark {
+            sequence: record.sequence,
+            operation_id: record.operation_id,
+        }))
 }
 
 fn store_preflight_check(name: &str, ok: bool, message: impl Into<String>) -> serde_json::Value {
@@ -12541,16 +13810,175 @@ fn store_preflight_check(name: &str, ok: bool, message: impl Into<String>) -> se
     })
 }
 
-fn print_store_replacement_preflight_text(
+fn store_replacement_preflight_report(
     store: &str,
     workspace: &str,
     ok: bool,
     checks: &[serde_json::Value],
-) {
+    live_store: Option<&str>,
+    candidate_report: Option<&str>,
+    force_owner_approval: Option<&str>,
+    backup_store: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "store": store,
+        "workspace": workspace,
+        "ok": ok,
+        "safe_to_replace": ok,
+        "freshness_watermark": store_replacement_freshness_watermark_report(candidate_report),
+        "backup_plan": store_replacement_backup_plan_report(force_owner_approval, backup_store),
+        "active_store_freshness": store_replacement_active_freshness_report(live_store, candidate_report, checks),
+        "legacy_projection_collision_risks": store_replacement_legacy_projection_report(checks),
+        "checks": checks,
+    })
+}
+
+fn store_replacement_freshness_watermark_report(
+    candidate_report: Option<&str>,
+) -> serde_json::Value {
+    match candidate_report {
+        Some(path) => match read_store_copy_report(path) {
+            Ok(report) => {
+                let watermark = report
+                    .get("freshness_watermark")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                serde_json::json!({
+                    "candidate_report": path,
+                    "available": !watermark.is_null(),
+                    "watermark": watermark,
+                    "read_error": serde_json::Value::Null,
+                })
+            }
+            Err(error) => serde_json::json!({
+                "candidate_report": path,
+                "available": false,
+                "watermark": serde_json::Value::Null,
+                "read_error": error,
+            }),
+        },
+        None => serde_json::json!({
+            "candidate_report": serde_json::Value::Null,
+            "available": false,
+            "watermark": serde_json::Value::Null,
+            "read_error": serde_json::Value::Null,
+        }),
+    }
+}
+
+fn store_replacement_backup_plan_report(
+    force_owner_approval: Option<&str>,
+    backup_store: Option<&str>,
+) -> serde_json::Value {
+    let force_owner_approval_present =
+        force_owner_approval.is_some_and(|approval| !approval.trim().is_empty());
+    let backup_exists = backup_store.map(|path| std::path::Path::new(path).exists());
+    serde_json::json!({
+        "backup_store": backup_store,
+        "backup_exists": backup_exists,
+        "force_owner_approval_present": force_owner_approval_present,
+        "stale_candidate_override_ready": force_owner_approval_present && backup_exists.unwrap_or(false),
+    })
+}
+
+fn store_replacement_active_freshness_report(
+    live_store: Option<&str>,
+    candidate_report: Option<&str>,
+    checks: &[serde_json::Value],
+) -> serde_json::Value {
+    let freshness_checks = checks
+        .iter()
+        .filter(|check| {
+            check
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.starts_with("freshness_"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let ok = freshness_checks
+        .iter()
+        .all(|check| check["ok"].as_bool() == Some(true));
+    serde_json::json!({
+        "live_store": live_store,
+        "checked": live_store.is_some() && candidate_report.is_some(),
+        "ok": ok,
+        "checks": freshness_checks,
+    })
+}
+
+fn store_replacement_legacy_projection_report(checks: &[serde_json::Value]) -> serde_json::Value {
+    let preflight = checks.iter().find(|check| {
+        check.get("name").and_then(serde_json::Value::as_str) == Some("vcs_namespace_preflight")
+    });
+    match preflight {
+        Some(check) => serde_json::json!({
+            "checked": true,
+            "ok": check["ok"].as_bool().unwrap_or(false),
+            "collision_risk": check["ok"].as_bool() != Some(true),
+            "message": check["message"].as_str().unwrap_or(""),
+        }),
+        None => serde_json::json!({
+            "checked": false,
+            "ok": false,
+            "collision_risk": true,
+            "message": "VCS namespace preflight did not run",
+        }),
+    }
+}
+
+fn print_store_replacement_preflight_text(report: &serde_json::Value) {
+    let store = report["store"].as_str().unwrap_or("");
+    let workspace = report["workspace"].as_str().unwrap_or("");
+    let ok = report["ok"].as_bool() == Some(true);
+    let empty = Vec::new();
+    let checks = report["checks"].as_array().unwrap_or(&empty);
     println!("store replacement preflight");
     println!("store\t{store}");
     println!("workspace\t{workspace}");
     println!("status\t{}", if ok { "ok" } else { "blocked" });
+    println!(
+        "safe_to_replace\t{}",
+        if report["safe_to_replace"].as_bool() == Some(true) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "freshness_watermark\t{}",
+        if report["freshness_watermark"]["available"].as_bool() == Some(true) {
+            "available"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "backup_plan\tforce_owner_approval_present={} backup_exists={}",
+        report["backup_plan"]["force_owner_approval_present"]
+            .as_bool()
+            .unwrap_or(false),
+        report["backup_plan"]["backup_exists"]
+            .as_bool()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "active_store_freshness\t{}",
+        if report["active_store_freshness"]["ok"].as_bool() == Some(true) {
+            "ok"
+        } else {
+            "blocked"
+        }
+    );
+    println!(
+        "legacy_projection_collision_risks\t{}",
+        if report["legacy_projection_collision_risks"]["collision_risk"].as_bool() == Some(true) {
+            "present"
+        } else {
+            "none"
+        }
+    );
     for check in checks {
         println!(
             "{}\t{}\t{}",
@@ -15087,6 +16515,7 @@ struct StoreCopyReport {
     compaction_after_bytes: Option<u64>,
     omitted_items: Vec<String>,
     warnings: Vec<String>,
+    freshness_watermark: serde_json::Value,
 }
 
 struct StoreCopyReportInput<'a> {
@@ -15100,6 +16529,7 @@ struct StoreCopyReportInput<'a> {
     source_encrypted: bool,
     destination_encrypted: bool,
     dry_run: bool,
+    freshness_watermark: serde_json::Value,
 }
 
 impl StoreCopyReport {
@@ -15131,8 +16561,40 @@ impl StoreCopyReport {
             compaction_after_bytes: None,
             omitted_items,
             warnings: Vec::new(),
+            freshness_watermark: input.freshness_watermark,
         }
     }
+}
+
+fn store_copy_freshness_watermark(source: &Loom<FileStore>) -> serde_json::Value {
+    let workspaces = source
+        .registry()
+        .list(None)
+        .into_iter()
+        .map(|info| {
+            let workspace_id = info.id.to_string();
+            let latest = ticket_profile_latest_operation(source, info.id, &workspace_id)
+                .ok()
+                .flatten()
+                .map(|operation| {
+                    serde_json::json!({
+                        "sequence": operation.sequence,
+                        "operation_id": operation.operation_id,
+                    })
+                });
+            serde_json::json!({
+                "workspace_id": workspace_id,
+                "workspace_name": info.name,
+                "latest_ticket_operation": latest,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "created_at_ms": now_ms(),
+        "source_reference_root": source.store().reference_root().map(|root| root.to_string()).unwrap_or_default(),
+        "source_control_root": source.store().control_root().map(|root| root.to_string()).unwrap_or_default(),
+        "workspaces": workspaces,
+    })
 }
 
 fn parse_store_copy_modifiers(values: &[String]) -> Result<StoreCopyModifiers, String> {
@@ -15299,6 +16761,8 @@ fn store_copy_report_json(report: &StoreCopyReport) -> String {
     push_json_string_array(&mut out, &report.omitted_items);
     out.push_str(",\"warnings\":");
     push_json_string_array(&mut out, &report.warnings);
+    out.push_str(",\"freshness_watermark\":");
+    out.push_str(&report.freshness_watermark.to_string());
     out.push('}');
     out
 }
@@ -15330,10 +16794,80 @@ fn store_policy_json(policy: StorePolicy, audit_seq: Option<u64>) -> String {
     } else {
         "false"
     });
+    out.push_str(",\"default_durability\":");
+    out.push_str(&json_string(policy.default_durability.as_str()));
+    out.push_str(",\"facet_durability_overrides\":{");
+    let mut first = true;
+    for facet in FacetKind::ALL {
+        if let Some(policy) = policy.facet_durability_overrides[facet.stable_tag() as usize] {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str(&json_string(facet.as_str()));
+            out.push(':');
+            out.push_str(&json_string(policy.as_str()));
+        }
+    }
+    out.push('}');
     out.push_str(",\"audit_seq\":");
     push_json_u64(&mut out, audit_seq);
     out.push('}');
     out
+}
+
+fn apply_store_policy_cli_updates(
+    policy: &mut StorePolicy,
+    fips_required: Option<bool>,
+    default_durability: Option<&str>,
+    facet_durability: Vec<String>,
+    clear_facet_durability: Vec<String>,
+) -> Result<(), String> {
+    if let Some(value) = fips_required {
+        policy.fips_required = value;
+    }
+    if let Some(value) = default_durability {
+        policy
+            .set_default_durability(
+                loom_store::parse_store_durability_policy(value).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    for assignment in facet_durability {
+        let (facet, durability) = assignment.split_once('=').ok_or_else(|| {
+            format!("facet durability override {assignment:?} must use <facet>=<policy>")
+        })?;
+        let facet = FacetKind::parse(facet).map_err(|e| e.to_string())?;
+        let durability =
+            loom_store::parse_store_durability_policy(durability).map_err(|e| e.to_string())?;
+        policy
+            .set_facet_durability(facet, Some(durability))
+            .map_err(|e| e.to_string())?;
+    }
+    for facet in clear_facet_durability {
+        let facet = FacetKind::parse(&facet).map_err(|e| e.to_string())?;
+        policy
+            .set_facet_durability(facet, None)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn store_policy_audit_target(policy: &StorePolicy) -> String {
+    let mut target = format!(
+        "fips_required={},default_durability={}",
+        policy.fips_required,
+        policy.default_durability.as_str()
+    );
+    for facet in FacetKind::ALL {
+        if let Some(durability) = policy.facet_durability_overrides[facet.stable_tag() as usize] {
+            target.push(',');
+            target.push_str(facet.as_str());
+            target.push('=');
+            target.push_str(durability.as_str());
+        }
+    }
+    target
 }
 
 fn ensure_store_copy_clean(loom: &Loom<FileStore>) -> Result<(), String> {
@@ -15576,6 +17110,109 @@ mod root_help_tests {
                 .iter()
                 .all(|record| record.get("dimensions").is_some())
         );
+    }
+
+    #[test]
+    fn store_policy_cli_updates_durability_settings() {
+        let mut policy = StorePolicy::default();
+        apply_store_policy_cli_updates(
+            &mut policy,
+            Some(true),
+            Some("relaxed"),
+            vec!["document=normal".to_string(), "ledger=strict".to_string()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(policy.fips_required);
+        assert_eq!(
+            policy.default_durability,
+            loom_store::StoreDurabilityPolicy::Relaxed
+        );
+        assert_eq!(
+            policy.effective_durability(FacetKind::Ledger),
+            loom_store::StoreDurabilityPolicy::Strict
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&store_policy_json(policy, Some(7))).unwrap();
+        assert_eq!(json["default_durability"], "relaxed");
+        assert_eq!(json["facet_durability_overrides"]["document"], "normal");
+
+        apply_store_policy_cli_updates(
+            &mut policy,
+            None,
+            None,
+            Vec::new(),
+            vec!["document".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            policy.effective_durability(FacetKind::Document),
+            loom_store::StoreDurabilityPolicy::Relaxed
+        );
+    }
+
+    #[test]
+    fn store_replacement_preflight_report_surfaces_migration_fields() {
+        let report_path = std::env::temp_dir().join(format!(
+            "loom-store-replacement-preflight-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &report_path,
+            r#"{"freshness_watermark":{"source_reference_root":"r1","source_control_root":"c1","workspaces":[]}}"#,
+        )
+        .unwrap();
+        let backup_path = std::env::temp_dir().join(format!(
+            "loom-store-replacement-backup-{}",
+            std::process::id()
+        ));
+        std::fs::write(&backup_path, b"backup").unwrap();
+        let report_path = report_path.to_string_lossy().into_owned();
+        let backup_path = backup_path.to_string_lossy().into_owned();
+        let body = store_replacement_preflight_report(
+            "candidate.loom",
+            "main",
+            false,
+            &[
+                store_preflight_check(
+                    "freshness_watermark",
+                    false,
+                    "candidate is stale relative to live store",
+                ),
+                store_preflight_check(
+                    "vcs_namespace_preflight",
+                    false,
+                    "legacy projection collisions: docs -> files",
+                ),
+            ],
+            Some("live.loom"),
+            Some(&report_path),
+            Some("owner-approved"),
+            Some(&backup_path),
+        );
+
+        assert_eq!(body["safe_to_replace"], serde_json::json!(false));
+        assert_eq!(
+            body["freshness_watermark"]["available"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            body["backup_plan"]["stale_candidate_override_ready"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            body["active_store_freshness"]["ok"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            body["legacy_projection_collision_risks"]["collision_risk"],
+            serde_json::json!(true)
+        );
+
+        let _ = std::fs::remove_file(&report_path);
+        let _ = std::fs::remove_file(&backup_path);
     }
 
     #[test]
@@ -17081,9 +18718,12 @@ mod cli_parse_tests {
         .unwrap();
 
         let loom = loom_store::open_loom_read(&store).unwrap();
-        let history_path = revision_index_path(&profile_id).unwrap();
-        let history =
-            RevisionIndex::decode(&loom.read_file_reserved(ns, &history_path).unwrap()).unwrap();
+        let history = loom_substrate::versioning::load_current_revision_index(
+            &loom,
+            workspace_id,
+            &profile_id,
+        )
+        .unwrap();
         let revisions = history.history("meeting:meet-1");
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].revision, 1);
@@ -17109,8 +18749,12 @@ mod cli_parse_tests {
         .unwrap();
 
         let loom = loom_store::open_loom_read(&store).unwrap();
-        let history =
-            RevisionIndex::decode(&loom.read_file_reserved(ns, &history_path).unwrap()).unwrap();
+        let history = loom_substrate::versioning::load_current_revision_index(
+            &loom,
+            workspace_id,
+            &profile_id,
+        )
+        .unwrap();
         assert_eq!(history.history("meeting:meet-1").len(), 1);
         assert_eq!(history.checkpoints().len(), 1);
     }
@@ -17164,9 +18808,9 @@ mod cli_parse_tests {
 
         assert_eq!(report.candidates, 1);
         assert_eq!(report.inserted, 1);
-        let history_path = revision_index_path(&profile_id).unwrap();
         let history =
-            RevisionIndex::decode(&loom.read_file_reserved(ns, &history_path).unwrap()).unwrap();
+            loom_substrate::versioning::load_current_revision_index(&loom, workspace, &profile_id)
+                .unwrap();
         let revisions = history.history("drive:metadata:file-1");
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].revision, 1);
@@ -17225,9 +18869,9 @@ mod cli_parse_tests {
 
         assert_eq!(report.candidates, 1);
         assert_eq!(report.inserted, 1);
-        let history_path = revision_index_path(&profile_id).unwrap();
         let history =
-            RevisionIndex::decode(&loom.read_file_reserved(ns, &history_path).unwrap()).unwrap();
+            loom_substrate::versioning::load_current_revision_index(&loom, workspace, &profile_id)
+                .unwrap();
         let revisions = history.history("structure-node:node-1");
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].revision, 1);
@@ -17287,9 +18931,9 @@ mod cli_parse_tests {
 
         assert_eq!(report.candidates, 1);
         assert_eq!(report.inserted, 1);
-        let history_path = revision_index_path(&profile_id).unwrap();
         let history =
-            RevisionIndex::decode(&loom.read_file_reserved(ns, &history_path).unwrap()).unwrap();
+            loom_substrate::versioning::load_current_revision_index(&loom, workspace, &profile_id)
+                .unwrap();
         let revisions = history.history("lifecycle:instance:inst-1");
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].revision, 1);
@@ -18784,6 +20428,10 @@ mod cli_parse_tests {
                     fields: Vec::new(),
                     delete_fields: Vec::new(),
                     action: None,
+                    comment_body: None,
+                    comment_id: None,
+                    comment_type: None,
+                    comment_evidence: None,
                     observed_source_status: None,
                     observed_workflow_version: None,
                     expected_root: None,
@@ -18809,6 +20457,10 @@ mod cli_parse_tests {
                     fields: vec!["component=cli".to_string()],
                     delete_fields: Vec::new(),
                     action: None,
+                    comment_body: None,
+                    comment_id: None,
+                    comment_type: None,
+                    comment_evidence: None,
                     observed_source_status: None,
                     observed_workflow_version: None,
                     expected_root: None,
@@ -18850,6 +20502,7 @@ mod cli_parse_tests {
                     ticket_id: "CORE-1".to_string(),
                     projection: Some("jira".to_string()),
                     detailed: false,
+                    compact: false,
                     format: "json".to_string(),
                 },
             },
@@ -18988,6 +20641,175 @@ mod cli_parse_tests {
         assert_eq!(board.cards[0].column_id, "doing");
 
         let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn store_replacement_preflight_rejects_stale_ticket_candidate() {
+        let store = temp_store("replacement-live");
+        let candidate = temp_store("replacement-candidate");
+        let mut report = std::path::PathBuf::from(&candidate);
+        report.set_extension("json");
+        let report = report.to_string_lossy().into_owned();
+        run(
+            Command::Store {
+                action: StoreCmd::Init {
+                    store: store.clone(),
+                    encrypt: false,
+                    suite: None,
+                    identity_profile: None,
+                    fips: false,
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        run(
+            Command::Workspace {
+                action: WorkspaceCmd::Create {
+                    store: store.clone(),
+                    name: "main".to_string(),
+                    facet: None,
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        run(
+            Command::Tickets {
+                action: TicketsCmd::ProjectCreate {
+                    store: store.clone(),
+                    workspace: "main".to_string(),
+                    project_id: "core".to_string(),
+                    key_prefix: "CORE".to_string(),
+                    name: "Core".to_string(),
+                    expected_root: None,
+                    format: "text".to_string(),
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        run(
+            Command::Tickets {
+                action: TicketsCmd::Create {
+                    store: store.clone(),
+                    workspace: "main".to_string(),
+                    ticket_type: "task".to_string(),
+                    project_id: Some("core".to_string()),
+                    title: Some("Replace safely".to_string()),
+                    description: None,
+                    priority: None,
+                    assignee: None,
+                    fields: "{}".to_string(),
+                    projection: None,
+                    external_source: None,
+                    external_id: None,
+                    policy_labels: Vec::new(),
+                    expected_root: None,
+                    format: "text".to_string(),
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        run(
+            Command::Store {
+                action: StoreCmd::Copy {
+                    src: store.clone(),
+                    dst: candidate.clone(),
+                    with: Vec::new(),
+                    format: "json".to_string(),
+                    report_file: Some(report.clone()),
+                    dry_run: false,
+                    new_key_source: None,
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        run(
+            Command::Tickets {
+                action: TicketsCmd::Update {
+                    store: store.clone(),
+                    workspace: Some("main".to_string()),
+                    ticket_id: Some("CORE-1".to_string()),
+                    request: None,
+                    projection: None,
+                    status: Some("in_progress".to_string()),
+                    assignee: None,
+                    title: None,
+                    description: None,
+                    priority: None,
+                    fields: Vec::new(),
+                    delete_fields: Vec::new(),
+                    action: None,
+                    comment_body: Some("advanced live state".to_string()),
+                    comment_id: None,
+                    comment_type: None,
+                    comment_evidence: None,
+                    observed_source_status: None,
+                    observed_workflow_version: None,
+                    expected_root: None,
+                    format: "text".to_string(),
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        let error = run_store_replacement_preflight(
+            &candidate,
+            "main",
+            Some(&store),
+            Some(&report),
+            None,
+            None,
+            "json",
+            &KeyOpts::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("store replacement preflight failed"));
+        let report_body = store_replacement_preflight_report(
+            &candidate,
+            "main",
+            false,
+            &[
+                store_preflight_check(
+                    "freshness_watermark",
+                    false,
+                    "candidate is stale relative to live store",
+                ),
+                store_preflight_check(
+                    "vcs_namespace_preflight",
+                    true,
+                    "no VCS namespace collisions from legacy projections",
+                ),
+            ],
+            Some(&store),
+            Some(&report),
+            None,
+            None,
+        );
+        assert_eq!(report_body["safe_to_replace"], serde_json::json!(false));
+        assert_eq!(
+            report_body["freshness_watermark"]["available"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            report_body["backup_plan"]["stale_candidate_override_ready"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            report_body["active_store_freshness"]["ok"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            report_body["legacy_projection_collision_risks"]["collision_risk"],
+            serde_json::json!(false)
+        );
+
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(&candidate);
+        let _ = std::fs::remove_file(&report);
     }
 
     #[test]
@@ -21098,11 +22920,12 @@ mod cli_parse_tests {
         assert_eq!(snapshot.import_runs[0].observed_ids, vec!["source-a"]);
         let profile_id = snapshot.workspace_id.clone();
         let workspace_id = WorkspaceId::parse(&profile_id).unwrap();
-        let history_path = revision_index_path(&profile_id).unwrap();
-        let history = loom
-            .read_file_reserved(workspace_id, &history_path)
-            .unwrap();
-        let history = RevisionIndex::decode(&history).unwrap();
+        let history = loom_substrate::versioning::load_current_revision_index(
+            &loom,
+            workspace_id,
+            &profile_id,
+        )
+        .unwrap();
         let revisions = history.history("meeting:meeting/source-a");
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].revision, 1);
@@ -21202,10 +23025,12 @@ mod cli_parse_tests {
         )
         .unwrap();
         let loom = loom_store::open_loom_read(&store_path).unwrap();
-        let history = loom
-            .read_file_reserved(workspace_id, &history_path)
-            .unwrap();
-        let history = RevisionIndex::decode(&history).unwrap();
+        let history = loom_substrate::versioning::load_current_revision_index(
+            &loom,
+            workspace_id,
+            &profile_id,
+        )
+        .unwrap();
         assert_eq!(history.history("meeting:meeting/source-a").len(), 1);
     }
 

@@ -2312,6 +2312,30 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    override fun docDeleteCollection(
+        loomPath: String,
+        workspace: String,
+        collection: String,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) {
+        executor.execute {
+            try {
+                promise.resolve(
+                    UldrenLoomNative.nativeDocDeleteCollection(
+                        loomPath, workspace, collection, passphrase.encodeToByteArray(), keyBytes(kek),
+                        authPrincipal, authPassphrase.encodeToByteArray()
+                    )
+                )
+            } catch (e: Throwable) {
+                promise.reject(e)
+            }
+        }
+    }
+
     override fun docListBinary(
         loomPath: String,
         workspace: String,

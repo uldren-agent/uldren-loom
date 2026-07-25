@@ -1736,6 +1736,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(document::doc_put_binary, m)?)?;
     m.add_function(wrap_pyfunction!(document::doc_get_binary, m)?)?;
     m.add_function(wrap_pyfunction!(document::doc_delete, m)?)?;
+    m.add_function(wrap_pyfunction!(document::doc_delete_collection, m)?)?;
     m.add_function(wrap_pyfunction!(document::doc_list_binary, m)?)?;
     m.add_function(wrap_pyfunction!(document::doc_index_create, m)?)?;
     m.add_function(wrap_pyfunction!(document::doc_index_create_json, m)?)?;

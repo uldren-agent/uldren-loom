@@ -8592,6 +8592,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "gluesql-core",
+ "hex",
  "interprocess",
  "kafka-protocol",
  "p256",
@@ -9016,6 +9017,7 @@ dependencies = [
  "uldren-loom-codec",
  "uldren-loom-core",
  "uldren-loom-store",
+ "uldren-loom-tickets",
  "uldren-loom-types",
 ]
 
@@ -9059,9 +9061,11 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "uldren-loom-client",
  "uldren-loom-codec",
  "uldren-loom-coordination",
  "uldren-loom-core",
+ "uldren-loom-drive",
  "uldren-loom-inference",
  "uldren-loom-interchange",
  "uldren-loom-interchange-io",
@@ -9263,6 +9267,7 @@ dependencies = [
  "chrono",
  "serde_json",
  "uldren-loom-codec",
+ "uldren-loom-core",
  "uldren-loom-types",
  "unicode-normalization",
 ]

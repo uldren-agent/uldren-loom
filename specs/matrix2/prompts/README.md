@@ -58,11 +58,14 @@ as the blocker. It must not ask an owner question only in chat.
 
 ## MCP Document Operations
 
-Prompt packets, boards, decisions, and result closeouts are UTF-8 documents unless the packet says
-otherwise. Workers should use `document_get_text` and `document_put_text` for those records when the
-tools are available. If only binary document tools are exposed, workers may use
-`document_get_binary` and `document_put_binary`, but they should generate byte arrays from local
-UTF-8 text and record the fallback in the result.
+Prompt packets, boards, and decisions are UTF-8 documents unless the packet says otherwise. Workers
+should use `document_get_text` and `document_put_text` for those records when the tools are
+available. If only binary document tools are exposed, workers may use `document_get_binary` and
+`document_put_binary`, but they should generate byte arrays from local UTF-8 text and record the
+fallback on the active ticket.
 
-Writing a result document is not the same as updating a ticket. If a ticket status change is required
-and no ticket operation surface is available, the missing ticket operation is the blocker.
+Closeout evidence is ticket-sourced. Record progress, blockers, questions, review requests, closeout
+evidence, and source anchors in typed ticket comments and first-class ticket fields on the active
+ticket. Do not write closeout evidence to a separate result document. If a ticket status change or
+comment is required and no ticket operation surface is available, the missing ticket operation is the
+blocker.

@@ -1,15 +1,196 @@
 use super::*;
 use crate::MemoryStore;
+use crate::mutable_overlay::{MutableOverlay, OverlayKey, OverlayOwnerToken};
+use crate::provider::ObjectStore;
 use crate::workspace::{DEFAULT_BRANCH, FacetKind, WorkspaceId};
+use std::sync::Mutex;
 
 fn nid(seed: u8) -> WorkspaceId {
     WorkspaceId::from_bytes([seed; 16])
+}
+
+#[derive(Debug, Default)]
+struct OverlayMemoryStore {
+    objects: MemoryStore,
+    overlay: Mutex<MutableOverlay>,
+}
+
+impl OverlayMemoryStore {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ObjectStore for OverlayMemoryStore {
+    fn put(&self, canonical: &[u8]) -> Result<Digest> {
+        self.objects.put(canonical)
+    }
+
+    fn get(&self, digest: &Digest) -> Result<Option<Vec<u8>>> {
+        self.objects.get(digest)
+    }
+
+    fn has(&self, digest: &Digest) -> Result<bool> {
+        self.objects.has(digest)
+    }
+
+    fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    fn put_mutable_overlay_value(
+        &self,
+        key: OverlayKey,
+        payload: Vec<u8>,
+    ) -> Result<OverlayOwnerToken> {
+        self.overlay.lock().unwrap().put_value(key, None, payload)
+    }
+
+    fn put_mutable_overlay_tombstone(&self, key: OverlayKey) -> Result<OverlayOwnerToken> {
+        self.overlay.lock().unwrap().put_tombstone(key, None)
+    }
+
+    fn uses_mutable_overlay_current_records(&self) -> bool {
+        true
+    }
+
+    fn mutable_overlay_current_entries(&self) -> Result<Vec<crate::MutableOverlayEntrySnapshot>> {
+        self.overlay.lock().unwrap().export_entries()
+    }
+
+    fn mutable_overlay_current_entry(
+        &self,
+        key: &OverlayKey,
+    ) -> Result<Option<crate::MutableOverlayEntrySnapshot>> {
+        Ok(self.overlay.lock().unwrap().current_entry(key))
+    }
+
+    fn mutable_overlay_generation(&self) -> Result<crate::OverlayGeneration> {
+        Ok(self.overlay.lock().unwrap().generation())
+    }
+
+    fn commit_workflow_transaction(
+        &self,
+        txn: crate::WorkflowTransaction,
+    ) -> Result<crate::CommitReceipt> {
+        txn.validate()?;
+        for (_, canonical) in &txn.owner_state.objects {
+            self.objects.put(canonical)?;
+        }
+        let mut overlay = self.overlay.lock().unwrap();
+        if txn
+            .expected_generation
+            .is_some_and(|expected| expected != overlay.generation())
+        {
+            return Err(LoomError::new(
+                Code::Conflict,
+                "overlay generation is stale",
+            ));
+        }
+        let before = overlay.export_entries()?;
+        let mut outcomes = Vec::with_capacity(txn.writes.len());
+        for write in txn.writes {
+            let expected = write.expected.as_ref().map(|token| &token.0);
+            let outcome = match write.op {
+                crate::FacetWriteOp::Put { payload } => overlay
+                    .put_value(write.target.clone(), expected, payload)
+                    .map(|owner_token| (owner_token, crate::OverlayEntryKind::Value)),
+                crate::FacetWriteOp::Delete => overlay
+                    .put_tombstone(write.target.clone(), expected)
+                    .map(|owner_token| (owner_token, crate::OverlayEntryKind::Tombstone)),
+            };
+            let (owner_token, change) = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    *overlay = MutableOverlay::import_entries(&before)?;
+                    return Err(error);
+                }
+            };
+            outcomes.push(crate::WriteOutcome {
+                facet: write.facet,
+                target: write.target,
+                owner_token,
+                change,
+            });
+        }
+        let generation = overlay.generation();
+        Ok(crate::CommitReceipt {
+            generation,
+            root_after: Digest::blake3(&generation.as_u64().to_be_bytes()),
+            writes: outcomes,
+            replayed: false,
+        })
+    }
 }
 
 fn new_vcs_ns(loom: &mut Loom<MemoryStore>, seed: u8) -> WorkspaceId {
     loom.registry_mut()
         .create(FacetKind::Files, None, nid(seed))
         .unwrap()
+}
+
+fn new_overlay_doc_ns(loom: &mut Loom<OverlayMemoryStore>, seed: u8) -> WorkspaceId {
+    loom.registry_mut()
+        .create(FacetKind::Document, None, nid(seed))
+        .unwrap()
+}
+
+fn committed_document_text<S: ObjectStore>(
+    loom: &Loom<S>,
+    commit: Digest,
+    collection: &str,
+    id: &str,
+) -> String {
+    let (flat, _) = loom.flatten_commit(commit).unwrap();
+    let path = crate::workspace::facet_path(FacetKind::Document, collection);
+    let Some(StagedEntry::Document(root)) = flat.get(&path) else {
+        panic!("missing committed document collection");
+    };
+    let Object::Tree(entries) = loom.get_object(root).unwrap() else {
+        panic!("document root is not a tree");
+    };
+    let mut manifest_addr = None;
+    let mut documents_root = None;
+    for entry in entries {
+        match entry.name.as_str() {
+            "manifest" if entry.kind == EntryKind::Blob => manifest_addr = Some(entry.target),
+            "documents" if entry.kind == EntryKind::ProllyMap => {
+                documents_root = Some(entry.target)
+            }
+            _ => panic!("invalid document root entry"),
+        }
+    }
+    let manifest = DocumentCollectionManifest::decode(
+        &loom
+            .load_content(manifest_addr.expect("document root has manifest"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.collection_id, collection);
+    let documents_root = documents_root.expect("document root has documents map");
+    assert_eq!(manifest.document_map_root, documents_root);
+    for (key, value) in crate::prolly::entries(&loom.store, &documents_root).unwrap() {
+        if DocumentId::decode(&key).unwrap() == DocumentId::String(id.to_string()) {
+            let record = DocumentRecord::decode(&value).unwrap();
+            let digest = match record.body_ref {
+                DocumentBodyRef::Direct { digest } => digest,
+                DocumentBodyRef::Chunked { .. } => panic!("expected direct body"),
+            };
+            let body_path = crate::workspace::facet_path(
+                FacetKind::Document,
+                &format!(
+                    ".bodies/{}/{}",
+                    hex::encode(collection.as_bytes()),
+                    digest.to_hex()
+                ),
+            );
+            let Some(StagedEntry::File(file)) = flat.get(&body_path) else {
+                panic!("missing committed document body");
+            };
+            return String::from_utf8(loom.load_content(file.content_addr).unwrap()).unwrap();
+        }
+    }
+    panic!("missing committed document id");
 }
 
 fn authenticate_root_with_files_rights(
@@ -77,6 +258,157 @@ fn unauthenticated_root_mode_bypasses_engine_acl() {
     loom.set_identity_store(crate::IdentityStore::new(nid(1)));
     loom.write_file(ns, "a.txt", b"a", 0o100644).unwrap();
     assert_eq!(loom.read_file(ns, "a.txt").unwrap(), b"a");
+}
+
+#[test]
+fn bounded_engine_planning_rewrites_only_declared_path_sections() {
+    let mut loom = Loom::new(MemoryStore::new());
+    let workspace = new_vcs_ns(&mut loom, 9);
+    loom.write_file(workspace, "target.txt", b"old", 0o100644)
+        .unwrap();
+    loom.write_file(workspace, "unrelated.txt", b"keep", 0o100644)
+        .unwrap();
+    let baseline_root = loom.save_state().unwrap();
+    loom.write_file(workspace, "target.txt", b"unpublished", 0o100644)
+        .unwrap();
+    let io_before = loom.engine_state_io_counts();
+
+    let scope = EnginePlanningScope::new(
+        workspace,
+        [EnginePathSelector::Exact("target.txt".to_string())],
+    )
+    .unwrap()
+    .with_read_paths([EnginePathSelector::Exact("unrelated.txt".to_string())])
+    .unwrap();
+    let mut planner = loom
+        .bounded_engine_planner(scope, baseline_root, MutableOverlay::new())
+        .unwrap();
+    assert_eq!(
+        planner.engine().read_file(workspace, "target.txt").unwrap(),
+        b"old"
+    );
+    assert_eq!(
+        planner
+            .engine()
+            .read_file(workspace, "unrelated.txt")
+            .unwrap(),
+        b"keep"
+    );
+    planner
+        .engine_mut()
+        .write_file(workspace, "target.txt", b"new", 0o100644)
+        .unwrap();
+    let (delta, objects) = planner.finish().unwrap();
+
+    assert_eq!(delta.changed_paths(), vec!["target.txt".to_string()]);
+    assert_eq!(delta.rewritten_sections(), vec!["01-content", "02-work"]);
+    let prepared = loom
+        .prepare_engine_state_delta_reference(&delta, baseline_root, objects)
+        .unwrap();
+    assert!(!prepared.1.is_empty());
+    for (expected, canonical) in &prepared.1 {
+        assert_eq!(loom.store().put(canonical).unwrap(), *expected);
+    }
+    let io_after_prepare = loom.engine_state_io_counts();
+    assert_eq!(io_after_prepare.full_exports, io_before.full_exports);
+    assert_eq!(io_after_prepare.full_imports, io_before.full_imports);
+    assert_eq!(
+        io_after_prepare.bounded_section_rewrites - io_before.bounded_section_rewrites,
+        2
+    );
+    assert_eq!(io_after_prepare.unrelated_section_rewrites, 0);
+
+    loom.apply_engine_state_delta(delta).unwrap();
+    assert_eq!(loom.read_file(workspace, "target.txt").unwrap(), b"new");
+    assert_eq!(loom.read_file(workspace, "unrelated.txt").unwrap(), b"keep");
+}
+
+#[test]
+fn current_facet_state_reference_excludes_unrelated_worktree_changes() {
+    let mut loom = Loom::new(MemoryStore::new());
+    let workspace = new_vcs_ns(&mut loom, 29);
+    crate::kv::kv_put(
+        &mut loom,
+        workspace,
+        "test",
+        crate::tabular::Value::Text("current".to_string()),
+        b"old".to_vec(),
+    )
+    .unwrap();
+    loom.write_file(workspace, "unrelated.txt", b"baseline", 0o100644)
+        .unwrap();
+    let baseline_root = loom.save_state().unwrap();
+    crate::kv::kv_put(
+        &mut loom,
+        workspace,
+        "test",
+        crate::tabular::Value::Text("current".to_string()),
+        b"new".to_vec(),
+    )
+    .unwrap();
+    loom.write_file(workspace, "unrelated.txt", b"unpublished", 0o100644)
+        .unwrap();
+    let io_before = loom.engine_state_io_counts();
+
+    let (reference_root, objects) = loom
+        .prepare_current_facet_state_reference(workspace, baseline_root)
+        .unwrap();
+    for (expected, canonical) in objects {
+        assert_eq!(loom.store().put(&canonical).unwrap(), expected);
+    }
+    let io_after = loom.engine_state_io_counts();
+    assert_eq!(io_after.full_exports, io_before.full_exports);
+    assert_eq!(io_after.bounded_plans, io_before.bounded_plans + 1);
+
+    let mut restored = Loom::new(loom.store().clone());
+    restored.load_state(reference_root).unwrap();
+    assert_eq!(
+        crate::kv::kv_get(
+            &restored,
+            workspace,
+            "test",
+            &crate::tabular::Value::Text("current".to_string()),
+        )
+        .unwrap(),
+        Some(b"new".to_vec())
+    );
+    assert_eq!(
+        restored.read_file(workspace, "unrelated.txt").unwrap(),
+        b"baseline"
+    );
+}
+
+#[test]
+fn bounded_engine_planning_rejects_read_only_path_mutation() {
+    let mut loom = Loom::new(MemoryStore::new());
+    let workspace = new_vcs_ns(&mut loom, 19);
+    loom.write_file(workspace, "target.txt", b"old", 0o100644)
+        .unwrap();
+    loom.write_file(workspace, "read-only.txt", b"keep", 0o100644)
+        .unwrap();
+    let baseline_root = loom.save_state().unwrap();
+    let scope = EnginePlanningScope::new(
+        workspace,
+        [EnginePathSelector::Exact("target.txt".to_string())],
+    )
+    .unwrap()
+    .with_read_paths([EnginePathSelector::Exact("read-only.txt".to_string())])
+    .unwrap();
+    let mut planner = loom
+        .bounded_engine_planner(scope, baseline_root, MutableOverlay::new())
+        .unwrap();
+    planner
+        .engine_mut()
+        .write_file(workspace, "read-only.txt", b"changed", 0o100644)
+        .unwrap();
+
+    let error = planner.finish().unwrap_err();
+    assert_eq!(error.code, Code::InvalidArgument);
+    assert!(
+        error
+            .message
+            .contains("mutated a path outside its declared scope")
+    );
 }
 
 #[test]
@@ -1978,6 +2310,265 @@ fn three_way_merge_auto_resolves_disjoint_edits() {
 }
 
 #[test]
+fn clean_merge_commit_materializes_overlay_document_current_state() {
+    let mut loom = Loom::new(OverlayMemoryStore::new());
+    let ns = new_overlay_doc_ns(&mut loom, 2);
+    crate::document::document_put_text(&mut loom, ns, "notes", "a", "base", None).unwrap();
+    loom.commit(ns, "nas", "base", 1).unwrap();
+    loom.branch(ns, "feature").unwrap();
+
+    loom.checkout_branch(ns, "feature").unwrap();
+    crate::document::document_put_text(&mut loom, ns, "notes", "b", "feature", None).unwrap();
+    loom.commit(ns, "nas", "feature", 2).unwrap();
+
+    loom.checkout_branch(ns, DEFAULT_BRANCH).unwrap();
+    loom.write_file(ns, "main.txt", b"main", 0o100644).unwrap();
+    loom.commit(ns, "nas", "main", 3).unwrap();
+    crate::document::document_put_text(&mut loom, ns, "notes", "a", "live", None).unwrap();
+
+    let MergeOutcome::Merged(merge_commit) = loom.merge(ns, "feature", "nas", 4).unwrap() else {
+        panic!("expected a clean merge commit");
+    };
+    assert_eq!(
+        committed_document_text(&loom, merge_commit, "notes", "a"),
+        "live"
+    );
+    assert_eq!(
+        committed_document_text(&loom, merge_commit, "notes", "b"),
+        "feature"
+    );
+}
+
+#[test]
+fn document_head_hot_writes_keep_one_current_version_and_bounded_overlay_records() {
+    // Repeatedly overwrite the same document id and collection head through the
+    // real document persistence path (document_put_text -> put_document_current
+    // overlay writes). Current-head churn must collapse to one logical current
+    // version with a bounded set of overlay current records, even though the
+    // number of physical hot writes grows with each update.
+    let mut loom = Loom::new(OverlayMemoryStore::new());
+    let ns = new_overlay_doc_ns(&mut loom, 7);
+
+    crate::document::document_put_text(&mut loom, ns, "notes", "a", "v0", None).unwrap();
+    let health_first = loom.mutable_overlay().health().unwrap();
+
+    for update in 1..=64 {
+        crate::document::document_put_text(
+            &mut loom,
+            ns,
+            "notes",
+            "a",
+            &format!("v{update}"),
+            None,
+        )
+        .unwrap();
+    }
+    let health_warm = loom.mutable_overlay().health().unwrap();
+
+    for update in 65..=128 {
+        crate::document::document_put_text(
+            &mut loom,
+            ns,
+            "notes",
+            "a",
+            &format!("v{update}"),
+            None,
+        )
+        .unwrap();
+    }
+    let health_measured = loom.mutable_overlay().health().unwrap();
+
+    // One logical current version: the live head reflects only the last write.
+    assert_eq!(
+        loom.mutable_overlay()
+            .health()
+            .unwrap()
+            .current_record_count,
+        health_first.current_record_count,
+        "overwriting one id must not add logical current records"
+    );
+    assert_eq!(
+        crate::document::document_get_text(&loom, ns, "notes", "a")
+            .unwrap()
+            .unwrap()
+            .text,
+        "v128"
+    );
+
+    // Current-head churn vs immutable history: the count of logical current
+    // records is bounded and does not grow across hot-write windows, while the
+    // physical hot-write count keeps climbing with each overwrite.
+    assert_eq!(
+        health_measured.current_record_count, health_warm.current_record_count,
+        "current-head churn must not accumulate logical current records"
+    );
+    assert!(
+        health_measured.current_record_count <= 4,
+        "one collection + one id should hold a small bounded set of overlay current records, got {}",
+        health_measured.current_record_count
+    );
+    assert!(
+        health_measured.hot_write_count > health_warm.hot_write_count,
+        "repeated overwrites must register as hot writes (churn), got warm={} measured={}",
+        health_warm.hot_write_count,
+        health_measured.hot_write_count
+    );
+
+    // Intentional immutable history is only created on an explicit commit, and a
+    // commit is not rewritten by later current-head churn.
+    let commit = loom.commit(ns, "nas", "snapshot", 1).unwrap();
+    assert_eq!(committed_document_text(&loom, commit, "notes", "a"), "v128");
+
+    crate::document::document_put_text(&mut loom, ns, "notes", "a", "v-after-commit", None)
+        .unwrap();
+    assert_eq!(
+        crate::document::document_get_text(&loom, ns, "notes", "a")
+            .unwrap()
+            .unwrap()
+            .text,
+        "v-after-commit",
+        "the live current head advances with new writes"
+    );
+    assert_eq!(
+        committed_document_text(&loom, commit, "notes", "a"),
+        "v128",
+        "committed history is immutable and unaffected by later current-head churn"
+    );
+}
+
+#[test]
+fn document_overlay_promotion_does_not_collide_with_file_namespace() {
+    let mut loom = Loom::new(OverlayMemoryStore::new());
+    let ns = new_overlay_doc_ns(&mut loom, 84);
+    loom.registry_mut().add_facet(ns, FacetKind::Files).unwrap();
+
+    loom.write_file(ns, "results", b"file leaf", 0o100644)
+        .unwrap();
+    crate::document::document_put_text(&mut loom, ns, "results", "run-001", "doc body", None)
+        .unwrap();
+
+    let report = loom.vcs_namespace_preflight(ns).unwrap();
+    assert!(
+        report.conflicts.is_empty(),
+        "document overlay projection must stay under the reserved facet namespace"
+    );
+
+    let commit = loom.commit(ns, "nas", "file and document", 1).unwrap();
+    let (flat, _) = loom.flatten_commit(commit).unwrap();
+    assert!(matches!(flat.get("results"), Some(StagedEntry::File(_))));
+    assert!(matches!(
+        flat.get(&crate::workspace::facet_path(
+            FacetKind::Document,
+            "results"
+        )),
+        Some(StagedEntry::Document(_))
+    ));
+    assert_eq!(
+        committed_document_text(&loom, commit, "results", "run-001"),
+        "doc body"
+    );
+}
+
+#[test]
+fn document_overlay_collision_repair_preserves_reserved_projection() {
+    let mut loom = Loom::new(OverlayMemoryStore::new());
+    let ns = new_overlay_doc_ns(&mut loom, 85);
+    loom.registry_mut().add_facet(ns, FacetKind::Files).unwrap();
+
+    loom.write_file(ns, "results", b"file leaf", 0o100644)
+        .unwrap();
+    crate::document::document_put_text(&mut loom, ns, "results", "run-001", "doc body", None)
+        .unwrap();
+    let leaf = *loom.work.get(&ns).unwrap().get("results").unwrap();
+    loom.work
+        .entry(ns)
+        .or_default()
+        .insert("results/run-001".to_string(), leaf);
+
+    let blocked = loom.vcs_namespace_preflight(ns).unwrap();
+    assert_eq!(blocked.conflicts.len(), 1);
+    assert_eq!(blocked.conflicts[0].leaf_path, "results");
+    assert_eq!(blocked.conflicts[0].child_path, "results/run-001");
+    assert!(loom.commit(ns, "nas", "blocked", 1).is_err());
+
+    loom.work
+        .get_mut(&ns)
+        .unwrap()
+        .remove("results/run-001")
+        .unwrap();
+    assert!(loom.vcs_namespace_preflight(ns).unwrap().is_clean());
+
+    let commit = loom.commit(ns, "nas", "repaired", 2).unwrap();
+    let (flat, _) = loom.flatten_commit(commit).unwrap();
+    assert!(matches!(flat.get("results"), Some(StagedEntry::File(_))));
+    assert!(matches!(
+        flat.get(&crate::workspace::facet_path(
+            FacetKind::Document,
+            "results"
+        )),
+        Some(StagedEntry::Document(_))
+    ));
+    assert_eq!(
+        committed_document_text(&loom, commit, "results", "run-001"),
+        "doc body"
+    );
+    let status = loom.status(ns).unwrap();
+    assert!(status.staged.is_empty());
+    assert!(status.unstaged.is_empty());
+    assert!(status.untracked.is_empty());
+    assert!(status.conflicts.is_empty());
+}
+
+#[test]
+fn migration_readiness_detects_uncommitted_and_namespace_collision_state() {
+    let mut loom = Loom::new(MemoryStore::new());
+    let ns = new_vcs_ns(&mut loom, 86);
+    loom.write_file(ns, "base.txt", b"base", 0o100644).unwrap();
+    loom.commit(ns, "nas", "base", 1).unwrap();
+
+    let clean = loom.status(ns).unwrap();
+    assert!(clean.staged.is_empty());
+    assert!(clean.unstaged.is_empty());
+    assert!(clean.untracked.is_empty());
+    assert!(clean.conflicts.is_empty());
+    assert!(loom.vcs_namespace_preflight(ns).unwrap().is_clean());
+
+    loom.write_file(ns, "new.txt", b"new", 0o100644).unwrap();
+    let uncommitted = loom.status(ns).unwrap();
+    assert_eq!(uncommitted.untracked, vec!["new.txt".to_string()]);
+    assert!(uncommitted.staged.is_empty());
+    assert!(uncommitted.unstaged.is_empty());
+    assert!(uncommitted.conflicts.is_empty());
+    assert!(loom.vcs_namespace_preflight(ns).unwrap().is_clean());
+
+    loom.stage_all(ns).unwrap();
+    let staged = loom.status(ns).unwrap();
+    assert_eq!(staged.staged.len(), 1);
+    assert!(staged.unstaged.is_empty());
+    assert!(staged.untracked.is_empty());
+    assert!(staged.conflicts.is_empty());
+    loom.commit_staged(ns, "nas", "commit clean state", 2)
+        .unwrap();
+
+    let after_commit = loom.status(ns).unwrap();
+    assert!(after_commit.staged.is_empty());
+    assert!(after_commit.unstaged.is_empty());
+    assert!(after_commit.untracked.is_empty());
+    assert!(after_commit.conflicts.is_empty());
+
+    loom.write_file(ns, "results", b"leaf", 0o100644).unwrap();
+    let leaf = *loom.work.get(&ns).unwrap().get("results").unwrap();
+    loom.work
+        .entry(ns)
+        .or_default()
+        .insert("results/run-001".to_string(), leaf);
+    let collision = loom.vcs_namespace_preflight(ns).unwrap();
+    assert!(!collision.is_clean());
+    assert_eq!(collision.conflicts[0].leaf_path, "results");
+    assert_eq!(collision.conflicts[0].child_path, "results/run-001");
+}
+
+#[test]
 fn three_way_merge_reports_conflicts() {
     let mut loom = Loom::new(MemoryStore::new());
     let ns = new_vcs_ns(&mut loom, 1);
@@ -2076,6 +2667,36 @@ fn merge_resolve_theirs_then_continue_makes_two_parent_commit() {
 }
 
 #[test]
+fn merge_continue_materializes_overlay_document_current_state() {
+    let mut loom = Loom::new(OverlayMemoryStore::new());
+    let ns = new_overlay_doc_ns(&mut loom, 3);
+    loom.write_file(ns, "a.txt", b"base", 0o100644).unwrap();
+    loom.commit(ns, "nas", "base", 1).unwrap();
+    loom.branch(ns, "feature").unwrap();
+
+    loom.checkout_branch(ns, "feature").unwrap();
+    loom.write_file(ns, "a.txt", b"theirs", 0o100644).unwrap();
+    loom.commit(ns, "nas", "feature", 2).unwrap();
+
+    loom.checkout_branch(ns, DEFAULT_BRANCH).unwrap();
+    loom.write_file(ns, "a.txt", b"ours", 0o100644).unwrap();
+    loom.commit(ns, "nas", "main", 3).unwrap();
+    assert!(matches!(
+        loom.merge(ns, "feature", "nas", 4).unwrap(),
+        MergeOutcome::Conflicts(_)
+    ));
+
+    crate::document::document_put_text(&mut loom, ns, "notes", "a", "resolved", None).unwrap();
+    loom.merge_resolve(ns, "a.txt", ConflictResolution::Theirs)
+        .unwrap();
+    let merge_commit = loom.merge_continue(ns, "nas", 5).unwrap();
+    assert_eq!(
+        committed_document_text(&loom, merge_commit, "notes", "a"),
+        "resolved"
+    );
+}
+
+#[test]
 fn merge_resolve_working_accepts_hand_merged_content() {
     let (mut loom, ns, _ours) = conflict_scenario();
     loom.merge(ns, "feature", "nas", 4).unwrap();
@@ -2134,6 +2755,109 @@ fn commit_staged_records_only_the_index() {
     let st = loom.status(ns).unwrap();
     assert!(st.staged.is_empty());
     assert_eq!(st.untracked, vec!["b.txt".to_string()]);
+}
+
+#[test]
+fn vcs_namespace_preflight_reports_leaf_parent_collision_before_commit() {
+    let mut loom = Loom::new(MemoryStore::new());
+    let ns = new_vcs_ns(&mut loom, 80);
+    loom.write_file(ns, "results", b"leaf", 0o100644).unwrap();
+    let leaf = *loom.work.get(&ns).unwrap().get("results").unwrap();
+    loom.work
+        .entry(ns)
+        .or_default()
+        .insert("results/run-001".to_string(), leaf);
+
+    let report = loom.vcs_namespace_preflight(ns).unwrap();
+    assert_eq!(report.conflicts.len(), 1);
+    let conflict = &report.conflicts[0];
+    assert_eq!(conflict.path, "results");
+    assert_eq!(conflict.leaf_path, "results");
+    assert_eq!(conflict.child_path, "results/run-001");
+    assert!(
+        conflict
+            .repair_options
+            .iter()
+            .any(|option| option.contains("remove or unstage"))
+    );
+    assert!(
+        conflict
+            .repair_options
+            .iter()
+            .any(|option| option.contains("rename or move"))
+    );
+
+    let err = loom.commit(ns, "nas", "collision", 1).unwrap_err();
+    assert_eq!(err.code, Code::InvalidArgument);
+    let message = err.to_string();
+    assert!(message.contains("vcs namespace collision preflight failed"));
+    assert!(message.contains("\"results\""));
+    assert!(message.contains("\"results/run-001\""));
+    assert!(message.contains("repair options"));
+    assert!(!message.contains("duplicate tree entry name"));
+}
+
+#[test]
+fn vcs_staged_namespace_preflight_reports_index_collision_before_commit_staged() {
+    let mut loom = Loom::new(MemoryStore::new());
+    let ns = new_vcs_ns(&mut loom, 81);
+    loom.write_file(ns, "results", b"leaf", 0o100644).unwrap();
+    loom.stage_all(ns).unwrap();
+    let leaf = *loom.index.get(&ns).unwrap().get("results").unwrap();
+    loom.index
+        .entry(ns)
+        .or_default()
+        .insert("results/run-001".to_string(), leaf);
+
+    let report = loom.vcs_staged_namespace_preflight(ns).unwrap();
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(report.conflicts[0].leaf_path, "results");
+    assert_eq!(report.conflicts[0].child_path, "results/run-001");
+
+    let err = loom.commit_staged(ns, "nas", "collision", 1).unwrap_err();
+    assert_eq!(err.code, Code::InvalidArgument);
+    let message = err.to_string();
+    assert!(message.contains("vcs namespace collision preflight failed"));
+    assert!(message.contains("\"results\""));
+    assert!(message.contains("\"results/run-001\""));
+    assert!(!message.contains("duplicate tree entry name"));
+}
+
+#[test]
+fn vcs_namespace_preflight_reports_explicit_directory_collision() {
+    let mut loom = Loom::new(MemoryStore::new());
+    let ns = new_vcs_ns(&mut loom, 82);
+    loom.write_file(ns, "results", b"leaf", 0o100644).unwrap();
+    loom.dirs
+        .entry(ns)
+        .or_default()
+        .insert("results".to_string());
+
+    let report = loom.vcs_namespace_preflight(ns).unwrap();
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(report.conflicts[0].leaf_path, "results");
+    assert_eq!(report.conflicts[0].child_path, "results/");
+}
+
+#[test]
+fn vcs_namespace_preflight_reports_reserved_facet_path_collision() {
+    let mut loom = Loom::new(MemoryStore::new());
+    let ns = new_vcs_ns(&mut loom, 83);
+    loom.write_file_reserved(ns, ".loom", b"leaf", 0o100644)
+        .unwrap();
+    let leaf = *loom.work.get(&ns).unwrap().get(".loom").unwrap();
+    loom.work
+        .entry(ns)
+        .or_default()
+        .insert(".loom/facets/document/results".to_string(), leaf);
+
+    let report = loom.vcs_namespace_preflight(ns).unwrap();
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(report.conflicts[0].leaf_path, ".loom");
+    assert_eq!(
+        report.conflicts[0].child_path,
+        ".loom/facets/document/results"
+    );
 }
 
 #[test]

@@ -9,7 +9,11 @@
 use loom_core::digest::{Algo, Digest};
 use loom_core::error::{Code, LoomError, Result};
 use loom_core::lock::LockCoordinator;
-use loom_core::{AclStore, ExternalCredentialKind, IdentityStore, VerifiedExternalCredentialAuth};
+use loom_core::{
+    AclStore, CommitReceipt, ExternalCredentialKind, IdentityStore, SecondaryIndexWrite,
+    VerifiedExternalCredentialAuth, WorkflowTransaction, WorkflowTransactionErrorKind,
+    WriteOutcome,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod daemon;
@@ -29,7 +33,7 @@ pub fn provided_capabilities() -> &'static [&'static str] {
 }
 use loom_core::keys::{DekSession, KeySpec};
 use loom_core::provider::ObjectStore;
-use loom_core::{CompressionHint, Loom, WorkspaceId};
+use loom_core::{CompressionHint, FacetKind, Loom, WorkspaceId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::{File, OpenOptions};
@@ -39,6 +43,7 @@ use std::path::PathBuf;
 // are cfg-gated off for wasm32; `PathBuf` stays unconditional (it is the `FileStore.path` field type).
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 mod frame;
@@ -81,6 +86,11 @@ pub use derived::{
     vector_pq_artifact_stamp,
 };
 pub use frame::Codec;
+pub use loom_core::{
+    MutableOverlay, MutableOverlayEntrySnapshot, MutableOverlayHealth, OverlayCheckpoint,
+    OverlayDurabilityPolicy, OverlayEntryKind, OverlayGeneration, OverlayKey, OverlayOwnerScope,
+    OverlayOwnerToken, OverlayPromotionEntry, OverlayPromotionSelection, OverlaySnapshot,
+};
 pub use maintenance_policy::{
     StoreMaintenancePolicy, StoreMaintenanceReport, StoreMaintenanceRunState,
 };
@@ -115,6 +125,26 @@ const AUTHORITY_REPLICATION_PREFIX: &[u8] = b"authority/v1/replication/";
 const CERTIFICATE_BUNDLE_PREFIX: &[u8] = b"certificate/v1/bundle/";
 const NETWORK_ACCESS_POLICY_PREFIX: &[u8] = b"network-access/v1/policy/";
 const STORE_POLICY_KEY: &[u8] = b"store/v1/policy";
+const MUTABLE_OVERLAY_META_ADDRESS: &[u8] = b"mutable-overlay/v1/meta";
+const MUTABLE_OVERLAY_CURRENT_INDEX_ADDRESS: &[u8] = b"mutable-overlay/v1/current-index";
+const MUTABLE_OVERLAY_ENTRY_ADDRESS_PREFIX: &[u8] = b"mutable-overlay/v1/current/";
+const MUTABLE_OVERLAY_OWNER_TOKEN_ADDRESS_PREFIX: &[u8] = b"mutable-overlay/v1/owner-token/";
+const MUTABLE_OVERLAY_SECONDARY_INDEX_ADDRESS_PREFIX: &[u8] =
+    b"mutable-overlay/v1/secondary-index/";
+const MUTABLE_OVERLAY_IDEMPOTENCY_ADDRESS_PREFIX: &[u8] = b"mutable-overlay/v1/idempotency/";
+const MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_ADDRESS_PREFIX: &[u8] =
+    b"mutable-overlay/v1/transaction-idempotency/";
+const RETAINED_HISTORY_HEAD_ADDRESS_PREFIX: &[u8] = b"retained-history/v1/head/";
+const RETAINED_HISTORY_RECORD_ADDRESS_PREFIX: &[u8] = b"retained-history/v1/record/";
+const MUTABLE_OVERLAY_OWNER_TOKEN_RECORD: &[u8] = b"loom.store.mutable-overlay.owner-token.v1";
+const MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD: &[u8] =
+    b"loom.store.mutable-overlay.secondary-index.v1";
+const MUTABLE_OVERLAY_IDEMPOTENCY_RECORD: &[u8] = b"loom.store.mutable-overlay.idempotency.v1";
+const MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD: &[u8] =
+    b"loom.store.mutable-overlay.transaction-idempotency.v1";
+const MUTABLE_OVERLAY_CURRENT_INDEX_RECORD: &[u8] = b"loom.store.mutable-overlay.current-index.v1";
+const RETAINED_HISTORY_HEAD_RECORD: &[u8] = b"loom.store.retained-history.head.v1";
+const RETAINED_HISTORY_ENTRY_RECORD: &[u8] = b"loom.store.retained-history.entry.v1";
 const AUDIT_RECORD_MAGIC: &[u8; 8] = b"LAUDIT1\0";
 const AUDIT_CONFIG_MAGIC: &[u8; 8] = b"LAUDCFG1";
 const AUDIT_CHECKPOINT_MAGIC: &[u8; 8] = b"LAUDCHK1";
@@ -154,9 +184,72 @@ impl Default for AuditConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorePolicy {
     pub fips_required: bool,
+    pub default_durability: StoreDurabilityPolicy,
+    pub facet_durability_overrides: [Option<StoreDurabilityPolicy>; 21],
+}
+
+impl Default for StorePolicy {
+    fn default() -> Self {
+        Self {
+            fips_required: false,
+            default_durability: StoreDurabilityPolicy::Normal,
+            facet_durability_overrides: [None; 21],
+        }
+    }
+}
+
+impl StorePolicy {
+    pub fn effective_durability(self, facet: FacetKind) -> StoreDurabilityPolicy {
+        self.facet_durability_overrides[facet.stable_tag() as usize]
+            .unwrap_or(self.default_durability)
+    }
+
+    pub fn effective_derived_artifact_durability(
+        self,
+        facet: FacetKind,
+        owner_policy: Option<StoreDurabilityPolicy>,
+    ) -> StoreDurabilityPolicy {
+        loom_core::strictest_durability([
+            StoreDurabilityPolicy::Relaxed,
+            self.facet_durability_overrides[facet.stable_tag() as usize]
+                .unwrap_or(StoreDurabilityPolicy::Relaxed),
+            owner_policy.unwrap_or(StoreDurabilityPolicy::Relaxed),
+        ])
+    }
+
+    pub fn set_default_durability(&mut self, policy: StoreDurabilityPolicy) -> Result<()> {
+        validate_store_durability_policy(policy)?;
+        self.default_durability = policy;
+        Ok(())
+    }
+
+    pub fn set_facet_durability(
+        &mut self,
+        facet: FacetKind,
+        policy: Option<StoreDurabilityPolicy>,
+    ) -> Result<()> {
+        if let Some(policy) = policy {
+            validate_store_durability_policy(policy)?;
+        }
+        self.facet_durability_overrides[facet.stable_tag() as usize] = policy;
+        Ok(())
+    }
+}
+
+pub type StoreDurabilityPolicy = OverlayDurabilityPolicy;
+
+pub fn validate_store_durability_policy(policy: StoreDurabilityPolicy) -> Result<()> {
+    let _ = policy;
+    Ok(())
+}
+
+pub fn parse_store_durability_policy(value: &str) -> Result<StoreDurabilityPolicy> {
+    let policy = StoreDurabilityPolicy::parse(value)?;
+    validate_store_durability_policy(policy)?;
+    Ok(policy)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +274,292 @@ pub struct MaintenanceStatus {
     pub touched_segments: Vec<u64>,
     pub candidate_segments: Vec<u64>,
     pub segment_overflow: bool,
+    /// Group-commit / hot-mutable durability diagnostics.
+    pub group_commit: GroupCommitDiagnostics,
+}
+
+/// Group-commit / hot-mutable durability diagnostics.
+///
+/// Statistic model: cumulative counters plus counts plus
+/// point-in-time gauges; consumers derive averages themselves (e.g. mean fsync latency is
+/// `fsync_total_micros / fsync_count`, mean records/batch is
+/// `group_commit_records_total / group_commit_batches_total`). Durations are microseconds (`u64`);
+/// sizes are counts. The cumulative counters are monotonic for the life of an open store handle and
+/// reset to zero when the store is reopened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupCommitDiagnostics {
+    /// Number of hot-mutable batch publishes (each a single drain-and-fsync of queued transactions).
+    pub group_commit_batches_total: u64,
+    /// Total queued transactions folded into those batches.
+    pub group_commit_transactions_total: u64,
+    /// Total records folded into those batches.
+    pub group_commit_records_total: u64,
+    /// Cumulative time spent in durable-commit `fsync` calls, microseconds.
+    pub fsync_total_micros: u64,
+    /// Number of durable-commit `fsync` calls measured.
+    pub fsync_count: u64,
+    /// Cumulative time spent waiting to acquire the store write lock, microseconds.
+    pub write_lock_wait_total_micros: u64,
+    /// Number of write-lock acquisitions measured.
+    pub write_lock_wait_count: u64,
+    /// Point-in-time gauge: transactions currently enqueued in the hot-mutable queue but not yet drained.
+    pub pending_durable_window_transactions: u64,
+    /// Point-in-time gauge: records currently enqueued in the hot-mutable queue but not yet drained.
+    pub pending_durable_window_records: u64,
+    /// Reader pins currently blocking overlay reclamation. `None` when this count is not available
+    /// from the store diagnostics surface: the live reader-pin registry is owned by the daemon layer
+    /// (`daemon::DaemonPinStatus`) and is not reachable here, so the store reports "unavailable"
+    /// rather than a hardcoded zero that would falsely imply no blockers.
+    pub pinned_reader_blockers: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreMvccSnapshotIdentity {
+    pub overlay_generation: loom_core::OverlayGeneration,
+    pub immutable_base_root: Option<Digest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreMvccSnapshotPin {
+    pub pin_id: u64,
+    pub identity: StoreMvccSnapshotIdentity,
+    pub owner: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreMvccSnapshotDiagnostics {
+    pub active_snapshot_count: u64,
+    pub oldest_pinned_overlay_generation: Option<loom_core::OverlayGeneration>,
+    pub pins: Vec<StoreMvccSnapshotPin>,
+}
+
+#[derive(Debug, Default)]
+struct StoreMvccSnapshotRegistry {
+    next_pin_id: u64,
+    pins: BTreeMap<u64, StoreMvccSnapshotPin>,
+}
+
+#[derive(Debug)]
+pub struct StoreMvccSnapshot {
+    pin_id: u64,
+    identity: StoreMvccSnapshotIdentity,
+    snapshot: loom_core::OverlaySnapshot,
+    registry: Arc<Mutex<StoreMvccSnapshotRegistry>>,
+    released: AtomicBool,
+}
+
+impl StoreMvccSnapshot {
+    pub fn pin_id(&self) -> u64 {
+        self.pin_id
+    }
+
+    pub fn identity(&self) -> StoreMvccSnapshotIdentity {
+        self.identity
+    }
+
+    pub fn overlay_generation(&self) -> loom_core::OverlayGeneration {
+        self.identity.overlay_generation
+    }
+
+    pub fn immutable_base_root(&self) -> Option<Digest> {
+        self.identity.immutable_base_root
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    pub fn read_composite(
+        &self,
+        key: &loom_core::OverlayKey,
+        base_read: impl FnOnce(Option<Digest>, &loom_core::OverlayKey) -> Result<Option<Vec<u8>>>,
+    ) -> Result<Option<Vec<u8>>> {
+        let base_root = self.identity.immutable_base_root;
+        self.snapshot
+            .read_composite(key, |key| base_read(base_root, key))
+    }
+
+    pub fn release(&self) -> Result<bool> {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return Ok(false);
+        }
+        self.registry
+            .lock()
+            .map_err(|_| poisoned())?
+            .pins
+            .remove(&self.pin_id);
+        Ok(true)
+    }
+}
+
+impl loom_core::OverlaySnapshotPin for StoreMvccSnapshot {
+    fn release(&self) -> Result<bool> {
+        StoreMvccSnapshot::release(self)
+    }
+}
+
+impl Drop for StoreMvccSnapshot {
+    fn drop(&mut self) {
+        if !self.released.swap(true, Ordering::AcqRel)
+            && let Ok(mut registry) = self.registry.lock()
+        {
+            registry.pins.remove(&self.pin_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePageClassAttribution {
+    pub physical_bytes: u64,
+    pub page_size: u64,
+    pub data_pages: u64,
+    pub classes: Vec<StorePageClass>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePageClass {
+    pub class: String,
+    pub pages: u64,
+    pub bytes: u64,
+    pub examples: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutableOverlayCheckpointPlan {
+    pub overlay_generation: loom_core::OverlayGeneration,
+    pub active_snapshot_count: u64,
+    pub oldest_pinned_generation: Option<loom_core::OverlayGeneration>,
+    pub pinned_generations: Vec<loom_core::OverlayGeneration>,
+    pub current_record_count: u64,
+    pub tombstone_count: u64,
+    pub compactable_current_records: u64,
+    pub blocked_current_records: u64,
+    pub stale_record_bytes: u64,
+    pub reusable_free_bytes: u64,
+    pub current_records: Vec<MutableOverlayCheckpointRecordPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutableOverlayCheckpointRecordPlan {
+    pub key: loom_core::OverlayKey,
+    pub generation: loom_core::OverlayGeneration,
+    pub kind: loom_core::OverlayEntryKind,
+    pub page_start: u64,
+    pub page_span: u64,
+    pub bytes: u64,
+    pub blockers: Vec<MutableOverlayReclaimBlocker>,
+    pub compactable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutableOverlayCheckpointWriteReport {
+    pub planned_current_records: u64,
+    pub compacted_current_records: u64,
+    pub blocked_current_records: u64,
+    pub rewritten_record_bytes: u64,
+    pub freed_record_pages: u64,
+    pub reusable_free_bytes: u64,
+    pub physical_page_count: u64,
+}
+
+/// Why a superseded mutable-overlay page run cannot yet return to the allocator. Each variant is
+/// reported per page run so operators can see whether storage growth is caused by readers, retention
+/// policy, recovery safety, or promotion consumers rather than a collapsed "not reclaimable" state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MutableOverlayReclaimBlocker {
+    /// The logical-key current index still points at (or before) the superseded generation.
+    CurrentIndexVisible,
+    /// A pinned MVCC snapshot can still read the superseded record.
+    PinnedSnapshot,
+    /// A retained-history checkpoint can still read the superseded record.
+    RetainedHistory,
+    /// Audit retention (operation log / legal hold) has not reached its compaction horizon.
+    AuditRetention,
+    /// A tombstone is still required to hide a value reachable from the immutable base through
+    /// composite reads. Cleared once a later value supersedes the tombstone or the base no longer
+    /// exposes the deleted record.
+    TombstoneRetention,
+    /// The durable-generation floor has not reached the superseding generation, so recovery could
+    /// still roll the replacement back.
+    DurableGenerationWindow,
+    /// A strict promotion, sync, export, ledger, or audit boundary pins its selected checkpoint.
+    StrictPromotionBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutableOverlayReclaimState {
+    pub superseded_generation: u64,
+    pub superseding_generation: u64,
+    pub latest_index_generation: u64,
+    pub oldest_pinned_snapshot_generation: Option<u64>,
+    pub retained_history_generation: Option<u64>,
+    pub audit_retention_active: bool,
+    pub tombstone_masks_base: bool,
+    pub durable_reclaim_floor: u64,
+    pub strict_promotion_generation: Option<u64>,
+}
+
+impl MutableOverlayReclaimState {
+    pub fn blockers(self) -> Result<Vec<MutableOverlayReclaimBlocker>> {
+        if self.superseding_generation <= self.superseded_generation {
+            return Err(LoomError::invalid(
+                "mutable overlay reclaim requires a later superseding generation",
+            ));
+        }
+        let mut blockers = Vec::new();
+        if self.latest_index_generation <= self.superseded_generation {
+            blockers.push(MutableOverlayReclaimBlocker::CurrentIndexVisible);
+        }
+        if generation_in_superseded_window(
+            self.oldest_pinned_snapshot_generation,
+            self.superseded_generation,
+            self.superseding_generation,
+        ) {
+            blockers.push(MutableOverlayReclaimBlocker::PinnedSnapshot);
+        }
+        if generation_in_superseded_window(
+            self.retained_history_generation,
+            self.superseded_generation,
+            self.superseding_generation,
+        ) {
+            blockers.push(MutableOverlayReclaimBlocker::RetainedHistory);
+        }
+        if self.audit_retention_active {
+            blockers.push(MutableOverlayReclaimBlocker::AuditRetention);
+        }
+        if self.tombstone_masks_base {
+            blockers.push(MutableOverlayReclaimBlocker::TombstoneRetention);
+        }
+        if self.durable_reclaim_floor < self.superseding_generation {
+            blockers.push(MutableOverlayReclaimBlocker::DurableGenerationWindow);
+        }
+        if generation_in_superseded_window(
+            self.strict_promotion_generation,
+            self.superseded_generation,
+            self.superseding_generation,
+        ) {
+            blockers.push(MutableOverlayReclaimBlocker::StrictPromotionBoundary);
+        }
+        blockers.sort();
+        blockers.dedup();
+        Ok(blockers)
+    }
+
+    pub fn is_eligible(self) -> Result<bool> {
+        self.blockers().map(|blockers| blockers.is_empty())
+    }
+}
+
+fn generation_in_superseded_window(
+    generation: Option<u64>,
+    superseded_generation: u64,
+    superseding_generation: u64,
+) -> bool {
+    generation
+        .map(|generation| {
+            generation >= superseded_generation && generation < superseding_generation
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -194,6 +573,9 @@ pub struct StoreIoStats {
     pub index_pages_read: u64,
     pub sparse_index_lookup_count: u64,
     pub materialized_index_lookup_count: u64,
+    pub open_mutable_current_records_loaded: u64,
+    pub open_mutable_control_records_skipped: u64,
+    pub open_mutable_used_current_index: bool,
     pub open_index_materialized: bool,
 }
 
@@ -497,6 +879,15 @@ pub struct FileStore {
     default_codec: Codec, // codec attempted for new object records; a runtime write policy only,
     // reads are self-describing, so it isn't persisted
     group: Mutex<GroupCommit>, // staging queue that coalesces concurrent writers into one fsync
+    // Lock-free durability diagnostics counters surfaced through GroupCommitDiagnostics.
+    group_commit_metrics: GroupCommitMetrics,
+    mutable_overlay: Mutex<loom_core::MutableOverlay>,
+    mutable_overlay_enumerations: AtomicU64,
+    overlay_publication: Mutex<()>,
+    pending_mutable_idempotency: Mutex<BTreeMap<String, PendingMutableIdempotency>>,
+    pending_workflow_idempotency: Mutex<BTreeMap<Vec<u8>, PendingWorkflowIdempotency>>,
+    mvcc_snapshot_registry: Arc<Mutex<StoreMvccSnapshotRegistry>>,
+    pub(crate) hot_mutable_queue: Mutex<HotMutableCommitQueue>,
     // The unlocked data-encryption-key session for an encrypted Loom, or `None` when
     // the store is unencrypted or still locked. Object seal/unseal requires this; a read that
     // needs it while `None` is `E2eLocked`. Behind its own lock so `unlock` takes `&self`.
@@ -520,6 +911,7 @@ struct Inner {
     reference_root: Option<Digest>, // the engine-state root object digest, if any
     control_root: Option<Digest>,   // durable-local control-plane root object digest, if any
     index_root: Option<PageId>,     // page of the object-index CoW B-tree root, if any
+    overlay_root: Option<PageId>,   // page of the mutable overlay current-record CoW B-tree root
     freemap: Option<(PageId, u64)>, // (root, page span) of the persisted free-page map
     region_table_root: Option<PageId>, // page holding the region roots, freed and rewritten each commit
     maintenance_root: Option<PageId>,  // page holding conservative maintenance metadata
@@ -540,6 +932,20 @@ struct Waiter {
     cv: Condvar,
 }
 
+#[derive(Debug, Clone)]
+struct PendingMutableIdempotency {
+    request_digest: Digest,
+    owner_token: loom_core::OverlayOwnerToken,
+    waiter: Arc<Waiter>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingWorkflowIdempotency {
+    request_digest: Digest,
+    receipt: CommitReceipt,
+    waiter: Arc<Waiter>,
+}
+
 /// The group-commit staging area. Concurrent writers enqueue their objects here; whichever writer
 /// finds no leader active becomes the leader and commits the whole queue in one fsync'd transaction,
 /// while the rest wait. `pending` and `waiters` are non-empty together: every submitter enqueues at
@@ -549,6 +955,198 @@ struct GroupCommit {
     pending: Vec<(Digest, Vec<u8>, Codec)>, // owned: the leader commits other threads' objects too
     waiters: Vec<Arc<Waiter>>,
     leader_active: bool,
+}
+
+/// Thread-safe accumulator behind [`GroupCommitDiagnostics`]. Plain atomics with `Relaxed`
+/// ordering: these are diagnostic counters, not synchronization, so recording a sample never takes a
+/// lock and adds only a single relaxed add on the hot path. Recording is one measurement per
+/// batch / fsync / lock-acquisition event - never per record.
+#[derive(Debug, Default)]
+pub(crate) struct GroupCommitMetrics {
+    batches_total: AtomicU64,
+    transactions_total: AtomicU64,
+    records_total: AtomicU64,
+    fsync_total_micros: AtomicU64,
+    fsync_count: AtomicU64,
+    write_lock_wait_total_micros: AtomicU64,
+    write_lock_wait_count: AtomicU64,
+}
+
+impl GroupCommitMetrics {
+    /// Record one published batch: `transactions` queued transactions and `records` records drained.
+    fn record_batch(&self, transactions: u64, records: u64) {
+        self.batches_total.fetch_add(1, Ordering::Relaxed);
+        self.transactions_total
+            .fetch_add(transactions, Ordering::Relaxed);
+        self.records_total.fetch_add(records, Ordering::Relaxed);
+    }
+
+    /// Record one durable-commit `fsync` and how long it took.
+    pub(crate) fn record_fsync(&self, elapsed: std::time::Duration) {
+        self.fsync_total_micros
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.fsync_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one write-lock acquisition and how long it waited.
+    fn record_write_lock_wait(&self, elapsed: std::time::Duration) {
+        self.write_lock_wait_total_micros
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.write_lock_wait_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+const HOT_MUTABLE_QUEUE_MAX_TRANSACTIONS: usize = 1024;
+const HOT_MUTABLE_QUEUE_MAX_RECORDS: usize = 8192;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotMutableCommit {
+    pub sequence: u64,
+    pub base_generation: u64,
+    pub pending_generation: u64,
+    pub durability: StoreDurabilityPolicy,
+    pub records: Vec<([u8; 32], Vec<u8>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotMutableCommitWindow {
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub base_generation: u64,
+    pub pending_generation: u64,
+    pub transaction_count: usize,
+    pub record_count: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct HotMutableCommitQueue {
+    next_sequence: u64,
+    pending: VecDeque<HotMutableCommit>,
+    pending_records: usize,
+    waiters: VecDeque<Arc<Waiter>>,
+    leader_active: bool,
+}
+
+impl HotMutableCommitQueue {
+    pub fn enqueue(
+        &mut self,
+        base_generation: u64,
+        durability: StoreDurabilityPolicy,
+        records: Vec<([u8; 32], Vec<u8>)>,
+    ) -> Result<HotMutableCommitWindow> {
+        if durability != StoreDurabilityPolicy::Normal {
+            return Err(LoomError::new(
+                Code::InvalidArgument,
+                "hot mutable commit queue only accepts normal durability transactions",
+            ));
+        }
+        if records.is_empty() {
+            return Err(LoomError::new(
+                Code::InvalidArgument,
+                "hot mutable commit queue transaction is empty",
+            ));
+        }
+        if self.pending.len() >= HOT_MUTABLE_QUEUE_MAX_TRANSACTIONS {
+            return Err(LoomError::new(
+                Code::ResourceExhausted,
+                "hot mutable commit queue transaction limit reached",
+            ));
+        }
+        let pending_records = self
+            .pending_records
+            .checked_add(records.len())
+            .ok_or_else(|| corrupt("hot mutable commit queue record count overflow"))?;
+        if pending_records > HOT_MUTABLE_QUEUE_MAX_RECORDS {
+            return Err(LoomError::new(
+                Code::ResourceExhausted,
+                "hot mutable commit queue record limit reached",
+            ));
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| corrupt("hot mutable commit queue sequence overflow"))?;
+        let pending_generation = match self.pending.back() {
+            Some(commit) => commit
+                .pending_generation
+                .checked_add(1)
+                .ok_or_else(|| corrupt("hot mutable commit queue generation overflow"))?,
+            None => base_generation
+                .checked_add(1)
+                .ok_or_else(|| corrupt("hot mutable commit queue generation overflow"))?,
+        };
+        self.pending.push_back(HotMutableCommit {
+            sequence,
+            base_generation,
+            pending_generation,
+            durability,
+            records,
+        });
+        self.pending_records = pending_records;
+        self.pending_window()
+            .ok_or_else(|| corrupt("hot mutable commit queue window missing after enqueue"))
+    }
+
+    pub fn pending_window(&self) -> Option<HotMutableCommitWindow> {
+        let first = self.pending.front()?;
+        let last = self.pending.back().expect("front exists");
+        Some(HotMutableCommitWindow {
+            first_sequence: first.sequence,
+            last_sequence: last.sequence,
+            base_generation: first.base_generation,
+            pending_generation: last.pending_generation,
+            transaction_count: self.pending.len(),
+            record_count: self.pending_records,
+        })
+    }
+
+    pub fn drain_ready(&mut self, max_records: usize) -> Vec<HotMutableCommit> {
+        self.drain_ready_with_waiters(max_records)
+            .into_iter()
+            .map(|(commit, _)| commit)
+            .collect()
+    }
+
+    fn enqueue_with_waiter(
+        &mut self,
+        base_generation: u64,
+        records: Vec<([u8; 32], Vec<u8>)>,
+        waiter: Arc<Waiter>,
+    ) -> Result<bool> {
+        self.enqueue(base_generation, StoreDurabilityPolicy::Normal, records)?;
+        self.waiters.push_back(waiter);
+        let was_idle = !self.leader_active;
+        self.leader_active = true;
+        Ok(was_idle)
+    }
+
+    fn drain_ready_with_waiters(
+        &mut self,
+        max_records: usize,
+    ) -> Vec<(HotMutableCommit, Option<Arc<Waiter>>)> {
+        let mut drained = Vec::new();
+        let mut drained_records = 0usize;
+        while let Some(next) = self.pending.front() {
+            if !drained.is_empty() && drained_records + next.records.len() > max_records {
+                break;
+            }
+            let next = self.pending.pop_front().expect("front exists");
+            drained_records += next.records.len();
+            self.pending_records -= next.records.len();
+            drained.push((next, self.waiters.pop_front()));
+        }
+        drained
+    }
+
+    fn finish_leader_if_empty(&mut self) -> bool {
+        if self.pending.is_empty() {
+            self.leader_active = false;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl FileStore {
@@ -648,16 +1246,26 @@ impl FileStore {
         // One writer per file: an exclusive advisory lock for this handle's lifetime keeps a second
         // process from racing the superblock. Readers take no lock; the lock releases when the handle
         // is dropped.
-        if writable {
+        // Measure the wait to take the exclusive advisory lock. The store struct does not
+        // exist yet, so the sample is recorded into its metrics once it is constructed below.
+        let write_lock_wait = if writable {
+            let started = std::time::Instant::now();
             acquire_write_lock(&file)?;
-        }
-        Self::open_over_backing(
+            Some(started.elapsed())
+        } else {
+            None
+        };
+        let store = Self::open_over_backing(
             Box::new(file),
             writable,
             path,
             encryption,
             create_digest_algo,
-        )
+        )?;
+        if let Some(elapsed) = write_lock_wait {
+            store.group_commit_metrics.record_write_lock_wait(elapsed);
+        }
+        Ok(store)
     }
 
     /// Open a `FileStore` over a caller-supplied [`BackingIo`] - an in-memory buffer, a browser OPFS
@@ -743,7 +1351,7 @@ impl FileStore {
             write_at(&mut *backing, 0, &sb).map_err(io_err)?;
             write_at(&mut *backing, SLOT_SIZE, &sb).map_err(io_err)?;
             backing.fsync().map_err(io_err)?;
-            return Ok(Self {
+            let store = Self {
                 file: Mutex::new(backing),
                 inner: Mutex::new(Inner {
                     index: BTreeMap::new(),
@@ -760,6 +1368,7 @@ impl FileStore {
                     reference_root: None,
                     control_root: None,
                     index_root: None,
+                    overlay_root: None,
                     freemap: None,
                     region_table_root: None,
                     maintenance_root: None,
@@ -771,9 +1380,19 @@ impl FileStore {
                 path,
                 default_codec: Codec::Deflate,
                 group: Mutex::new(GroupCommit::default()),
+                group_commit_metrics: GroupCommitMetrics::default(),
+                mutable_overlay: Mutex::new(loom_core::MutableOverlay::new()),
+                mutable_overlay_enumerations: AtomicU64::new(0),
+                overlay_publication: Mutex::new(()),
+                pending_mutable_idempotency: Mutex::new(BTreeMap::new()),
+                pending_workflow_idempotency: Mutex::new(BTreeMap::new()),
+                mvcc_snapshot_registry: Arc::new(Mutex::new(StoreMvccSnapshotRegistry::default())),
+                hot_mutable_queue: Mutex::new(HotMutableCommitQueue::default()),
                 dek: Mutex::new(None),
                 digest_algo: create_digest_algo,
-            });
+            };
+            store.load_mutable_overlay_from_storage()?;
+            return Ok(store);
         }
         if len < DATA_START {
             return Err(corrupt("file too short to hold both superblock slots"));
@@ -847,18 +1466,20 @@ impl FileStore {
 
         // Read the region table the superblock points at. Object lookups use bounded B-tree reads from
         // the index root; heavyweight maintenance paths materialize the full map explicitly.
-        let (index_root, freemap_root, maintenance_root, open_segment) = match sb.region_table {
-            Some(rt) => {
-                let region = read_region_table(&mut *backing, rt, sb.page_count)?;
-                (
-                    region.index_root,
-                    region.freemap_root,
-                    region.maintenance_root,
-                    region.open_segment,
-                )
-            }
-            None => (None, None, None, 0),
-        };
+        let (index_root, overlay_root, freemap_root, maintenance_root, open_segment) =
+            match sb.region_table {
+                Some(rt) => {
+                    let region = read_region_table(&mut *backing, rt, sb.page_count)?;
+                    (
+                        region.index_root,
+                        region.overlay_root,
+                        region.freemap_root,
+                        region.maintenance_root,
+                        region.open_segment,
+                    )
+                }
+                None => (None, None, None, None, 0),
+            };
         let mut index = BTreeMap::new();
         let mut index_materialized = false;
 
@@ -892,7 +1513,7 @@ impl FileStore {
             }
         }
 
-        Ok(Self {
+        let store = Self {
             file: Mutex::new(backing),
             inner: Mutex::new(Inner {
                 index,
@@ -916,6 +1537,7 @@ impl FileStore {
                 reference_root: sb.reference.map(|b| Digest::of(sb.digest_algo, b)),
                 control_root: sb.control.map(|b| Digest::of(sb.digest_algo, b)),
                 index_root,
+                overlay_root,
                 freemap,
                 region_table_root: sb.region_table,
                 maintenance_root,
@@ -927,9 +1549,19 @@ impl FileStore {
             path,
             default_codec: Codec::Deflate,
             group: Mutex::new(GroupCommit::default()),
+            group_commit_metrics: GroupCommitMetrics::default(),
+            mutable_overlay: Mutex::new(loom_core::MutableOverlay::new()),
+            mutable_overlay_enumerations: AtomicU64::new(0),
+            overlay_publication: Mutex::new(()),
+            pending_mutable_idempotency: Mutex::new(BTreeMap::new()),
+            pending_workflow_idempotency: Mutex::new(BTreeMap::new()),
+            mvcc_snapshot_registry: Arc::new(Mutex::new(StoreMvccSnapshotRegistry::default())),
+            hot_mutable_queue: Mutex::new(HotMutableCommitQueue::default()),
             dek: Mutex::new(None),
             digest_algo: sb.digest_algo,
-        })
+        };
+        store.load_mutable_overlay_from_storage()?;
+        Ok(store)
     }
 
     /// The codec attempted for newly written object records. The size and shrink guardrails still
@@ -945,7 +1577,1313 @@ impl FileStore {
         self.inner.lock().ok().and_then(|i| i.reference_root)
     }
 
+    pub fn mutable_overlay_health(&self) -> Result<loom_core::MutableOverlayHealth> {
+        self.mutable_overlay
+            .lock()
+            .map_err(|_| poisoned())?
+            .health()
+    }
+
+    pub fn mutable_overlay_snapshot(&self) -> Result<loom_core::OverlaySnapshot> {
+        Ok(self
+            .mutable_overlay
+            .lock()
+            .map_err(|_| poisoned())?
+            .snapshot())
+    }
+
+    pub fn open_mvcc_snapshot(&self) -> Result<StoreMvccSnapshot> {
+        self.open_mvcc_snapshot_with_owner(None)
+    }
+
+    pub fn open_mvcc_snapshot_with_owner(&self, owner: Option<&str>) -> Result<StoreMvccSnapshot> {
+        let _publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+        let immutable_base_root = self.inner.lock().map_err(|_| poisoned())?.reference_root;
+        let snapshot = self
+            .mutable_overlay
+            .lock()
+            .map_err(|_| poisoned())?
+            .snapshot();
+        self.register_mvcc_snapshot(snapshot, immutable_base_root, owner)
+    }
+
+    fn register_mvcc_snapshot(
+        &self,
+        snapshot: loom_core::OverlaySnapshot,
+        immutable_base_root: Option<Digest>,
+        owner: Option<&str>,
+    ) -> Result<StoreMvccSnapshot> {
+        let identity = StoreMvccSnapshotIdentity {
+            overlay_generation: snapshot.generation(),
+            immutable_base_root,
+        };
+        let owner = owner.map(str::to_owned);
+        let mut registry = self.mvcc_snapshot_registry.lock().map_err(|_| poisoned())?;
+        registry.next_pin_id = registry
+            .next_pin_id
+            .checked_add(1)
+            .ok_or_else(|| corrupt("MVCC snapshot pin id overflow"))?;
+        let pin_id = registry.next_pin_id;
+        registry.pins.insert(
+            pin_id,
+            StoreMvccSnapshotPin {
+                pin_id,
+                identity,
+                owner,
+            },
+        );
+        Ok(StoreMvccSnapshot {
+            pin_id,
+            identity,
+            snapshot,
+            registry: Arc::clone(&self.mvcc_snapshot_registry),
+            released: AtomicBool::new(false),
+        })
+    }
+
+    pub fn mvcc_snapshot_diagnostics(&self) -> Result<StoreMvccSnapshotDiagnostics> {
+        let registry = self.mvcc_snapshot_registry.lock().map_err(|_| poisoned())?;
+        let pins = registry.pins.values().cloned().collect::<Vec<_>>();
+        let oldest_pinned_overlay_generation =
+            pins.iter().map(|pin| pin.identity.overlay_generation).min();
+        Ok(StoreMvccSnapshotDiagnostics {
+            active_snapshot_count: pins.len() as u64,
+            oldest_pinned_overlay_generation,
+            pins,
+        })
+    }
+
+    pub fn oldest_pinned_mvcc_snapshot_generation(
+        &self,
+    ) -> Result<Option<loom_core::OverlayGeneration>> {
+        Ok(self
+            .mvcc_snapshot_diagnostics()?
+            .oldest_pinned_overlay_generation)
+    }
+
+    pub fn mutable_overlay_entries(&self) -> Result<Vec<loom_core::MutableOverlayEntrySnapshot>> {
+        self.mutable_overlay_enumerations
+            .fetch_add(1, Ordering::Relaxed);
+        self.mutable_overlay
+            .lock()
+            .map_err(|_| poisoned())?
+            .export_entries()
+    }
+
+    pub fn mutable_overlay_enumeration_count(&self) -> u64 {
+        self.mutable_overlay_enumerations.load(Ordering::Relaxed)
+    }
+
+    pub fn mutable_overlay_current_entry(
+        &self,
+        key: &loom_core::OverlayKey,
+    ) -> Result<Option<loom_core::MutableOverlayEntrySnapshot>> {
+        self.mutable_overlay
+            .lock()
+            .map_err(|_| poisoned())?
+            .current_entry(key)
+            .map_or(Ok(None), |entry| Ok(Some(entry)))
+    }
+
+    pub fn mutable_overlay_generation(&self) -> Result<loom_core::OverlayGeneration> {
+        Ok(self
+            .mutable_overlay
+            .lock()
+            .map_err(|_| poisoned())?
+            .generation())
+    }
+
+    pub fn mutable_overlay_owner_token(
+        &self,
+        key: &loom_core::OverlayKey,
+    ) -> Result<Option<loom_core::OverlayOwnerToken>> {
+        Ok(self
+            .mutable_overlay
+            .lock()
+            .map_err(|_| poisoned())?
+            .current_entry(key)
+            .map(|entry| entry.owner_token))
+    }
+
+    pub fn hot_mutable_commit_window(&self) -> Result<Option<HotMutableCommitWindow>> {
+        Ok(self
+            .hot_mutable_queue
+            .lock()
+            .map_err(|_| poisoned())?
+            .pending_window())
+    }
+
+    pub fn put_mutable_overlay_value(
+        &self,
+        key: loom_core::OverlayKey,
+        payload: Vec<u8>,
+    ) -> Result<loom_core::OverlayOwnerToken> {
+        let mut tokens = self.put_mutable_overlay_values(vec![(key, payload)])?;
+        tokens
+            .pop()
+            .ok_or_else(|| corrupt("mutable overlay batch returned no owner token"))
+    }
+
+    pub fn put_mutable_overlay_value_idempotent(
+        &self,
+        key: loom_core::OverlayKey,
+        payload: Vec<u8>,
+        idempotency_key: &str,
+    ) -> Result<loom_core::OverlayOwnerToken> {
+        let _publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+        validate_mutable_overlay_idempotency_key(idempotency_key)?;
+        let request_digest = mutable_overlay_idempotency_request_digest(&key, &payload);
+        let durability = self.mutable_overlay_key_durability(&key)?;
+        if durability != StoreDurabilityPolicy::Ephemeral
+            && let Some(record) = self.mutable_overlay_idempotency_record(idempotency_key)?
+        {
+            if record.request_digest == request_digest {
+                return Ok(record.owner_token);
+            }
+            return Err(LoomError::new(
+                Code::Conflict,
+                "mutable overlay idempotency key was already used with a different payload",
+            ));
+        }
+        let pending = {
+            self.pending_mutable_idempotency
+                .lock()
+                .map_err(|_| poisoned())?
+                .get(idempotency_key)
+                .cloned()
+        };
+        if let Some(pending) = pending {
+            if pending.request_digest != request_digest {
+                return Err(LoomError::new(
+                    Code::Conflict,
+                    "mutable overlay idempotency key was already used with a different payload",
+                ));
+            }
+            drop(_publication_guard);
+            self.finish_normal_mutable_publish(pending.waiter, false)?;
+            return Ok(pending.owner_token);
+        }
+        let mut overlay = self.mutable_overlay.lock().map_err(|_| poisoned())?;
+        let owner_token = overlay.snapshot().owner_token(&key)?;
+        let token = overlay.put_value(key.clone(), owner_token.as_ref(), payload)?;
+        let latest = overlay
+            .export_entries()?
+            .into_iter()
+            .rev()
+            .find(|entry| entry.key == key)
+            .ok_or_else(|| corrupt("mutable overlay idempotent write missing current entry"))?;
+        let current_index =
+            mutable_overlay_current_index_record(&overlay.export_entries()?, self.store_policy()?)?;
+        drop(overlay);
+        let mut records = vec![
+            (
+                mutable_overlay_entry_address(&key),
+                encode_mutable_overlay_entry(&latest),
+            ),
+            (
+                mutable_overlay_owner_token_address(&key),
+                encode_mutable_overlay_owner_token_record(&token),
+            ),
+            (
+                mutable_overlay_idempotency_address(idempotency_key),
+                encode_mutable_overlay_idempotency_record(&request_digest, &token),
+            ),
+        ];
+        records.push(current_index);
+        if durability == StoreDurabilityPolicy::Normal {
+            let (waiter, lead) = self.enqueue_normal_mutable_records(records)?;
+            self.pending_mutable_idempotency
+                .lock()
+                .map_err(|_| poisoned())?
+                .insert(
+                    idempotency_key.to_string(),
+                    PendingMutableIdempotency {
+                        request_digest,
+                        owner_token: token.clone(),
+                        waiter: Arc::clone(&waiter),
+                    },
+                );
+            drop(_publication_guard);
+            let outcome = self.finish_normal_mutable_publish(waiter, lead);
+            let _publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+            self.pending_mutable_idempotency
+                .lock()
+                .map_err(|_| poisoned())?
+                .remove(idempotency_key);
+            outcome?;
+        } else {
+            self.publish_mutable_overlay_records(durability, records)?;
+        }
+        Ok(token)
+    }
+
+    fn publish_mutable_overlay_records(
+        &self,
+        durability: StoreDurabilityPolicy,
+        records: Vec<([u8; 32], Vec<u8>)>,
+    ) -> Result<()> {
+        match durability {
+            StoreDurabilityPolicy::Normal => self.publish_normal_mutable_records(records),
+            StoreDurabilityPolicy::Strict => {
+                self.publish_hot_mutable_queue()?;
+                self.commit_mutable_overlay_records(&records)
+            }
+            StoreDurabilityPolicy::Relaxed => self.commit_mutable_overlay_records(&records),
+            StoreDurabilityPolicy::Ephemeral => Ok(()),
+        }
+    }
+
+    fn enqueue_normal_mutable_records(
+        &self,
+        records: Vec<([u8; 32], Vec<u8>)>,
+    ) -> Result<(Arc<Waiter>, bool)> {
+        let waiter = Arc::new(Waiter {
+            outcome: Mutex::new(None),
+            cv: Condvar::new(),
+        });
+        let generation = self.inner.lock().map_err(|_| poisoned())?.generation;
+        let lead = self
+            .hot_mutable_queue
+            .lock()
+            .map_err(|_| poisoned())?
+            .enqueue_with_waiter(generation, records, Arc::clone(&waiter))?;
+        Ok((waiter, lead))
+    }
+
+    fn finish_normal_mutable_publish(&self, waiter: Arc<Waiter>, lead: bool) -> Result<()> {
+        if lead {
+            loop {
+                for _ in 0..4 {
+                    let ready = {
+                        let queue = self.hot_mutable_queue.lock().map_err(|_| poisoned())?;
+                        queue.pending.len() > 1
+                    };
+                    if ready {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(250));
+                }
+                let batch = {
+                    let mut queue = self.hot_mutable_queue.lock().map_err(|_| poisoned())?;
+                    if queue.finish_leader_if_empty() {
+                        break;
+                    }
+                    queue.drain_ready_with_waiters(HOT_MUTABLE_QUEUE_MAX_RECORDS)
+                };
+                let waiters = batch
+                    .iter()
+                    .filter_map(|(_, waiter)| waiter.clone())
+                    .collect::<Vec<_>>();
+                let batch_transactions = batch.len() as u64;
+                let records = batch
+                    .into_iter()
+                    .flat_map(|(commit, _)| commit.records)
+                    .collect::<Vec<_>>();
+                // One measurement per drained batch (never per record).
+                self.group_commit_metrics
+                    .record_batch(batch_transactions, records.len() as u64);
+                let outcome = self.commit_mutable_overlay_records(&records);
+                for waiter in waiters {
+                    let mut slot = waiter.outcome.lock().unwrap_or_else(|p| p.into_inner());
+                    *slot = Some(outcome.clone());
+                    waiter.cv.notify_all();
+                }
+            }
+        }
+
+        let mut slot = waiter.outcome.lock().map_err(|_| poisoned())?;
+        loop {
+            if let Some(outcome) = slot.as_ref() {
+                return outcome.clone();
+            }
+            slot = waiter.cv.wait(slot).map_err(|_| poisoned())?;
+        }
+    }
+
+    fn publish_normal_mutable_records(&self, records: Vec<([u8; 32], Vec<u8>)>) -> Result<()> {
+        let (waiter, lead) = self.enqueue_normal_mutable_records(records)?;
+        self.finish_normal_mutable_publish(waiter, lead)
+    }
+
+    fn publish_hot_mutable_queue(&self) -> Result<()> {
+        loop {
+            let batch = {
+                let mut queue = self.hot_mutable_queue.lock().map_err(|_| poisoned())?;
+                if queue.pending.is_empty() {
+                    queue.leader_active = false;
+                    break;
+                }
+                queue.drain_ready_with_waiters(HOT_MUTABLE_QUEUE_MAX_RECORDS)
+            };
+            let waiters = batch
+                .iter()
+                .filter_map(|(_, waiter)| waiter.clone())
+                .collect::<Vec<_>>();
+            let batch_transactions = batch.len() as u64;
+            let records = batch
+                .into_iter()
+                .flat_map(|(commit, _)| commit.records)
+                .collect::<Vec<_>>();
+            // One measurement per drained batch (never per record).
+            self.group_commit_metrics
+                .record_batch(batch_transactions, records.len() as u64);
+            let outcome = self.commit_mutable_overlay_records(&records);
+            for waiter in waiters {
+                let mut slot = waiter.outcome.lock().unwrap_or_else(|p| p.into_inner());
+                *slot = Some(outcome.clone());
+                waiter.cv.notify_all();
+            }
+            outcome?;
+        }
+        Ok(())
+    }
+
+    fn mutable_overlay_records_durability(
+        &self,
+        durabilities: &[StoreDurabilityPolicy],
+    ) -> StoreDurabilityPolicy {
+        if durabilities.contains(&StoreDurabilityPolicy::Strict) {
+            StoreDurabilityPolicy::Strict
+        } else if durabilities.contains(&StoreDurabilityPolicy::Normal) {
+            StoreDurabilityPolicy::Normal
+        } else if durabilities.contains(&StoreDurabilityPolicy::Relaxed) {
+            StoreDurabilityPolicy::Relaxed
+        } else {
+            StoreDurabilityPolicy::Ephemeral
+        }
+    }
+
+    pub fn flush_hot_mutable_commits(&self) -> Result<()> {
+        let _publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+        self.publish_hot_mutable_queue()
+    }
+
+    #[cfg(test)]
+    fn enqueue_hot_mutable_commit_for_test(
+        &self,
+        records: Vec<([u8; 32], Vec<u8>)>,
+    ) -> Result<HotMutableCommitWindow> {
+        let generation = self.inner.lock().map_err(|_| poisoned())?.generation;
+        self.hot_mutable_queue
+            .lock()
+            .map_err(|_| poisoned())?
+            .enqueue(generation, StoreDurabilityPolicy::Normal, records)
+    }
+
+    #[cfg(test)]
+    fn publish_mutable_overlay_records_for_test(
+        &self,
+        durability: StoreDurabilityPolicy,
+        records: Vec<([u8; 32], Vec<u8>)>,
+    ) -> Result<()> {
+        let _publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+        self.publish_mutable_overlay_records(durability, records)
+    }
+
+    pub fn put_mutable_overlay_values(
+        &self,
+        entries: Vec<(loom_core::OverlayKey, Vec<u8>)>,
+    ) -> Result<Vec<loom_core::OverlayOwnerToken>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+        let entry_durabilities = entries
+            .iter()
+            .map(|(key, _)| self.mutable_overlay_key_durability(key))
+            .collect::<Result<Vec<_>>>()?;
+        let mut overlay = self.mutable_overlay.lock().map_err(|_| poisoned())?;
+        let mut keys = Vec::new();
+        let mut tokens = Vec::new();
+        for ((key, payload), durability) in entries.into_iter().zip(entry_durabilities) {
+            let owner_token = overlay.current_entry(&key).map(|entry| entry.owner_token);
+            let token = overlay.put_value(key.clone(), owner_token.as_ref(), payload)?;
+            keys.push((key, durability));
+            tokens.push(token);
+        }
+        let mut records = Vec::new();
+        let mut record_durabilities = Vec::new();
+        for (key, durability) in keys {
+            if durability == StoreDurabilityPolicy::Ephemeral {
+                continue;
+            }
+            let latest = overlay
+                .current_entry(&key)
+                .ok_or_else(|| corrupt("mutable overlay write missing current entry"))?;
+            records.push((
+                mutable_overlay_entry_address(&key),
+                encode_mutable_overlay_entry(&latest),
+            ));
+            records.push((
+                mutable_overlay_owner_token_address(&key),
+                encode_mutable_overlay_owner_token_record(&latest.owner_token),
+            ));
+            record_durabilities.push(durability);
+        }
+        if !records.is_empty() {
+            records.push(mutable_overlay_current_index_record(
+                &overlay.export_entries()?,
+                self.store_policy()?,
+            )?);
+        }
+        drop(overlay);
+        let durability = self.mutable_overlay_records_durability(&record_durabilities);
+        if durability == StoreDurabilityPolicy::Normal {
+            let (waiter, lead) = self.enqueue_normal_mutable_records(records)?;
+            drop(publication_guard);
+            self.finish_normal_mutable_publish(waiter, lead)?;
+        } else {
+            self.publish_mutable_overlay_records(durability, records)?;
+        }
+        Ok(tokens)
+    }
+
+    fn mutable_overlay_key_durability(
+        &self,
+        key: &loom_core::OverlayKey,
+    ) -> Result<StoreDurabilityPolicy> {
+        let policy = self.store_policy()?;
+        Ok(mutable_overlay_key_facet(key)?
+            .map(|facet| policy.effective_durability(facet))
+            .unwrap_or(policy.default_durability))
+    }
+
+    fn validate_resolved_workflow_durability(
+        &self,
+        txn: &WorkflowTransaction,
+        resolved: StoreDurabilityPolicy,
+        write_durabilities: &[StoreDurabilityPolicy],
+    ) -> Result<()> {
+        if txn.idempotency.is_some() && resolved == StoreDurabilityPolicy::Ephemeral {
+            return Err(WorkflowTransactionErrorKind::UnhonoredDurabilityPolicy
+                .into_error("ephemeral workflow transaction idempotency cannot be honored"));
+        }
+        if resolved != StoreDurabilityPolicy::Ephemeral
+            && write_durabilities.contains(&StoreDurabilityPolicy::Ephemeral)
+        {
+            return Err(WorkflowTransactionErrorKind::UnhonoredDurabilityPolicy
+                .into_error("ephemeral write cannot join a stronger single transaction"));
+        }
+        Ok(())
+    }
+
+    pub fn commit_workflow_transaction(&self, txn: WorkflowTransaction) -> Result<CommitReceipt> {
+        txn.validate()?;
+        let publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+        if let Some(generation) = txn.expected_generation {
+            let current = self
+                .mutable_overlay
+                .lock()
+                .map_err(|_| poisoned())?
+                .generation();
+            if current != generation {
+                return Err(WorkflowTransactionErrorKind::RetryableStaleGeneration
+                    .into_error("workflow transaction overlay generation is stale"));
+            }
+        }
+        let policy = self.store_policy()?;
+        let write_durabilities = txn
+            .writes
+            .iter()
+            .map(|write| workflow_write_durability(&txn, &policy, write))
+            .collect::<Vec<_>>();
+        let resolved_durability = self.mutable_overlay_records_durability(&write_durabilities);
+        self.validate_resolved_workflow_durability(&txn, resolved_durability, &write_durabilities)?;
+        let request_digest = workflow_transaction_request_digest(&txn, &write_durabilities);
+        if let Some(idempotency) = txn.idempotency.as_ref()
+            && let Some(receipt) =
+                self.workflow_transaction_idempotency_record(idempotency.as_bytes())?
+        {
+            if receipt.request_digest == request_digest {
+                return Ok(receipt.receipt);
+            }
+            return Err(WorkflowTransactionErrorKind::DuplicateIdempotencyKey
+                .into_error("workflow transaction idempotency key was already used"));
+        }
+        let pending = txn.idempotency.as_ref().map_or(Ok(None), |idempotency| {
+            self.pending_workflow_idempotency
+                .lock()
+                .map_err(|_| poisoned())
+                .map(|pending| pending.get(idempotency.as_bytes()).cloned())
+        })?;
+        if let Some(pending) = pending {
+            if pending.request_digest != request_digest {
+                return Err(WorkflowTransactionErrorKind::DuplicateIdempotencyKey
+                    .into_error("workflow transaction idempotency key was already used"));
+            }
+            drop(publication_guard);
+            self.finish_normal_mutable_publish(pending.waiter, false)?;
+            let mut receipt = pending.receipt;
+            receipt.replayed = true;
+            return Ok(receipt);
+        }
+        let mut overlay = self.mutable_overlay.lock().map_err(|_| poisoned())?;
+        let before_snapshot = overlay.snapshot();
+        let mut outcomes = Vec::with_capacity(txn.writes.len());
+        let mut writes = Vec::with_capacity(txn.writes.len());
+        for (write, durability) in txn.writes.iter().zip(write_durabilities.iter().copied()) {
+            let expected = write.expected.as_ref().map(|token| &token.0);
+            let token = match match &write.op {
+                loom_core::FacetWriteOp::Put { payload } => {
+                    overlay.put_value(write.target.clone(), expected, payload.clone())
+                }
+                loom_core::FacetWriteOp::Delete => {
+                    overlay.put_tombstone(write.target.clone(), expected)
+                }
+            } {
+                Ok(token) => token,
+                Err(error) => {
+                    *overlay =
+                        loom_core::MutableOverlay::fork_from_snapshot(before_snapshot.clone());
+                    return Err(error);
+                }
+            };
+            outcomes.push(WriteOutcome {
+                facet: write.facet,
+                target: write.target.clone(),
+                owner_token: token,
+                change: write.op.entry_kind(),
+            });
+            writes.push((
+                write.target.clone(),
+                durability,
+                write.secondary_indexes.clone(),
+            ));
+        }
+        let overlay_generation = overlay.generation();
+        let current_index = if writes
+            .iter()
+            .any(|(_, durability, _)| *durability != StoreDurabilityPolicy::Ephemeral)
+        {
+            Some(mutable_overlay_current_index_record(
+                &overlay.export_entries()?,
+                policy,
+            )?)
+        } else {
+            None
+        };
+        let mut records = Vec::new();
+        let mut record_durabilities = Vec::new();
+        for (key, durability, secondary_indexes) in &writes {
+            if *durability == StoreDurabilityPolicy::Ephemeral {
+                continue;
+            }
+            let latest = overlay
+                .current_entry(key)
+                .ok_or_else(|| corrupt("workflow transaction write missing current entry"))?;
+            records.push((
+                mutable_overlay_entry_address(key),
+                encode_mutable_overlay_entry(&latest),
+            ));
+            records.push((
+                mutable_overlay_owner_token_address(key),
+                encode_mutable_overlay_owner_token_record(&latest.owner_token),
+            ));
+            for index_write in secondary_indexes {
+                records.push((
+                    mutable_overlay_secondary_index_address(&index_write.index),
+                    encode_mutable_overlay_secondary_index_record(overlay_generation, index_write),
+                ));
+            }
+            record_durabilities.push(*durability);
+        }
+        drop(overlay);
+        if let Some(current_index) = current_index {
+            records.push(current_index);
+        }
+        let root_after = workflow_transaction_root_digest(self.digest_algo, overlay_generation);
+        let receipt = CommitReceipt {
+            generation: overlay_generation,
+            root_after,
+            writes: outcomes,
+            replayed: false,
+        };
+        if let Some(idempotency) = txn.idempotency.as_ref()
+            && !records.is_empty()
+        {
+            records.push((
+                mutable_overlay_transaction_idempotency_address(idempotency.as_bytes()),
+                encode_workflow_transaction_idempotency_record(&request_digest, &receipt),
+            ));
+            record_durabilities.push(resolved_durability);
+        }
+        let durability = self.mutable_overlay_records_durability(&record_durabilities);
+        let publish = if txn.owner_state.is_empty() {
+            if durability == StoreDurabilityPolicy::Normal {
+                let (waiter, lead) = self.enqueue_normal_mutable_records(records)?;
+                let pending_key = txn.idempotency.as_ref().map(|key| key.as_bytes().to_vec());
+                if let Some(key) = pending_key.as_ref() {
+                    self.pending_workflow_idempotency
+                        .lock()
+                        .map_err(|_| poisoned())?
+                        .insert(
+                            key.clone(),
+                            PendingWorkflowIdempotency {
+                                request_digest,
+                                receipt: receipt.clone(),
+                                waiter: Arc::clone(&waiter),
+                            },
+                        );
+                }
+                drop(publication_guard);
+                let outcome = self.finish_normal_mutable_publish(waiter, lead);
+                let _publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+                if let Some(key) = pending_key {
+                    self.pending_workflow_idempotency
+                        .lock()
+                        .map_err(|_| poisoned())?
+                        .remove(&key);
+                }
+                outcome
+            } else {
+                self.publish_mutable_overlay_records(durability, records)
+            }
+        } else {
+            self.publish_hot_mutable_queue()?;
+            self.commit_workflow_owner_state_records(&records, &txn.owner_state)
+        };
+        if let Err(error) = publish {
+            *self.mutable_overlay.lock().map_err(|_| poisoned())? =
+                loom_core::MutableOverlay::fork_from_snapshot(before_snapshot);
+            return Err(error);
+        }
+        Ok(receipt)
+    }
+
+    fn commit_workflow_owner_state_records(
+        &self,
+        records: &[([u8; 32], Vec<u8>)],
+        owner_state: &loom_core::WorkflowOwnerState,
+    ) -> Result<()> {
+        let mut retained_heads = BTreeMap::<Vec<u8>, u64>::new();
+        let mut records = records.to_vec();
+        for write in &owner_state.controls {
+            let loom_core::WorkflowControlWrite::AppendRetained {
+                key,
+                expected_next_sequence,
+                records: appended,
+            } = write
+            else {
+                continue;
+            };
+            let current = match retained_heads.get(key) {
+                Some(sequence) => *sequence,
+                None => self.retained_history_head(key)?,
+            };
+            let actual_next = current
+                .checked_add(1)
+                .ok_or_else(|| LoomError::invalid("retained-history sequence overflow"))?;
+            if actual_next != *expected_next_sequence {
+                return Err(LoomError::new(
+                    Code::Conflict,
+                    format!(
+                        "retained-history expected sequence {expected_next_sequence}, current next sequence is {actual_next}"
+                    ),
+                ));
+            }
+            let mut sequence = actual_next;
+            for payload in appended {
+                records.push((
+                    retained_history_record_address(key, sequence),
+                    encode_retained_history_entry(key, sequence, payload),
+                ));
+                sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| LoomError::invalid("retained-history sequence overflow"))?;
+            }
+            let head = sequence - 1;
+            records.push((
+                retained_history_head_address(key),
+                encode_retained_history_head(key, head),
+            ));
+            retained_heads.insert(key.clone(), head);
+        }
+        let records = records
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let oldest_pinned_snapshot_generation = self
+            .oldest_pinned_mvcc_snapshot_generation()?
+            .map(|generation| generation.as_u64());
+        let audit_retention_active = self.audit_config()?.legal_hold;
+        let mut control_map = self.control_map()?;
+        let mut control_changed = false;
+        for write in &owner_state.controls {
+            match write {
+                loom_core::WorkflowControlWrite::Put { key, payload } => {
+                    control_map.insert(key.clone(), payload.clone());
+                    control_changed = true;
+                }
+                loom_core::WorkflowControlWrite::Delete { key } => {
+                    control_map.remove(key);
+                    control_changed = true;
+                }
+                loom_core::WorkflowControlWrite::AppendRetained { .. } => {}
+            }
+        }
+        for audit in &owner_state.audits {
+            append_audit_record(
+                &mut control_map,
+                self.digest_algo,
+                audit.principal,
+                &audit.action,
+                audit.target.as_deref(),
+            )?;
+        }
+        let control_bytes = if !control_changed && owner_state.audits.is_empty() {
+            None
+        } else {
+            let bytes = encode_control_map(&control_map);
+            Some((Digest::hash(self.digest_algo, &bytes), bytes))
+        };
+        let mut owner_objects = owner_state.objects.clone();
+        if let Some((digest, bytes)) = &control_bytes {
+            owner_objects.push((*digest, bytes.clone()));
+        }
+
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        let reference = match owner_state.reference {
+            loom_core::WorkflowReferenceUpdate::Keep => {
+                inner.reference_root.map(|digest| *digest.bytes())
+            }
+            loom_core::WorkflowReferenceUpdate::Set(root) => root.map(|digest| *digest.bytes()),
+        };
+        let control = control_bytes
+            .as_ref()
+            .map(|(digest, _)| *digest.bytes())
+            .or_else(|| inner.control_root.map(|digest| *digest.bytes()));
+        let mut seen = BTreeSet::new();
+        let mut fresh = Vec::new();
+        for (digest, canonical) in &owner_objects {
+            if Digest::hash(self.digest_algo, canonical) != *digest {
+                return Err(LoomError::integrity_failure(
+                    "workflow owner-state object digest does not match payload",
+                ));
+            }
+            if seen.insert(*digest.bytes())
+                && self
+                    .lookup_loc_locked(&mut inner, digest.bytes())?
+                    .is_none()
+            {
+                fresh.push((*digest, canonical.as_slice(), self.default_codec));
+            }
+        }
+        let new_gen = inner.generation + 1;
+        let (roots, index_root, object_placements) = {
+            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            let mut alloc = PageAllocator::new_with_current_free_reusable(
+                inner.page_count,
+                new_gen,
+                inner.free.clone(),
+            );
+            let overlay_entries = overlay_current_record_locs(
+                &mut **file,
+                inner.overlay_root,
+                inner.page_count,
+                records.iter().map(|(address, _)| *address),
+            )?;
+            let reclaimed = reclaim_superseded_overlay_blobs_from_current(
+                &mut **file,
+                &mut alloc,
+                &overlay_entries,
+                records
+                    .iter()
+                    .map(|(address, value)| (*address, value.as_slice())),
+                oldest_pinned_snapshot_generation,
+                audit_retention_active,
+            )?;
+            let overlay_borrowed = records
+                .iter()
+                .map(|(key, value)| (*key, value.as_slice()))
+                .collect::<Vec<_>>();
+            let overlay_placements = write_overlay_blob_pages(
+                &mut **file,
+                &mut alloc,
+                &overlay_entries,
+                &overlay_borrowed,
+            )?;
+            let mut overlay_root = inner.overlay_root;
+            for (address, loc) in &overlay_placements {
+                let bound = alloc.page_count();
+                overlay_root = Some(pagebtree::insert(
+                    &mut **file,
+                    DATA_START,
+                    &mut alloc,
+                    overlay_root,
+                    address,
+                    *loc,
+                    bound,
+                )?);
+            }
+            let dek = self.dek.lock().map_err(|_| poisoned())?;
+            let object_placements =
+                write_record_pages(&mut **file, &mut alloc, &fresh, dek.as_ref())?;
+            drop(dek);
+            let mut index_root = inner.index_root;
+            for (key, loc) in &object_placements {
+                let bound = alloc.page_count();
+                index_root = Some(pagebtree::insert(
+                    &mut **file,
+                    DATA_START,
+                    &mut alloc,
+                    index_root,
+                    key,
+                    *loc,
+                    bound,
+                )?);
+            }
+            let mut touched_segments = object_placements
+                .iter()
+                .map(|(_, loc)| loc.segment_id)
+                .collect::<BTreeSet<_>>();
+            touched_segments.extend(reclaimed);
+            let object_count = inner
+                .maintenance
+                .object_count
+                .saturating_add(fresh.len() as u64);
+            let roots = finish_txn(
+                &mut **file,
+                &mut alloc,
+                new_gen,
+                object_count,
+                index_root,
+                overlay_root,
+                inner.open_segment,
+                reference,
+                control,
+                &inner.maintenance,
+                &touched_segments,
+                (
+                    inner.freemap,
+                    inner.region_table_root,
+                    inner.maintenance_root,
+                ),
+                inner.encryption_meta.clone(),
+                self.digest_algo,
+                Some(&self.group_commit_metrics),
+            )?;
+            (roots, index_root, object_placements)
+        };
+        inner.generation = new_gen;
+        inner.page_count = roots.page_count;
+        inner.index_root = index_root;
+        inner.overlay_root = roots.overlay_root;
+        Self::clear_index_page_cache_locked(&mut inner);
+        inner.free = roots.free;
+        inner.freemap = roots.freemap;
+        inner.region_table_root = Some(roots.region_table_root);
+        inner.maintenance_root = Some(roots.maintenance_root);
+        inner.maintenance = roots.maintenance;
+        for (key, loc) in object_placements {
+            Self::cache_locator_locked(&mut inner, key, loc);
+        }
+        if let loom_core::WorkflowReferenceUpdate::Set(root) = owner_state.reference {
+            inner.reference_root = root;
+        }
+        if control_changed || !owner_state.audits.is_empty() {
+            inner.control_root = control_bytes.map(|(digest, _)| digest);
+        }
+        Ok(())
+    }
+
+    pub fn put_mutable_overlay_tombstone(
+        &self,
+        key: loom_core::OverlayKey,
+    ) -> Result<loom_core::OverlayOwnerToken> {
+        let publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+        let durability = self.mutable_overlay_key_durability(&key)?;
+        let mut overlay = self.mutable_overlay.lock().map_err(|_| poisoned())?;
+        let owner_token = overlay.current_entry(&key).map(|entry| entry.owner_token);
+        let token = overlay.put_tombstone(key.clone(), owner_token.as_ref())?;
+        let latest = overlay
+            .current_entry(&key)
+            .ok_or_else(|| corrupt("mutable overlay tombstone missing current entry"))?;
+        let current_index =
+            mutable_overlay_current_index_record(&overlay.export_entries()?, self.store_policy()?)?;
+        drop(overlay);
+        let records = vec![
+            (
+                mutable_overlay_entry_address(&key),
+                encode_mutable_overlay_entry(&latest),
+            ),
+            (
+                mutable_overlay_owner_token_address(&key),
+                encode_mutable_overlay_owner_token_record(&token),
+            ),
+            current_index,
+        ];
+        if durability == StoreDurabilityPolicy::Normal {
+            let (waiter, lead) = self.enqueue_normal_mutable_records(records)?;
+            drop(publication_guard);
+            self.finish_normal_mutable_publish(waiter, lead)?;
+        } else {
+            self.publish_mutable_overlay_records(durability, records)?;
+        }
+        Ok(token)
+    }
+
+    pub fn mutable_overlay_durable_owner_token(
+        &self,
+        key: &loom_core::OverlayKey,
+    ) -> Result<Option<loom_core::OverlayOwnerToken>> {
+        self.mutable_overlay_owner_token_record(&mutable_overlay_owner_token_address(key))
+    }
+
+    fn mutable_overlay_owner_token_record(
+        &self,
+        address: &[u8; 32],
+    ) -> Result<Option<loom_core::OverlayOwnerToken>> {
+        self.mutable_overlay_record_payload(address)?
+            .map(|bytes| decode_mutable_overlay_owner_token_record(&bytes))
+            .transpose()
+    }
+
+    fn mutable_overlay_idempotency_record(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<MutableOverlayIdempotencyRecord>> {
+        self.mutable_overlay_record_payload(&mutable_overlay_idempotency_address(idempotency_key))?
+            .map(|bytes| decode_mutable_overlay_idempotency_record(&bytes))
+            .transpose()
+    }
+
+    pub fn mutable_overlay_secondary_index_value(
+        &self,
+        index: &loom_core::OverlayKey,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(bytes) =
+            self.mutable_overlay_record_payload(&mutable_overlay_secondary_index_address(index))?
+        else {
+            return Ok(None);
+        };
+        let record = decode_mutable_overlay_secondary_index_record(&bytes)?;
+        if record.index != *index {
+            return Err(corrupt("mutable overlay secondary-index key mismatch"));
+        }
+        let _generation = record.generation;
+        Ok(match record.kind {
+            loom_core::OverlayEntryKind::Value => record.payload,
+            loom_core::OverlayEntryKind::Tombstone => None,
+        })
+    }
+
+    pub fn retained_history_head(&self, key: &[u8]) -> Result<u64> {
+        let Some(bytes) =
+            self.mutable_overlay_record_payload(&retained_history_head_address(key))?
+        else {
+            return Ok(0);
+        };
+        let (stored_key, sequence) = decode_retained_history_head(&bytes)?;
+        if stored_key != key {
+            return Err(corrupt("retained-history head key mismatch"));
+        }
+        Ok(sequence)
+    }
+
+    pub fn retained_history_records(
+        &self,
+        key: &[u8],
+        first_sequence: u64,
+        max: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        if first_sequence == 0 {
+            return Err(LoomError::invalid(
+                "retained-history sequence must start at one",
+            ));
+        }
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let head = self.retained_history_head(key)?;
+        if first_sequence > head {
+            return Ok(Vec::new());
+        }
+        let available = head - first_sequence + 1;
+        let count = available.min(max as u64);
+        let mut records = Vec::with_capacity(count as usize);
+        for sequence in first_sequence..first_sequence.saturating_add(count) {
+            let bytes = self
+                .mutable_overlay_record_payload(&retained_history_record_address(key, sequence))?
+                .ok_or_else(|| corrupt("retained-history record is missing before head"))?;
+            let (stored_key, stored_sequence, payload) = decode_retained_history_entry(&bytes)?;
+            if stored_key != key || stored_sequence != sequence {
+                return Err(corrupt("retained-history record identity mismatch"));
+            }
+            records.push(payload);
+        }
+        Ok(records)
+    }
+
+    fn workflow_transaction_idempotency_record(
+        &self,
+        idempotency_key: &[u8],
+    ) -> Result<Option<WorkflowTransactionIdempotencyRecord>> {
+        self.mutable_overlay_record_payload(&mutable_overlay_transaction_idempotency_address(
+            idempotency_key,
+        ))?
+        .map(|bytes| decode_workflow_transaction_idempotency_record(&bytes))
+        .transpose()
+    }
+
+    fn mutable_overlay_record_payload(&self, address: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        let (root, page_count) = {
+            let inner = self.inner.lock().map_err(|_| poisoned())?;
+            (inner.overlay_root, inner.page_count)
+        };
+        let Some(root) = root else {
+            return Ok(None);
+        };
+        let loc = {
+            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            pagebtree::get(&mut **file, DATA_START, Some(root), address, page_count)?
+        };
+        let Some(loc) = loc else {
+            return Ok(None);
+        };
+        self.read_blob_at_loc(loc, page_count).map(Some)
+    }
+
+    fn load_mutable_overlay_from_storage(&self) -> Result<()> {
+        let (root, page_count) = {
+            let inner = self.inner.lock().map_err(|_| poisoned())?;
+            (inner.overlay_root, inner.page_count)
+        };
+        let Some(root) = root else {
+            return Ok(());
+        };
+        let mut used_current_index = false;
+        let mut control_records_skipped = 0u64;
+        let mut generation = 0;
+        let mut entries = Vec::new();
+        {
+            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            if let Some(loc) = pagebtree::get(
+                &mut **file,
+                DATA_START,
+                Some(root),
+                &mutable_overlay_meta_address(),
+                page_count,
+            )? {
+                generation = decode_mutable_overlay_meta(&read_blob_from_loc(&mut **file, loc)?)?;
+            }
+            if let Some(loc) = pagebtree::get(
+                &mut **file,
+                DATA_START,
+                Some(root),
+                &mutable_overlay_current_index_address(),
+                page_count,
+            )? {
+                let current_addresses = decode_mutable_overlay_current_index_record(
+                    &read_blob_from_loc(&mut **file, loc)?,
+                )?;
+                used_current_index = true;
+                for address in current_addresses {
+                    let loc =
+                        pagebtree::get(&mut **file, DATA_START, Some(root), &address, page_count)?
+                            .ok_or_else(|| {
+                                corrupt("mutable overlay current-index address missing")
+                            })?;
+                    entries.push(decode_mutable_overlay_entry(&read_blob_from_loc(
+                        &mut **file,
+                        loc,
+                    )?)?);
+                }
+            } else {
+                for (address, loc) in
+                    pagebtree::load_all(&mut **file, DATA_START, root, page_count)?
+                {
+                    let value = read_blob_from_loc(&mut **file, loc)?;
+                    if address == mutable_overlay_meta_address() {
+                        generation = decode_mutable_overlay_meta(&value)?;
+                    } else if address == mutable_overlay_current_index_address() {
+                        control_records_skipped += 1;
+                    } else if value.starts_with(MUTABLE_OVERLAY_OWNER_TOKEN_RECORD)
+                        || value.starts_with(MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD)
+                        || value.starts_with(MUTABLE_OVERLAY_IDEMPOTENCY_RECORD)
+                        || value.starts_with(MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD)
+                        || value.starts_with(RETAINED_HISTORY_HEAD_RECORD)
+                        || value.starts_with(RETAINED_HISTORY_ENTRY_RECORD)
+                    {
+                        control_records_skipped += 1;
+                    } else {
+                        entries.push(decode_mutable_overlay_entry(&value)?);
+                    }
+                }
+            }
+        }
+        let entries_loaded = entries.len() as u64;
+        entries.sort_by_key(|entry| entry.generation);
+        let mut overlay = loom_core::MutableOverlay::import_entries(&entries)?;
+        overlay.set_generation_floor(generation);
+        *self.mutable_overlay.lock().map_err(|_| poisoned())? = overlay;
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        inner.io_stats.open_mutable_current_records_loaded = entries_loaded;
+        inner.io_stats.open_mutable_control_records_skipped = control_records_skipped;
+        inner.io_stats.open_mutable_used_current_index = used_current_index;
+        Ok(())
+    }
+
+    fn read_blob_at_loc(&self, loc: RecordLoc, page_count: u64) -> Result<Vec<u8>> {
+        let global = loc.global_page();
+        if global >= page_count {
+            return Err(corrupt("blob locator past the page array"));
+        }
+        let mut file = self.file.lock().map_err(|_| poisoned())?;
+        let mut first = [0u8; PAGE_SIZE as usize];
+        read_exact_at(&mut **file, PageId(global).offset(DATA_START), &mut first)
+            .map_err(io_err)?;
+        match first[0] {
+            record::SLAB_MAGIC => record::read_slab_slot(&first, loc.slot)
+                .map(|bytes| bytes.to_vec())
+                .ok_or_else(|| corrupt("bad slab blob slot on read")),
+            record::LARGE_MAGIC => {
+                let blob_len = record::large_blob_len(&first)
+                    .ok_or_else(|| corrupt("bad large blob header"))?;
+                let pages = record::large_pages(blob_len);
+                if global + pages > page_count {
+                    return Err(corrupt("large blob run past the page array"));
+                }
+                let mut buf = vec![0u8; (pages * PAGE_SIZE) as usize];
+                read_exact_at(&mut **file, PageId(global).offset(DATA_START), &mut buf)
+                    .map_err(io_err)?;
+                record::decode_large(&buf)
+                    .map(|bytes| bytes.to_vec())
+                    .ok_or_else(|| corrupt("large blob parse failure"))
+            }
+            record::CHUNKED_BLOB_MAGIC => {
+                record_io::read_chunked_blob(&mut **file, global, page_count)
+            }
+            _ => Err(corrupt("bad blob page magic on read")),
+        }
+    }
+
+    fn commit_mutable_overlay_records(&self, records: &[([u8; 32], Vec<u8>)]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let records = records
+            .iter()
+            .cloned()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let oldest_pinned_snapshot_generation = self
+            .oldest_pinned_mvcc_snapshot_generation()?
+            .map(|generation| generation.as_u64());
+        let audit_retention_active = self.audit_config()?.legal_hold;
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        let new_gen = inner.generation + 1;
+        let roots = {
+            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            let mut alloc = PageAllocator::new_with_current_free_reusable(
+                inner.page_count,
+                new_gen,
+                inner.free.clone(),
+            );
+            let borrowed = records
+                .iter()
+                .map(|(key, value)| (*key, value.as_slice()))
+                .collect::<Vec<_>>();
+            let overlay_entries = overlay_current_record_locs(
+                &mut **file,
+                inner.overlay_root,
+                inner.page_count,
+                records.iter().map(|(address, _)| *address),
+            )?;
+            let reclaimed = reclaim_superseded_overlay_blobs_from_current(
+                &mut **file,
+                &mut alloc,
+                &overlay_entries,
+                records
+                    .iter()
+                    .map(|(address, value)| (*address, value.as_slice())),
+                oldest_pinned_snapshot_generation,
+                audit_retention_active,
+            )?;
+            let placements =
+                write_overlay_blob_pages(&mut **file, &mut alloc, &overlay_entries, &borrowed)?;
+            let mut overlay_root = inner.overlay_root;
+            for (address, loc) in &placements {
+                let bound = alloc.page_count();
+                overlay_root = Some(pagebtree::insert(
+                    &mut **file,
+                    DATA_START,
+                    &mut alloc,
+                    overlay_root,
+                    address,
+                    *loc,
+                    bound,
+                )?);
+            }
+            finish_txn(
+                &mut **file,
+                &mut alloc,
+                new_gen,
+                inner.maintenance.object_count,
+                inner.index_root,
+                overlay_root,
+                inner.open_segment,
+                inner.reference_root.map(|d| *d.bytes()),
+                inner.control_root.map(|d| *d.bytes()),
+                &inner.maintenance,
+                &reclaimed,
+                (
+                    inner.freemap,
+                    inner.region_table_root,
+                    inner.maintenance_root,
+                ),
+                inner.encryption_meta.clone(),
+                self.digest_algo,
+                Some(&self.group_commit_metrics),
+            )?
+        };
+        inner.generation = new_gen;
+        inner.page_count = roots.page_count;
+        inner.overlay_root = roots.overlay_root;
+        inner.free = roots.free;
+        inner.freemap = roots.freemap;
+        inner.region_table_root = Some(roots.region_table_root);
+        inner.maintenance_root = Some(roots.maintenance_root);
+        inner.maintenance = roots.maintenance;
+        Ok(())
+    }
+
+    /// Group-commit / hot-mutable durability diagnostics. Loads the cumulative counters from
+    /// the lock-free accumulator and reads the point-in-time pending-window gauges from the hot-mutable
+    /// queue. Takes no lock beyond a brief hold of the hot-mutable queue; does not touch `inner`, so it
+    /// can be called before locking `inner` without inverting the queue -> inner lock order used on the
+    /// publish path.
+    pub fn group_commit_diagnostics(&self) -> Result<GroupCommitDiagnostics> {
+        let metrics = &self.group_commit_metrics;
+        let (pending_transactions, pending_records) = {
+            let queue = self.hot_mutable_queue.lock().map_err(|_| poisoned())?;
+            queue.pending_window().map_or((0, 0), |window| {
+                (window.transaction_count as u64, window.record_count as u64)
+            })
+        };
+        Ok(GroupCommitDiagnostics {
+            group_commit_batches_total: metrics.batches_total.load(Ordering::Relaxed),
+            group_commit_transactions_total: metrics.transactions_total.load(Ordering::Relaxed),
+            group_commit_records_total: metrics.records_total.load(Ordering::Relaxed),
+            fsync_total_micros: metrics.fsync_total_micros.load(Ordering::Relaxed),
+            fsync_count: metrics.fsync_count.load(Ordering::Relaxed),
+            write_lock_wait_total_micros: metrics
+                .write_lock_wait_total_micros
+                .load(Ordering::Relaxed),
+            write_lock_wait_count: metrics.write_lock_wait_count.load(Ordering::Relaxed),
+            pending_durable_window_transactions: pending_transactions,
+            pending_durable_window_records: pending_records,
+            // The live reader-pin registry is owned by the daemon layer and is not reachable from the
+            // store diagnostics surface, so this count is reported as unavailable rather than a
+            // hardcoded zero.
+            pinned_reader_blockers: None,
+        })
+    }
+
     pub fn maintenance_status(&self) -> Result<MaintenanceStatus> {
+        // Computed before locking `inner` to keep the hot-mutable queue -> inner lock order.
+        let group_commit = self.group_commit_diagnostics()?;
         let inner = self.inner.lock().map_err(|_| poisoned())?;
         let tail_free_pages = tail_free_pages(&inner.free, inner.maintenance.physical_page_count);
         Ok(MaintenanceStatus {
@@ -961,6 +2899,385 @@ impl FileStore {
             touched_segments: inner.maintenance.touched_segments.clone(),
             candidate_segments: inner.maintenance.candidate_segments.clone(),
             segment_overflow: inner.maintenance.segment_overflow,
+            group_commit,
+        })
+    }
+
+    pub fn page_class_attribution(&self, max_examples: usize) -> Result<StorePageClassAttribution> {
+        let (
+            page_count,
+            index_root,
+            overlay_root,
+            freemap,
+            region_table_root,
+            maintenance_root,
+            free,
+            index_locs,
+        ) = {
+            let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+            self.materialize_index_locked(&mut inner)?;
+            (
+                inner.maintenance.physical_page_count,
+                inner.index_root,
+                inner.overlay_root,
+                inner.freemap,
+                inner.region_table_root,
+                inner.maintenance_root,
+                inner.free.clone(),
+                inner.index.values().copied().collect::<Vec<_>>(),
+            )
+        };
+        let mut pages = BTreeMap::<u64, String>::new();
+        let mut file = self.file.lock().map_err(|_| poisoned())?;
+        if let Some((root, span)) = freemap {
+            classify_page_run(&mut pages, root.0, span, "free_map_page");
+        }
+        if let Some(root) = region_table_root {
+            classify_page_run(&mut pages, root.0, 1, "region_table_page");
+        }
+        if let Some(root) = maintenance_root {
+            classify_page_run(&mut pages, root.0, 1, "maintenance_page");
+        }
+        for run in free {
+            let class = if run.start.saturating_add(run.len) == page_count {
+                "tail_free_page"
+            } else {
+                "reusable_free_page"
+            };
+            classify_page_run(&mut pages, run.start, run.len, class);
+        }
+        if let Some(root) = index_root {
+            for page in pagebtree::collect_pages(&mut **file, DATA_START, root, page_count)? {
+                classify_page_run(&mut pages, page.0, 1, "object_index_tree_page");
+            }
+        }
+        let overlay_locs = if let Some(root) = overlay_root {
+            for page in pagebtree::collect_pages(&mut **file, DATA_START, root, page_count)? {
+                classify_page_run(&mut pages, page.0, 1, "mutable_overlay_tree_page");
+            }
+            pagebtree::load_all(&mut **file, DATA_START, root, page_count)?
+                .into_iter()
+                .map(|(_, loc)| loc)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for loc in index_locs {
+            classify_record_loc(&mut **file, &mut pages, loc, page_count, "record")?;
+        }
+        for loc in overlay_locs {
+            classify_record_loc(
+                &mut **file,
+                &mut pages,
+                loc,
+                page_count,
+                "mutable_overlay_record",
+            )?;
+        }
+        let mut classes = BTreeMap::<String, StorePageClass>::new();
+        add_page_class(
+            &mut classes,
+            "file_header_journal_checkpoint",
+            DATA_START / PAGE_SIZE,
+            "file header",
+            max_examples,
+        );
+        let mut page = 0;
+        while page < page_count {
+            let class = if let Some(class) = pages.get(&page).cloned() {
+                class
+            } else {
+                classify_unreferenced_page(&mut **file, &mut pages, page, page_count)?
+            };
+            add_page_class(
+                &mut classes,
+                &class,
+                1,
+                &format!("page:{page}"),
+                max_examples,
+            );
+            page += 1;
+        }
+        let mut classes = classes.into_values().collect::<Vec<_>>();
+        classes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.class.cmp(&b.class)));
+        Ok(StorePageClassAttribution {
+            physical_bytes: DATA_START + page_count * PAGE_SIZE,
+            page_size: PAGE_SIZE,
+            data_pages: page_count,
+            classes,
+        })
+    }
+
+    pub fn mutable_overlay_checkpoint_plan(
+        &self,
+        max_examples: usize,
+    ) -> Result<MutableOverlayCheckpointPlan> {
+        self.mutable_overlay_checkpoint_plan_with_durable_floor(max_examples, None)
+    }
+
+    pub fn checkpoint_mutable_overlay_pages(
+        &self,
+        max_examples: usize,
+    ) -> Result<MutableOverlayCheckpointWriteReport> {
+        let _publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+        let plan = self.mutable_overlay_checkpoint_plan(max_examples)?;
+        if plan.compactable_current_records == 0 || plan.stale_record_bytes == 0 {
+            let status = self.store_maintenance_report(0)?;
+            return Ok(MutableOverlayCheckpointWriteReport {
+                planned_current_records: plan.current_record_count,
+                compacted_current_records: 0,
+                blocked_current_records: plan.blocked_current_records,
+                rewritten_record_bytes: 0,
+                freed_record_pages: 0,
+                reusable_free_bytes: status.reusable_free_bytes,
+                physical_page_count: status.status.physical_page_count,
+            });
+        }
+        let compactable = plan
+            .current_records
+            .iter()
+            .filter(|record| record.compactable)
+            .map(|record| (record.key.clone(), record.generation))
+            .collect::<BTreeMap<_, _>>();
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        let Some(root) = inner.overlay_root else {
+            let physical_page_count = inner.maintenance.physical_page_count;
+            drop(inner);
+            let status = self.store_maintenance_report(0)?;
+            return Ok(MutableOverlayCheckpointWriteReport {
+                planned_current_records: plan.current_record_count,
+                compacted_current_records: 0,
+                blocked_current_records: plan.blocked_current_records,
+                rewritten_record_bytes: 0,
+                freed_record_pages: 0,
+                reusable_free_bytes: status.reusable_free_bytes,
+                physical_page_count,
+            });
+        };
+        let new_gen = inner.generation + 1;
+        let (roots, compacted_current_records, rewritten_record_bytes, freed_record_pages) = {
+            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            let mut alloc = PageAllocator::new_with_current_free_reusable(
+                inner.page_count,
+                new_gen,
+                inner.free.clone(),
+            );
+            let overlay_entries =
+                pagebtree::load_all(&mut **file, DATA_START, root, inner.page_count)?;
+            pagebtree::free_all(&mut **file, DATA_START, &mut alloc, root, inner.page_count)?;
+            let mut compacted_current_records = 0u64;
+            let mut rewritten_record_bytes = 0u64;
+            let mut freed_record_pages = 0u64;
+            let mut rewritten = Vec::<([u8; 32], Vec<u8>)>::new();
+            let mut next_entries = Vec::<([u8; 32], RecordLoc)>::new();
+            let mut freed_segments = BTreeSet::new();
+            for (address, loc) in overlay_entries {
+                let value = read_blob_from_loc(&mut **file, loc)?;
+                let rewrite = if address == mutable_overlay_meta_address()
+                    || address == mutable_overlay_current_index_address()
+                    || value.starts_with(MUTABLE_OVERLAY_OWNER_TOKEN_RECORD)
+                    || value.starts_with(MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD)
+                    || value.starts_with(MUTABLE_OVERLAY_IDEMPOTENCY_RECORD)
+                    || value.starts_with(MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD)
+                    || value.starts_with(RETAINED_HISTORY_HEAD_RECORD)
+                    || value.starts_with(RETAINED_HISTORY_ENTRY_RECORD)
+                {
+                    false
+                } else {
+                    let entry = decode_mutable_overlay_entry(&value)?;
+                    compactable
+                        .get(&entry.key)
+                        .is_some_and(|generation| *generation == entry.generation)
+                };
+                if rewrite {
+                    let pages =
+                        record_io::blob_pages(&mut **file, loc.global_page(), inner.page_count)?;
+                    for page in &pages {
+                        alloc.free(PageId(*page), 1);
+                        freed_segments.insert(page / page::PAGES_PER_SEGMENT);
+                    }
+                    let page_span = pages.len() as u64;
+                    compacted_current_records += 1;
+                    rewritten_record_bytes =
+                        rewritten_record_bytes.saturating_add(value.len() as u64);
+                    freed_record_pages = freed_record_pages.saturating_add(page_span);
+                    rewritten.push((address, value));
+                } else {
+                    next_entries.push((address, loc));
+                }
+            }
+            let borrowed = rewritten
+                .iter()
+                .map(|(address, value)| (*address, value.as_slice()))
+                .collect::<Vec<_>>();
+            let placements =
+                record_io::write_dedicated_blob_pages(&mut **file, &mut alloc, &borrowed)?;
+            next_entries.extend(placements);
+            next_entries.sort_by_key(|entry| entry.0);
+            let mut overlay_root = None;
+            for (address, loc) in &next_entries {
+                let bound = alloc.page_count();
+                overlay_root = Some(pagebtree::insert(
+                    &mut **file,
+                    DATA_START,
+                    &mut alloc,
+                    overlay_root,
+                    address,
+                    *loc,
+                    bound,
+                )?);
+            }
+            let roots = finish_txn(
+                &mut **file,
+                &mut alloc,
+                new_gen,
+                inner.maintenance.object_count,
+                inner.index_root,
+                overlay_root,
+                inner.open_segment,
+                inner.reference_root.map(|d| *d.bytes()),
+                inner.control_root.map(|d| *d.bytes()),
+                &inner.maintenance,
+                &freed_segments,
+                (
+                    inner.freemap,
+                    inner.region_table_root,
+                    inner.maintenance_root,
+                ),
+                inner.encryption_meta.clone(),
+                self.digest_algo,
+                Some(&self.group_commit_metrics),
+            )?;
+            (
+                roots,
+                compacted_current_records,
+                rewritten_record_bytes,
+                freed_record_pages,
+            )
+        };
+        inner.generation = new_gen;
+        inner.page_count = roots.page_count;
+        inner.overlay_root = roots.overlay_root;
+        inner.free = roots.free;
+        inner.freemap = roots.freemap;
+        inner.region_table_root = Some(roots.region_table_root);
+        inner.maintenance_root = Some(roots.maintenance_root);
+        inner.maintenance = roots.maintenance;
+        drop(inner);
+        let status = self.store_maintenance_report(0)?;
+        Ok(MutableOverlayCheckpointWriteReport {
+            planned_current_records: plan.current_record_count,
+            compacted_current_records,
+            blocked_current_records: plan.blocked_current_records,
+            rewritten_record_bytes,
+            freed_record_pages,
+            reusable_free_bytes: status.reusable_free_bytes,
+            physical_page_count: status.status.physical_page_count,
+        })
+    }
+
+    fn mutable_overlay_checkpoint_plan_with_durable_floor(
+        &self,
+        max_examples: usize,
+        durable_reclaim_floor_override: Option<u64>,
+    ) -> Result<MutableOverlayCheckpointPlan> {
+        let overlay_health = self.mutable_overlay_health()?;
+        let mvcc = self.mvcc_snapshot_diagnostics()?;
+        let audit_retention_active = self.audit_config()?.legal_hold;
+        let attribution = self.page_class_attribution(max_examples)?;
+        let stale_record_bytes = attribution
+            .classes
+            .iter()
+            .filter(|class| class.class.starts_with("stale_record_"))
+            .map(|class| class.bytes)
+            .sum();
+        let reusable_free_bytes = attribution
+            .classes
+            .iter()
+            .filter(|class| class.class == "reusable_free_page")
+            .map(|class| class.bytes)
+            .sum();
+        let (overlay_root, page_count, durable_reclaim_floor) = {
+            let inner = self.inner.lock().map_err(|_| poisoned())?;
+            (
+                inner.overlay_root,
+                inner.page_count,
+                durable_reclaim_floor_override.unwrap_or(overlay_health.current_generation),
+            )
+        };
+        let mut current_records = Vec::new();
+        if let Some(root) = overlay_root {
+            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            for (address, loc) in pagebtree::load_all(&mut **file, DATA_START, root, page_count)? {
+                let value = read_blob_from_loc(&mut **file, loc)?;
+                if address == mutable_overlay_meta_address()
+                    || address == mutable_overlay_current_index_address()
+                    || value.starts_with(MUTABLE_OVERLAY_OWNER_TOKEN_RECORD)
+                    || value.starts_with(MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD)
+                    || value.starts_with(MUTABLE_OVERLAY_IDEMPOTENCY_RECORD)
+                    || value.starts_with(MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD)
+                    || value.starts_with(RETAINED_HISTORY_HEAD_RECORD)
+                    || value.starts_with(RETAINED_HISTORY_ENTRY_RECORD)
+                {
+                    continue;
+                }
+                let entry = decode_mutable_overlay_entry(&value)?;
+                let generation = if entry.generation.as_u64() == 0 {
+                    loom_core::OverlayGeneration::new(overlay_health.current_generation)
+                } else {
+                    entry.generation
+                };
+                let blockers = mutable_overlay_checkpoint_record_blockers(
+                    generation,
+                    entry.kind,
+                    &mvcc,
+                    audit_retention_active,
+                    durable_reclaim_floor,
+                );
+                let page_span =
+                    record_io::blob_pages(&mut **file, loc.global_page(), page_count)?.len() as u64;
+                let compactable = blockers.is_empty();
+                current_records.push(MutableOverlayCheckpointRecordPlan {
+                    key: entry.key,
+                    generation,
+                    kind: entry.kind,
+                    page_start: loc.global_page(),
+                    page_span,
+                    bytes: page_span.saturating_mul(PAGE_SIZE),
+                    blockers,
+                    compactable,
+                });
+            }
+        }
+        current_records.sort_by(|left, right| {
+            left.generation
+                .cmp(&right.generation)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        let compactable_current_records = current_records
+            .iter()
+            .filter(|record| record.compactable)
+            .count() as u64;
+        let blocked_current_records = current_records.len() as u64 - compactable_current_records;
+        let pinned_generations = mvcc
+            .pins
+            .iter()
+            .map(|pin| pin.identity.overlay_generation)
+            .collect();
+        Ok(MutableOverlayCheckpointPlan {
+            overlay_generation: loom_core::OverlayGeneration::new(
+                overlay_health.current_generation,
+            ),
+            active_snapshot_count: mvcc.active_snapshot_count,
+            oldest_pinned_generation: mvcc.oldest_pinned_overlay_generation,
+            pinned_generations,
+            current_record_count: overlay_health.current_record_count,
+            tombstone_count: overlay_health.tombstone_count,
+            compactable_current_records,
+            blocked_current_records,
+            stale_record_bytes,
+            reusable_free_bytes,
+            current_records,
         })
     }
 
@@ -1273,6 +3590,13 @@ impl FileStore {
     /// Persist the ACL grant snapshot outside workspace history.
     pub fn save_acl_store(&self, acl: &AclStore) -> Result<()> {
         self.control_set(ACL_STORE_KEY, acl.encode())
+    }
+
+    pub fn acl_store_control_write(&self, acl: &AclStore) -> loom_core::WorkflowControlWrite {
+        loom_core::WorkflowControlWrite::Put {
+            key: ACL_STORE_KEY.to_vec(),
+            payload: acl.encode(),
+        }
     }
 
     pub fn save_acl_store_audited(
@@ -2032,6 +4356,59 @@ impl FileStore {
         Ok(digests)
     }
 
+    pub fn put_batch_and_set_reference_root(
+        &self,
+        items: &[(Digest, Vec<u8>)],
+        root: Digest,
+    ) -> Result<()> {
+        let to_append = items
+            .iter()
+            .map(|(digest, canonical)| (*digest, canonical.as_slice(), self.default_codec))
+            .collect::<Vec<_>>();
+        self.commit_txn(&to_append, Some(Some(*root.bytes())), None, None)
+    }
+
+    pub fn put_batch_control_set_with_reference(
+        &self,
+        items: &[(Digest, Vec<u8>)],
+        key: &[u8],
+        value: Vec<u8>,
+        principal: Option<WorkspaceId>,
+        action: Option<&str>,
+        target: Option<&str>,
+        reference_root: Option<Digest>,
+    ) -> Result<()> {
+        let mut map = self.control_map()?;
+        map.insert(key.to_vec(), value);
+        if let Some(action) = action {
+            append_audit_record(&mut map, self.digest_algo, principal, action, target)?;
+        }
+
+        let mut to_append = items
+            .iter()
+            .map(|(digest, canonical)| (*digest, canonical.as_slice(), self.default_codec))
+            .collect::<Vec<_>>();
+        let control_bytes = if map.is_empty() {
+            None
+        } else {
+            let bytes = encode_control_map(&map);
+            let digest = Digest::hash(self.digest_algo, &bytes);
+            Some((digest, bytes))
+        };
+        let control = if let Some((digest, bytes)) = &control_bytes {
+            to_append.push((*digest, bytes.as_slice(), self.default_codec));
+            Some(*digest.bytes())
+        } else {
+            None
+        };
+        self.commit_txn(
+            &to_append,
+            Some(reference_root.map(|d| *d.bytes())),
+            Some(control),
+            None,
+        )
+    }
+
     /// Group commit: coalesce concurrent object writes into one fsync'd transaction. The caller
     /// enqueues its objects, then whichever caller finds no leader running becomes the leader and
     /// commits the whole queue (its own objects plus any other threads' that have arrived) via
@@ -2174,6 +4551,7 @@ impl FileStore {
                 new_gen,
                 object_count,
                 index_root,
+                inner.overlay_root,
                 inner.open_segment,
                 reference,
                 control,
@@ -2186,6 +4564,7 @@ impl FileStore {
                 ),
                 inner.encryption_meta.clone(),
                 self.digest_algo,
+                Some(&self.group_commit_metrics),
             )?;
             (roots, index_root, placements)
         };
@@ -2193,6 +4572,7 @@ impl FileStore {
         inner.generation = new_gen;
         inner.page_count = roots.page_count;
         inner.index_root = index_root;
+        inner.overlay_root = roots.overlay_root;
         Self::clear_index_page_cache_locked(&mut inner);
         inner.free = roots.free;
         inner.freemap = roots.freemap;
@@ -2244,6 +4624,102 @@ fn tail_free_pages(free: &[FreePageRun], page_count: u64) -> u64 {
         end = run.start;
     }
     total
+}
+
+fn classify_page_run(pages: &mut BTreeMap<u64, String>, start: u64, len: u64, class: &str) {
+    for page in start..start.saturating_add(len) {
+        pages.insert(page, class.to_string());
+    }
+}
+
+fn classify_record_loc(
+    file: &mut dyn BackingIo,
+    pages: &mut BTreeMap<u64, String>,
+    loc: RecordLoc,
+    page_count: u64,
+    prefix: &str,
+) -> Result<()> {
+    let page = loc.global_page();
+    let mut first = [0u8; PAGE_SIZE as usize];
+    read_exact_at(file, PageId(page).offset(DATA_START), &mut first).map_err(io_err)?;
+    if first[0] == record::CHUNKED_BLOB_MAGIC {
+        let class = format!("{prefix}_chunked_page");
+        for page in record_io::chunked_blob_pages(file, page, page_count)? {
+            pages.insert(page, class.clone());
+        }
+        return Ok(());
+    }
+    let span = record_io::page_span(file, page)?;
+    let class = if span == 1 {
+        format!("{prefix}_slab_page")
+    } else {
+        format!("{prefix}_large_page")
+    };
+    classify_page_run(pages, page, span, &class);
+    Ok(())
+}
+
+fn classify_unreferenced_page(
+    file: &mut dyn BackingIo,
+    pages: &mut BTreeMap<u64, String>,
+    page: u64,
+    page_count: u64,
+) -> Result<String> {
+    let mut buf = [0u8; PAGE_SIZE as usize];
+    read_exact_at(file, PageId(page).offset(DATA_START), &mut buf).map_err(io_err)?;
+    let class = if buf.iter().all(|byte| *byte == 0) {
+        "unreferenced_zero_page".to_string()
+    } else if record::read_slab_slot(&buf, 0).is_some() {
+        "stale_record_slab_page".to_string()
+    } else if let Some(blob_len) = record::large_blob_len(&buf) {
+        let span = record::large_pages(blob_len);
+        if page.saturating_add(span) <= page_count {
+            let mut run = vec![0u8; (span * PAGE_SIZE) as usize];
+            read_exact_at(file, PageId(page).offset(DATA_START), &mut run).map_err(io_err)?;
+            if record::decode_large(&run).is_some() {
+                classify_page_run(pages, page, span, "stale_record_large_page");
+                "stale_record_large_page".to_string()
+            } else {
+                "unreferenced_unclassified_page".to_string()
+            }
+        } else {
+            "unreferenced_unclassified_page".to_string()
+        }
+    } else if record::decode_chunked_blob_page(&buf).is_some() {
+        "stale_record_chunked_page".to_string()
+    } else if pagebtree::looks_like_node_page(&buf) {
+        "stale_tree_page".to_string()
+    } else if page::RegionTable::decode(&buf).is_some() {
+        "stale_region_table_page".to_string()
+    } else if maintenance::looks_like_maintenance_page(&buf) {
+        "stale_maintenance_page".to_string()
+    } else if pagemap::decode(&buf).is_some() {
+        "stale_free_map_page".to_string()
+    } else {
+        "unreferenced_unclassified_page".to_string()
+    };
+    pages.insert(page, class.clone());
+    Ok(class)
+}
+
+fn add_page_class(
+    classes: &mut BTreeMap<String, StorePageClass>,
+    class: &str,
+    pages: u64,
+    example: &str,
+    max_examples: usize,
+) {
+    let entry = classes.entry(class.to_string()).or_insert(StorePageClass {
+        class: class.to_string(),
+        pages: 0,
+        bytes: 0,
+        examples: Vec::new(),
+    });
+    entry.pages = entry.pages.saturating_add(pages);
+    entry.bytes = entry.bytes.saturating_add(pages.saturating_mul(PAGE_SIZE));
+    if entry.examples.len() < max_examples {
+        entry.examples.push(example.to_string());
+    }
 }
 
 // ---- compaction / GC FileStore impl lives in compact.rs ----
@@ -2669,25 +5145,130 @@ fn decode_audit_config(value: &[u8]) -> Result<AuditConfig> {
 }
 
 fn encode_store_policy(policy: StorePolicy) -> Vec<u8> {
-    let mut out = Vec::with_capacity(STORE_POLICY_MAGIC.len() + 1);
+    let override_count = policy
+        .facet_durability_overrides
+        .iter()
+        .filter(|value| value.is_some())
+        .count();
+    let mut out = Vec::with_capacity(STORE_POLICY_MAGIC.len() + 5 + override_count * 2);
     out.extend_from_slice(STORE_POLICY_MAGIC);
+    out.push(2);
     out.push(u8::from(policy.fips_required));
+    out.push(encode_durability_policy_tag(policy.default_durability));
+    out.extend_from_slice(&(override_count as u16).to_be_bytes());
+    for (idx, policy) in policy.facet_durability_overrides.iter().enumerate() {
+        if let Some(policy) = policy {
+            out.push(idx as u8);
+            out.push(encode_durability_policy_tag(*policy));
+        }
+    }
     out
 }
 
 fn decode_store_policy(value: &[u8]) -> Result<StorePolicy> {
-    if value.len() != STORE_POLICY_MAGIC.len() + 1 {
-        return Err(corrupt("store policy length"));
+    if value.len() < STORE_POLICY_MAGIC.len() {
+        return Err(corrupt("store policy truncated"));
     }
     if &value[..STORE_POLICY_MAGIC.len()] != STORE_POLICY_MAGIC {
         return Err(corrupt("bad store policy magic"));
     }
-    let fips_required = match value[STORE_POLICY_MAGIC.len()] {
-        0 => false,
-        1 => true,
-        _ => return Err(corrupt("store policy FIPS-required tag")),
+    if value.len() == STORE_POLICY_MAGIC.len() + 1 {
+        let fips_required = match value[STORE_POLICY_MAGIC.len()] {
+            0 => false,
+            1 => true,
+            _ => return Err(corrupt("store policy FIPS-required tag")),
+        };
+        return Ok(StorePolicy {
+            fips_required,
+            ..StorePolicy::default()
+        });
+    }
+    let mut pos = STORE_POLICY_MAGIC.len();
+    let Some(version) = value.get(pos).copied() else {
+        return Err(corrupt("store policy version missing"));
     };
-    Ok(StorePolicy { fips_required })
+    pos += 1;
+    if version != 2 {
+        return Err(corrupt("unsupported store policy version"));
+    }
+    let fips_required = match value.get(pos).copied() {
+        Some(0) => false,
+        Some(1) => true,
+        Some(_) => return Err(corrupt("store policy FIPS-required tag")),
+        None => return Err(corrupt("store policy FIPS-required tag missing")),
+    };
+    pos += 1;
+    let default_durability = decode_durability_policy_tag(
+        value
+            .get(pos)
+            .copied()
+            .ok_or_else(|| corrupt("store policy default durability missing"))?,
+    )?;
+    pos += 1;
+    if pos + 2 > value.len() {
+        return Err(corrupt("store policy facet override count missing"));
+    }
+    let count = u16::from_be_bytes(
+        value[pos..pos + 2]
+            .try_into()
+            .map_err(|_| corrupt("store policy facet override count invalid"))?,
+    ) as usize;
+    pos += 2;
+    let mut policy = StorePolicy {
+        fips_required,
+        default_durability,
+        facet_durability_overrides: [None; 21],
+    };
+    for _ in 0..count {
+        if pos + 2 > value.len() {
+            return Err(corrupt("store policy facet override truncated"));
+        }
+        let facet = FacetKind::from_stable_tag(value[pos])
+            .ok_or_else(|| corrupt("store policy facet override tag"))?;
+        let durability = decode_durability_policy_tag(value[pos + 1])?;
+        policy.set_facet_durability(facet, Some(durability))?;
+        pos += 2;
+    }
+    if pos != value.len() {
+        return Err(corrupt("store policy trailing bytes"));
+    }
+    Ok(policy)
+}
+
+fn encode_durability_policy_tag(policy: StoreDurabilityPolicy) -> u8 {
+    match policy {
+        StoreDurabilityPolicy::Strict => 0,
+        StoreDurabilityPolicy::Normal => 1,
+        StoreDurabilityPolicy::Relaxed => 2,
+        StoreDurabilityPolicy::Ephemeral => 3,
+    }
+}
+
+fn decode_durability_policy_tag(value: u8) -> Result<StoreDurabilityPolicy> {
+    match value {
+        0 => Ok(StoreDurabilityPolicy::Strict),
+        1 => Ok(StoreDurabilityPolicy::Normal),
+        2 => Ok(StoreDurabilityPolicy::Relaxed),
+        3 => Ok(StoreDurabilityPolicy::Ephemeral),
+        _ => Err(corrupt("store policy durability tag")),
+    }
+}
+
+fn mutable_overlay_key_facet(key: &loom_core::OverlayKey) -> Result<Option<FacetKind>> {
+    let segments = key.segments()?;
+    if segments.len() != 6 {
+        return Ok(None);
+    }
+    if segments[2] == b"loom.document.current.v1" || segments[2] == b"documents" {
+        return Ok(Some(FacetKind::Document));
+    }
+    let Ok(name) = std::str::from_utf8(segments[2]) else {
+        return Ok(None);
+    };
+    match FacetKind::parse(name) {
+        Ok(facet) => Ok(Some(facet)),
+        Err(_) => Ok(None),
+    }
 }
 
 fn encode_authority_replication_policy(policy: &AuthorityReplicationPolicy) -> Vec<u8> {
@@ -3768,6 +6349,10 @@ impl ObjectStore for FileStore {
                     .ok_or_else(|| corrupt("large record parse failure"))?;
                 decode_record(rec, digest, dek.as_ref(), self.digest_algo)?
             }
+            record::CHUNKED_BLOB_MAGIC => {
+                let rec = record_io::read_chunked_blob(&mut **file, global, page_count)?;
+                decode_record(&rec, digest, dek.as_ref(), self.digest_algo)?
+            }
             _ => return Err(corrupt("bad record page magic on read")),
         };
         Ok(Some(payload))
@@ -3789,6 +6374,94 @@ impl ObjectStore for FileStore {
 
     fn digest_algo(&self) -> Algo {
         self.digest_algo
+    }
+
+    fn put_mutable_overlay_value(
+        &self,
+        key: loom_core::OverlayKey,
+        payload: Vec<u8>,
+    ) -> Result<loom_core::OverlayOwnerToken> {
+        FileStore::put_mutable_overlay_value(self, key, payload)
+    }
+
+    fn put_mutable_overlay_tombstone(
+        &self,
+        key: loom_core::OverlayKey,
+    ) -> Result<loom_core::OverlayOwnerToken> {
+        FileStore::put_mutable_overlay_tombstone(self, key)
+    }
+
+    fn uses_mutable_overlay_current_records(&self) -> bool {
+        true
+    }
+
+    fn mutable_overlay_current_entries(
+        &self,
+    ) -> Result<Vec<loom_core::MutableOverlayEntrySnapshot>> {
+        FileStore::mutable_overlay_entries(self)
+    }
+
+    fn mutable_overlay_current_entry(
+        &self,
+        key: &loom_core::OverlayKey,
+    ) -> Result<Option<loom_core::MutableOverlayEntrySnapshot>> {
+        FileStore::mutable_overlay_current_entry(self, key)
+    }
+
+    fn mutable_overlay_generation(&self) -> Result<loom_core::OverlayGeneration> {
+        FileStore::mutable_overlay_generation(self)
+    }
+
+    fn retained_history_head(&self, key: &[u8]) -> Result<u64> {
+        FileStore::retained_history_head(self, key)
+    }
+
+    fn retained_history_records(
+        &self,
+        key: &[u8],
+        first_sequence: u64,
+        max: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        FileStore::retained_history_records(self, key, first_sequence, max)
+    }
+
+    fn mutable_overlay_owner_token(
+        &self,
+        key: &loom_core::OverlayKey,
+    ) -> Result<Option<loom_core::OverlayOwnerToken>> {
+        FileStore::mutable_overlay_owner_token(self, key)
+    }
+
+    fn open_mutable_overlay_read_snapshot(
+        &self,
+        snapshot: loom_core::OverlaySnapshot,
+        owner: Option<&str>,
+    ) -> Result<loom_core::OverlayReadSnapshot> {
+        let _publication_guard = self.overlay_publication.lock().map_err(|_| poisoned())?;
+        let immutable_base_root = self.inner.lock().map_err(|_| poisoned())?.reference_root;
+        let store_snapshot =
+            self.register_mvcc_snapshot(snapshot.clone(), immutable_base_root, owner)?;
+        Ok(loom_core::OverlayReadSnapshot::new(
+            snapshot,
+            immutable_base_root,
+            Some(Box::new(store_snapshot)),
+        ))
+    }
+
+    fn open_workflow_planning_snapshot(
+        &self,
+        owner: Option<&str>,
+    ) -> Result<loom_core::OverlayReadSnapshot> {
+        let store_snapshot = self.open_mvcc_snapshot_with_owner(owner)?;
+        Ok(loom_core::OverlayReadSnapshot::new(
+            store_snapshot.snapshot.clone(),
+            store_snapshot.identity.immutable_base_root,
+            Some(Box::new(store_snapshot)),
+        ))
+    }
+
+    fn commit_workflow_transaction(&self, txn: WorkflowTransaction) -> Result<CommitReceipt> {
+        FileStore::commit_workflow_transaction(self, txn)
     }
 }
 
@@ -3822,6 +6495,8 @@ fn finish_open(
     if let Some(root) = root {
         loom.load_state(root)?;
     }
+    let entries = loom.store().mutable_overlay_entries()?;
+    *loom.mutable_overlay_mut() = loom_core::MutableOverlay::import_entries(&entries)?;
     Ok(loom)
 }
 
@@ -4091,13 +6766,22 @@ pub fn loom_over_backing_encrypted(
     finish_open(store, None)
 }
 
-/// Persist a complete [`Loom`]: serialize the engine state to a Blob object in the store, then record
-/// that Blob's digest as the file's reference root. Two commits (object append, then superblock); a crash
-/// between them leaves a durable but unreferenced object and the prior committed root - never a torn
-/// engine state. Reverse of [`open_loom`].
+/// Persist a complete [`Loom`]: serialize the engine state and publish its digest as the file's
+/// reference root in one store transaction. Reverse of [`open_loom`].
 pub fn save_loom(loom: &mut Loom<FileStore>) -> Result<()> {
-    let root = loom.save_state()?;
-    loom.store_mut().set_reference_root(Some(root))
+    let (root, objects) = loom.save_state_objects()?;
+    loom.store_mut()
+        .put_batch_and_set_reference_root(&objects, root)
+}
+
+pub fn ensure_engine_state_base(loom: &mut Loom<FileStore>) -> Result<Digest> {
+    if let Some(root) = loom.store().reference_root() {
+        return Ok(root);
+    }
+    save_loom(loom)?;
+    loom.store()
+        .reference_root()
+        .ok_or_else(|| LoomError::corrupt("engine-state base root was not published"))
 }
 
 /// Garbage-collect a `.loom`: keep only the objects reachable from the engine's refs + tags + the
@@ -4225,6 +6909,1080 @@ pub(crate) fn get_uvarint(buf: &[u8], pos: &mut usize) -> Option<u64> {
             return None;
         }
     }
+}
+
+fn mutable_overlay_meta_address() -> [u8; 32] {
+    *Digest::blake3(MUTABLE_OVERLAY_META_ADDRESS).bytes()
+}
+
+fn mutable_overlay_current_index_address() -> [u8; 32] {
+    *Digest::blake3(MUTABLE_OVERLAY_CURRENT_INDEX_ADDRESS).bytes()
+}
+
+fn mutable_overlay_entry_address(key: &loom_core::OverlayKey) -> [u8; 32] {
+    let mut out = MUTABLE_OVERLAY_ENTRY_ADDRESS_PREFIX.to_vec();
+    out.extend_from_slice(Digest::blake3(key.as_bytes()).bytes());
+    *Digest::blake3(&out).bytes()
+}
+
+fn mutable_overlay_owner_token_address(key: &loom_core::OverlayKey) -> [u8; 32] {
+    let mut out = MUTABLE_OVERLAY_OWNER_TOKEN_ADDRESS_PREFIX.to_vec();
+    out.extend_from_slice(Digest::blake3(key.as_bytes()).bytes());
+    *Digest::blake3(&out).bytes()
+}
+
+fn mutable_overlay_secondary_index_address(index: &loom_core::OverlayKey) -> [u8; 32] {
+    let mut out = MUTABLE_OVERLAY_SECONDARY_INDEX_ADDRESS_PREFIX.to_vec();
+    out.extend_from_slice(Digest::blake3(index.as_bytes()).bytes());
+    *Digest::blake3(&out).bytes()
+}
+
+fn mutable_overlay_idempotency_address(idempotency_key: &str) -> [u8; 32] {
+    let mut out = MUTABLE_OVERLAY_IDEMPOTENCY_ADDRESS_PREFIX.to_vec();
+    out.extend_from_slice(idempotency_key.as_bytes());
+    *Digest::blake3(&out).bytes()
+}
+
+fn mutable_overlay_transaction_idempotency_address(idempotency_key: &[u8]) -> [u8; 32] {
+    let mut out = MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_ADDRESS_PREFIX.to_vec();
+    out.extend_from_slice(idempotency_key);
+    *Digest::blake3(&out).bytes()
+}
+
+fn retained_history_head_address(key: &[u8]) -> [u8; 32] {
+    let mut out = RETAINED_HISTORY_HEAD_ADDRESS_PREFIX.to_vec();
+    out.extend_from_slice(Digest::blake3(key).bytes());
+    *Digest::blake3(&out).bytes()
+}
+
+fn retained_history_record_address(key: &[u8], sequence: u64) -> [u8; 32] {
+    let mut out = RETAINED_HISTORY_RECORD_ADDRESS_PREFIX.to_vec();
+    out.extend_from_slice(Digest::blake3(key).bytes());
+    out.extend_from_slice(&sequence.to_be_bytes());
+    *Digest::blake3(&out).bytes()
+}
+
+fn encode_retained_history_head(key: &[u8], sequence: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(RETAINED_HISTORY_HEAD_RECORD);
+    put_uvarint(&mut out, key.len() as u64);
+    out.extend_from_slice(key);
+    put_uvarint(&mut out, sequence);
+    out
+}
+
+fn decode_retained_history_head(bytes: &[u8]) -> Result<(Vec<u8>, u64)> {
+    if !bytes.starts_with(RETAINED_HISTORY_HEAD_RECORD) {
+        return Err(corrupt("retained-history head schema mismatch"));
+    }
+    let mut pos = RETAINED_HISTORY_HEAD_RECORD.len();
+    let key_len = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("retained-history head key length truncated"))?
+        as usize;
+    let key_end = pos
+        .checked_add(key_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| corrupt("retained-history head key truncated"))?;
+    let key = bytes[pos..key_end].to_vec();
+    pos = key_end;
+    let sequence = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("retained-history head sequence truncated"))?;
+    if pos != bytes.len() {
+        return Err(corrupt("retained-history head trailing bytes"));
+    }
+    Ok((key, sequence))
+}
+
+fn encode_retained_history_entry(key: &[u8], sequence: u64, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(RETAINED_HISTORY_ENTRY_RECORD);
+    put_uvarint(&mut out, key.len() as u64);
+    out.extend_from_slice(key);
+    put_uvarint(&mut out, sequence);
+    put_uvarint(&mut out, payload.len() as u64);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn decode_retained_history_entry(bytes: &[u8]) -> Result<(Vec<u8>, u64, Vec<u8>)> {
+    if !bytes.starts_with(RETAINED_HISTORY_ENTRY_RECORD) {
+        return Err(corrupt("retained-history entry schema mismatch"));
+    }
+    let mut pos = RETAINED_HISTORY_ENTRY_RECORD.len();
+    let key_len = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("retained-history entry key length truncated"))?
+        as usize;
+    let key_end = pos
+        .checked_add(key_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| corrupt("retained-history entry key truncated"))?;
+    let key = bytes[pos..key_end].to_vec();
+    pos = key_end;
+    let sequence = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("retained-history entry sequence truncated"))?;
+    let payload_len = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("retained-history entry payload length truncated"))?
+        as usize;
+    let payload_end = pos
+        .checked_add(payload_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| corrupt("retained-history entry payload truncated"))?;
+    let payload = bytes[pos..payload_end].to_vec();
+    if payload_end != bytes.len() {
+        return Err(corrupt("retained-history entry trailing bytes"));
+    }
+    Ok((key, sequence, payload))
+}
+
+fn validate_mutable_overlay_idempotency_key(idempotency_key: &str) -> Result<()> {
+    if idempotency_key.is_empty() {
+        return Err(LoomError::invalid(
+            "mutable overlay idempotency key must not be empty",
+        ));
+    }
+    if idempotency_key.len() > 512 {
+        return Err(LoomError::invalid(
+            "mutable overlay idempotency key is too long",
+        ));
+    }
+    if idempotency_key.as_bytes().contains(&0) {
+        return Err(LoomError::invalid(
+            "mutable overlay idempotency key contains NUL",
+        ));
+    }
+    Ok(())
+}
+
+fn mutable_overlay_idempotency_request_digest(
+    key: &loom_core::OverlayKey,
+    payload: &[u8],
+) -> Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"loom.store.mutable-overlay.idempotency-request.v1");
+    put_uvarint(&mut bytes, key.as_bytes().len() as u64);
+    bytes.extend_from_slice(key.as_bytes());
+    put_uvarint(&mut bytes, payload.len() as u64);
+    bytes.extend_from_slice(payload);
+    Digest::blake3(&bytes)
+}
+
+fn workflow_transaction_request_digest(
+    txn: &WorkflowTransaction,
+    write_durabilities: &[StoreDurabilityPolicy],
+) -> Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"loom.store.workflow-transaction.request.v2");
+    bytes.extend_from_slice(txn.workspace.as_bytes());
+    bytes.extend_from_slice(txn.actor.as_bytes());
+    put_uvarint(&mut bytes, txn.writes.len() as u64);
+    for (write, durability) in txn.writes.iter().zip(write_durabilities) {
+        bytes.push(write.facet.stable_tag());
+        bytes.push(workflow_durability_tag(*durability));
+        put_uvarint(&mut bytes, write.target.as_bytes().len() as u64);
+        bytes.extend_from_slice(write.target.as_bytes());
+        match &write.op {
+            loom_core::FacetWriteOp::Put { payload } => {
+                bytes.push(1);
+                put_uvarint(&mut bytes, payload.len() as u64);
+                bytes.extend_from_slice(payload);
+            }
+            loom_core::FacetWriteOp::Delete => bytes.push(2),
+        }
+        match write.expected.as_ref() {
+            Some(token) => {
+                bytes.push(1);
+                bytes.extend_from_slice(token.0.as_bytes());
+            }
+            None => bytes.push(0),
+        }
+        put_uvarint(&mut bytes, write.secondary_indexes.len() as u64);
+        for index_write in &write.secondary_indexes {
+            put_uvarint(&mut bytes, index_write.index.as_bytes().len() as u64);
+            bytes.extend_from_slice(index_write.index.as_bytes());
+            match &index_write.op {
+                loom_core::SecondaryIndexWriteOp::Put { payload } => {
+                    bytes.push(1);
+                    put_uvarint(&mut bytes, payload.len() as u64);
+                    bytes.extend_from_slice(payload);
+                }
+                loom_core::SecondaryIndexWriteOp::Delete => bytes.push(2),
+            }
+        }
+        match write.audit.as_ref() {
+            Some(audit) => {
+                bytes.push(1);
+                put_uvarint(&mut bytes, audit.operation.len() as u64);
+                bytes.extend_from_slice(audit.operation.as_bytes());
+            }
+            None => bytes.push(0),
+        }
+        put_uvarint(&mut bytes, write.side_effects.intents.len() as u64);
+        for intent in &write.side_effects.intents {
+            match intent {
+                loom_core::FacetSideEffect::OperationLog { operation_id } => {
+                    bytes.push(1);
+                    put_uvarint(&mut bytes, operation_id.len() as u64);
+                    bytes.extend_from_slice(operation_id.as_bytes());
+                }
+                loom_core::FacetSideEffect::AuditRecord { operation } => {
+                    bytes.push(2);
+                    put_uvarint(&mut bytes, operation.len() as u64);
+                    bytes.extend_from_slice(operation.as_bytes());
+                }
+                loom_core::FacetSideEffect::RevisionIndex { entity_id } => {
+                    bytes.push(3);
+                    put_uvarint(&mut bytes, entity_id.len() as u64);
+                    bytes.extend_from_slice(entity_id.as_bytes());
+                }
+                loom_core::FacetSideEffect::ReferenceIndex { source_id } => {
+                    bytes.push(4);
+                    put_uvarint(&mut bytes, source_id.len() as u64);
+                    bytes.extend_from_slice(source_id.as_bytes());
+                }
+            }
+        }
+    }
+    put_uvarint(&mut bytes, txn.owner_state.objects.len() as u64);
+    for (digest, payload) in &txn.owner_state.objects {
+        bytes.extend_from_slice(digest.bytes());
+        put_uvarint(&mut bytes, payload.len() as u64);
+        bytes.extend_from_slice(payload);
+    }
+    match txn.owner_state.reference {
+        loom_core::WorkflowReferenceUpdate::Keep => bytes.push(0),
+        loom_core::WorkflowReferenceUpdate::Set(None) => bytes.push(1),
+        loom_core::WorkflowReferenceUpdate::Set(Some(root)) => {
+            bytes.push(2);
+            bytes.extend_from_slice(root.bytes());
+        }
+    }
+    put_uvarint(&mut bytes, txn.owner_state.controls.len() as u64);
+    for write in &txn.owner_state.controls {
+        match write {
+            loom_core::WorkflowControlWrite::Put { key, payload } => {
+                bytes.push(1);
+                put_uvarint(&mut bytes, key.len() as u64);
+                bytes.extend_from_slice(key);
+                put_uvarint(&mut bytes, payload.len() as u64);
+                bytes.extend_from_slice(payload);
+            }
+            loom_core::WorkflowControlWrite::Delete { key } => {
+                bytes.push(2);
+                put_uvarint(&mut bytes, key.len() as u64);
+                bytes.extend_from_slice(key);
+            }
+            loom_core::WorkflowControlWrite::AppendRetained {
+                key,
+                expected_next_sequence,
+                records,
+            } => {
+                bytes.push(3);
+                put_uvarint(&mut bytes, key.len() as u64);
+                bytes.extend_from_slice(key);
+                put_uvarint(&mut bytes, *expected_next_sequence);
+                put_uvarint(&mut bytes, records.len() as u64);
+                for record in records {
+                    put_uvarint(&mut bytes, record.len() as u64);
+                    bytes.extend_from_slice(record);
+                }
+            }
+        }
+    }
+    put_uvarint(&mut bytes, txn.owner_state.audits.len() as u64);
+    for audit in &txn.owner_state.audits {
+        match audit.principal {
+            Some(principal) => {
+                bytes.push(1);
+                bytes.extend_from_slice(principal.as_bytes());
+            }
+            None => bytes.push(0),
+        }
+        put_uvarint(&mut bytes, audit.action.len() as u64);
+        bytes.extend_from_slice(audit.action.as_bytes());
+        match &audit.target {
+            Some(target) => {
+                bytes.push(1);
+                put_uvarint(&mut bytes, target.len() as u64);
+                bytes.extend_from_slice(target.as_bytes());
+            }
+            None => bytes.push(0),
+        }
+    }
+    Digest::blake3(&bytes)
+}
+
+fn workflow_write_durability(
+    txn: &WorkflowTransaction,
+    policy: &StorePolicy,
+    write: &loom_core::FacetWrite,
+) -> StoreDurabilityPolicy {
+    loom_core::strictest_durability([
+        txn.durability,
+        write
+            .durability
+            .unwrap_or_else(|| policy.effective_durability(write.facet)),
+    ])
+}
+
+fn workflow_durability_tag(durability: StoreDurabilityPolicy) -> u8 {
+    match durability {
+        StoreDurabilityPolicy::Strict => 1,
+        StoreDurabilityPolicy::Normal => 2,
+        StoreDurabilityPolicy::Relaxed => 3,
+        StoreDurabilityPolicy::Ephemeral => 4,
+    }
+}
+
+fn workflow_transaction_root_digest(
+    algo: Algo,
+    generation: loom_core::OverlayGeneration,
+) -> Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"loom.store.workflow-transaction.root.v1");
+    put_uvarint(&mut bytes, generation.as_u64());
+    Digest::hash(algo, &bytes)
+}
+
+fn mutable_overlay_checkpoint_record_blockers(
+    generation: loom_core::OverlayGeneration,
+    kind: loom_core::OverlayEntryKind,
+    mvcc: &StoreMvccSnapshotDiagnostics,
+    audit_retention_active: bool,
+    durable_reclaim_floor: u64,
+) -> Vec<MutableOverlayReclaimBlocker> {
+    let generation = generation.as_u64();
+    let mut blockers = Vec::new();
+    if mvcc
+        .pins
+        .iter()
+        .any(|pin| pin.identity.overlay_generation.as_u64() >= generation)
+    {
+        blockers.push(MutableOverlayReclaimBlocker::PinnedSnapshot);
+        blockers.push(MutableOverlayReclaimBlocker::RetainedHistory);
+        blockers.push(MutableOverlayReclaimBlocker::StrictPromotionBoundary);
+    }
+    if audit_retention_active {
+        blockers.push(MutableOverlayReclaimBlocker::AuditRetention);
+    }
+    if kind == loom_core::OverlayEntryKind::Tombstone {
+        blockers.push(MutableOverlayReclaimBlocker::TombstoneRetention);
+    }
+    if durable_reclaim_floor < generation {
+        blockers.push(MutableOverlayReclaimBlocker::DurableGenerationWindow);
+    }
+    blockers.sort();
+    blockers.dedup();
+    blockers
+}
+
+fn overlay_current_record_locs(
+    file: &mut dyn BackingIo,
+    root: Option<PageId>,
+    page_count: u64,
+    addresses: impl Iterator<Item = [u8; 32]>,
+) -> Result<Vec<([u8; 32], RecordLoc)>> {
+    let mut current = Vec::new();
+    for address in addresses {
+        if let Some(loc) = pagebtree::get(file, DATA_START, root, &address, page_count)? {
+            current.push((address, loc));
+        }
+    }
+    Ok(current)
+}
+
+fn write_overlay_blob_pages(
+    file: &mut dyn BackingIo,
+    alloc: &mut PageAllocator,
+    current: &[([u8; 32], RecordLoc)],
+    records: &[([u8; 32], &[u8])],
+) -> Result<Vec<([u8; 32], RecordLoc)>> {
+    let replaced = current
+        .iter()
+        .map(|(address, _)| *address)
+        .collect::<BTreeSet<_>>();
+    let mut new_records = Vec::new();
+    let mut replacement_records = Vec::new();
+    for record in records {
+        if replaced.contains(&record.0) {
+            replacement_records.push(*record);
+        } else {
+            new_records.push(*record);
+        }
+    }
+    let mut placements = record_io::write_blob_pages(file, alloc, &new_records)?;
+    placements.extend(record_io::write_dedicated_blob_pages(
+        file,
+        alloc,
+        &replacement_records,
+    )?);
+    Ok(placements)
+}
+
+fn reclaim_superseded_overlay_blobs_from_current<'a>(
+    file: &mut dyn BackingIo,
+    alloc: &mut PageAllocator,
+    current: &[([u8; 32], RecordLoc)],
+    replacements: impl Iterator<Item = ([u8; 32], &'a [u8])>,
+    oldest_pinned_snapshot_generation: Option<u64>,
+    audit_retention_active: bool,
+) -> Result<BTreeSet<u64>> {
+    let replacements = replacements.collect::<BTreeMap<_, _>>();
+    if replacements.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut touched_segments = BTreeSet::new();
+    let mut eligible_locs = Vec::new();
+    for (address, loc) in current {
+        let Some(replacement) = replacements.get(address) else {
+            continue;
+        };
+        let prior = read_blob_from_loc(file, *loc)?;
+        if let (Ok((prior_key, prior_sequence)), Ok((replacement_key, replacement_sequence))) = (
+            decode_retained_history_head(&prior),
+            decode_retained_history_head(replacement),
+        ) {
+            if prior_key != replacement_key || replacement_sequence <= prior_sequence {
+                return Err(corrupt(
+                    "retained-history head replacement is not monotonic",
+                ));
+            }
+            eligible_locs.push(*loc);
+            continue;
+        }
+        if decode_mutable_overlay_owner_token_record(&prior).is_ok()
+            && decode_mutable_overlay_owner_token_record(replacement).is_ok()
+        {
+            eligible_locs.push(*loc);
+            continue;
+        }
+        if let (Ok(prior), Ok(replacement)) = (
+            decode_mutable_overlay_secondary_index_record(&prior),
+            decode_mutable_overlay_secondary_index_record(replacement),
+        ) {
+            if superseded_overlay_record_is_eligible(
+                prior.generation,
+                replacement.generation,
+                replacement.kind == loom_core::OverlayEntryKind::Tombstone,
+                oldest_pinned_snapshot_generation,
+                audit_retention_active,
+            )? {
+                eligible_locs.push(*loc);
+            }
+            continue;
+        }
+        let Ok(prior) = decode_mutable_overlay_entry(&prior) else {
+            continue;
+        };
+        let replacement = decode_mutable_overlay_entry(replacement)?;
+        if prior.generation.as_u64() == 0 || replacement.generation <= prior.generation {
+            continue;
+        }
+        // A tombstone must be kept only while it is the current entry required to hide a value still
+        // reachable from the immutable base through composite reads. A value superseded by a tombstone
+        // (a delete) keeps that requirement, so its superseded page stays retained. A tombstone
+        // superseded by a value (a reopen) no longer hides anything because the newer value shadows
+        // the base, so the superseded tombstone page is governed only by the pinned-snapshot,
+        // retained-history, durable-window, and strict-promotion horizons below.
+        let tombstone_masks_base = replacement.kind == loom_core::OverlayEntryKind::Tombstone;
+        if !superseded_overlay_record_is_eligible(
+            prior.generation,
+            replacement.generation,
+            tombstone_masks_base,
+            oldest_pinned_snapshot_generation,
+            audit_retention_active,
+        )? {
+            continue;
+        }
+        eligible_locs.push(*loc);
+    }
+    free_overlay_record_pages_batch(file, alloc, &eligible_locs, &mut touched_segments)?;
+    Ok(touched_segments)
+}
+
+fn superseded_overlay_record_is_eligible(
+    prior_generation: loom_core::OverlayGeneration,
+    replacement_generation: loom_core::OverlayGeneration,
+    tombstone_masks_base: bool,
+    oldest_pinned_snapshot_generation: Option<u64>,
+    audit_retention_active: bool,
+) -> Result<bool> {
+    if prior_generation.as_u64() == 0 || replacement_generation <= prior_generation {
+        return Ok(false);
+    }
+    MutableOverlayReclaimState {
+        superseded_generation: prior_generation.as_u64(),
+        superseding_generation: replacement_generation.as_u64(),
+        latest_index_generation: replacement_generation.as_u64(),
+        oldest_pinned_snapshot_generation,
+        retained_history_generation: oldest_pinned_snapshot_generation,
+        audit_retention_active,
+        tombstone_masks_base,
+        durable_reclaim_floor: replacement_generation.as_u64(),
+        strict_promotion_generation: oldest_pinned_snapshot_generation,
+    }
+    .is_eligible()
+}
+
+fn free_overlay_record_pages(
+    file: &mut dyn BackingIo,
+    alloc: &mut PageAllocator,
+    loc: RecordLoc,
+    touched_segments: &mut BTreeSet<u64>,
+) -> Result<()> {
+    let start = loc.global_page();
+    let mut first = [0u8; PAGE_SIZE as usize];
+    read_exact_at(file, PageId(start).offset(DATA_START), &mut first).map_err(io_err)?;
+    if first[0] == record::SLAB_MAGIC {
+        if record::read_slab_slot(&first, 0).is_some()
+            && record::read_slab_slot(&first, 1).is_none()
+        {
+            alloc.free(PageId(start), 1);
+            touched_segments.insert(start / page::PAGES_PER_SEGMENT);
+        }
+        return Ok(());
+    }
+    if first[0] == record::CHUNKED_BLOB_MAGIC {
+        for page in record_io::chunked_blob_pages(file, start, alloc.page_count())? {
+            alloc.free(PageId(page), 1);
+            touched_segments.insert(page / page::PAGES_PER_SEGMENT);
+        }
+        return Ok(());
+    }
+    let span = record_io::page_span(file, start)?;
+    alloc.free(PageId(start), span);
+    for page in start..start.saturating_add(span) {
+        touched_segments.insert(page / page::PAGES_PER_SEGMENT);
+    }
+    Ok(())
+}
+
+fn free_overlay_record_pages_batch(
+    file: &mut dyn BackingIo,
+    alloc: &mut PageAllocator,
+    locs: &[RecordLoc],
+    touched_segments: &mut BTreeSet<u64>,
+) -> Result<()> {
+    let mut by_page = BTreeMap::<u64, BTreeSet<u32>>::new();
+    for loc in locs {
+        by_page
+            .entry(loc.global_page())
+            .or_default()
+            .insert(loc.slot);
+    }
+    for (page, slots) in by_page {
+        let mut first = [0u8; PAGE_SIZE as usize];
+        read_exact_at(file, PageId(page).offset(DATA_START), &mut first).map_err(io_err)?;
+        if first[0] == record::SLAB_MAGIC {
+            let slot_count = u16::from_le_bytes([first[1], first[2]]) as usize;
+            let all_slots_are_eligible = slots.len() == slot_count
+                && (0..slot_count).all(|slot| slots.contains(&(slot as u32)))
+                && (0..slot_count)
+                    .all(|slot| record::read_slab_slot(&first, slot as u32).is_some());
+            if all_slots_are_eligible {
+                alloc.free(PageId(page), 1);
+                touched_segments.insert(page / page::PAGES_PER_SEGMENT);
+            }
+            continue;
+        }
+        free_overlay_record_pages(
+            file,
+            alloc,
+            RecordLoc::from_global(page, 0),
+            touched_segments,
+        )?;
+    }
+    Ok(())
+}
+
+fn read_blob_from_loc(file: &mut dyn BackingIo, loc: RecordLoc) -> Result<Vec<u8>> {
+    let global = loc.global_page();
+    let mut first = [0u8; PAGE_SIZE as usize];
+    read_exact_at(file, PageId(global).offset(DATA_START), &mut first).map_err(io_err)?;
+    match first[0] {
+        record::SLAB_MAGIC => record::read_slab_slot(&first, loc.slot)
+            .map(|bytes| bytes.to_vec())
+            .ok_or_else(|| corrupt("bad slab blob slot on read")),
+        record::LARGE_MAGIC => {
+            let blob_len =
+                record::large_blob_len(&first).ok_or_else(|| corrupt("bad large blob header"))?;
+            let pages = record::large_pages(blob_len);
+            let mut buf = vec![0u8; (pages * PAGE_SIZE) as usize];
+            read_exact_at(file, PageId(global).offset(DATA_START), &mut buf).map_err(io_err)?;
+            record::decode_large(&buf)
+                .map(|bytes| bytes.to_vec())
+                .ok_or_else(|| corrupt("large blob parse failure"))
+        }
+        record::CHUNKED_BLOB_MAGIC => record_io::read_chunked_blob(file, global, u64::MAX),
+        _ => Err(corrupt("bad blob page magic on read")),
+    }
+}
+
+fn encode_mutable_overlay_meta(generation: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"loom.store.mutable-overlay.meta.v1");
+    put_uvarint(&mut out, generation);
+    out
+}
+
+fn decode_mutable_overlay_meta(bytes: &[u8]) -> Result<u64> {
+    const HEADER: &[u8] = b"loom.store.mutable-overlay.meta.v1";
+    if !bytes.starts_with(HEADER) {
+        return Err(corrupt("mutable overlay meta schema mismatch"));
+    }
+    let mut pos = HEADER.len();
+    let generation = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("mutable overlay generation truncated"))?;
+    if pos != bytes.len() {
+        return Err(corrupt("mutable overlay meta trailing bytes"));
+    }
+    Ok(generation)
+}
+
+fn mutable_overlay_current_index_record(
+    entries: &[loom_core::MutableOverlayEntrySnapshot],
+    policy: StorePolicy,
+) -> Result<([u8; 32], Vec<u8>)> {
+    let mut addresses = entries
+        .iter()
+        .map(|entry| {
+            let durability = mutable_overlay_key_facet(&entry.key)?
+                .map(|facet| policy.effective_durability(facet))
+                .unwrap_or(policy.default_durability);
+            if durability == StoreDurabilityPolicy::Ephemeral {
+                Ok(None)
+            } else {
+                Ok(Some(mutable_overlay_entry_address(&entry.key)))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+    Ok((
+        mutable_overlay_current_index_address(),
+        encode_mutable_overlay_current_index_record(&addresses),
+    ))
+}
+
+fn encode_mutable_overlay_current_index_record(addresses: &[[u8; 32]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MUTABLE_OVERLAY_CURRENT_INDEX_RECORD);
+    put_uvarint(&mut out, addresses.len() as u64);
+    for address in addresses {
+        out.extend_from_slice(address);
+    }
+    out
+}
+
+fn decode_mutable_overlay_current_index_record(bytes: &[u8]) -> Result<Vec<[u8; 32]>> {
+    if !bytes.starts_with(MUTABLE_OVERLAY_CURRENT_INDEX_RECORD) {
+        return Err(corrupt("mutable overlay current-index schema mismatch"));
+    }
+    let mut pos = MUTABLE_OVERLAY_CURRENT_INDEX_RECORD.len();
+    let count = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("mutable overlay current-index count truncated"))?
+        as usize;
+    let mut addresses = Vec::with_capacity(count);
+    for _ in 0..count {
+        let end = pos
+            .checked_add(32)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| corrupt("mutable overlay current-index address truncated"))?;
+        addresses.push(
+            bytes[pos..end]
+                .try_into()
+                .map_err(|_| corrupt("mutable overlay current-index address invalid"))?,
+        );
+        pos = end;
+    }
+    if pos != bytes.len() {
+        return Err(corrupt("mutable overlay current-index trailing bytes"));
+    }
+    if !addresses.windows(2).all(|window| window[0] < window[1]) {
+        return Err(corrupt(
+            "mutable overlay current-index addresses must be sorted and unique",
+        ));
+    }
+    Ok(addresses)
+}
+
+fn encode_mutable_overlay_entry(entry: &loom_core::MutableOverlayEntrySnapshot) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"loom.store.mutable-overlay.entry.v3");
+    put_uvarint(&mut out, entry.generation.as_u64());
+    put_uvarint(&mut out, entry.key.as_bytes().len() as u64);
+    out.extend_from_slice(entry.key.as_bytes());
+    out.push(match entry.kind {
+        loom_core::OverlayEntryKind::Value => 1,
+        loom_core::OverlayEntryKind::Tombstone => 2,
+    });
+    out.extend_from_slice(entry.owner_token.as_bytes());
+    put_uvarint(&mut out, entry.payload.len() as u64);
+    out.extend_from_slice(&entry.payload);
+    out
+}
+
+fn decode_mutable_overlay_entry(bytes: &[u8]) -> Result<loom_core::MutableOverlayEntrySnapshot> {
+    const HEADER_V1: &[u8] = b"loom.store.mutable-overlay.entry.v1";
+    const HEADER_V2: &[u8] = b"loom.store.mutable-overlay.entry.v2";
+    const HEADER_V3: &[u8] = b"loom.store.mutable-overlay.entry.v3";
+    let version = if bytes.starts_with(HEADER_V2) {
+        2
+    } else if bytes.starts_with(HEADER_V3) {
+        3
+    } else if bytes.starts_with(HEADER_V1) {
+        1
+    } else {
+        return Err(corrupt("mutable overlay entry schema mismatch"));
+    };
+    let mut pos = match version {
+        3 => HEADER_V3.len(),
+        2 => HEADER_V2.len(),
+        _ => HEADER_V1.len(),
+    };
+    let generation = if version == 3 {
+        let generation = get_uvarint(bytes, &mut pos)
+            .ok_or_else(|| corrupt("mutable overlay entry generation truncated"))?;
+        if generation == 0 {
+            return Err(corrupt("mutable overlay entry generation invalid"));
+        }
+        loom_core::OverlayGeneration::new(generation)
+    } else {
+        loom_core::OverlayGeneration::new(0)
+    };
+    let key_len = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("mutable overlay entry key length truncated"))?
+        as usize;
+    let key_end = pos
+        .checked_add(key_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| corrupt("mutable overlay entry key truncated"))?;
+    let key = loom_core::OverlayKey::from_encoded_bytes(bytes[pos..key_end].to_vec())?;
+    pos = key_end;
+    let kind = match bytes.get(pos).copied() {
+        Some(1) => loom_core::OverlayEntryKind::Value,
+        Some(2) => loom_core::OverlayEntryKind::Tombstone,
+        _ => return Err(corrupt("mutable overlay entry kind invalid")),
+    };
+    pos += 1;
+    let owner_token = if version >= 2 {
+        let token_end = pos
+            .checked_add(32)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| corrupt("mutable overlay entry owner token truncated"))?;
+        let token = loom_core::OverlayOwnerToken::from_bytes(
+            bytes[pos..token_end]
+                .try_into()
+                .map_err(|_| corrupt("mutable overlay entry owner token invalid"))?,
+        );
+        pos = token_end;
+        token
+    } else {
+        loom_core::OverlayOwnerToken::from_bytes([0; 32])
+    };
+    let payload_len = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("mutable overlay entry payload length truncated"))?
+        as usize;
+    let payload_end = pos
+        .checked_add(payload_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| corrupt("mutable overlay entry payload truncated"))?;
+    let payload = bytes[pos..payload_end].to_vec();
+    pos = payload_end;
+    if pos != bytes.len() {
+        return Err(corrupt("mutable overlay entry trailing bytes"));
+    }
+    let owner_token = if version >= 2 {
+        owner_token
+    } else {
+        let prior = None;
+        match kind {
+            loom_core::OverlayEntryKind::Value => {
+                let mut overlay = loom_core::MutableOverlay::new();
+                overlay.put_value(key.clone(), prior.as_ref(), payload.clone())?
+            }
+            loom_core::OverlayEntryKind::Tombstone => {
+                let mut overlay = loom_core::MutableOverlay::new();
+                overlay.put_tombstone(key.clone(), prior.as_ref())?
+            }
+        }
+    };
+    Ok(loom_core::MutableOverlayEntrySnapshot {
+        key,
+        generation,
+        owner_token,
+        kind,
+        payload,
+    })
+}
+
+fn encode_mutable_overlay_owner_token_record(token: &loom_core::OverlayOwnerToken) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MUTABLE_OVERLAY_OWNER_TOKEN_RECORD);
+    out.extend_from_slice(token.as_bytes());
+    out
+}
+
+fn decode_mutable_overlay_owner_token_record(bytes: &[u8]) -> Result<loom_core::OverlayOwnerToken> {
+    if !bytes.starts_with(MUTABLE_OVERLAY_OWNER_TOKEN_RECORD) {
+        return Err(corrupt("mutable overlay owner-token schema mismatch"));
+    }
+    let pos = MUTABLE_OVERLAY_OWNER_TOKEN_RECORD.len();
+    if pos + 32 != bytes.len() {
+        return Err(corrupt("mutable overlay owner-token length"));
+    }
+    Ok(loom_core::OverlayOwnerToken::from_bytes(
+        bytes[pos..pos + 32]
+            .try_into()
+            .map_err(|_| corrupt("mutable overlay owner-token invalid"))?,
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MutableOverlaySecondaryIndexRecord {
+    generation: loom_core::OverlayGeneration,
+    index: loom_core::OverlayKey,
+    kind: loom_core::OverlayEntryKind,
+    payload: Option<Vec<u8>>,
+}
+
+fn encode_mutable_overlay_secondary_index_record(
+    generation: loom_core::OverlayGeneration,
+    write: &SecondaryIndexWrite,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD);
+    put_uvarint(&mut out, generation.as_u64());
+    put_uvarint(&mut out, write.index.as_bytes().len() as u64);
+    out.extend_from_slice(write.index.as_bytes());
+    match &write.op {
+        loom_core::SecondaryIndexWriteOp::Put { payload } => {
+            out.push(1);
+            put_uvarint(&mut out, payload.len() as u64);
+            out.extend_from_slice(payload);
+        }
+        loom_core::SecondaryIndexWriteOp::Delete => out.push(2),
+    }
+    out
+}
+
+fn decode_mutable_overlay_secondary_index_record(
+    bytes: &[u8],
+) -> Result<MutableOverlaySecondaryIndexRecord> {
+    if !bytes.starts_with(MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD) {
+        return Err(corrupt("mutable overlay secondary-index schema mismatch"));
+    }
+    let mut pos = MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD.len();
+    let generation = loom_core::OverlayGeneration::new(
+        get_uvarint(bytes, &mut pos)
+            .ok_or_else(|| corrupt("mutable overlay secondary-index generation truncated"))?,
+    );
+    let key_len = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("mutable overlay secondary-index key length truncated"))?
+        as usize;
+    let key_end = pos
+        .checked_add(key_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| corrupt("mutable overlay secondary-index key truncated"))?;
+    let index = loom_core::OverlayKey::from_encoded_bytes(bytes[pos..key_end].to_vec())?;
+    pos = key_end;
+    let kind = match bytes.get(pos).copied() {
+        Some(1) => loom_core::OverlayEntryKind::Value,
+        Some(2) => loom_core::OverlayEntryKind::Tombstone,
+        _ => return Err(corrupt("mutable overlay secondary-index kind invalid")),
+    };
+    pos += 1;
+    let payload = if kind == loom_core::OverlayEntryKind::Value {
+        let payload_len = get_uvarint(bytes, &mut pos)
+            .ok_or_else(|| corrupt("mutable overlay secondary-index payload length truncated"))?
+            as usize;
+        let payload_end = pos
+            .checked_add(payload_len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| corrupt("mutable overlay secondary-index payload truncated"))?;
+        let payload = bytes[pos..payload_end].to_vec();
+        pos = payload_end;
+        Some(payload)
+    } else {
+        None
+    };
+    if pos != bytes.len() {
+        return Err(corrupt("mutable overlay secondary-index trailing bytes"));
+    }
+    Ok(MutableOverlaySecondaryIndexRecord {
+        generation,
+        index,
+        kind,
+        payload,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MutableOverlayIdempotencyRecord {
+    request_digest: Digest,
+    owner_token: loom_core::OverlayOwnerToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkflowTransactionIdempotencyRecord {
+    request_digest: Digest,
+    receipt: CommitReceipt,
+}
+
+fn encode_mutable_overlay_idempotency_record(
+    request_digest: &Digest,
+    token: &loom_core::OverlayOwnerToken,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MUTABLE_OVERLAY_IDEMPOTENCY_RECORD);
+    out.extend_from_slice(request_digest.bytes());
+    out.extend_from_slice(token.as_bytes());
+    out
+}
+
+fn decode_mutable_overlay_idempotency_record(
+    bytes: &[u8],
+) -> Result<MutableOverlayIdempotencyRecord> {
+    if !bytes.starts_with(MUTABLE_OVERLAY_IDEMPOTENCY_RECORD) {
+        return Err(corrupt("mutable overlay idempotency schema mismatch"));
+    }
+    let pos = MUTABLE_OVERLAY_IDEMPOTENCY_RECORD.len();
+    if pos + 64 != bytes.len() {
+        return Err(corrupt("mutable overlay idempotency length"));
+    }
+    let request_digest = Digest::of(
+        Algo::Blake3,
+        bytes[pos..pos + 32]
+            .try_into()
+            .map_err(|_| corrupt("mutable overlay idempotency digest invalid"))?,
+    );
+    let owner_token = loom_core::OverlayOwnerToken::from_bytes(
+        bytes[pos + 32..pos + 64]
+            .try_into()
+            .map_err(|_| corrupt("mutable overlay idempotency token invalid"))?,
+    );
+    Ok(MutableOverlayIdempotencyRecord {
+        request_digest,
+        owner_token,
+    })
+}
+
+fn encode_workflow_transaction_idempotency_record(
+    request_digest: &Digest,
+    receipt: &CommitReceipt,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD);
+    out.extend_from_slice(request_digest.bytes());
+    put_uvarint(&mut out, receipt.generation.as_u64());
+    out.extend_from_slice(receipt.root_after.bytes());
+    put_uvarint(&mut out, receipt.writes.len() as u64);
+    for write in &receipt.writes {
+        out.push(write.facet.stable_tag());
+        put_uvarint(&mut out, write.target.as_bytes().len() as u64);
+        out.extend_from_slice(write.target.as_bytes());
+        out.extend_from_slice(write.owner_token.as_bytes());
+        out.push(match write.change {
+            loom_core::OverlayEntryKind::Value => 1,
+            loom_core::OverlayEntryKind::Tombstone => 2,
+        });
+    }
+    out
+}
+
+fn decode_workflow_transaction_idempotency_record(
+    bytes: &[u8],
+) -> Result<WorkflowTransactionIdempotencyRecord> {
+    if !bytes.starts_with(MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD) {
+        return Err(corrupt("workflow transaction idempotency schema mismatch"));
+    }
+    let mut pos = MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD.len();
+    let digest_end = pos
+        .checked_add(32)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| corrupt("workflow transaction idempotency digest truncated"))?;
+    let request_digest = Digest::of(
+        Algo::Blake3,
+        bytes[pos..digest_end]
+            .try_into()
+            .map_err(|_| corrupt("workflow transaction idempotency digest invalid"))?,
+    );
+    pos = digest_end;
+    let generation = loom_core::OverlayGeneration::new(
+        get_uvarint(bytes, &mut pos)
+            .ok_or_else(|| corrupt("workflow transaction idempotency generation truncated"))?,
+    );
+    let root_end = pos
+        .checked_add(32)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| corrupt("workflow transaction idempotency root truncated"))?;
+    let root_after = Digest::of(
+        Algo::Blake3,
+        bytes[pos..root_end]
+            .try_into()
+            .map_err(|_| corrupt("workflow transaction idempotency root invalid"))?,
+    );
+    pos = root_end;
+    let write_count = get_uvarint(bytes, &mut pos)
+        .ok_or_else(|| corrupt("workflow transaction idempotency write count truncated"))?
+        as usize;
+    let mut writes = Vec::with_capacity(write_count);
+    for _ in 0..write_count {
+        let facet = bytes
+            .get(pos)
+            .copied()
+            .ok_or_else(|| corrupt("workflow transaction idempotency facet truncated"))
+            .and_then(|tag| {
+                FacetKind::from_stable_tag(tag)
+                    .ok_or_else(|| corrupt("workflow transaction idempotency facet invalid"))
+            })?;
+        pos += 1;
+        let key_len = get_uvarint(bytes, &mut pos)
+            .ok_or_else(|| corrupt("workflow transaction idempotency key length truncated"))?
+            as usize;
+        let key_end = pos
+            .checked_add(key_len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| corrupt("workflow transaction idempotency key truncated"))?;
+        let target = loom_core::OverlayKey::from_encoded_bytes(bytes[pos..key_end].to_vec())?;
+        pos = key_end;
+        let token_end = pos
+            .checked_add(32)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| corrupt("workflow transaction idempotency token truncated"))?;
+        let owner_token = loom_core::OverlayOwnerToken::from_bytes(
+            bytes[pos..token_end]
+                .try_into()
+                .map_err(|_| corrupt("workflow transaction idempotency token invalid"))?,
+        );
+        pos = token_end;
+        let change = match bytes.get(pos).copied() {
+            Some(1) => loom_core::OverlayEntryKind::Value,
+            Some(2) => loom_core::OverlayEntryKind::Tombstone,
+            _ => return Err(corrupt("workflow transaction idempotency change invalid")),
+        };
+        pos += 1;
+        writes.push(WriteOutcome {
+            facet,
+            target,
+            owner_token,
+            change,
+        });
+    }
+    if pos != bytes.len() {
+        return Err(corrupt("workflow transaction idempotency trailing bytes"));
+    }
+    Ok(WorkflowTransactionIdempotencyRecord {
+        request_digest,
+        receipt: CommitReceipt {
+            generation,
+            root_after,
+            writes,
+            replayed: true,
+        },
+    })
 }
 
 /// CRC-32C (Castagnoli), software bitwise, reflected polynomial `0x82F63B78`. No dependency.

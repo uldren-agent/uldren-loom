@@ -135,10 +135,11 @@ pub(crate) fn write_record_pages(
     for (digest, canonical, codec) in fresh {
         let rec = encode_record(digest, canonical, *codec, enc)?;
         if record::is_large(rec.len() as u64) {
-            let buf = record::encode_large(&rec);
-            let page = alloc.alloc(record::large_pages(rec.len() as u64));
-            write_at(file, page.offset(DATA_START), &buf).map_err(io_err)?;
-            placements.push((*digest.bytes(), RecordLoc::from_global(page.0, 0)));
+            placements.extend(write_dedicated_blob_pages(
+                file,
+                alloc,
+                &[(*digest.bytes(), rec.as_slice())],
+            )?);
         } else {
             let slot = match slab.try_push(&rec) {
                 Some(slot) => slot,
@@ -157,6 +158,162 @@ pub(crate) fn write_record_pages(
         flush_slab(file, alloc, &slab, &pending, &mut placements)?;
     }
     Ok(placements)
+}
+
+pub(crate) fn write_blob_pages(
+    file: &mut dyn BackingIo,
+    alloc: &mut PageAllocator,
+    fresh: &[([u8; 32], &[u8])],
+) -> Result<Vec<([u8; 32], RecordLoc)>> {
+    let mut placements = Vec::with_capacity(fresh.len());
+    let mut slab = SlabBuilder::new();
+    let mut pending: Vec<([u8; 32], u32)> = Vec::new();
+    for (key, blob) in fresh {
+        if record::is_large(blob.len() as u64) {
+            let buf = record::encode_large(blob);
+            let page = alloc.alloc(record::large_pages(blob.len() as u64));
+            write_at(file, page.offset(DATA_START), &buf).map_err(io_err)?;
+            placements.push((*key, RecordLoc::from_global(page.0, 0)));
+        } else {
+            let slot = match slab.try_push(blob) {
+                Some(slot) => slot,
+                None => {
+                    flush_slab(file, alloc, &slab, &pending, &mut placements)?;
+                    slab = SlabBuilder::new();
+                    pending.clear();
+                    slab.try_push(blob)
+                        .expect("a fresh slab page holds one small blob")
+                }
+            };
+            pending.push((*key, slot));
+        }
+    }
+    if !slab.is_empty() {
+        flush_slab(file, alloc, &slab, &pending, &mut placements)?;
+    }
+    Ok(placements)
+}
+
+pub(crate) fn write_dedicated_blob_pages(
+    file: &mut dyn BackingIo,
+    alloc: &mut PageAllocator,
+    fresh: &[([u8; 32], &[u8])],
+) -> Result<Vec<([u8; 32], RecordLoc)>> {
+    let mut placements = Vec::with_capacity(fresh.len());
+    for (key, blob) in fresh {
+        let capacity = record::chunked_blob_payload_capacity();
+        let page_count = blob.len().max(1).div_ceil(capacity);
+        let pages = (0..page_count).map(|_| alloc.alloc(1)).collect::<Vec<_>>();
+        for (index, page) in pages.iter().enumerate() {
+            let start = index * capacity;
+            let end = blob.len().min(start + capacity);
+            let chunk = &blob[start.min(blob.len())..end];
+            let next = pages.get(index + 1).map(|page| page.0);
+            let encoded = record::encode_chunked_blob_page(chunk, next, blob.len() as u64)
+                .ok_or_else(|| corrupt("mutable blob chunk exceeds page capacity"))?;
+            write_at(file, page.offset(DATA_START), &encoded).map_err(io_err)?;
+        }
+        placements.push((*key, RecordLoc::from_global(pages[0].0, 0)));
+    }
+    Ok(placements)
+}
+
+fn visit_chunked_blob_pages(
+    file: &mut dyn BackingIo,
+    start: u64,
+    page_count: u64,
+    mut visit: impl FnMut(u64, u64, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut current = start;
+    let mut expected_total = None;
+    let mut accumulated = 0u64;
+    loop {
+        if current >= page_count || !seen.insert(current) {
+            return Err(corrupt(
+                "mutable blob chunk chain is cyclic or out of bounds",
+            ));
+        }
+        let mut page = [0u8; PAGE_SIZE as usize];
+        read_exact_at(file, PageId(current).offset(DATA_START), &mut page).map_err(io_err)?;
+        let (next, total, chunk) = record::decode_chunked_blob_page(&page)
+            .ok_or_else(|| corrupt("bad mutable blob chunk page"))?;
+        if expected_total
+            .replace(total)
+            .is_some_and(|seen| seen != total)
+        {
+            return Err(corrupt(
+                "mutable blob chunk total length changed within chain",
+            ));
+        }
+        accumulated = accumulated
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| corrupt("mutable blob chunk length overflow"))?;
+        if accumulated > total {
+            return Err(corrupt("mutable blob chunk chain exceeds total length"));
+        }
+        visit(current, total, chunk)?;
+        match next {
+            Some(next) => current = next,
+            None if accumulated == total => return Ok(()),
+            None => return Err(corrupt("mutable blob chunk chain is truncated")),
+        }
+    }
+}
+
+pub(crate) fn chunked_blob_pages(
+    file: &mut dyn BackingIo,
+    start: u64,
+    page_count: u64,
+) -> Result<Vec<u64>> {
+    let mut pages = Vec::new();
+    visit_chunked_blob_pages(file, start, page_count, |page, _, _| {
+        pages.push(page);
+        Ok(())
+    })?;
+    Ok(pages)
+}
+
+pub(crate) fn read_chunked_blob(
+    file: &mut dyn BackingIo,
+    start: u64,
+    page_count: u64,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    visit_chunked_blob_pages(file, start, page_count, |_, total, chunk| {
+        if out.is_empty() {
+            let capacity = usize::try_from(total)
+                .map_err(|_| corrupt("mutable blob length does not fit this platform"))?;
+            out.try_reserve(capacity)
+                .map_err(|_| corrupt("mutable blob length exceeds addressable memory"))?;
+        }
+        out.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+pub(crate) fn blob_pages(
+    file: &mut dyn BackingIo,
+    start: u64,
+    page_count: u64,
+) -> Result<Vec<u64>> {
+    let mut header = [0u8; 9];
+    read_exact_at(file, PageId(start).offset(DATA_START), &mut header).map_err(io_err)?;
+    match header[0] {
+        record::SLAB_MAGIC => Ok(vec![start]),
+        record::LARGE_MAGIC => {
+            let len =
+                record::large_blob_len(&header).ok_or_else(|| corrupt("bad large blob header"))?;
+            let span = record::large_pages(len);
+            if start.saturating_add(span) > page_count {
+                return Err(corrupt("large blob run past the page array"));
+            }
+            Ok((start..start + span).collect())
+        }
+        record::CHUNKED_BLOB_MAGIC => chunked_blob_pages(file, start, page_count),
+        _ => Err(corrupt("bad blob page magic")),
+    }
 }
 
 /// Allocate a page for `slab`, write it, and record a locator for every record it packed.
@@ -241,6 +398,7 @@ pub(crate) struct TxnRoots {
     pub(crate) freemap: Option<(PageId, u64)>, // (root, page span) of the persisted free-page map
     pub(crate) region_table_root: PageId,
     pub(crate) maintenance_root: PageId,
+    pub(crate) overlay_root: Option<PageId>,
     pub(crate) maintenance: MaintenanceState,
 }
 
@@ -255,6 +413,7 @@ pub(crate) fn finish_txn(
     new_gen: u64,
     object_count: u64,
     index_root: Option<PageId>,
+    overlay_root: Option<PageId>,
     open_segment: u64,
     reference: Option<[u8; 32]>,
     control: Option<[u8; 32]>,
@@ -263,6 +422,9 @@ pub(crate) fn finish_txn(
     superseded: (Option<(PageId, u64)>, Option<PageId>, Option<PageId>),
     encryption: Option<Vec<u8>>,
     digest_algo: Algo,
+    // Durability diagnostics sink: `Some` on the group-commit / hot-mutable durable publish
+    // path, `None` on maintenance/compaction paths. Each `fsync` below is timed once when present.
+    metrics: Option<&GroupCommitMetrics>,
 ) -> Result<TxnRoots> {
     // The prior free-page map and region-table page are superseded; free them (the new map can reuse
     // them once they age out).
@@ -278,8 +440,9 @@ pub(crate) fn finish_txn(
     }
     // Place the region-table page and the free-page-map run by reusing low aged-out pages where one
     // fits (so they do not pin the top of the file and block truncation), carving them out of the free
-    // set before the map is snapshotted so the map never lists its own pages. The map is sized for the
-    // run count before its own pages are removed - an upper bound on what it must hold.
+    // set before the map is snapshotted so the map never lists its own pages. Allocating the map can
+    // split one coalesced run when current-transaction frees surround an older reusable run, so the
+    // reservation includes one additional run.
     let rt_page = alloc.alloc(1);
     let maintenance_page = alloc.alloc(1);
     let (freemap, map_root, map_reserved) = {
@@ -287,7 +450,7 @@ pub(crate) fn finish_txn(
         if pending == 0 {
             (None, None, 0)
         } else {
-            let reserved = pagemap::map_pages(pending);
+            let reserved = pagemap::map_pages(pending.saturating_add(1));
             let root = alloc.alloc(reserved);
             (Some((root, reserved)), Some(root), reserved)
         }
@@ -296,7 +459,14 @@ pub(crate) fn finish_txn(
     // of free pages, so the file can shrink to just above the highest live page.
     let runs = alloc.snapshot_free();
     let (page_count, runs) = truncate_trailing(runs, alloc.page_count());
-    validate_truncated_roots(page_count, index_root, rt_page, maintenance_page, freemap)?;
+    validate_truncated_roots(
+        page_count,
+        index_root,
+        overlay_root,
+        rt_page,
+        maintenance_page,
+        freemap,
+    )?;
     let maintenance = MaintenanceState::next(
         previous_maintenance,
         new_gen,
@@ -314,12 +484,17 @@ pub(crate) fn finish_txn(
         index_root,
         freemap_root: map_root,
         maintenance_root: Some(maintenance_page),
+        overlay_root,
         open_segment,
     };
     let mut rt_buf = [0u8; PAGE_SIZE as usize];
     rt_buf[..page::REGION_TABLE_LEN].copy_from_slice(&region.encode());
     write_at(file, rt_page.offset(DATA_START), &rt_buf).map_err(io_err)?;
+    let fsync_started = std::time::Instant::now();
     file.fsync().map_err(io_err)?; // every referenced page durable before the commit point
+    if let Some(metrics) = metrics {
+        metrics.record_fsync(fsync_started.elapsed());
+    }
     // journal ring: fsync the new root-set into this generation's ring slot. That fsync IS the commit
     // point - every referenced page is already durable above it, and the record survives in its own
     // slot until a later checkpoint, so a torn newer record cannot destroy this one.
@@ -332,7 +507,11 @@ pub(crate) fn finish_txn(
     });
     let ring_off = JOURNAL_OFFSET + (new_gen % RING_SLOTS) * journal::RECORD_SIZE as u64;
     write_at(file, ring_off, &jrec).map_err(io_err)?;
+    let commit_fsync_started = std::time::Instant::now();
     file.fsync().map_err(io_err)?; // commit point: the ring record is durable
+    if let Some(metrics) = metrics {
+        metrics.record_fsync(commit_fsync_started.elapsed());
+    }
     // Online shrink, strictly after the commit point: recovery always adopts this now-durable
     // generation, whose live pages are all below `page_count`, so a lost or partial truncate just
     // leaves ignorable trailing bytes - never a too-short file for the committed generation. This is
@@ -356,7 +535,11 @@ pub(crate) fn finish_txn(
         }
         .encode();
         write_at(file, cp_slot, &sb).map_err(io_err)?;
+        let checkpoint_fsync_started = std::time::Instant::now();
         file.fsync().map_err(io_err)?;
+        if let Some(metrics) = metrics {
+            metrics.record_fsync(checkpoint_fsync_started.elapsed());
+        }
     }
     Ok(TxnRoots {
         page_count,
@@ -364,6 +547,7 @@ pub(crate) fn finish_txn(
         freemap,
         region_table_root: rt_page,
         maintenance_root: maintenance_page,
+        overlay_root,
         maintenance,
     })
 }
@@ -371,6 +555,7 @@ pub(crate) fn finish_txn(
 fn validate_truncated_roots(
     page_count: u64,
     index_root: Option<PageId>,
+    overlay_root: Option<PageId>,
     region_table_root: PageId,
     maintenance_root: PageId,
     freemap: Option<(PageId, u64)>,
@@ -378,7 +563,12 @@ fn validate_truncated_roots(
     if page_count == 0 {
         return Err(corrupt("transaction roots beyond truncated page count"));
     }
-    for root in [index_root, Some(region_table_root), Some(maintenance_root)] {
+    for root in [
+        index_root,
+        overlay_root,
+        Some(region_table_root),
+        Some(maintenance_root),
+    ] {
         if root.is_some_and(|page| page.0 >= page_count) {
             return Err(corrupt("transaction root beyond truncated page count"));
         }

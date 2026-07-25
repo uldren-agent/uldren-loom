@@ -28,17 +28,18 @@ use loom_core::vcs::{ChangeKind as VcsChangeKind, Status};
 use loom_core::workspace::{FacetKind, WorkspaceId, WorkspaceInfo, WsSelector};
 use loom_core::{
     AclDomain, AclRight, Algo, Digest, DomainChange, FieldValue, GraphQuery, KvMap, LogQuery, Loom,
-    MetricQuery, MetricQueryResult, Object, TraceQuery, TraceQueryResult, UnsupportedDomainDetail,
-    WatchBatch, WatchCursor, WatchSelector, cas_get, cas_has, cas_list, columnar_aggregate,
-    columnar_columns, columnar_inspect, columnar_rows, columnar_scan, columnar_select,
-    columnar_source_digest, dataframe_collect, dataframe_plan_digest, dataframe_preview,
-    dataframe_source_digests, graph_explain_query, graph_get_edge, graph_get_node, graph_in_edges,
-    graph_neighbors, graph_out_edges, graph_query, graph_reachable, graph_shortest_path,
-    key_from_cbor, ledger_get, ledger_head, ledger_len, logs_get_record, logs_query,
-    metrics_get_descriptor, metrics_query_observations, search_collections, search_get, search_ids,
-    search_query, search_source_digest, traces_get_span, traces_query, traces_trace_spans, ts_get,
-    ts_latest, vector_embedding_model, vector_get, vector_ids, vector_metadata_index_keys,
-    vector_search, vector_search_with_pq_policy, vector_source_text, watch_batch_from_cbor,
+    MetricQuery, MetricQueryResult, Object, ObjectStore, TraceQuery, TraceQueryResult,
+    UnsupportedDomainDetail, WatchBatch, WatchCursor, WatchSelector, cas_get, cas_has, cas_list,
+    columnar_aggregate, columnar_columns, columnar_inspect, columnar_rows, columnar_scan,
+    columnar_select, columnar_source_digest, dataframe_collect, dataframe_plan_digest,
+    dataframe_preview, dataframe_source_digests, graph_explain_query, graph_get_edge,
+    graph_get_node, graph_in_edges, graph_neighbors, graph_out_edges, graph_query, graph_reachable,
+    graph_shortest_path, key_from_cbor, ledger_get, ledger_head, ledger_len, logs_get_record,
+    logs_query, metrics_get_descriptor, metrics_query_observations, search_collections, search_get,
+    search_ids, search_query, search_source_digest, traces_get_span, traces_query,
+    traces_trace_spans, ts_get, ts_latest, vector_embedding_model, vector_get, vector_ids,
+    vector_metadata_index_keys, vector_search, vector_search_with_pq_policy, vector_source_text,
+    watch_batch_from_cbor,
 };
 use loom_sql::{LoomSqlStore, lookup_cbor, result_cbor};
 use loom_store::{FileStore, daemon, local_auth_requires_write};
@@ -48,7 +49,10 @@ use loom_substrate::predicate::{CompareOp, Predicate};
 use loom_substrate::refs::{
     AliasBinding, AliasIndex, EntityRef, ReferenceEdge, ReferenceIndex, ReferenceSource,
 };
-use loom_substrate::versioning::{Checkpoint, EntityRevision, RevisionIndex};
+use loom_substrate::versioning::{
+    Checkpoint, EntityRevision, RevisionIndex, load_optional_current_revision_index,
+    revision_index_path,
+};
 use loom_substrate::view::ViewDefinition;
 use loom_substrate::workgraph::{
     WorkgraphFact, WorkgraphFactKind, WorkgraphOperationRecord, WorkgraphState,
@@ -76,10 +80,11 @@ use crate::pages::{
 };
 pub use crate::substrate_refs::ReferenceReconciliationSummary;
 use crate::substrate_refs::{ALIAS_INDEX_PATH, REF_INDEX_DIR, REF_INDEX_PATH};
-use crate::substrate_revisions::{REVISION_INDEX_DIR, revision_index_path};
+use crate::substrate_revisions::REVISION_INDEX_DIR;
 use crate::substrate_views::{VIEW_DIR, ViewDefinitionSummary, view_path};
 use crate::{LoomMcp, authorize_workgraph_task, now_ms, reject_stateless_ephemeral_kv};
-use loom_lanes::{Lane, LaneDecodeDiagnostic, LaneTicketView, LaneView};
+use loom_client::local::build_lane_view;
+use loom_lanes::{Lane, LaneDecodeDiagnostic, LaneView};
 use loom_lifecycle::{
     LifecycleDefinitionSummary, LifecycleInstanceSummary, LifecycleOperationLogSummary,
     LifecycleSnapshotPlanSummary, LifecycleSnapshotRecordSummary, LifecycleStageSurfaceSummary,
@@ -524,16 +529,13 @@ fn alias_index_from_reserved(
 fn read_authorized_revision_index(
     loom: &Loom<FileStore>,
     workspace: &str,
-    path: &str,
+    scope_id: &str,
 ) -> Result<Option<RevisionIndex>> {
     let ns = resolve_ns(loom, workspace)?;
+    let path = revision_index_path(scope_id)?;
     loom.authorize_file_path(ns, REVISION_INDEX_DIR, AclRight::Read)?;
-    loom.authorize_file_path(ns, path, AclRight::Read)?;
-    match loom.read_file_reserved(ns, path) {
-        Ok(bytes) => RevisionIndex::decode(&bytes).map(Some),
-        Err(e) if e.code == Code::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+    loom.authorize_file_path(ns, &path, AclRight::Read)?;
+    load_optional_current_revision_index(loom, ns, scope_id)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -767,7 +769,7 @@ fn compare_tabular_values(left: &TabularValue, op: CompareOp, right: &TabularVal
 }
 
 /// Resolve a workspace argument (id or name) to a [`WorkspaceId`], mirroring the C ABI resolver.
-pub(crate) fn resolve_ns(loom: &Loom<FileStore>, workspace: &str) -> Result<WorkspaceId> {
+pub(crate) fn resolve_ns<S: ObjectStore>(loom: &Loom<S>, workspace: &str) -> Result<WorkspaceId> {
     let selector = match WorkspaceId::parse(workspace) {
         Ok(id) => WsSelector::Id(id),
         Err(_) => WsSelector::Name(workspace.to_string()),
@@ -3080,7 +3082,7 @@ impl LoomMcp {
                 Err(e) => return Err(e),
             }
             let mut index = ReferenceIndex::new();
-            for collection in loom.list_collections(ns, FacetKind::Document) {
+            for collection in loom_core::document::doc_list_collections(loom, ns)? {
                 let documents = match loom_core::document::doc_list(loom, ns, &collection) {
                     Ok(documents) => documents,
                     Err(e) if matches!(e.code, Code::PermissionDenied | Code::NotFound) => {
@@ -3200,26 +3202,21 @@ impl LoomMcp {
         scope_id: &str,
         entity_id: &str,
     ) -> Result<SubstrateHistorySummary> {
-        let path = revision_index_path(scope_id)?;
         self.store.read(|loom| {
             let ns = resolve_ns(loom, workspace)?;
+            let path = revision_index_path(scope_id)?;
             loom.authorize_file_path(ns, REVISION_INDEX_DIR, AclRight::Read)?;
             loom.authorize_file_path(ns, &path, AclRight::Read)?;
-            let bytes = match loom.read_file_reserved(ns, &path) {
-                Ok(bytes) => bytes,
-                Err(e) if e.code == Code::NotFound => {
-                    return Ok(SubstrateHistorySummary {
-                        scope_id: scope_id.to_string(),
-                        entity_id: entity_id.to_string(),
-                        index_present: false,
-                        revisions: Vec::new(),
-                        latest: None,
-                        checkpoints: Vec::new(),
-                    });
-                }
-                Err(e) => return Err(e),
+            let Some(index) = load_optional_current_revision_index(loom, ns, scope_id)? else {
+                return Ok(SubstrateHistorySummary {
+                    scope_id: scope_id.to_string(),
+                    entity_id: entity_id.to_string(),
+                    index_present: false,
+                    revisions: Vec::new(),
+                    latest: None,
+                    checkpoints: Vec::new(),
+                });
             };
-            let index = RevisionIndex::decode(&bytes)?;
             let revisions = index
                 .history(entity_id)
                 .into_iter()
@@ -3250,9 +3247,8 @@ impl LoomMcp {
         scope_id: &str,
         entity_id: &str,
     ) -> Result<SubstrateRevisionLookupSummary> {
-        let path = revision_index_path(scope_id)?;
         self.store.read(|loom| {
-            let Some(index) = read_authorized_revision_index(loom, workspace, &path)? else {
+            let Some(index) = read_authorized_revision_index(loom, workspace, scope_id)? else {
                 return Ok(SubstrateRevisionLookupSummary {
                     scope_id: scope_id.to_string(),
                     entity_id: entity_id.to_string(),
@@ -3276,9 +3272,8 @@ impl LoomMcp {
         entity_id: &str,
         revision: u64,
     ) -> Result<SubstrateRevisionLookupSummary> {
-        let path = revision_index_path(scope_id)?;
         self.store.read(|loom| {
-            let Some(index) = read_authorized_revision_index(loom, workspace, &path)? else {
+            let Some(index) = read_authorized_revision_index(loom, workspace, scope_id)? else {
                 return Ok(SubstrateRevisionLookupSummary {
                     scope_id: scope_id.to_string(),
                     entity_id: entity_id.to_string(),
@@ -3304,10 +3299,9 @@ impl LoomMcp {
         entity_id: &str,
         root: &str,
     ) -> Result<SubstrateRevisionLookupSummary> {
-        let path = revision_index_path(scope_id)?;
         let root = Digest::parse(root)?;
         self.store.read(|loom| {
-            let Some(index) = read_authorized_revision_index(loom, workspace, &path)? else {
+            let Some(index) = read_authorized_revision_index(loom, workspace, scope_id)? else {
                 return Ok(SubstrateRevisionLookupSummary {
                     scope_id: scope_id.to_string(),
                     entity_id: entity_id.to_string(),
@@ -3332,9 +3326,8 @@ impl LoomMcp {
         scope_id: &str,
         revision: u64,
     ) -> Result<SubstrateCheckpointLookupSummary> {
-        let path = revision_index_path(scope_id)?;
         self.store.read(|loom| {
-            let Some(index) = read_authorized_revision_index(loom, workspace, &path)? else {
+            let Some(index) = read_authorized_revision_index(loom, workspace, scope_id)? else {
                 return Ok(SubstrateCheckpointLookupSummary {
                     scope_id: scope_id.to_string(),
                     index_present: false,
@@ -3544,6 +3537,42 @@ impl LoomMcp {
             let comments =
                 loom_tickets::list_ticket_comments(loom, ns, workspace_id, &ticket.primary_key)?;
             Ok(Some(readable_ticket_json(&ticket, &history, &comments)))
+        })
+    }
+
+    /// Lean sibling of [`Self::read_tickets_get_readable`] for arbiter workflows.
+    /// Emits the compact ticket projection built by `readable_ticket_compact_json`, which omits the
+    /// full `description` and `comments` bodies while keeping `comment_count`, dependency ids, and
+    /// the `latest_update` summary. Comments are still loaded, but only to take `.len()`; they are
+    /// never serialized.
+    pub fn read_tickets_get_compact(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        ticket_id: &str,
+        projection: Option<&str>,
+    ) -> Result<Option<serde_json::Value>> {
+        self.store.read(|loom| {
+            let ns = resolve_ns(loom, workspace)?;
+            let Some(ticket) = loom_tickets::get_ticket_with_projection(
+                loom,
+                ns,
+                workspace_id,
+                ticket_id,
+                loom_tickets::parse_ticket_projection(projection)?,
+            )?
+            else {
+                return Ok(None);
+            };
+            let history = loom_tickets::history(loom, ns, workspace_id, Some(&ticket.primary_key))?;
+            let comments =
+                loom_tickets::list_ticket_comments(loom, ns, workspace_id, &ticket.primary_key)?;
+            let latest = history.iter().max_by_key(|record| record.sequence);
+            Ok(Some(readable_ticket_compact_json(
+                &ticket,
+                comments.len(),
+                latest,
+            )))
         })
     }
 
@@ -3820,12 +3849,20 @@ impl LoomMcp {
     ) -> Result<(Vec<LaneView>, Vec<LaneDecodeDiagnostic>)> {
         self.store.read(|loom| {
             let ns = resolve_ns(loom, workspace)?;
-            let (lanes, diagnostics) = loom_lanes::list_lanes_with_diagnostics(loom, ns)?;
+            let (lanes, mut diagnostics) = loom_lanes::list_lanes_with_diagnostics(loom, ns)?;
             let ticket_workspace_id = ns.to_string();
             let views = lanes
                 .iter()
                 .map(|lane| build_lane_view(loom, ns, &ticket_workspace_id, lane))
-                .collect();
+                .collect::<Vec<_>>();
+            diagnostics.extend(views.iter().flat_map(|view| {
+                view.status_warnings
+                    .iter()
+                    .map(|warning| LaneDecodeDiagnostic {
+                        lane_id: view.lane_id.clone(),
+                        error: warning.message.clone(),
+                    })
+            }));
             Ok((views, diagnostics))
         })
     }
@@ -5210,19 +5247,62 @@ fn readable_ticket_json(
         },
         "comment_count": comments.len(),
         "comments": comments,
-        "latest_update": latest.map(|record| {
-            serde_json::json!({
-                "timestamp_ms": record.envelope
-                    .get("timestamp_ms")
-                    .and_then(serde_json::Value::as_u64),
-                "actor": record.envelope
-                    .get("actor_principal")
-                    .and_then(serde_json::Value::as_str),
-                "operation_kind": &record.operation_kind,
-                "sequence": record.sequence,
-                "operation_id": &record.operation_id
-            })
-        })
+        "latest_update": readable_latest_update_json(latest)
+    })
+}
+
+/// Shared `latest_update` block used by the readable and compact ticket projections. Emits `null`
+/// when no history exists, otherwise the inline update summary (timestamp_ms, actor, operation_kind,
+/// sequence, operation_id). Keeping this in one place guarantees the readable and compact shapes stay
+/// byte-for-byte identical for this field.
+fn readable_latest_update_json(latest: Option<&TicketHistoryRecord>) -> serde_json::Value {
+    match latest {
+        Some(record) => serde_json::json!({
+            "timestamp_ms": record.envelope
+                .get("timestamp_ms")
+                .and_then(serde_json::Value::as_u64),
+            "actor": record.envelope
+                .get("actor_principal")
+                .and_then(serde_json::Value::as_str),
+            "operation_kind": &record.operation_kind,
+            "sequence": record.sequence,
+            "operation_id": &record.operation_id
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Lean ticket projection for arbiter workflows. Mirrors [`readable_ticket_json`] but omits the
+/// heavy `description` field and the full `comments` array to keep payloads small.
+/// `comment_count`, the dependency graph (including relations), and the `latest_update` summary are
+/// preserved. The emitted keys MUST match `compact_summary_ticket_schema()` in `server.rs` exactly
+/// (that schema is `additionalProperties: false`, so any drift errors at runtime).
+fn readable_ticket_compact_json(
+    ticket: &TicketSummary,
+    comment_count: usize,
+    latest: Option<&TicketHistoryRecord>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "primary_key": &ticket.primary_key,
+        "title": ticket_title(ticket),
+        "status": ticket_text_field(ticket, "status"),
+        "priority": ticket_text_field(ticket, "priority"),
+        "type": &ticket.ticket_type,
+        "assignee": ticket_text_field(ticket, "assignee"),
+        "assignee_display": ticket_text_field(ticket, "assignee_display"),
+        "project": &ticket.project_id,
+        "dependencies": {
+            "depends_on": &ticket.depends_on,
+            "blocks": &ticket.blocks,
+            "relations": ticket.relations.iter().map(|relation| {
+                serde_json::json!({
+                    "kind": &relation.kind,
+                    "target_id": &relation.target_id
+                })
+            }).collect::<Vec<_>>()
+        },
+        "comment_count": comment_count,
+        "latest_update": readable_latest_update_json(latest)
     })
 }
 
@@ -5288,49 +5368,6 @@ fn ticket_title(ticket: &TicketSummary) -> String {
     ticket_text_field(ticket, "title")
         .or_else(|| ticket_text_field(ticket, "summary"))
         .unwrap_or_default()
-}
-
-fn build_lane_view(
-    loom: &Loom<FileStore>,
-    workspace: WorkspaceId,
-    ticket_workspace_id: &str,
-    lane: &Lane,
-) -> LaneView {
-    let lane_tickets = lane
-        .lane_tickets
-        .iter()
-        .map(|lane_ticket| {
-            let ticket = loom_tickets::get_ticket(
-                loom,
-                workspace,
-                ticket_workspace_id,
-                &lane_ticket.ticket_id,
-            )
-            .ok()
-            .flatten();
-            LaneTicketView {
-                ticket_id: lane_ticket.ticket_id.clone(),
-                status: Some(
-                    ticket
-                        .as_ref()
-                        .map(ticket_status)
-                        .unwrap_or_else(|| "missing".to_string()),
-                ),
-                priority: ticket
-                    .as_ref()
-                    .and_then(|ticket| ticket_text_field(ticket, "priority")),
-                title: ticket.as_ref().map(ticket_title),
-            }
-        })
-        .collect();
-    let mut view = loom_lanes::lane_view(lane, lane_tickets);
-    // resolve the lane owner's display alias at the projection layer using the shared
-    // ticket-service resolver (loom-lanes cannot see the identity store).
-    view.owner_display = view
-        .owner_principal
-        .as_deref()
-        .map(|id| loom_tickets::resolve_principal_display(loom.identity_store(), id));
-    view
 }
 
 fn ticket_metric_item(ticket: &TicketSummary, status: &str, lanes: &[&Lane]) -> JsonValue {
@@ -5688,18 +5725,18 @@ mod tests {
                 .unwrap();
         });
         let m = mcp(&path);
-        m.write_tickets_project_create("repo", "studio", "mx", "MX", "Matrix", None)
+        m.write_tickets_project_create("repo", "studio", "demo", "DEMO", "Demo Project", None)
             .expect("project");
         let created = m
             .write_tickets_create(
                 "repo",
                 TicketCreateRequest {
                     workspace_id: "studio",
-                    project_id: "mx",
+                    project_id: "demo",
                     ticket_type: "task",
                     external_source: None,
                     external_id: None,
-                    fields: &serde_json::json!({"title": "Assigned", "assignee": "agent:5"}),
+                    fields: &serde_json::json!({"title": "Assigned", "assignee": "user:assignee-a"}),
                     policy_labels: &[],
                     expected_root: None,
                 },
@@ -5709,8 +5746,11 @@ mod tests {
             .read_tickets_get_readable("repo", "studio", &created.primary_key, None)
             .unwrap()
             .unwrap();
-        assert_eq!(readable["assignee"], serde_json::json!("agent:5"));
-        assert_eq!(readable["assignee_display"], serde_json::json!("agent:5"));
+        assert_eq!(readable["assignee"], serde_json::json!("user:assignee-a"));
+        assert_eq!(
+            readable["assignee_display"],
+            serde_json::json!("user:assignee-a")
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -5727,23 +5767,23 @@ mod tests {
                 .unwrap();
         });
         let m = mcp(&path);
-        m.write_tickets_project_create("repo", "studio", "mx", "MX", "Matrix", None)
+        m.write_tickets_project_create("repo", "studio", "demo", "DEMO", "Demo Project", None)
             .expect("project");
-        define_optional_string_fields(&m, "repo", "studio", "mx", &["lane_owner", "queue_lane"]);
+        define_optional_string_fields(&m, "repo", "studio", "demo", &["lane_owner", "queue_lane"]);
         let one = m
             .write_tickets_create(
                 "repo",
                 TicketCreateRequest {
                     workspace_id: "studio",
-                    project_id: "mx",
+                    project_id: "demo",
                     ticket_type: "task",
                     external_source: None,
                     external_id: None,
                     fields: &serde_json::json!({
                         "title": "Needs review",
                         "status": "waiting_for_review",
-                        "lane_owner": "agent:1",
-                        "queue_lane": "matrix-workflow"
+                        "lane_owner": "user:reviewer-a",
+                        "queue_lane": "review-lane-a"
                     }),
                     policy_labels: &[],
                     expected_root: None,
@@ -5755,15 +5795,15 @@ mod tests {
                 "repo",
                 TicketCreateRequest {
                     workspace_id: "studio",
-                    project_id: "mx",
+                    project_id: "demo",
                     ticket_type: "task",
                     external_source: None,
                     external_id: None,
                     fields: &serde_json::json!({
                         "title": "Has feedback",
                         "status": "feedback_available",
-                        "lane_owner": "agent:1",
-                        "queue_lane": "matrix-workflow"
+                        "lane_owner": "user:reviewer-a",
+                        "queue_lane": "review-lane-a"
                     }),
                     policy_labels: &[],
                     expected_root: Some(&one.profile_root),
@@ -5775,14 +5815,14 @@ mod tests {
                 "repo",
                 TicketCreateRequest {
                     workspace_id: "studio",
-                    project_id: "mx",
+                    project_id: "demo",
                     ticket_type: "task",
                     external_source: None,
                     external_id: None,
                     fields: &serde_json::json!({
                         "title": "Blocked",
                         "status": "blocked",
-                        "lane_owner": "agent:2",
+                        "lane_owner": "user:reviewer-b",
                         "queue_lane": "other-lane"
                     }),
                     policy_labels: &[],
@@ -5795,7 +5835,7 @@ mod tests {
                 "repo",
                 TicketCreateRequest {
                     workspace_id: "studio",
-                    project_id: "mx",
+                    project_id: "demo",
                     ticket_type: "task",
                     external_source: None,
                     external_id: None,
@@ -5808,16 +5848,16 @@ mod tests {
                 },
             )
             .expect("ticket four");
-        assert_eq!(four.primary_key, "MX-4");
+        assert_eq!(four.primary_key, "DEMO-4");
         m.write_lanes_create(
             "repo",
             crate::writes::LaneCreateRequest {
-                lane_id: "agent-1",
-                lane_key: "matrix-workflow",
-                title: "Agent 1 lane",
+                lane_id: "review-lane-a",
+                lane_key: "review-lane-a",
+                title: "Review lane A",
                 description: "Workgraph metrics test lane.",
                 lane_kind: loom_lanes::LaneKind::Assignment.as_str(),
-                owner_principal: Some("agent:1"),
+                owner_principal: Some("user:reviewer-a"),
                 lane_status: "ready",
                 lane_tickets: &[
                     loom_lanes::LaneTicket {
@@ -5830,9 +5870,9 @@ mod tests {
                     },
                 ],
                 active_ticket_id: Some(&one.primary_key),
-                status_report: "ready",
+                status_report: "blocked by stale note",
                 reviewer_feedback: "",
-                updated_by: Some("agent:1"),
+                updated_by: Some("user:reviewer-a"),
             },
         )
         .expect("lane");
@@ -5843,14 +5883,14 @@ mod tests {
         assert_eq!(metrics["ticket_counts"]["feedback_available"], 1);
         assert_eq!(metrics["ticket_counts"]["blocked"], 1);
         assert_eq!(metrics["ticket_counts"]["accepted"], 1);
-        assert_eq!(metrics["lanes"][0]["active_ticket_id"], "MX-1");
+        assert_eq!(metrics["lanes"][0]["active_ticket_id"], "DEMO-1");
         assert_eq!(metrics["lanes"][0]["queue_depth"], 2);
         assert!(
             metrics["lane_assignment_mismatches"]["items"]
                 .as_array()
                 .expect("mismatch items")
                 .iter()
-                .any(|item| item["primary_key"] == "MX-3")
+                .any(|item| item["primary_key"] == "DEMO-3")
         );
         let filtered = m
             .read_workgraph_metrics(
@@ -5862,7 +5902,7 @@ mod tests {
             )
             .expect("filtered");
         assert_eq!(filtered["cohort"]["returned"], 1);
-        assert_eq!(filtered["cohort"]["items"][0]["primary_key"], "MX-2");
+        assert_eq!(filtered["cohort"]["items"][0]["primary_key"], "DEMO-2");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -5877,14 +5917,14 @@ mod tests {
             id.to_string()
         });
         let m = mcp(&path);
-        m.write_tickets_project_create("repo", &profile_id, "mx", "MX", "Matrix", None)
+        m.write_tickets_project_create("repo", &profile_id, "demo", "DEMO", "Demo Project", None)
             .expect("project");
         let ready = m
             .write_tickets_create(
                 "repo",
                 TicketCreateRequest {
                     workspace_id: &profile_id,
-                    project_id: "mx",
+                    project_id: "demo",
                     ticket_type: "task",
                     external_source: None,
                     external_id: None,
@@ -5903,7 +5943,7 @@ mod tests {
                 "repo",
                 TicketCreateRequest {
                     workspace_id: &profile_id,
-                    project_id: "mx",
+                    project_id: "demo",
                     ticket_type: "bug",
                     external_source: None,
                     external_id: None,
@@ -5920,12 +5960,12 @@ mod tests {
         m.write_lanes_create(
             "repo",
             crate::writes::LaneCreateRequest {
-                lane_id: "agent-views",
-                lane_key: "matrix-workflow",
-                title: "Agent view lane",
+                lane_id: "view-lane",
+                lane_key: "review-workflow",
+                title: "View lane",
                 description: "Lane view projection regression.",
                 lane_kind: loom_lanes::LaneKind::Assignment.as_str(),
-                owner_principal: Some("agent:views"),
+                owner_principal: Some("user:view-reviewer"),
                 lane_status: "ready",
                 lane_tickets: &[
                     loom_lanes::LaneTicket {
@@ -5937,27 +5977,35 @@ mod tests {
                         order_key: "V".to_string(),
                     },
                     loom_lanes::LaneTicket {
-                        ticket_id: "MX-999".to_string(),
+                        ticket_id: "DEMO-999".to_string(),
                         order_key: "l".to_string(),
                     },
                 ],
                 active_ticket_id: Some(&ready.primary_key),
-                status_report: "ready",
+                status_report: "blocked by stale note",
                 reviewer_feedback: "",
-                updated_by: Some("agent:views"),
+                updated_by: Some("user:view-reviewer"),
             },
         )
         .expect("lane");
 
         let view = m
-            .read_lanes_get_view("repo", "agent-views")
+            .read_lanes_get_view("repo", "view-lane")
             .expect("lane view")
             .expect("lane exists");
         assert_eq!(view.status_counts.total, 3);
-        assert_eq!(view.status_counts.backlog, 1);
+        assert_eq!(view.status_counts.ready, 1);
+        assert_eq!(view.status_counts.backlog, 0);
         assert_eq!(view.status_counts.blocked, 1);
         assert_eq!(view.status_counts.missing, 1);
-        assert_eq!(view.status_counts.next_ticket_id.as_deref(), Some("MX-1"));
+        assert_eq!(view.status_counts.next_ticket_id.as_deref(), Some("DEMO-1"));
+        assert_eq!(view.display_status, "ready");
+        assert_eq!(view.compact().display_status, "ready");
+        assert_eq!(view.status_warnings.len(), 2);
+        assert_eq!(view.status_warnings[0].field, "status_report");
+        assert_eq!(view.status_warnings[0].stated_status, "blocked");
+        assert_eq!(view.status_warnings[1].field, "status_report");
+        assert_eq!(view.status_warnings[1].stated_status, "blocker");
         assert_eq!(view.lane_tickets[0].status.as_deref(), Some("ready"));
         assert_eq!(view.lane_tickets[0].title.as_deref(), Some("Ready task"));
         assert_eq!(view.lane_tickets[0].priority.as_deref(), Some("P1"));
@@ -5969,7 +6017,8 @@ mod tests {
         let (views, diagnostics) = m
             .read_lanes_list_views_with_diagnostics("repo")
             .expect("lane views");
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].lane_id, "view-lane");
         assert_eq!(views[0].status_counts, view.status_counts);
 
         let listed = m
@@ -5981,7 +6030,7 @@ mod tests {
                     lane_member_ids: Some(vec![
                         ready.primary_key.clone(),
                         blocked.primary_key.clone(),
-                        "MX-999".to_string(),
+                        "DEMO-999".to_string(),
                     ]),
                     limit: Some(10),
                     ..Default::default()
@@ -5994,8 +6043,8 @@ mod tests {
             .iter()
             .map(|ticket| (ticket.primary_key.as_str(), ticket_status(ticket)))
             .collect::<Vec<_>>();
-        assert!(listed_statuses.contains(&("MX-1", "ready".to_string())));
-        assert!(listed_statuses.contains(&("MX-2", "blocked".to_string())));
+        assert!(listed_statuses.contains(&("DEMO-1", "ready".to_string())));
+        assert!(listed_statuses.contains(&("DEMO-2", "blocked".to_string())));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -7035,15 +7084,14 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
-            let path_in_loom = crate::substrate_revisions::revision_index_path("studio").unwrap();
-            loom.create_directory_reserved(
+            loom_substrate::versioning::persist_current_revision_index(
+                loom,
                 ns,
-                crate::substrate_revisions::REVISION_INDEX_DIR,
-                true,
+                "studio",
+                loom_core::FacetKind::Document,
+                &index,
             )
             .unwrap();
-            loom.write_file_reserved(ns, &path_in_loom, &index.encode().unwrap(), 0o100644)
-                .unwrap();
         });
 
         let result = mcp(&path)

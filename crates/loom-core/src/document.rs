@@ -8,11 +8,16 @@ use crate::acl::AclRight;
 use crate::cbor::{self, Value as CborValue};
 use crate::digest::Digest;
 use crate::error::{Code, LoomError, Result};
+use crate::mutable_overlay::{OverlayCheckpoint, OverlayKey, OverlayReadSnapshot, OverlaySnapshot};
 use crate::object::{ChunkRef, EntryKind, Object, TreeEntry};
 use crate::provider::ObjectStore;
 use crate::tabular::{CmpOp, Value as IndexedValue, cell_from, cell_value};
 use crate::vcs::{Loom, StagedEntry, normalize_path};
 use crate::workspace::{FacetKind, WorkspaceId, facet_path, facet_root};
+use crate::{
+    AtomicityBoundary, AuditIntent, CompareToken, FacetSideEffects, FacetWrite, FacetWriteOp,
+    OverlayDurabilityPolicy, SecondaryIndexWrite, SecondaryIndexWriteOp, WorkflowTransaction,
+};
 use loom_types::{
     CompareCondition, CompareOutcome, ConflictReason, ContentTag, EntityTag, MutationMode,
     MutationRequest,
@@ -38,6 +43,9 @@ const DOCUMENT_TOMBSTONE_RETENTION_CLASS: &str = "retained-delete.v1";
 const DOCUMENT_DELETION_REVISION_SCHEMA: &str = "loom.document.deletion-revision.v1";
 const DOCUMENT_ROOT_MANIFEST_ENTRY: &str = "manifest";
 const DOCUMENT_ROOT_DOCUMENTS_ENTRY: &str = "documents";
+const DOCUMENT_CURRENT_OVERLAY_SCHEMA: &str = "loom.document.current-overlay.v1";
+const DOCUMENT_CURRENT_HEAD_KIND: &str = "collection-head";
+const DOCUMENT_CURRENT_RECORD_KIND: &str = "document-record";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentId {
@@ -609,7 +617,7 @@ impl DocumentCollectionManifest {
             metadata: text_map_from_cbor(fields.next_field()?)?,
         };
         fields.end()?;
-        validate_document_text_field("document collection id", &manifest.collection_id)?;
+        validate_document_collection_name(&manifest.collection_id)?;
         Ok(manifest)
     }
 }
@@ -1153,6 +1161,28 @@ fn document_chunk_path(collection: &str, digest: &Digest) -> String {
     )
 }
 
+fn document_component_prefixes(collection: &str) -> [String; 6] {
+    [
+        col_path(collection),
+        document_map_path(collection),
+        document_tombstone_path(collection),
+        document_body_dir(collection),
+        document_chunk_dir(collection),
+        index_catalog_path(collection),
+    ]
+}
+
+pub fn document_engine_planning_paths(collection: &str) -> Vec<crate::EnginePathSelector> {
+    let mut paths = document_component_prefixes(collection)
+        .into_iter()
+        .map(crate::EnginePathSelector::Prefix)
+        .collect::<Vec<_>>();
+    paths.push(crate::EnginePathSelector::Prefix(index_state_dir(
+        collection,
+    )));
+    paths
+}
+
 fn index_catalog_path(collection: &str) -> String {
     facet_path(
         FacetKind::Document,
@@ -1169,6 +1199,677 @@ fn index_state_path(collection: &str, index: &str) -> String {
             hex::encode(index.as_bytes())
         ),
     )
+}
+
+fn index_state_dir(collection: &str) -> String {
+    facet_path(
+        FacetKind::Document,
+        &format!(".index-data/{}", hex::encode(collection.as_bytes())),
+    )
+}
+
+fn document_current_head_key(ns: WorkspaceId, collection: &str) -> Result<OverlayKey> {
+    document_current_overlay_key(ns, collection, DOCUMENT_CURRENT_HEAD_KIND, "")
+}
+
+fn document_current_record_key(ns: WorkspaceId, collection: &str, id: &str) -> Result<OverlayKey> {
+    document_current_overlay_key(ns, collection, DOCUMENT_CURRENT_RECORD_KIND, id)
+}
+
+fn document_current_overlay_key(
+    ns: WorkspaceId,
+    collection: &str,
+    kind: &str,
+    id: &str,
+) -> Result<OverlayKey> {
+    validate_document_collection_name(collection)?;
+    OverlayKey::from_segments([
+        DOCUMENT_CURRENT_OVERLAY_SCHEMA.as_bytes(),
+        ns.as_bytes(),
+        collection.as_bytes(),
+        kind.as_bytes(),
+        id.as_bytes(),
+        b"v1",
+    ])
+}
+
+fn encode_document_current_head(value: &Collection) -> Vec<u8> {
+    cbor::encode(&CborValue::Array(vec![
+        CborValue::Text(DOCUMENT_CURRENT_OVERLAY_SCHEMA.to_string()),
+        CborValue::Text(DOCUMENT_CURRENT_HEAD_KIND.to_string()),
+        CborValue::Array(
+            value
+                .ids()
+                .map(|id| CborValue::Text(id.to_string()))
+                .collect(),
+        ),
+    ]))
+}
+
+fn decode_document_current_head(bytes: &[u8]) -> Result<Vec<String>> {
+    let mut fields = cbor::Fields::new(cbor::decode_array(bytes)?);
+    let schema = fields.text()?;
+    if schema != DOCUMENT_CURRENT_OVERLAY_SCHEMA {
+        return Err(LoomError::corrupt("document current head schema mismatch"));
+    }
+    let kind = fields.text()?;
+    if kind != DOCUMENT_CURRENT_HEAD_KIND {
+        return Err(LoomError::corrupt("document current head kind mismatch"));
+    }
+    let ids = cbor::as_array(fields.next_field()?)?
+        .into_iter()
+        .map(cbor::as_text)
+        .collect::<Result<Vec<_>>>()?;
+    fields.end()?;
+    Ok(ids)
+}
+
+enum DocumentCurrentRecord {
+    Live(Vec<u8>),
+    Deleted,
+}
+
+fn encode_document_current_record(doc: Option<&[u8]>) -> Vec<u8> {
+    let state = match doc {
+        Some(bytes) => CborValue::Array(vec![
+            CborValue::Text("live".to_string()),
+            CborValue::Bytes(bytes.to_vec()),
+        ]),
+        None => CborValue::Array(vec![CborValue::Text("deleted".to_string())]),
+    };
+    cbor::encode(&CborValue::Array(vec![
+        CborValue::Text(DOCUMENT_CURRENT_OVERLAY_SCHEMA.to_string()),
+        CborValue::Text(DOCUMENT_CURRENT_RECORD_KIND.to_string()),
+        state,
+    ]))
+}
+
+fn decode_document_current_record(bytes: &[u8]) -> Result<DocumentCurrentRecord> {
+    let mut fields = cbor::Fields::new(cbor::decode_array(bytes)?);
+    let schema = fields.text()?;
+    if schema != DOCUMENT_CURRENT_OVERLAY_SCHEMA {
+        return Err(LoomError::corrupt(
+            "document current record schema mismatch",
+        ));
+    }
+    let kind = fields.text()?;
+    if kind != DOCUMENT_CURRENT_RECORD_KIND {
+        return Err(LoomError::corrupt("document current record kind mismatch"));
+    }
+    let mut state = cbor::Fields::new(cbor::as_array(fields.next_field()?)?);
+    let record = match state.text()?.as_str() {
+        "live" => {
+            let bytes = state.bytes()?;
+            state.end()?;
+            DocumentCurrentRecord::Live(bytes)
+        }
+        "deleted" => {
+            state.end()?;
+            DocumentCurrentRecord::Deleted
+        }
+        other => {
+            return Err(LoomError::corrupt(format!(
+                "unknown document current state {other}"
+            )));
+        }
+    };
+    fields.end()?;
+    Ok(record)
+}
+
+fn put_document_current_overlay_values<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    values: Vec<(OverlayKey, Vec<u8>)>,
+    operation: &str,
+) -> Result<()> {
+    let workspace = ns_from_document_overlay_values(&values)?;
+    let snapshot =
+        crate::WorkflowPlanningSnapshot::open(loom.store(), Some("document.current.put"))?;
+    let (reference_root, objects) = match snapshot.immutable_base_root() {
+        Some(base_root) => loom.prepare_current_facet_state_reference(workspace, base_root)?,
+        None => loom.save_state_objects()?,
+    };
+    let writes = values
+        .iter()
+        .map(|(key, payload)| {
+            Ok(FacetWrite {
+                facet: FacetKind::Document,
+                target: key.clone(),
+                op: FacetWriteOp::Put {
+                    payload: payload.clone(),
+                },
+                secondary_indexes: document_current_secondary_indexes(key, payload)?,
+                expected: snapshot.owner_token(key)?.map(CompareToken),
+                durability: None,
+                audit: Some(AuditIntent {
+                    operation: operation.to_string(),
+                }),
+                side_effects: FacetSideEffects::default(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expected_generation = snapshot.expected_generation();
+    snapshot.release()?;
+    let receipt = loom
+        .store()
+        .commit_workflow_transaction(WorkflowTransaction {
+            workspace,
+            actor: loom.effective_principal()?.unwrap_or(workspace),
+            expected_generation: Some(expected_generation),
+            writes,
+            durability: OverlayDurabilityPolicy::Normal,
+            boundary: AtomicityBoundary::Single,
+            idempotency: None,
+            owner_state: crate::WorkflowOwnerState {
+                objects,
+                reference: crate::WorkflowReferenceUpdate::Set(Some(reference_root)),
+                controls: Vec::new(),
+                audits: Vec::new(),
+            },
+        })?;
+    for outcome in receipt.writes {
+        let current = loom
+            .store()
+            .mutable_overlay_current_entry(&outcome.target)?
+            .ok_or_else(|| {
+                LoomError::corrupt("document workflow transaction omitted current record")
+            })?;
+        loom.mutable_overlay_mut()
+            .synchronize_current_entry(current)?;
+    }
+    Ok(())
+}
+
+fn put_document_current_overlay_tombstone<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    key: OverlayKey,
+    ns: WorkspaceId,
+) -> Result<()> {
+    let snapshot =
+        crate::WorkflowPlanningSnapshot::open(loom.store(), Some("document.current.delete"))?;
+    let (reference_root, objects) = match snapshot.immutable_base_root() {
+        Some(base_root) => loom.prepare_current_facet_state_reference(ns, base_root)?,
+        None => loom.save_state_objects()?,
+    };
+    let expected_generation = snapshot.expected_generation();
+    let expected = snapshot.owner_token(&key)?.map(CompareToken);
+    snapshot.release()?;
+    let receipt = loom
+        .store()
+        .commit_workflow_transaction(WorkflowTransaction {
+            workspace: ns,
+            actor: loom.effective_principal()?.unwrap_or(ns),
+            expected_generation: Some(expected_generation),
+            writes: vec![FacetWrite {
+                facet: FacetKind::Document,
+                target: key.clone(),
+                op: FacetWriteOp::Delete,
+                secondary_indexes: document_current_secondary_deletes(&key)?,
+                expected,
+                durability: None,
+                audit: Some(AuditIntent {
+                    operation: "document.current.delete".to_string(),
+                }),
+                side_effects: FacetSideEffects::default(),
+            }],
+            durability: OverlayDurabilityPolicy::Normal,
+            boundary: AtomicityBoundary::Single,
+            idempotency: None,
+            owner_state: crate::WorkflowOwnerState {
+                objects,
+                reference: crate::WorkflowReferenceUpdate::Set(Some(reference_root)),
+                controls: Vec::new(),
+                audits: Vec::new(),
+            },
+        })?;
+    for outcome in receipt.writes {
+        let current = loom
+            .store()
+            .mutable_overlay_current_entry(&outcome.target)?
+            .ok_or_else(|| {
+                LoomError::corrupt("document workflow transaction omitted current tombstone")
+            })?;
+        loom.mutable_overlay_mut()
+            .synchronize_current_entry(current)?;
+    }
+    Ok(())
+}
+
+fn ns_from_document_overlay_values(values: &[(OverlayKey, Vec<u8>)]) -> Result<WorkspaceId> {
+    let Some((key, _)) = values.first() else {
+        return Err(LoomError::invalid(
+            "document current transaction must include a write",
+        ));
+    };
+    let segments = key.segments()?;
+    let ns = segments
+        .get(1)
+        .ok_or_else(|| LoomError::corrupt("document current overlay key missing workspace"))?;
+    let bytes: [u8; 16] = (*ns)
+        .try_into()
+        .map_err(|_| LoomError::corrupt("document current overlay workspace id is invalid"))?;
+    Ok(WorkspaceId::from_bytes(bytes))
+}
+
+fn document_current_secondary_index_key(
+    ns: WorkspaceId,
+    collection: &str,
+    index_name: &str,
+    index_value: &str,
+    record_id: &str,
+) -> Result<OverlayKey> {
+    OverlayKey::from_segments([
+        DOCUMENT_CURRENT_OVERLAY_SCHEMA.as_bytes(),
+        ns.as_bytes(),
+        collection.as_bytes(),
+        index_name.as_bytes(),
+        index_value.as_bytes(),
+        record_id.as_bytes(),
+    ])
+}
+
+fn document_current_secondary_index_put(
+    ns: WorkspaceId,
+    collection: &str,
+    index_name: &str,
+    index_value: &str,
+    record_id: &str,
+    payload: impl Into<Vec<u8>>,
+) -> Result<SecondaryIndexWrite> {
+    Ok(SecondaryIndexWrite {
+        index: document_current_secondary_index_key(
+            ns,
+            collection,
+            index_name,
+            index_value,
+            record_id,
+        )?,
+        op: SecondaryIndexWriteOp::Put {
+            payload: payload.into(),
+        },
+    })
+}
+
+fn document_current_secondary_index_delete(
+    ns: WorkspaceId,
+    collection: &str,
+    index_name: &str,
+    index_value: &str,
+    record_id: &str,
+) -> Result<SecondaryIndexWrite> {
+    Ok(SecondaryIndexWrite {
+        index: document_current_secondary_index_key(
+            ns,
+            collection,
+            index_name,
+            index_value,
+            record_id,
+        )?,
+        op: SecondaryIndexWriteOp::Delete,
+    })
+}
+
+fn document_current_key_parts(key: &OverlayKey) -> Result<(WorkspaceId, String, String, String)> {
+    let segments = key.segments()?;
+    let [schema, ns, collection, kind, id, version] = segments.as_slice() else {
+        return Err(LoomError::corrupt(
+            "document current overlay key shape mismatch",
+        ));
+    };
+    if *schema != DOCUMENT_CURRENT_OVERLAY_SCHEMA.as_bytes() || *version != b"v1" {
+        return Err(LoomError::corrupt(
+            "document current overlay key schema mismatch",
+        ));
+    }
+    let ns_bytes: [u8; 16] = (*ns)
+        .try_into()
+        .map_err(|_| LoomError::corrupt("document current overlay workspace id is invalid"))?;
+    let collection = std::str::from_utf8(collection)
+        .map_err(|_| LoomError::corrupt("document current collection is not UTF-8"))?
+        .to_string();
+    let kind = std::str::from_utf8(kind)
+        .map_err(|_| LoomError::corrupt("document current kind is not UTF-8"))?
+        .to_string();
+    let id = std::str::from_utf8(id)
+        .map_err(|_| LoomError::corrupt("document current id is not UTF-8"))?
+        .to_string();
+    Ok((WorkspaceId::from_bytes(ns_bytes), collection, kind, id))
+}
+
+fn document_current_secondary_indexes(
+    key: &OverlayKey,
+    payload: &[u8],
+) -> Result<Vec<SecondaryIndexWrite>> {
+    let (ns, collection, kind, id) = document_current_key_parts(key)?;
+    if kind == DOCUMENT_CURRENT_HEAD_KIND {
+        return Ok(vec![document_current_secondary_index_put(
+            ns,
+            &collection,
+            "collection-head",
+            &collection,
+            &collection,
+            collection.as_bytes().to_vec(),
+        )?]);
+    }
+    if kind != DOCUMENT_CURRENT_RECORD_KIND {
+        return Ok(Vec::new());
+    }
+    match decode_document_current_record(payload)? {
+        DocumentCurrentRecord::Live(_) => Ok(vec![document_current_secondary_index_put(
+            ns,
+            &collection,
+            "document-record",
+            &id,
+            &id,
+            id.as_bytes().to_vec(),
+        )?]),
+        DocumentCurrentRecord::Deleted => Ok(vec![document_current_secondary_index_delete(
+            ns,
+            &collection,
+            "document-record",
+            &id,
+            &id,
+        )?]),
+    }
+}
+
+fn document_current_secondary_deletes(key: &OverlayKey) -> Result<Vec<SecondaryIndexWrite>> {
+    let (ns, collection, kind, id) = document_current_key_parts(key)?;
+    if kind == DOCUMENT_CURRENT_HEAD_KIND {
+        return Ok(vec![document_current_secondary_index_delete(
+            ns,
+            &collection,
+            "collection-head",
+            &collection,
+            &collection,
+        )?]);
+    }
+    if kind == DOCUMENT_CURRENT_RECORD_KIND {
+        return Ok(vec![document_current_secondary_index_delete(
+            ns,
+            &collection,
+            "document-record",
+            &id,
+            &id,
+        )?]);
+    }
+    Ok(Vec::new())
+}
+
+fn put_document_current_overlay_unchecked<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    ns: WorkspaceId,
+    collection: &str,
+    value: &Collection,
+    changed_id: &str,
+    changed_doc: Option<&[u8]>,
+) -> Result<()> {
+    put_document_current_overlay_values(
+        loom,
+        vec![
+            (
+                document_current_head_key(ns, collection)?,
+                encode_document_current_head(value),
+            ),
+            (
+                document_current_record_key(ns, collection, changed_id)?,
+                encode_document_current_record(changed_doc),
+            ),
+        ],
+        "document.current.put",
+    )
+}
+
+pub fn prepare_document_workflow_writes(
+    snapshot: &OverlaySnapshot,
+    ns: WorkspaceId,
+    collection: &str,
+    value: &Collection,
+    changed_ids: &BTreeSet<String>,
+) -> Result<Vec<FacetWrite>> {
+    if changed_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut values = Vec::with_capacity(changed_ids.len() + 1);
+    values.push((
+        document_current_head_key(ns, collection)?,
+        encode_document_current_head(value),
+    ));
+    for id in changed_ids {
+        values.push((
+            document_current_record_key(ns, collection, id)?,
+            encode_document_current_record(value.get(id)),
+        ));
+    }
+    values
+        .into_iter()
+        .map(|(target, payload)| {
+            Ok(FacetWrite {
+                facet: FacetKind::Document,
+                secondary_indexes: document_current_secondary_indexes(&target, &payload)?,
+                expected: snapshot.owner_token(&target)?.map(CompareToken),
+                target,
+                op: FacetWriteOp::Put { payload },
+                durability: None,
+                audit: Some(AuditIntent {
+                    operation: "document.current.put".to_string(),
+                }),
+                side_effects: FacetSideEffects::default(),
+            })
+        })
+        .collect()
+}
+
+fn read_document_current_overlay_value(
+    snapshot: &OverlayReadSnapshot,
+    key: &OverlayKey,
+) -> Result<Option<Vec<u8>>> {
+    snapshot.read_composite(key, |_, _| Ok(None))
+}
+
+fn read_document_current_record(
+    snapshot: &OverlayReadSnapshot,
+    ns: WorkspaceId,
+    collection: &str,
+    id: &str,
+) -> Result<Option<DocumentCurrentRecord>> {
+    read_document_current_overlay_value(
+        snapshot,
+        &document_current_record_key(ns, collection, id)?,
+    )?
+    .map(|bytes| decode_document_current_record(&bytes))
+    .transpose()
+}
+
+fn read_document_checkpoint_record(
+    checkpoint: &OverlayCheckpoint,
+    ns: WorkspaceId,
+    collection: &str,
+    id: &str,
+) -> Result<Option<DocumentCurrentRecord>> {
+    checkpoint
+        .read_composite(&document_current_record_key(ns, collection, id)?, |_| {
+            Ok(None)
+        })?
+        .map(|bytes| decode_document_current_record(&bytes))
+        .transpose()
+}
+
+fn load_document_current_overlay_collection<S: ObjectStore>(
+    loom: &Loom<S>,
+    ns: WorkspaceId,
+    collection: &str,
+) -> Result<Option<Collection>> {
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("document.current.read"))?;
+    let Some(head) = read_document_current_overlay_value(
+        &snapshot,
+        &document_current_head_key(ns, collection)?,
+    )?
+    else {
+        return Ok(None);
+    };
+    let ids = decode_document_current_head(&head)?;
+    let base = match load_staged_collection_unchecked(loom, ns, collection) {
+        Ok(collection) => collection,
+        Err(error) if error.code == Code::NotFound => Collection::new(),
+        Err(error) => return Err(error),
+    };
+    let mut out = Collection::new();
+    for id in ids {
+        match read_document_current_record(&snapshot, ns, collection, &id)? {
+            Some(DocumentCurrentRecord::Live(bytes)) => out.put(id, bytes),
+            Some(DocumentCurrentRecord::Deleted) => {}
+            None => {
+                if let Some(bytes) = base.get(&id) {
+                    out.put(id, bytes.to_vec());
+                }
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+fn load_document_checkpoint_overlay_collection<S: ObjectStore>(
+    loom: &Loom<S>,
+    checkpoint: &OverlayCheckpoint,
+    ns: WorkspaceId,
+    collection: &str,
+) -> Result<Option<Collection>> {
+    let Some(head) =
+        checkpoint.read_composite(&document_current_head_key(ns, collection)?, |_| Ok(None))?
+    else {
+        return Ok(None);
+    };
+    let ids = decode_document_current_head(&head)?;
+    let base = match load_staged_collection_unchecked(loom, ns, collection) {
+        Ok(collection) => collection,
+        Err(error) if error.code == Code::NotFound => Collection::new(),
+        Err(error) => return Err(error),
+    };
+    let mut out = Collection::new();
+    for id in ids {
+        match read_document_checkpoint_record(checkpoint, ns, collection, &id)? {
+            Some(DocumentCurrentRecord::Live(bytes)) => out.put(id, bytes),
+            Some(DocumentCurrentRecord::Deleted) => {}
+            None => {
+                if let Some(bytes) = base.get(&id) {
+                    out.put(id, bytes.to_vec());
+                }
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+fn document_overlay_collection_from_key(
+    key: &OverlayKey,
+    ns: WorkspaceId,
+) -> Result<Option<String>> {
+    let segments = key.segments()?;
+    if segments.len() != 6
+        || segments[0] != DOCUMENT_CURRENT_OVERLAY_SCHEMA.as_bytes()
+        || segments[1] != ns.as_bytes()
+        || segments[3] != DOCUMENT_CURRENT_HEAD_KIND.as_bytes()
+        || !segments[4].is_empty()
+        || segments[5] != b"v1"
+    {
+        return Ok(None);
+    }
+    let collection = std::str::from_utf8(segments[2])
+        .map_err(|_| LoomError::corrupt("document current collection is not UTF-8"))?;
+    Ok(Some(collection.to_string()))
+}
+
+fn checkpoint_document_collections(
+    checkpoint: &OverlayCheckpoint,
+    ns: WorkspaceId,
+) -> Result<BTreeSet<String>> {
+    let mut owner_scopes = BTreeSet::new();
+    for key in checkpoint.keys() {
+        let Some(collection) = document_overlay_collection_from_key(key, ns)? else {
+            continue;
+        };
+        owner_scopes.insert(crate::OverlayOwnerScope::new(
+            DOCUMENT_CURRENT_OVERLAY_SCHEMA.as_bytes(),
+            ns.as_bytes(),
+            collection.as_bytes(),
+        )?);
+    }
+    let selection =
+        checkpoint.select_owner_scopes(&owner_scopes.into_iter().collect::<Vec<_>>())?;
+    let mut collections = BTreeSet::new();
+    for entry in selection.entries {
+        if let Some(collection) = document_overlay_collection_from_key(&entry.key, ns)?
+            && entry.kind == crate::OverlayEntryKind::Value
+        {
+            collections.insert(collection);
+        }
+    }
+    Ok(collections)
+}
+
+fn overlay_document_collections<S: ObjectStore>(
+    loom: &Loom<S>,
+    ns: WorkspaceId,
+) -> Result<BTreeSet<String>> {
+    let checkpoint = loom.mutable_overlay_checkpoint_with_inherited_keys()?;
+    checkpoint_document_collections(&checkpoint, ns)
+}
+
+pub(crate) fn materialize_document_current_overlays_for_commit<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    ns: WorkspaceId,
+) -> Result<()> {
+    let checkpoint = loom.mutable_overlay().checkpoint();
+    let collections = checkpoint_document_collections(&checkpoint, ns)?;
+    for collection in collections {
+        let value =
+            load_document_checkpoint_overlay_collection(loom, &checkpoint, ns, &collection)?
+                .unwrap_or_default();
+        let manifest = load_collection_manifest_unchecked(loom, ns, &collection)?;
+        let retention_policy = manifest
+            .as_ref()
+            .map(|manifest| manifest.retention_policy.clone())
+            .unwrap_or(DocumentPolicyConfig::new(DOCUMENT_RETENTION_POLICY_NONE)?);
+        let tombstones = manifest
+            .as_ref()
+            .and_then(|manifest| manifest.tombstone_root)
+            .map(|root| load_document_tombstones(loom, ns, &collection, root))
+            .transpose()?
+            .unwrap_or_default();
+        let mut tombstones = tombstones;
+        if retention_policy.name == DOCUMENT_RETENTION_POLICY_RETAIN {
+            let base = match load_staged_collection_unchecked(loom, ns, &collection) {
+                Ok(collection) => collection,
+                Err(error) if error.code == Code::NotFound => Collection::new(),
+                Err(error) => return Err(error),
+            };
+            for id in base.ids() {
+                if value.get(id).is_none()
+                    && matches!(
+                        read_document_checkpoint_record(&checkpoint, ns, &collection, id)?,
+                        Some(DocumentCurrentRecord::Deleted)
+                    )
+                    && let Some(old) = base.get(id)
+                {
+                    tombstones.insert(
+                        id.to_string(),
+                        document_tombstone_from_delete_policy(loom, id, old, &retention_policy)?,
+                    );
+                }
+            }
+        }
+        put_collection_with_tombstones_unchecked(
+            loom,
+            ns,
+            &collection,
+            &value,
+            retention_policy,
+            tombstones,
+        )?;
+    }
+    loom.mutable_overlay().validate_checkpoint(&checkpoint)?;
+    Ok(())
 }
 
 pub fn put_collection<S: ObjectStore>(
@@ -1218,6 +1919,7 @@ fn put_collection_with_tombstones_unchecked<S: ObjectStore>(
     retention_policy: DocumentPolicyConfig,
     tombstones: BTreeMap<String, DocumentTombstoneRecord>,
 ) -> Result<()> {
+    validate_document_collection_name(collection)?;
     loom.create_directory_reserved(ns, &facet_root(FacetKind::Document), true)?;
     loom.create_directory_reserved(ns, &facet_path(FacetKind::Document, ".maps"), true)?;
     loom.create_directory_reserved(ns, &facet_path(FacetKind::Document, ".tombstones"), true)?;
@@ -1430,9 +2132,6 @@ fn load_collection_manifest_unchecked<S: ObjectStore>(
             let (manifest, _) = document_root_parts(loom, *root)?;
             Ok(Some(manifest))
         }
-        Some(StagedEntry::File(file)) => Ok(Some(DocumentCollectionManifest::decode(
-            &loom.load_content(file.content_addr)?,
-        )?)),
         Some(_) => Err(LoomError::invalid(format!("{path:?} is not a document"))),
         None => Ok(None),
     }
@@ -1510,10 +2209,11 @@ fn stage_document_root_unchecked<S: ObjectStore>(
         });
     }
     let root = loom.put_object(&Object::tree(entries)?)?;
-    loom.work.entry(ns).or_default().insert(
-        normalize_path(&col_path(collection))?,
-        StagedEntry::Document(root),
-    );
+    let path = normalize_path(&col_path(collection))?;
+    loom.work
+        .entry(ns)
+        .or_default()
+        .insert(path, StagedEntry::Document(root));
     Ok(())
 }
 
@@ -1642,15 +2342,6 @@ fn refresh_index_catalog_root_unchecked<S: ObjectStore>(
             }
             Ok(())
         }
-        Some(StagedEntry::File(file)) => {
-            let mut manifest =
-                DocumentCollectionManifest::decode(&loom.load_content(file.content_addr)?)?;
-            if manifest.index_catalog_root != index_catalog_root {
-                manifest.index_catalog_root = index_catalog_root;
-                loom.write_file_reserved(ns, &col_path(collection), &manifest.encode(), 0o100644)?;
-            }
-            Ok(())
-        }
         Some(_) => Err(LoomError::invalid(format!("{path:?} is not a document"))),
         None => Ok(()),
     }
@@ -1733,48 +2424,27 @@ fn load_collection_unchecked<S: ObjectStore>(
     ns: WorkspaceId,
     collection: &str,
 ) -> Result<Collection> {
+    if let Some(collection) = load_document_current_overlay_collection(loom, ns, collection)? {
+        return Ok(collection);
+    }
+    load_staged_collection_unchecked(loom, ns, collection)
+}
+
+fn load_staged_collection_unchecked<S: ObjectStore>(
+    loom: &Loom<S>,
+    ns: WorkspaceId,
+    collection: &str,
+) -> Result<Collection> {
     let path = normalize_path(&col_path(collection))?;
     match loom.work.get(&ns).and_then(|work| work.get(&path)) {
         Some(StagedEntry::Document(root)) => {
             load_collection_from_document_root(loom, ns, collection, *root)
         }
-        Some(StagedEntry::File(file)) => load_collection_from_flat_manifest(
-            loom,
-            ns,
-            collection,
-            &loom.load_content(file.content_addr)?,
-        ),
         Some(_) => Err(LoomError::invalid(format!("{path:?} is not a document"))),
         None => Err(LoomError::not_found(format!(
             "document collection {collection:?} not staged"
         ))),
     }
-}
-
-fn load_collection_from_flat_manifest<S: ObjectStore>(
-    loom: &Loom<S>,
-    ns: WorkspaceId,
-    collection: &str,
-    manifest_bytes: &[u8],
-) -> Result<Collection> {
-    let manifest = DocumentCollectionManifest::decode(manifest_bytes)?;
-    if manifest.collection_id != collection {
-        return Err(LoomError::corrupt(
-            "document collection manifest id mismatch",
-        ));
-    }
-    let map_bytes = loom.read_file_reserved(ns, &document_map_path(collection))?;
-    if Digest::blake3(&map_bytes) != manifest.document_map_root {
-        return Err(LoomError::corrupt("document map root mismatch"));
-    }
-    let index_catalog_bytes = load_index_catalog_unchecked(loom, ns, collection)?.encode();
-    if Digest::blake3(&index_catalog_bytes) != manifest.index_catalog_root {
-        return Err(LoomError::corrupt("document index catalog root mismatch"));
-    }
-    if let Some(root) = manifest.tombstone_root {
-        load_document_tombstones(loom, ns, collection, root)?;
-    }
-    decode_flat_document_map(loom, ns, collection, &map_bytes)
 }
 
 fn load_collection_from_document_root<S: ObjectStore>(
@@ -1884,57 +2554,6 @@ fn decode_document_tombstones(bytes: &[u8]) -> Result<BTreeMap<String, DocumentT
     Ok(out)
 }
 
-fn decode_flat_document_map<S: ObjectStore>(
-    loom: &Loom<S>,
-    ns: WorkspaceId,
-    collection: &str,
-    bytes: &[u8],
-) -> Result<Collection> {
-    let mut fields = cbor::Fields::new(cbor::decode_array(bytes)?);
-    let schema = fields.text()?;
-    if schema != DOCUMENT_MAP_SCHEMA {
-        return Err(LoomError::corrupt("unknown document map schema"));
-    }
-    let raw_entries = fields.array()?;
-    fields.end()?;
-    // Parse and gate every entry before loading any body so a malformed map is rejected as a pure
-    // decode failure. The ordered document identifier map must contain each string id exactly once,
-    // in strictly ascending id order (the order the encoder emits from the id-keyed collection). A
-    // duplicate or out-of-order id is a negative-decode case, not a silent last-writer-wins overlay.
-    let mut parsed: Vec<(String, DocumentRecord)> = Vec::with_capacity(raw_entries.len());
-    for raw_entry in raw_entries {
-        let mut entry = cbor::Fields::new(cbor::as_array(raw_entry)?);
-        let document_id = DocumentId::from_cbor(entry.next_field()?)?;
-        let record = DocumentRecord::from_cbor(entry.next_field()?)?;
-        entry.end()?;
-        if record.document_id != document_id {
-            return Err(LoomError::corrupt("document map id mismatch"));
-        }
-        let id = match document_id {
-            DocumentId::String(id) => id,
-            _ => return Err(LoomError::corrupt("document map id is not string-backed")),
-        };
-        if let Some((previous_id, _)) = parsed.last() {
-            match id.cmp(previous_id) {
-                std::cmp::Ordering::Equal => {
-                    return Err(LoomError::corrupt("duplicate document id in document map"));
-                }
-                std::cmp::Ordering::Less => {
-                    return Err(LoomError::corrupt("document map ids out of order"));
-                }
-                std::cmp::Ordering::Greater => {}
-            }
-        }
-        parsed.push((id, record));
-    }
-    let mut out = Collection::new();
-    for (id, record) in parsed {
-        let body = load_document_body(loom, ns, collection, &record)?;
-        out.put(id, body);
-    }
-    Ok(out)
-}
-
 fn decode_prolly_document_map<S: ObjectStore>(
     loom: &Loom<S>,
     ns: WorkspaceId,
@@ -2028,6 +2647,55 @@ fn load_chunked_document_body<S: ObjectStore>(
     Ok(out)
 }
 
+fn persist_document_put_and_indexes<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    ns: WorkspaceId,
+    collection: &str,
+    value: &Collection,
+    id: &str,
+    states: Vec<(String, DocumentIndexState)>,
+) -> Result<()> {
+    if !loom.store().uses_mutable_overlay_current_records() {
+        put_collection_unchecked(loom, ns, collection, value)?;
+        return write_index_states_unchecked(loom, ns, collection, states);
+    }
+    let state_before = loom.export_state();
+    let result = (|| {
+        write_index_states_unchecked(loom, ns, collection, states)?;
+        put_document_current_overlay_unchecked(loom, ns, collection, value, id, value.get(id))
+    })();
+    if let Err(error) = result {
+        loom.import_state(&state_before)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn persist_document_delete_and_indexes<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    ns: WorkspaceId,
+    collection: &str,
+    value: &Collection,
+    id: &str,
+    old: Option<&[u8]>,
+    states: Vec<(String, DocumentIndexState)>,
+) -> Result<()> {
+    if !loom.store().uses_mutable_overlay_current_records() {
+        put_deleted_collection_unchecked(loom, ns, collection, value, id, old)?;
+        return write_index_states_unchecked(loom, ns, collection, states);
+    }
+    let state_before = loom.export_state();
+    let result = (|| {
+        write_index_states_unchecked(loom, ns, collection, states)?;
+        put_document_current_overlay_unchecked(loom, ns, collection, value, id, None)
+    })();
+    if let Err(error) = result {
+        loom.import_state(&state_before)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Put document `doc` at string `id` in value `collection` of `ns` (selected by the caller's selector),
 /// creating the value and the `document` facet if absent, and stage it. A later put at the same id
 /// replaces the document.
@@ -2043,8 +2711,7 @@ pub fn doc_put<S: ObjectStore>(
     let old = col.get(id).map(<[u8]>::to_vec);
     col.put(id, doc);
     let states = prepare_indexes_for_put_unchecked(loom, ns, collection, &col, id, old.as_deref())?;
-    put_collection_unchecked(loom, ns, collection, &col)?;
-    write_index_states_unchecked(loom, ns, collection, states)
+    persist_document_put_and_indexes(loom, ns, collection, &col, id, states)
 }
 
 fn document_digest<S: ObjectStore>(loom: &Loom<S>, bytes: &[u8]) -> Digest {
@@ -2166,8 +2833,7 @@ pub fn document_put_binary<S: ObjectStore>(
     let digest = document_digest(loom, &bytes);
     col.put(id, bytes);
     let states = prepare_indexes_for_put_unchecked(loom, ns, collection, &col, id, old.as_deref())?;
-    put_collection_unchecked(loom, ns, collection, &col)?;
-    write_index_states_unchecked(loom, ns, collection, states)?;
+    persist_document_put_and_indexes(loom, ns, collection, &col, id, states)?;
     Ok(digest)
 }
 
@@ -2187,8 +2853,7 @@ pub fn document_put_binary_with_request<S: ObjectStore>(
     let entity_tag = document_entity_tag(loom, &bytes);
     col.put(id, bytes);
     let states = prepare_indexes_for_put_unchecked(loom, ns, collection, &col, id, old.as_deref())?;
-    put_collection_unchecked(loom, ns, collection, &col)?;
-    write_index_states_unchecked(loom, ns, collection, states)?;
+    persist_document_put_and_indexes(loom, ns, collection, &col, id, states)?;
     Ok(DocumentMutationResult {
         digest,
         outcome: CompareOutcome::applied(Some(entity_tag)),
@@ -2251,8 +2916,7 @@ pub fn document_delete_with_request<S: ObjectStore>(
     col.delete(id);
     let states =
         prepare_indexes_for_delete_unchecked(loom, ns, collection, &col, id, old.as_deref())?;
-    put_deleted_collection_unchecked(loom, ns, collection, &col, id, old.as_deref())?;
-    write_index_states_unchecked(loom, ns, collection, states)?;
+    persist_document_delete_and_indexes(loom, ns, collection, &col, id, old.as_deref(), states)?;
     Ok(CompareOutcome::applied(None))
 }
 
@@ -2496,10 +3160,68 @@ pub fn doc_delete<S: ObjectStore>(
     if present {
         let states =
             prepare_indexes_for_delete_unchecked(loom, ns, collection, &col, id, old.as_deref())?;
-        put_deleted_collection_unchecked(loom, ns, collection, &col, id, old.as_deref())?;
-        write_index_states_unchecked(loom, ns, collection, states)?;
+        persist_document_delete_and_indexes(
+            loom,
+            ns,
+            collection,
+            &col,
+            id,
+            old.as_deref(),
+            states,
+        )?;
     }
     Ok(present)
+}
+
+/// Remove `collection` and its structured document roots; returns whether it existed.
+pub fn doc_delete_collection<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    ns: WorkspaceId,
+    collection: &str,
+) -> Result<bool> {
+    loom.authorize_collection(ns, FacetKind::Document, collection, AclRight::Write)?;
+    let existed = match load_collection_unchecked(loom, ns, collection) {
+        Ok(_) => true,
+        Err(error) if error.code == Code::NotFound => {
+            load_collection_manifest_unchecked(loom, ns, collection)?.is_some()
+        }
+        Err(error) => return Err(error),
+    };
+    if !existed {
+        return Ok(false);
+    }
+    let state_before = loom.export_state();
+    let exact_or_prefixes = document_component_prefixes(collection);
+    let index_state_dir = index_state_dir(collection);
+    let paths: Vec<String> = loom
+        .staged_paths(ns)
+        .into_iter()
+        .filter(|path| {
+            exact_or_prefixes
+                .iter()
+                .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
+                || path == &index_state_dir
+                || path.starts_with(&format!("{index_state_dir}/"))
+        })
+        .collect();
+    let result = (|| {
+        for path in paths {
+            loom.remove_file_reserved(ns, &path)?;
+        }
+        if loom.store().uses_mutable_overlay_current_records() {
+            put_document_current_overlay_tombstone(
+                loom,
+                document_current_head_key(ns, collection)?,
+                ns,
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        loom.import_state(&state_before)?;
+        return Err(error);
+    }
+    Ok(true)
 }
 
 /// The whole value named `collection` in id order, or an empty value when absent.
@@ -2532,6 +3254,7 @@ pub fn doc_list_collections<S: ObjectStore>(
             Some(rest.to_string())
         })
         .collect();
+    out.extend(overlay_document_collections(loom, ns)?);
     out.sort();
     out.dedup();
     Ok(out)
@@ -3434,6 +4157,21 @@ fn validate_document_text_field(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_document_collection_name(collection: &str) -> Result<()> {
+    if collection.is_empty()
+        || collection == "."
+        || collection == ".."
+        || collection.starts_with('.')
+        || collection.contains('/')
+        || collection.contains('\0')
+    {
+        return Err(crate::LoomError::invalid(
+            "document collection must be one non-reserved path segment",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_index_name(name: &str) -> Result<()> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(crate::LoomError::invalid("invalid document index name"));
@@ -3458,6 +4196,206 @@ mod tests {
     use crate::identity::IdentityStore;
     use crate::provider::memory::MemoryStore;
     use crate::workspace::{FacetKind, WorkspaceId};
+    use crate::{
+        CommitReceipt, FacetWriteOp, MutableOverlay, OverlayEntryKind, OverlayOwnerToken,
+        OverlayReadSnapshot, OverlaySnapshot, WorkflowTransaction, WriteOutcome,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn document_collection_name_is_one_non_reserved_segment() {
+        let mut loom = Loom::new(MemoryStore::new());
+        let ns = loom
+            .registry_mut()
+            .create(FacetKind::Document, None, WorkspaceId::from_bytes([65; 16]))
+            .unwrap();
+
+        for invalid in ["", ".", "..", ".maps", "decisions/MX-405", "bad\0name"] {
+            let error = document_put_text(&mut loom, ns, invalid, "id", "value", None).unwrap_err();
+            assert_eq!(error.code, Code::InvalidArgument);
+            assert!(
+                error
+                    .message
+                    .contains("document collection must be one non-reserved path segment")
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingOverlayStore {
+        inner: MemoryStore,
+        overlay: Mutex<MutableOverlay>,
+        snapshot_opens: Arc<AtomicU64>,
+    }
+
+    impl CountingOverlayStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                overlay: Mutex::new(MutableOverlay::new()),
+                snapshot_opens: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn snapshot_opens(&self) -> u64 {
+            self.snapshot_opens.load(Ordering::Relaxed)
+        }
+    }
+
+    impl ObjectStore for CountingOverlayStore {
+        fn put(&self, canonical: &[u8]) -> Result<Digest> {
+            self.inner.put(canonical)
+        }
+
+        fn get(&self, digest: &Digest) -> Result<Option<Vec<u8>>> {
+            self.inner.get(digest)
+        }
+
+        fn has(&self, digest: &Digest) -> Result<bool> {
+            self.inner.has(digest)
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn put_mutable_overlay_value(
+            &self,
+            key: OverlayKey,
+            payload: Vec<u8>,
+        ) -> Result<OverlayOwnerToken> {
+            let _ = payload;
+            Ok(OverlayOwnerToken::from_bytes(
+                *Digest::blake3(key.as_bytes()).bytes(),
+            ))
+        }
+
+        fn put_mutable_overlay_tombstone(&self, key: OverlayKey) -> Result<OverlayOwnerToken> {
+            Ok(OverlayOwnerToken::from_bytes(
+                *Digest::blake3(key.as_bytes()).bytes(),
+            ))
+        }
+
+        fn uses_mutable_overlay_current_records(&self) -> bool {
+            true
+        }
+
+        fn mutable_overlay_current_entry(
+            &self,
+            key: &OverlayKey,
+        ) -> Result<Option<crate::MutableOverlayEntrySnapshot>> {
+            Ok(self.overlay.lock().unwrap().current_entry(key))
+        }
+
+        fn mutable_overlay_generation(&self) -> Result<crate::OverlayGeneration> {
+            Ok(self.overlay.lock().unwrap().generation())
+        }
+
+        fn commit_workflow_transaction(&self, txn: WorkflowTransaction) -> Result<CommitReceipt> {
+            txn.validate()?;
+            for (_, canonical) in &txn.owner_state.objects {
+                self.inner.put(canonical)?;
+            }
+            let mut overlay = self.overlay.lock().unwrap();
+            if txn
+                .expected_generation
+                .is_some_and(|expected| expected != overlay.generation())
+            {
+                return Err(LoomError::new(
+                    Code::Conflict,
+                    "overlay generation is stale",
+                ));
+            }
+            let mut outcomes = Vec::new();
+            for write in txn.writes {
+                let expected = write.expected.as_ref().map(|token| &token.0);
+                let (owner_token, change) = match write.op {
+                    FacetWriteOp::Put { payload } => (
+                        overlay.put_value(write.target.clone(), expected, payload)?,
+                        OverlayEntryKind::Value,
+                    ),
+                    FacetWriteOp::Delete => (
+                        overlay.put_tombstone(write.target.clone(), expected)?,
+                        OverlayEntryKind::Tombstone,
+                    ),
+                };
+                outcomes.push(WriteOutcome {
+                    facet: write.facet,
+                    target: write.target,
+                    owner_token,
+                    change,
+                });
+            }
+            let generation = overlay.generation();
+            Ok(CommitReceipt {
+                generation,
+                root_after: Digest::blake3(&generation.as_u64().to_be_bytes()),
+                writes: outcomes,
+                replayed: false,
+            })
+        }
+
+        fn open_mutable_overlay_read_snapshot(
+            &self,
+            _snapshot: OverlaySnapshot,
+            owner: Option<&str>,
+        ) -> Result<OverlayReadSnapshot> {
+            let _ = owner;
+            self.snapshot_opens.fetch_add(1, Ordering::Relaxed);
+            Ok(OverlayReadSnapshot::new(
+                self.overlay.lock().unwrap().snapshot(),
+                None,
+                None,
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnsupportedOverlayStore {
+        inner: MemoryStore,
+    }
+
+    impl UnsupportedOverlayStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+            }
+        }
+    }
+
+    impl ObjectStore for UnsupportedOverlayStore {
+        fn put(&self, canonical: &[u8]) -> Result<Digest> {
+            self.inner.put(canonical)
+        }
+
+        fn get(&self, digest: &Digest) -> Result<Option<Vec<u8>>> {
+            self.inner.get(digest)
+        }
+
+        fn has(&self, digest: &Digest) -> Result<bool> {
+            self.inner.has(digest)
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn uses_mutable_overlay_current_records(&self) -> bool {
+            true
+        }
+
+        fn mutable_overlay_current_entry(
+            &self,
+            _key: &OverlayKey,
+        ) -> Result<Option<crate::MutableOverlayEntrySnapshot>> {
+            Ok(None)
+        }
+
+        fn mutable_overlay_generation(&self) -> Result<crate::OverlayGeneration> {
+            Ok(crate::OverlayGeneration::new(0))
+        }
+    }
 
     fn test_document_manifest<S: ObjectStore>(
         loom: &Loom<S>,
@@ -3612,51 +4550,6 @@ mod tests {
             "got: {}",
             err.message
         );
-    }
-
-    #[test]
-    fn document_map_decode_rejects_duplicate_and_out_of_order_ids() {
-        let mut loom = Loom::new(MemoryStore::new());
-        let ns = loom
-            .registry_mut()
-            .create(FacetKind::Document, None, WorkspaceId::from_bytes([41; 16]))
-            .unwrap();
-
-        let entry = |id: &str| -> CborValue {
-            let document_id = DocumentId::string(id).unwrap();
-            let record = DocumentRecord::new(
-                document_id.clone(),
-                DocumentBodyRef::Direct {
-                    digest: Digest::blake3(id.as_bytes()),
-                },
-                id.len() as u64,
-                "etag",
-                "rev",
-                DocumentRecordState::Live,
-            )
-            .unwrap();
-            CborValue::Array(vec![document_id.to_cbor(), record.to_cbor()])
-        };
-
-        let duplicate = cbor::encode(&CborValue::Array(vec![
-            CborValue::Text(DOCUMENT_MAP_SCHEMA.to_string()),
-            CborValue::Array(vec![entry("dup"), entry("dup")]),
-        ]));
-        let err = decode_flat_document_map(&loom, ns, "notes", &duplicate).unwrap_err();
-        assert_eq!(err.code, Code::CorruptObject);
-        assert!(
-            err.message.contains("duplicate document id"),
-            "got: {}",
-            err.message
-        );
-
-        let unordered = cbor::encode(&CborValue::Array(vec![
-            CborValue::Text(DOCUMENT_MAP_SCHEMA.to_string()),
-            CborValue::Array(vec![entry("b"), entry("a")]),
-        ]));
-        let err = decode_flat_document_map(&loom, ns, "notes", &unordered).unwrap_err();
-        assert_eq!(err.code, Code::CorruptObject);
-        assert!(err.message.contains("out of order"), "got: {}", err.message);
     }
 
     #[test]
@@ -3911,6 +4804,44 @@ mod tests {
     }
 
     #[test]
+    fn document_current_read_opens_provider_mvcc_snapshot() {
+        let mut loom = Loom::new(CountingOverlayStore::new());
+        let ns = loom
+            .registry_mut()
+            .create(FacetKind::Document, None, WorkspaceId::from_bytes([64; 16]))
+            .unwrap();
+        document_put_text(&mut loom, ns, "notes", "a", "one", None).unwrap();
+        let before = loom.store().snapshot_opens();
+
+        let read = document_get_text(&loom, ns, "notes", "a").unwrap().unwrap();
+
+        assert_eq!(read.text, "one");
+        assert!(
+            loom.store().snapshot_opens() > before,
+            "document current read must open the provider MVCC snapshot route"
+        );
+    }
+
+    #[test]
+    fn document_current_write_fails_closed_without_workflow_transactions() {
+        let mut loom = Loom::new(UnsupportedOverlayStore::new());
+        let ns = loom
+            .registry_mut()
+            .create(FacetKind::Document, None, WorkspaceId::from_bytes([65; 16]))
+            .unwrap();
+
+        let error = document_put_text(&mut loom, ns, "notes", "a", "one", None).unwrap_err();
+
+        assert_eq!(error.code, Code::Unsupported);
+        assert!(loom.staged_paths(ns).is_empty());
+        assert!(
+            document_get_text(&loom, ns, "notes", "a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn document_body_ref_threshold_boundary_is_pinned() {
         let mut loom = Loom::new(MemoryStore::new());
         let ns = loom
@@ -4010,6 +4941,57 @@ mod tests {
             doc_list_collections(&loom, ns).unwrap(),
             vec!["people".to_string()]
         );
+    }
+
+    #[test]
+    fn delete_collection_removes_visible_and_structured_roots() {
+        let mut loom = Loom::new(MemoryStore::new());
+        let ns = loom
+            .registry_mut()
+            .create(FacetKind::Document, None, WorkspaceId::from_bytes([47; 16]))
+            .unwrap();
+        doc_put(&mut loom, ns, "people", "ann", br#"{"x":1}"#.to_vec()).unwrap();
+        doc_create_index(
+            &mut loom,
+            ns,
+            "people",
+            DocumentIndexDef::new("by_x", DocumentFieldPath::dotted("x").unwrap(), false).unwrap(),
+        )
+        .unwrap();
+        doc_put(&mut loom, ns, "notes", "n1", br#"{"n":1}"#.to_vec()).unwrap();
+
+        assert!(doc_delete_collection(&mut loom, ns, "people").unwrap());
+
+        assert_eq!(
+            doc_list_collections(&loom, ns).unwrap(),
+            vec!["notes".to_string()]
+        );
+        assert_eq!(
+            loom.list_collections(ns, FacetKind::Document),
+            vec!["notes"]
+        );
+        assert!(doc_list(&loom, ns, "people").unwrap().is_empty());
+        assert!(doc_list(&loom, ns, "notes").unwrap().get("n1").is_some());
+        assert!(
+            loom.staged_paths(ns)
+                .into_iter()
+                .filter_map(|path| path
+                    .strip_prefix(&format!("{}/", facet_root(FacetKind::Document)))
+                    .map(str::to_string))
+                .all(|path| !path.contains(&collection_key("people")))
+        );
+    }
+
+    #[test]
+    fn delete_collection_absent_is_noop() {
+        let mut loom = Loom::new(MemoryStore::new());
+        let ns = loom
+            .registry_mut()
+            .create(FacetKind::Document, None, WorkspaceId::from_bytes([48; 16]))
+            .unwrap();
+
+        assert!(!doc_delete_collection(&mut loom, ns, "missing").unwrap());
+        assert!(doc_list_collections(&loom, ns).unwrap().is_empty());
     }
 
     #[test]

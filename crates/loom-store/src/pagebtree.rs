@@ -211,7 +211,6 @@ impl Tree<'_> {
         }
     }
 
-    #[cfg(test)]
     fn get_node(
         &mut self,
         page: PageId,
@@ -279,6 +278,34 @@ impl Tree<'_> {
                 out.push(node.entries[i]);
             }
             self.walk(node.children[node.entries.len()], depth + 1, out)?;
+        }
+        Ok(())
+    }
+
+    fn free_pages(&mut self, page: PageId, depth: usize) -> Result<()> {
+        if depth > MAX_DEPTH {
+            return Err(corrupt("btree deeper than the structural maximum"));
+        }
+        let node = self.read(page)?;
+        self.cur.free(page, 1);
+        if !node.is_leaf {
+            for child in node.children {
+                self.free_pages(child, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_pages(&mut self, page: PageId, depth: usize, out: &mut Vec<PageId>) -> Result<()> {
+        if depth > MAX_DEPTH {
+            return Err(corrupt("btree deeper than the structural maximum"));
+        }
+        let node = self.read(page)?;
+        out.push(page);
+        if !node.is_leaf {
+            for child in node.children {
+                self.collect_pages(child, depth + 1, out)?;
+            }
         }
         Ok(())
     }
@@ -544,6 +571,10 @@ fn decode_node_page(buf: &[u8; PAGE]) -> Result<Node> {
     })
 }
 
+pub(crate) fn looks_like_node_page(buf: &[u8; PAGE]) -> bool {
+    decode_node_page(buf).is_ok()
+}
+
 fn walk_with_page_reader(
     page_count: u64,
     read_page: &mut impl FnMut(PageId) -> Result<[u8; PAGE]>,
@@ -649,7 +680,6 @@ pub(crate) fn delete(
     }
 }
 
-#[cfg(test)]
 pub(crate) fn get(
     file: &mut dyn BackingIo,
     header_len: u64,
@@ -697,6 +727,39 @@ pub(crate) fn load_all(
     };
     let mut out = Vec::new();
     t.walk(root, 0, &mut out)?;
+    Ok(out)
+}
+
+pub(crate) fn free_all(
+    file: &mut dyn BackingIo,
+    header_len: u64,
+    cur: &mut PageAllocator,
+    root: PageId,
+    page_count: u64,
+) -> Result<()> {
+    let mut t = Tree {
+        file,
+        cur,
+        header_len,
+        page_count,
+    };
+    t.free_pages(root, 0)
+}
+
+pub(crate) fn collect_pages(
+    file: &mut dyn BackingIo,
+    header_len: u64,
+    root: PageId,
+    page_count: u64,
+) -> Result<Vec<PageId>> {
+    let mut t = Tree {
+        file,
+        cur: &mut PageAllocator::new(page_count, 0, Vec::new()),
+        header_len,
+        page_count,
+    };
+    let mut out = Vec::new();
+    t.collect_pages(root, 0, &mut out)?;
     Ok(out)
 }
 

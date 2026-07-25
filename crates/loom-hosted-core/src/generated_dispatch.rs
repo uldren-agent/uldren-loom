@@ -6766,6 +6766,33 @@ pub fn dispatch(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
             ))
         }
+        ("Document", "delete_collection") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let collection = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Document>::delete_collection(
+                client,
+                engine.clone(),
+                workspace,
+                collection,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
         ("Document", "delete_indexed") => {
             let workspace = {
                 let __v = take(args, 1)?;

@@ -121,6 +121,25 @@ pub(crate) fn doc_delete(
     }
     Ok(present)
 }
+
+/// Remove collection `collection` and its structured roots; returns whether it was present.
+#[pyfunction]
+#[pyo3(signature = (path, workspace, collection, passphrase=None))]
+pub(crate) fn doc_delete_collection(
+    path: &str,
+    workspace: &str,
+    collection: &str,
+    passphrase: Option<&str>,
+) -> PyResult<bool> {
+    let mut loom = open_loom_unlocked(path, key_spec(passphrase).as_ref()).map_err(py_err)?;
+    let ns = resolve_workspace_arg(&loom, workspace)?;
+    let present = loom_core::doc_delete_collection(&mut loom, ns, collection).map_err(py_err)?;
+    if present {
+        save_loom(&mut loom).map_err(py_err)?;
+    }
+    Ok(present)
+}
+
 /// List collection `collection` as its canonical binary representation.
 #[pyfunction]
 #[pyo3(signature = (path, workspace, collection, passphrase=None))]

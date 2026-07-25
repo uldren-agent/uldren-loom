@@ -9,6 +9,7 @@ struct GcReclaimEvidence {
     reference_root: Option<Digest>,
     control_root: Option<Digest>,
     index_root: Option<PageId>,
+    overlay_root: Option<PageId>,
     control_fingerprint: Option<Digest>,
     derived_roots: BTreeSet<Digest>,
 }
@@ -194,35 +195,28 @@ impl FileStore {
                 || keep_control.as_ref() == Some(digest)
                 || keep_derived.contains(digest)
         };
-        // Group index entries by record page: whether any object on the page survives, and the object
-        // count (so a packed slab page, span 1, is distinguished from a single-object page that may be
-        // a multi-page large run).
+        // Group index entries by every physical record page. A large record may use an old contiguous
+        // run or a fragmented page chain, while multiple small objects may share one slab page.
         let mut page_live: BTreeMap<u64, bool> = BTreeMap::new();
-        let mut page_objs: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut record_pages = BTreeMap::<[u8; 32], Vec<u64>>::new();
+        let mut file = self.file.lock().map_err(|_| poisoned())?;
         for (digest, loc) in &index_snapshot {
-            let p = loc.global_page();
-            *page_live.entry(p).or_insert(false) |= alive(digest);
-            *page_objs.entry(p).or_insert(0) += 1;
+            let pages =
+                crate::record_io::blob_pages(&mut **file, loc.global_page(), evidence.page_count)?;
+            for page in &pages {
+                *page_live.entry(*page).or_insert(false) |= alive(digest);
+            }
+            record_pages.insert(*digest, pages);
         }
-        // Resolve each page's span (slab = 1 page; a single-object page may be a large run, so read its
-        // header) and accumulate per-segment live vs total *pages*. Pages, not object counts, are the
-        // right basis for the decision: object counts mislead when large multi-page records dominate.
-        let mut page_span_map: BTreeMap<u64, u64> = BTreeMap::new();
+        drop(file);
         let mut occupancy: BTreeMap<u64, (u64, u64)> = BTreeMap::new(); // segment -> (live_pages, total_pages)
-        for (&p, &objs) in &page_objs {
-            let span = if objs > 1 {
-                1
-            } else {
-                let mut file = self.file.lock().map_err(|_| poisoned())?;
-                page_span(&mut **file, p)?
-            };
-            page_span_map.insert(p, span);
+        for (&page, &is_live) in &page_live {
             let e = occupancy
-                .entry(p / page::PAGES_PER_SEGMENT)
+                .entry(page / page::PAGES_PER_SEGMENT)
                 .or_insert((0, 0));
-            e.1 += span;
-            if page_live[&p] {
-                e.0 += span;
+            e.1 += 1;
+            if is_live {
+                e.0 += 1;
             }
         }
         let chosen: BTreeSet<u64> =
@@ -232,23 +226,49 @@ impl FileStore {
         if chosen.is_empty() {
             return Ok(GcStats::default());
         }
+        let active_segment = evidence
+            .page_count
+            .saturating_sub(1)
+            .checked_div(page::PAGES_PER_SEGMENT)
+            .unwrap_or(0);
+        let evacuation_segments = chosen
+            .iter()
+            .copied()
+            .filter(|segment| *segment != active_segment)
+            .collect::<BTreeSet<_>>();
         let mut survivors: Vec<(Digest, Vec<u8>)> = Vec::new();
         let mut dropped: Vec<[u8; 32]> = Vec::new();
         let mut pages_to_free: BTreeSet<u64> = BTreeSet::new();
         for (digest, loc) in &index_snapshot {
-            if !chosen.contains(&loc.segment_id) {
+            let pages = &record_pages[digest];
+            let touches_chosen = pages
+                .iter()
+                .any(|page| chosen.contains(&(page / page::PAGES_PER_SEGMENT)));
+            if !touches_chosen {
                 continue;
             }
-            pages_to_free.insert(loc.global_page());
-            if alive(digest) {
+            let touches_evacuation = pages
+                .iter()
+                .any(|page| evacuation_segments.contains(&(page / page::PAGES_PER_SEGMENT)));
+            if alive(digest) && touches_evacuation {
+                pages_to_free.extend(pages);
                 let d = Digest::of(self.digest_algo, *digest);
                 let payload = self
                     .read_indexed_payload_snapshot(loc, evidence.page_count, &d)?
                     .ok_or_else(|| corrupt("live object missing during gc"))?;
                 survivors.push((d, payload));
-            } else {
+            } else if !alive(digest) {
                 dropped.push(*digest);
+                pages_to_free.extend(
+                    pages
+                        .iter()
+                        .copied()
+                        .filter(|page| !page_live.get(page).copied().unwrap_or(false)),
+                );
             }
+        }
+        if survivors.is_empty() && dropped.is_empty() {
+            return Ok(GcStats::default());
         }
 
         // Phase B: one transaction - relocate survivors to fresh pages, point-update their index
@@ -311,14 +331,12 @@ impl FileStore {
                 index_root =
                     pagebtree::delete(&mut **file, DATA_START, &mut alloc, index_root, key, bound)?;
             }
-            // Free the reclaimed segments' record pages: a slab page is one page, a large record its
-            // whole run. The pages were never in the seeded free list, so survivor/index writes above
-            // could not have reused them.
+            // The pages were never in the seeded free list, so survivor/index writes above could not
+            // have reused them.
             let mut pages_freed = 0u64;
             for &p in &pages_to_free {
-                let span = page_span_map[&p];
-                alloc.free(PageId(p), span);
-                pages_freed += span;
+                alloc.free(PageId(p), 1);
+                pages_freed += 1;
             }
             let object_count = inner
                 .maintenance
@@ -330,6 +348,7 @@ impl FileStore {
                 new_gen,
                 object_count,
                 index_root,
+                inner.overlay_root,
                 inner.open_segment,
                 keep_reference,
                 keep_control,
@@ -342,6 +361,7 @@ impl FileStore {
                 ),
                 inner.encryption_meta.clone(),
                 self.digest_algo,
+                None,
             )?;
             (roots, index_root, placements, pages_freed)
         };
@@ -351,6 +371,7 @@ impl FileStore {
         inner.generation = new_gen;
         inner.page_count = root_page_count;
         inner.index_root = index_root;
+        inner.overlay_root = roots.overlay_root;
         Self::clear_index_page_cache_locked(&mut inner);
         inner.free = roots.free;
         inner.freemap = roots.freemap;
@@ -365,7 +386,7 @@ impl FileStore {
         }
         drop(inner);
         let mut stats = GcStats {
-            segments_reclaimed: chosen.len() as u64,
+            segments_reclaimed: evacuation_segments.len() as u64,
             pages_freed,
             pages_trimmed,
             objects_relocated: survivors.len() as u64,
@@ -402,6 +423,7 @@ impl FileStore {
                 new_gen,
                 inner.maintenance.object_count,
                 inner.index_root,
+                inner.overlay_root,
                 inner.open_segment,
                 inner.reference_root.map(|d| *d.bytes()),
                 inner.control_root.map(|d| *d.bytes()),
@@ -414,12 +436,14 @@ impl FileStore {
                 ),
                 inner.encryption_meta.clone(),
                 self.digest_algo,
+                None,
             )?
         };
         let trimmed = before.saturating_sub(roots.page_count);
         let root_page_count = roots.page_count;
         inner.generation = new_gen;
         inner.page_count = root_page_count;
+        inner.overlay_root = roots.overlay_root;
         inner.free = roots.free;
         inner.freemap = roots.freemap;
         inner.region_table_root = Some(roots.region_table_root);
@@ -480,39 +504,55 @@ impl FileStore {
         }
         let scan_start = tail_end.saturating_sub(max_pages);
         let index_snapshot = self.index_snapshot_from_evidence(&evidence, None)?;
-        let mut page_objs: BTreeMap<u64, u32> = BTreeMap::new();
-        for (_, loc) in &index_snapshot {
-            *page_objs.entry(loc.global_page()).or_insert(0) += 1;
+        let mut physical = Vec::with_capacity(index_snapshot.len());
+        {
+            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            for (key, loc) in index_snapshot {
+                let pages = crate::record_io::blob_pages(
+                    &mut **file,
+                    loc.global_page(),
+                    evidence.page_count,
+                )?;
+                physical.push((key, loc, pages));
+            }
         }
-        let mut selected: Vec<(Digest, RecordLoc, u64, Vec<u8>)> = Vec::new();
+        let mut selected: Vec<(Digest, RecordLoc, Vec<u64>, Vec<u8>)> = Vec::new();
+        let mut selected_page_set = BTreeSet::new();
         let mut selected_pages = 0u64;
         let mut selected_bytes = 0u64;
-        let mut sorted = index_snapshot;
-        sorted.sort_by_key(|(_, loc)| std::cmp::Reverse(loc.global_page()));
-        for (key, loc) in sorted {
-            let page = loc.global_page();
-            if page < scan_start || page >= tail_end || page_objs.get(&page) != Some(&1) {
+        physical.sort_by_key(|(_, _, pages)| {
+            std::cmp::Reverse(pages.iter().copied().max().unwrap_or(0))
+        });
+        for (key, loc, pages) in physical {
+            if !pages
+                .iter()
+                .any(|page| *page >= scan_start && *page < tail_end)
+            {
                 continue;
             }
-            let span = {
-                let mut file = self.file.lock().map_err(|_| poisoned())?;
-                page_span(&mut **file, page)?
-            };
-            if selected.len() as u64 >= max_objects
-                || selected_pages.saturating_add(span) > max_pages
+            let additional_pages = pages
+                .iter()
+                .filter(|page| !selected_page_set.contains(*page))
+                .count() as u64;
+            if additional_pages > 0
+                && (selected.len() as u64 >= max_objects
+                    || selected_pages.saturating_add(additional_pages) > max_pages)
             {
-                break;
+                continue;
             }
             let digest = Digest::of(self.digest_algo, key);
             let payload = self
                 .read_indexed_payload_snapshot(&loc, evidence.page_count, &digest)?
                 .ok_or_else(|| corrupt("tail object missing during compaction"))?;
-            if selected_bytes.saturating_add(payload.len() as u64) > max_bytes {
-                break;
+            if additional_pages > 0
+                && selected_bytes.saturating_add(payload.len() as u64) > max_bytes
+            {
+                continue;
             }
-            selected_pages = selected_pages.saturating_add(span);
+            selected_pages = selected_pages.saturating_add(additional_pages);
             selected_bytes = selected_bytes.saturating_add(payload.len() as u64);
-            selected.push((digest, loc, span, payload));
+            selected_page_set.extend(&pages);
+            selected.push((digest, loc, pages, payload));
         }
         if selected.is_empty() {
             return Ok(TailCompactionStats {
@@ -552,10 +592,6 @@ impl FileStore {
         let before_page_count = inner.page_count;
         let keep_reference = inner.reference_root.map(|d| *d.bytes());
         let keep_control = inner.control_root.map(|d| *d.bytes());
-        let selected_pages_set: BTreeSet<u64> = selected
-            .iter()
-            .map(|(_, loc, _, _)| loc.global_page())
-            .collect();
         let (roots, index_root, placements, relocated_pages) = {
             let mut file = self.file.lock().map_err(|_| poisoned())?;
             let mut alloc = PageAllocator::new_reusing_before(
@@ -571,15 +607,17 @@ impl FileStore {
             let dek = self.dek.lock().map_err(|_| poisoned())?;
             let placements = write_record_pages(&mut **file, &mut alloc, &borrowed, dek.as_ref())?;
             drop(dek);
-            if placements
-                .iter()
-                .any(|(_, loc)| loc.global_page() >= scan_start)
-            {
-                return Ok(TailCompactionStats {
-                    attempted: true,
-                    skipped: true,
-                    ..TailCompactionStats::default()
-                });
+            for (_, loc) in &placements {
+                if crate::record_io::blob_pages(&mut **file, loc.global_page(), alloc.page_count())?
+                    .iter()
+                    .any(|page| *page >= scan_start)
+                {
+                    return Ok(TailCompactionStats {
+                        attempted: true,
+                        skipped: true,
+                        ..TailCompactionStats::default()
+                    });
+                }
             }
             let mut index_root = inner.index_root;
             for (key, loc) in &placements {
@@ -595,15 +633,15 @@ impl FileStore {
                 )?);
             }
             let mut relocated_pages = 0u64;
-            for (_, loc, span, _) in &selected {
-                alloc.free(PageId(loc.global_page()), *span);
-                relocated_pages = relocated_pages.saturating_add(*span);
+            for page in &selected_page_set {
+                alloc.free(PageId(*page), 1);
+                relocated_pages = relocated_pages.saturating_add(1);
             }
             let touched_segments: BTreeSet<u64> = placements
                 .iter()
                 .map(|(_, loc)| loc.segment_id)
                 .chain(
-                    selected_pages_set
+                    selected_page_set
                         .iter()
                         .map(|page| page / page::PAGES_PER_SEGMENT),
                 )
@@ -614,6 +652,7 @@ impl FileStore {
                 new_gen,
                 inner.maintenance.object_count,
                 index_root,
+                inner.overlay_root,
                 inner.open_segment,
                 keep_reference,
                 keep_control,
@@ -626,6 +665,7 @@ impl FileStore {
                 ),
                 inner.encryption_meta.clone(),
                 self.digest_algo,
+                None,
             )?;
             (roots, index_root, placements, relocated_pages)
         };
@@ -633,6 +673,7 @@ impl FileStore {
         inner.generation = new_gen;
         inner.page_count = root_page_count;
         inner.index_root = index_root;
+        inner.overlay_root = roots.overlay_root;
         Self::clear_index_page_cache_locked(&mut inner);
         inner.free = roots.free;
         inner.freemap = roots.freemap;
@@ -691,6 +732,7 @@ impl FileStore {
             reference_root: inner.reference_root,
             control_root: inner.control_root,
             index_root: inner.index_root,
+            overlay_root: inner.overlay_root,
             control_fingerprint: self.control_reachability_fingerprint_from_map(control_map),
             derived_roots: self
                 .derived_payload_digests_from_control_map(control_map)?
@@ -774,6 +816,10 @@ impl FileStore {
                     .ok_or_else(|| corrupt("large record parse failure"))?;
                 decode_record(rec, digest, dek.as_ref(), self.digest_algo)?
             }
+            record::CHUNKED_BLOB_MAGIC => {
+                let rec = crate::record_io::read_chunked_blob(&mut **file, global, page_count)?;
+                decode_record(&rec, digest, dek.as_ref(), self.digest_algo)?
+            }
             _ => return Err(corrupt("bad record page magic on read")),
         };
         Ok(Some(payload))
@@ -852,6 +898,25 @@ impl FileStore {
                 self.materialize_index_locked(&mut i)?;
                 (i.index.keys().copied().collect(), i.encryption_meta.clone())
             };
+            let overlay_records = {
+                let overlay = self.mutable_overlay.lock().map_err(|_| poisoned())?;
+                let generation = overlay.generation().as_u64();
+                let entries = overlay.export_entries()?;
+                let mut records = Vec::new();
+                if generation > 0 || !entries.is_empty() {
+                    records.push((
+                        mutable_overlay_meta_address(),
+                        encode_mutable_overlay_meta(generation),
+                    ));
+                }
+                records.extend(entries.iter().map(|entry| {
+                    (
+                        mutable_overlay_entry_address(&entry.key),
+                        encode_mutable_overlay_entry(entry),
+                    )
+                }));
+                records
+            };
             // Read each retained object back through `get` (digest-verified) and collect it for packing.
             let mut retained: Vec<(Digest, Vec<u8>, Codec)> = Vec::with_capacity(keys.len());
             for k in &keys {
@@ -895,6 +960,14 @@ impl FileStore {
             };
             entries.sort_unstable_by_key(|e| e.0); // build_packed needs ascending, unique keys
             let index_root = pagebtree::build_packed(&mut out, DATA_START, &mut alloc, &entries)?;
+            let overlay_borrowed = overlay_records
+                .iter()
+                .map(|(key, value)| (*key, value.as_slice()))
+                .collect::<Vec<_>>();
+            let mut overlay_entries = write_blob_pages(&mut out, &mut alloc, &overlay_borrowed)?;
+            overlay_entries.sort_unstable_by_key(|e| e.0);
+            let overlay_root =
+                pagebtree::build_packed(&mut out, DATA_START, &mut alloc, &overlay_entries)?;
             let maintenance_page = alloc.extend(1);
             let rt_page = alloc.extend(1);
             let page_count = alloc.page_count();
@@ -916,6 +989,7 @@ impl FileStore {
                 index_root,
                 freemap_root: None, // a freshly compacted file has no dead pages
                 maintenance_root: Some(maintenance_page),
+                overlay_root,
                 open_segment: 0,
             };
             let mut rt_buf = [0u8; PAGE_SIZE as usize];

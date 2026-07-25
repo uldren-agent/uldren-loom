@@ -15,8 +15,10 @@ description = "Model Context Protocol host that projects an Uldren Loom as MCP t
 
 [dependencies]
 loom-core = { workspace = true }
+loom-client.workspace = true
 loom-codec = { workspace = true }
 loom-coordination = { workspace = true }
+loom-drive.workspace = true
 loom-wire = { workspace = true }
 loom-store = { workspace = true }
 loom-substrate = { workspace = true, features = ["studio-lifecycle", "studio-meetings", "studio-pages", "studio-surfaces"] }

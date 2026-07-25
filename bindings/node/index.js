@@ -653,6 +653,7 @@ module.exports.dataframePlanDigest = nativeBinding.dataframePlanDigest
 module.exports.dataframePreview = nativeBinding.dataframePreview
 module.exports.dataframeSourceDigests = nativeBinding.dataframeSourceDigests
 module.exports.docDelete = nativeBinding.docDelete
+module.exports.docDeleteCollection = nativeBinding.docDeleteCollection
 module.exports.docFindJson = nativeBinding.docFindJson
 module.exports.docGetBinary = nativeBinding.docGetBinary
 module.exports.docGetText = nativeBinding.docGetText

@@ -5,7 +5,9 @@
 This document specifies the source-backed byte-level format for the `SingleFile` provider
 (`crates/loom-store::FileStore`, 0004 §3.1). All multi-byte integers are little-endian unless stated.
 Offsets and lengths are in bytes. `uvarint` denotes unsigned LEB128. Target storage-format
-extensions are tracked by 0005a and are not part of this format until promoted.
+extensions are tracked by 0005a and are not part of this format until promoted. The mutable-overlay
+substrate target is specified in 0071 because it changes how high-churn current state is stored above
+the page engine without changing the source-backed v1 page layout by itself.
 
 > **Current implementation:** `FileStore` is a page engine. A `.loom` file has two 4096-byte
 > superblock slots, one 4096-byte journal-ring slot, then a 4096-byte page array. Object records are

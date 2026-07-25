@@ -79,6 +79,20 @@ actual fun Loom.docDelete(
     )
 
 
+actual fun Loom.docDeleteCollection(
+        path: String,
+        workspace: String,
+        collection: String,
+        passphrase: String?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: String?,
+    ): Boolean = LoomNative.nativeDocDeleteCollection(
+        path, workspace, collection, passphrase?.encodeToByteArray(), kek,
+        authPrincipal, authPassphrase?.encodeToByteArray(),
+    )
+
+
 actual fun Loom.docListBinary(
         path: String,
         workspace: String,

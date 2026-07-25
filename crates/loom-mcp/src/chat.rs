@@ -1,5 +1,5 @@
 use loom_core::error::{Code, LoomError};
-use loom_core::workspace::WorkspaceId;
+use loom_core::workspace::{FacetKind, WorkspaceId};
 use loom_core::{AclDomain, AclRight, Digest, Loom};
 use loom_store::FileStore;
 use loom_substrate::annotation::{EMOJI_REGISTRY_DIR, EmojiRegistry, emoji_registry_path};
@@ -11,12 +11,11 @@ use loom_substrate::chat::{
     chat_profile_operation_log_key,
 };
 use loom_substrate::versioning::{
-    BodyRef, ProfileRevisionUpdate, ProfileTransaction, ProfileTransactionState, RevisionIndex,
+    BodyRef, ProfileRevisionUpdate, ProfileTransaction, ProfileTransactionState,
+    load_current_revision_index, persist_current_revision_index_with_owner_state,
 };
 use loom_substrate::{ActorKind, OperationEnvelope, OperationEnvelopeInput};
 use serde::Serialize;
-
-use crate::substrate_revisions::{REVISION_INDEX_DIR, revision_index_path};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChatMessageSummary {
@@ -827,12 +826,7 @@ fn update_message_revision_index(
         | ChatOperationPayload::MessageRedacted { message_id, .. } => message_id,
         _ => return Ok(()),
     };
-    let index_path = revision_index_path(workspace_id)?;
-    let index = match loom.read_file_reserved(workspace, &index_path) {
-        Ok(bytes) => RevisionIndex::decode(&bytes)?,
-        Err(err) if err.code == Code::NotFound => RevisionIndex::new(),
-        Err(err) => return Err(err),
-    };
+    let index = load_current_revision_index(loom, workspace, workspace_id)?;
     let envelope = OperationEnvelope::decode(&record.envelope)?;
     let entity_id = format!("chat:{channel_id}:message:{message_id}");
     let expected_latest_revision = index
@@ -858,9 +852,20 @@ fn update_message_revision_index(
         record.root_after,
         vec![update],
     )?)?;
-    let index = state.into_revision_index();
-    loom.create_directory_reserved(workspace, REVISION_INDEX_DIR, true)?;
-    loom.write_file_reserved(workspace, &index_path, &index.encode()?, 0o100644)
+    let (reference_root, objects) = loom.save_state_objects()?;
+    persist_current_revision_index_with_owner_state(
+        loom,
+        workspace,
+        workspace_id,
+        FacetKind::Queue,
+        &state.into_revision_index(),
+        loom_core::WorkflowOwnerState {
+            objects,
+            reference: loom_core::WorkflowReferenceUpdate::Set(Some(reference_root)),
+            controls: Vec::new(),
+            audits: Vec::new(),
+        },
+    )
 }
 
 fn append_record(

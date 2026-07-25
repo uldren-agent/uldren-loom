@@ -970,6 +970,16 @@ internal object UldrenLoomNative {
         authPassphrase: ByteArray,
     ): Boolean
 
+    external fun nativeDocDeleteCollection(
+        loomPath: String,
+        workspace: String,
+        collection: String,
+        passphrase: ByteArray,
+        kek: ByteArray,
+        authPrincipal: String,
+        authPassphrase: ByteArray,
+    ): Boolean
+
     external fun nativeDocListBinary(
         loomPath: String,
         workspace: String,

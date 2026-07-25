@@ -60,6 +60,13 @@ Bindings build with their own toolchains - see each `bindings/*/README.md` and `
 - If a test must stay in `src` because it exercises private helpers, keep it unit-sized. It must not bind sockets, launch daemons, download models, require devices or emulators, or perform production-cost crypto.
 - `just test-integration` runs integration diagnostics. It is not a substitute for `just ci`.
 
+## Test sizing
+
+- Default tests (unit and focused tests in the `just ci` path) use small bounded loops that finish in milliseconds. Cap a repeated write, insert, or placement loop at a low iteration count (aim for 50 or fewer) and keep the whole test well under a second. `just ci` must stay fast.
+- Expensive work does not run in `just ci`. Real persistence at volume, socket binding, daemon or HTTP server startup, mounted filesystems, model downloads, device or emulator use, production-cost crypto, and stress or soak loops belong in one of: an `#[ignore]`-gated diagnostic run on demand, an integration test under `crates/<crate>/tests/` wired to a `test-*` recipe, or a dedicated `just` target.
+- A repeated write-loop test must justify its iteration count in a nearby comment (why that many iterations exercise the invariant) and must never turn routine verification into a multi-minute run. If a high iteration count is the point (fuzz, stress, soak), gate it as a diagnostic rather than leaving it in the default path.
+- Name stress, soak, and long-running diagnostic tests with a `stress_`, `soak_`, or `diagnostic_` prefix and mark them `#[ignore = "diagnostic: <reason>; run via just <recipe>"]`. The prefix keeps them greppable and the ignore attribute keeps them out of the default gate while documenting how to run them.
+
 ## Conventions
 
 Rules the tooling can't fully enforce. Breaking them lands a regression.

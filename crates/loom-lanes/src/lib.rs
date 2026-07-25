@@ -6,10 +6,19 @@ use loom_codec::Value;
 use loom_core::delivery::{DeliveryEnvelope, DeliveryProduceRequest, delivery_produce};
 use loom_core::document::{doc_delete, doc_list, document_get_text, document_put_text};
 use loom_core::error::{Code, LoomError, Result};
-use loom_core::workspace::WorkspaceId;
-use loom_core::{AclDomain, AclRight, Digest, Loom};
+use loom_core::workspace::{FacetKind, WorkspaceId};
+use loom_core::{
+    AclDomain, AclRight, AtomicityBoundary, AuditIntent, CompareToken, Digest, FacetSideEffects,
+    FacetWrite, FacetWriteOp, Loom, OverlayDurabilityPolicy, SecondaryIndexWrite,
+    WorkflowTransaction,
+};
 use loom_store::FileStore;
-use loom_types::order_key::OrderKey;
+use loom_tickets::{
+    WorkflowCurrentRecordKind, read_workflow_current_record, workflow_active_assignment_record,
+    workflow_current_secondary_index_delete, workflow_current_secondary_index_put,
+    workflow_lane_current_record,
+};
+use loom_types::{TicketStatusClass, classify_ticket_status, order_key::OrderKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -89,10 +98,6 @@ impl LaneKind {
     }
 }
 
-fn default_lane_kind() -> String {
-    LaneKind::Assignment.as_str().to_string()
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaneTicket {
@@ -161,6 +166,7 @@ pub struct LaneView {
     pub stored_lane_status: String,
     pub display_status: String,
     pub status_counts: LaneStatusCounts,
+    pub status_warnings: Vec<LaneStatusTextWarning>,
     pub lane_tickets: Vec<LaneTicketView>,
     pub active_ticket_id: Option<String>,
     pub status_report: String,
@@ -196,7 +202,17 @@ pub struct LaneCompactView {
     pub title: String,
     pub display_status: String,
     pub status_counts: LaneStatusCounts,
+    pub status_warnings: Vec<LaneStatusTextWarning>,
     pub lane_tickets: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LaneStatusTextWarning {
+    pub field: String,
+    pub stated_status: String,
+    pub ticket_id: Option<String>,
+    pub ticket_status: Option<String>,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -207,7 +223,11 @@ pub struct LaneStatusCounts {
     pub waiting_for_review: usize,
     pub in_progress: usize,
     pub backlog: usize,
+    pub planned: usize,
+    pub ready: usize,
     pub accepted: usize,
+    pub rejected: usize,
+    pub closed: usize,
     pub missing: usize,
     pub total: usize,
     pub next_ticket_id: Option<String>,
@@ -222,6 +242,7 @@ impl LaneView {
             title: self.title.clone(),
             display_status: self.display_status.clone(),
             status_counts: self.status_counts.clone(),
+            status_warnings: self.status_warnings.clone(),
             lane_tickets: self
                 .lane_tickets
                 .iter()
@@ -261,13 +282,13 @@ pub fn public_lane(lane: &Lane) -> PublicLane {
 
 pub fn lane_display_status(lane: &Lane, counts: &LaneStatusCounts) -> String {
     match lane.lane_status.as_str() {
-        "paused" | "closed" | "blocked" => lane.lane_status.clone(),
-        _ if counts.blocked > 0 => "blocked".to_string(),
-        _ if counts.waiting_for_decision > 0 => "waiting_for_decision".to_string(),
+        "paused" | "closed" => lane.lane_status.clone(),
+        _ if counts.in_progress > 0 => "working".to_string(),
+        _ if counts.ready > 0 || counts.planned > 0 || counts.backlog > 0 => "ready".to_string(),
         _ if counts.feedback_available > 0 => "feedback_available".to_string(),
         _ if counts.waiting_for_review > 0 => "review_required".to_string(),
-        _ if counts.in_progress > 0 => "working".to_string(),
-        _ if counts.backlog > 0 => "ready".to_string(),
+        _ if counts.waiting_for_decision > 0 => "waiting_for_decision".to_string(),
+        _ if counts.blocked > 0 => "blocked".to_string(),
         _ => "ready".to_string(),
     }
 }
@@ -278,24 +299,27 @@ pub fn lane_status_counts(lane_tickets: &[LaneTicketView]) -> LaneStatusCounts {
         ..LaneStatusCounts::default()
     };
     for ticket in lane_tickets {
-        match ticket.status.as_deref() {
-            Some("blocked") => counts.blocked += 1,
-            Some("waiting_for_decision") | Some("awaiting_decision") => {
-                counts.waiting_for_decision += 1
-            }
-            Some("feedback_available") => counts.feedback_available += 1,
-            Some("waiting_for_review") | Some("review_required") => counts.waiting_for_review += 1,
-            Some("in_progress") | Some("working") => counts.in_progress += 1,
-            Some("accepted") => counts.accepted += 1,
-            Some("missing") | None => counts.missing += 1,
-            Some("closed") | Some("rejected") => {}
-            Some("ready") | Some("backlog") | Some("planned") => counts.backlog += 1,
-            Some(_) => counts.backlog += 1,
+        match classify_ticket_status(ticket.status.as_deref()) {
+            TicketStatusClass::Blocked => counts.blocked += 1,
+            TicketStatusClass::WaitingForDecision => counts.waiting_for_decision += 1,
+            TicketStatusClass::FeedbackAvailable => counts.feedback_available += 1,
+            TicketStatusClass::WaitingForReview => counts.waiting_for_review += 1,
+            TicketStatusClass::InProgress => counts.in_progress += 1,
+            TicketStatusClass::Backlog => counts.backlog += 1,
+            TicketStatusClass::Planned => counts.planned += 1,
+            TicketStatusClass::Ready => counts.ready += 1,
+            TicketStatusClass::Accepted => counts.accepted += 1,
+            TicketStatusClass::Rejected => counts.rejected += 1,
+            TicketStatusClass::Closed => counts.closed += 1,
+            TicketStatusClass::Missing => counts.missing += 1,
         }
         if counts.next_ticket_id.is_none()
             && !matches!(
-                ticket.status.as_deref(),
-                Some("accepted" | "closed" | "rejected" | "missing") | None
+                classify_ticket_status(ticket.status.as_deref()),
+                TicketStatusClass::Accepted
+                    | TicketStatusClass::Closed
+                    | TicketStatusClass::Rejected
+                    | TicketStatusClass::Missing
             )
         {
             counts.next_ticket_id = Some(ticket.ticket_id.clone());
@@ -304,9 +328,157 @@ pub fn lane_status_counts(lane_tickets: &[LaneTicketView]) -> LaneStatusCounts {
     counts
 }
 
+pub fn lane_status_text_warnings(
+    lane: &Lane,
+    lane_tickets: &[LaneTicketView],
+) -> Vec<LaneStatusTextWarning> {
+    let active_subject = lane.active_ticket_id.as_deref().and_then(|active| {
+        lane_tickets
+            .iter()
+            .find(|ticket| ticket.ticket_id == active)
+    });
+    let counts = lane_status_counts(lane_tickets);
+    let next_subject = counts
+        .next_ticket_id
+        .as_deref()
+        .and_then(|next| lane_tickets.iter().find(|ticket| ticket.ticket_id == next));
+    let subject = active_subject.or(next_subject);
+    let actual = subject.map(|ticket| classify_ticket_status(ticket.status.as_deref()));
+    let mut warnings = Vec::new();
+    for (field, text) in [
+        ("status_report", lane.status_report.as_str()),
+        ("reviewer_feedback", lane.reviewer_feedback.as_str()),
+    ] {
+        let Some(stated) = classify_lane_status_text(text) else {
+            continue;
+        };
+        let disagrees = actual.is_some_and(|actual| !stated.matches(actual));
+        if disagrees {
+            let ticket_id = subject.map(|ticket| ticket.ticket_id.clone());
+            let ticket_status = subject.and_then(|ticket| ticket.status.clone());
+            warnings.push(LaneStatusTextWarning {
+                field: field.to_string(),
+                stated_status: stated.label().to_string(),
+                ticket_id: ticket_id.clone(),
+                ticket_status: ticket_status.clone(),
+                message: stale_lane_status_text_message(
+                    field,
+                    stated.label(),
+                    ticket_id.as_deref(),
+                    ticket_status.as_deref(),
+                ),
+            });
+        }
+    }
+    warnings
+}
+
+#[derive(Clone, Copy)]
+enum LaneStatusTextClaim {
+    Blocked,
+    Done,
+    ReadyForReview,
+    CommandRequested,
+    Waiting,
+}
+
+impl LaneStatusTextClaim {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::ReadyForReview => "ready_for_review",
+            Self::CommandRequested => "command_requested",
+            Self::Waiting => "waiting",
+        }
+    }
+
+    fn matches(self, actual: TicketStatusClass) -> bool {
+        match self {
+            Self::Blocked => matches!(actual, TicketStatusClass::Blocked),
+            Self::Done => matches!(
+                actual,
+                TicketStatusClass::Accepted | TicketStatusClass::Closed
+            ),
+            Self::ReadyForReview => matches!(actual, TicketStatusClass::WaitingForReview),
+            Self::CommandRequested => matches!(actual, TicketStatusClass::WaitingForDecision),
+            Self::Waiting => matches!(
+                actual,
+                TicketStatusClass::WaitingForDecision | TicketStatusClass::WaitingForReview
+            ),
+        }
+    }
+}
+
+fn classify_lane_status_text(text: &str) -> Option<LaneStatusTextClaim> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("ready for review") || lower.contains("ready_for_review") {
+        return Some(LaneStatusTextClaim::ReadyForReview);
+    }
+    if lower.contains("command requested") || lower.contains("command_requested") {
+        return Some(LaneStatusTextClaim::CommandRequested);
+    }
+    if lower.contains("blocked") {
+        return Some(LaneStatusTextClaim::Blocked);
+    }
+    if lower.contains("done") || lower.contains("complete") || lower.contains("completed") {
+        return Some(LaneStatusTextClaim::Done);
+    }
+    if lower.contains("waiting") || lower.contains("awaiting") {
+        return Some(LaneStatusTextClaim::Waiting);
+    }
+    None
+}
+
+fn stale_lane_status_text_message(
+    field: &str,
+    stated_status: &str,
+    ticket_id: Option<&str>,
+    ticket_status: Option<&str>,
+) -> String {
+    format!(
+        "{field} says {stated_status}, but {} is {}",
+        ticket_id.unwrap_or("the active ticket"),
+        ticket_status.unwrap_or("missing")
+    )
+}
+
+/// Detect a review/closeout handoff event described in lane text (`status_report` or
+/// `reviewer_feedback`). These events must also be recorded as a typed ticket comment; the lane text
+/// is only a summary. Returns the canonical event label when a phrase is present, else `None`. Pure
+/// over the text so callers (MCP/CLI) can warn when a lane update carries one of these phrases without
+/// a corresponding ticket comment.
+pub fn lane_text_closeout_event(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("review request")
+        || lower.contains("waiting for arbiter review")
+        || lower.contains("ready for review")
+        || lower.contains("ready_for_review")
+    {
+        return Some("review_request");
+    }
+    if lower.contains("command run requested")
+        || lower.contains("command requested")
+        || lower.contains("command_requested")
+    {
+        return Some("command_requested");
+    }
+    if lower.contains("feedback addressed") || lower.contains("feedback_addressed") {
+        return Some("feedback_addressed");
+    }
+    if lower.contains("closeout") {
+        return Some("closeout_evidence");
+    }
+    if lower.contains("blocker") || lower.contains("blocked") {
+        return Some("blocker");
+    }
+    None
+}
+
 pub fn lane_view(lane: &Lane, lane_tickets: Vec<LaneTicketView>) -> LaneView {
     let status_counts = lane_status_counts(&lane_tickets);
     let display_status = lane_display_status(lane, &status_counts);
+    let status_warnings = lane_status_text_warnings(lane, &lane_tickets);
     LaneView {
         lane_id: lane.lane_id.clone(),
         lane_key: lane.lane_key.clone(),
@@ -318,6 +490,7 @@ pub fn lane_view(lane: &Lane, lane_tickets: Vec<LaneTicketView>) -> LaneView {
         stored_lane_status: lane.lane_status.clone(),
         display_status,
         status_counts,
+        status_warnings,
         lane_tickets,
         active_ticket_id: lane.active_ticket_id.clone(),
         status_report: lane.status_report.clone(),
@@ -373,13 +546,9 @@ impl LaneTicket {
 pub struct Lane {
     pub lane_id: String,
     pub lane_key: String,
-    #[serde(default)]
     pub title: String,
-    #[serde(default)]
     pub description: String,
-    #[serde(default = "default_lane_kind")]
     pub lane_kind: String,
-    #[serde(default)]
     pub owner_principal: Option<String>,
     pub lane_status: String,
     pub lane_tickets: Vec<LaneTicket>,
@@ -605,8 +774,180 @@ pub fn put_lane(loom: &mut Loom<FileStore>, workspace: WorkspaceId, lane: Lane) 
     loom.authorize_domain(workspace, AclDomain::Tickets, AclRight::Write)?;
     let text = lane.to_json()?;
     validate_assignment_lane_membership(loom, workspace, &lane)?;
+    let prior = get_lane(loom, workspace, &lane.lane_id)?;
     document_put_text(loom, workspace, LANE_COLLECTION, &lane.lane_id, &text, None)?;
+    put_lane_current_record(loom, workspace, &lane, prior.as_ref())?;
     Ok(lane)
+}
+
+pub fn put_lane_current_record(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    lane: &Lane,
+    prior_lane: Option<&Lane>,
+) -> Result<()> {
+    let workspace_id = workspace.to_string();
+    let lane_record = workflow_lane_current_record(
+        &workspace_id,
+        &lane.lane_id,
+        lane.encode()?,
+        loom.store().reference_root(),
+    )?;
+    let mut records = vec![lane_record];
+    if lane.lane_kind == LaneKind::Assignment.as_str()
+        && let Some(active_ticket_id) = &lane.active_ticket_id
+    {
+        records.push(workflow_active_assignment_record(
+            &workspace_id,
+            &lane.lane_id,
+            active_ticket_id.as_bytes().to_vec(),
+            loom.store().reference_root(),
+        )?);
+    } else if let Some(prior) = prior_lane
+        && prior.active_ticket_id.is_some()
+    {
+        records.push(workflow_active_assignment_record(
+            &workspace_id,
+            &lane.lane_id,
+            Vec::new(),
+            loom.store().reference_root(),
+        )?);
+    }
+    let snapshot = loom.mutable_overlay_snapshot();
+    let mut writes = Vec::with_capacity(records.len());
+    for (index, record) in records.iter().enumerate() {
+        let key = record.overlay_key()?;
+        let mut secondary_indexes = Vec::new();
+        if index == 0 {
+            secondary_indexes =
+                lane_workflow_secondary_index_updates(&workspace_id, prior_lane, lane)?;
+        }
+        let op = if index == 1
+            && lane.active_ticket_id.is_none()
+            && prior_lane
+                .and_then(|prior| prior.active_ticket_id.as_ref())
+                .is_some()
+        {
+            FacetWriteOp::Delete
+        } else {
+            FacetWriteOp::Put {
+                payload: record.encode()?,
+            }
+        };
+        writes.push(FacetWrite {
+            facet: FacetKind::Queue,
+            target: key.clone(),
+            op,
+            secondary_indexes,
+            expected: snapshot.owner_token(&key)?.map(CompareToken),
+            durability: None,
+            audit: Some(AuditIntent {
+                operation: "lanes.current.put".to_string(),
+            }),
+            side_effects: FacetSideEffects::default(),
+        });
+    }
+    loom.store()
+        .commit_workflow_transaction(WorkflowTransaction {
+            workspace,
+            actor: loom.effective_principal()?.unwrap_or(workspace),
+            expected_generation: Some(snapshot.generation()),
+            writes,
+            durability: OverlayDurabilityPolicy::Normal,
+            boundary: AtomicityBoundary::Single,
+            idempotency: None,
+            owner_state: loom_core::WorkflowOwnerState::default(),
+        })?;
+    *loom.mutable_overlay_mut() =
+        loom_core::MutableOverlay::import_entries(&loom.store().mutable_overlay_entries()?)?;
+    Ok(())
+}
+
+fn lane_workflow_secondary_index_updates(
+    workspace_id: &str,
+    prior_lane: Option<&Lane>,
+    lane: &Lane,
+) -> Result<Vec<SecondaryIndexWrite>> {
+    let mut indexes = lane_workflow_secondary_indexes(workspace_id, lane)?;
+    if let Some(prior_lane) = prior_lane {
+        let current_keys = indexes
+            .iter()
+            .map(|write| write.index.clone())
+            .collect::<BTreeSet<_>>();
+        for write in lane_workflow_secondary_index_deletes(workspace_id, prior_lane)? {
+            if !current_keys.contains(&write.index) {
+                indexes.push(write);
+            }
+        }
+    }
+    Ok(indexes)
+}
+
+fn lane_workflow_secondary_indexes(
+    workspace_id: &str,
+    lane: &Lane,
+) -> Result<Vec<SecondaryIndexWrite>> {
+    let mut indexes = vec![workflow_current_secondary_index_put(
+        workspace_id,
+        LANE_COLLECTION,
+        "lane-kind",
+        &lane.lane_kind,
+        &lane.lane_id,
+        lane.lane_id.as_bytes().to_vec(),
+    )?];
+    if let Some(owner_principal) = &lane.owner_principal {
+        indexes.push(workflow_current_secondary_index_put(
+            workspace_id,
+            LANE_COLLECTION,
+            "owner-principal",
+            owner_principal,
+            &lane.lane_id,
+            lane.lane_id.as_bytes().to_vec(),
+        )?);
+    }
+    for lane_ticket in &lane.lane_tickets {
+        indexes.push(workflow_current_secondary_index_put(
+            workspace_id,
+            LANE_COLLECTION,
+            "lane-ticket",
+            &lane_ticket.ticket_id,
+            &lane.lane_id,
+            lane_ticket.order_key.as_bytes().to_vec(),
+        )?);
+    }
+    Ok(indexes)
+}
+
+fn lane_workflow_secondary_index_deletes(
+    workspace_id: &str,
+    lane: &Lane,
+) -> Result<Vec<SecondaryIndexWrite>> {
+    let mut indexes = vec![workflow_current_secondary_index_delete(
+        workspace_id,
+        LANE_COLLECTION,
+        "lane-kind",
+        &lane.lane_kind,
+        &lane.lane_id,
+    )?];
+    if let Some(owner_principal) = &lane.owner_principal {
+        indexes.push(workflow_current_secondary_index_delete(
+            workspace_id,
+            LANE_COLLECTION,
+            "owner-principal",
+            owner_principal,
+            &lane.lane_id,
+        )?);
+    }
+    for lane_ticket in &lane.lane_tickets {
+        indexes.push(workflow_current_secondary_index_delete(
+            workspace_id,
+            LANE_COLLECTION,
+            "lane-ticket",
+            &lane_ticket.ticket_id,
+            &lane.lane_id,
+        )?);
+    }
+    Ok(indexes)
 }
 
 pub fn append_lane_ticket(lane: &mut Lane, ticket_id: &str) -> Result<()> {
@@ -695,6 +1036,53 @@ pub fn lane_tickets_from_order(ticket_ids: &[String]) -> Result<Vec<LaneTicket>>
             })
         })
         .collect()
+}
+
+/// True when `status` classifies to a terminal ticket status class (Accepted, Rejected, or Closed).
+/// Terminal tickets carry no remaining active/queued work, so first-class lane cleanup drops them
+/// from lane membership while the ticket record and its history stay untouched.
+pub fn is_terminal_ticket_status(status: Option<&str>) -> bool {
+    matches!(
+        classify_ticket_status(status),
+        TicketStatusClass::Accepted | TicketStatusClass::Rejected | TicketStatusClass::Closed
+    )
+}
+
+/// The ids of the lane member tickets whose resolved status is terminal, in current lane order.
+/// Pure over the resolved [`LaneTicketView`]s, so callers can use it as a dry-run preview of what
+/// [`remove_lane_tickets`] would drop without mutating anything.
+pub fn terminal_lane_ticket_ids(lane_tickets: &[LaneTicketView]) -> Vec<String> {
+    lane_tickets
+        .iter()
+        .filter(|ticket| is_terminal_ticket_status(ticket.status.as_deref()))
+        .map(|ticket| ticket.ticket_id.clone())
+        .collect()
+}
+
+/// Remove `remove_ids` from `lane.lane_tickets`, preserving the order of the members that remain and
+/// re-minting valid, monotonic order keys via [`replace_lane_ticket_order`]. Clears `active_ticket_id`
+/// when the active ticket was among those removed. Returns the ids that were actually present and
+/// removed (ids not in the lane are ignored). This only edits lane membership: no ticket record is
+/// touched, so ticket history and evidence are preserved on the tickets themselves.
+pub fn remove_lane_tickets(lane: &mut Lane, remove_ids: &[String]) -> Vec<String> {
+    let remove_set: BTreeSet<&str> = remove_ids.iter().map(String::as_str).collect();
+    let mut removed = Vec::new();
+    let mut kept = Vec::new();
+    for lane_ticket in &lane.lane_tickets {
+        if remove_set.contains(lane_ticket.ticket_id.as_str()) {
+            removed.push(lane_ticket.ticket_id.clone());
+        } else {
+            kept.push(lane_ticket.ticket_id.clone());
+        }
+    }
+    if removed.is_empty() {
+        return removed;
+    }
+    // `kept` is a subset of the existing (already-validated) membership: valid ids with no repeats.
+    // Rebuilding from it re-mints order keys and clears active_ticket_id when it is no longer present.
+    replace_lane_ticket_order(lane, &kept)
+        .expect("kept ids are a valid subset of existing lane membership");
+    removed
 }
 
 pub fn transfer_assignment_lane_ticket(
@@ -786,9 +1174,23 @@ pub fn get_lane(
     lane_id: &str,
 ) -> Result<Option<Lane>> {
     loom.authorize_domain(workspace, AclDomain::Tickets, AclRight::Read)?;
-    document_get_text(loom, workspace, LANE_COLLECTION, lane_id)?
-        .map(|document| Lane::from_json(&document.text))
+    let Some(document) = document_get_text(loom, workspace, LANE_COLLECTION, lane_id)? else {
+        return Ok(None);
+    };
+    let base = Lane::from_json(&document.text)?;
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("lanes.get"))?;
+    let current = read_workflow_current_record(
+        &snapshot,
+        &workspace.to_string(),
+        "lanes",
+        WorkflowCurrentRecordKind::Lane,
+        lane_id,
+        |_| Ok(Some(base.encode()?)),
+    )?;
+    current
+        .map(|record| Lane::decode(&record.payload))
         .transpose()
+        .map(|current| current.or(Some(base)))
 }
 
 pub fn list_lanes(loom: &Loom<FileStore>, workspace: WorkspaceId) -> Result<Vec<Lane>> {
@@ -808,7 +1210,26 @@ pub fn list_lanes_with_diagnostics(
         .iter()
         .map(|(id, bytes)| (id.to_string(), bytes.to_vec()))
         .collect();
-    let (mut lanes, diagnostics) = partition_lane_documents(documents);
+    let (lanes, diagnostics) = partition_lane_documents(documents);
+    let workspace_id = workspace.to_string();
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("lanes.list"))?;
+    let mut lanes = lanes
+        .into_iter()
+        .map(|lane| {
+            let current = read_workflow_current_record(
+                &snapshot,
+                &workspace_id,
+                "lanes",
+                WorkflowCurrentRecordKind::Lane,
+                &lane.lane_id,
+                |_| Ok(Some(lane.encode()?)),
+            )?;
+            current
+                .map(|record| Lane::decode(&record.payload))
+                .transpose()
+                .map(|current| current.unwrap_or(lane))
+        })
+        .collect::<Result<Vec<_>>>()?;
     lanes.sort_by(|left, right| {
         left.lane_key
             .cmp(&right.lane_key)
@@ -995,28 +1416,28 @@ mod tests {
 
     fn sample_lane() -> Lane {
         Lane::new(LaneInput {
-            lane_id: "agent-3",
-            lane_key: "agent-3",
-            title: "Agent 3 ergonomics lane",
-            description: "Durable intention: land the ticket ergonomics work end to end.",
+            lane_id: "review-lane-a",
+            lane_key: "review-lane-a",
+            title: "Review lane A",
+            description: "Durable intention: land the sample ticket work end to end.",
             lane_kind: LaneKind::Assignment,
-            owner_principal: Some("agent:3"),
+            owner_principal: Some("user:reviewer-a"),
             lane_status: LaneStatus::Working,
             lane_tickets: &[
                 LaneTicket {
-                    ticket_id: "MX-102".to_string(),
+                    ticket_id: "DEMO-102".to_string(),
                     order_key: "F".to_string(),
                 },
                 LaneTicket {
-                    ticket_id: "MX-103".to_string(),
+                    ticket_id: "DEMO-103".to_string(),
                     order_key: "V".to_string(),
                 },
             ],
-            active_ticket_id: Some("MX-102"),
+            active_ticket_id: Some("DEMO-102"),
             status_report: "working lane model",
             reviewer_feedback: "",
             updated_at: 1,
-            updated_by: "agent:3",
+            updated_by: "user:reviewer-a",
         })
         .unwrap()
     }
@@ -1028,46 +1449,116 @@ mod tests {
         let lane = create_lane(&mut loom, workspace, sample_lane()).unwrap();
         assert_eq!(lane.lane_status, "working");
 
-        let read = get_lane(&loom, workspace, "agent-3").unwrap().unwrap();
+        let read = get_lane(&loom, workspace, "review-lane-a")
+            .unwrap()
+            .unwrap();
         assert_eq!(read, lane);
-        assert_eq!(read.lane_tickets[0].ticket_id, "MX-102");
+        assert_eq!(read.lane_tickets[0].ticket_id, "DEMO-102");
+        let lane_ticket_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace.to_string(),
+            "lanes",
+            "lane-ticket",
+            "DEMO-102",
+            "review-lane-a",
+        )
+        .unwrap();
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&lane_ticket_index)
+                .unwrap()
+                .as_deref(),
+            Some(&b"F"[..])
+        );
 
         let lanes = list_lanes(&loom, workspace).unwrap();
         assert_eq!(lanes, vec![lane]);
     }
 
     #[test]
+    fn lane_stale_index_entries_are_tombstoned_on_owner_and_membership_change() {
+        let workspace = workspace();
+        let mut loom = loom();
+        create_lane(&mut loom, workspace, sample_lane()).unwrap();
+
+        let mut lane = get_lane(&loom, workspace, "review-lane-a")
+            .unwrap()
+            .unwrap();
+        lane.owner_principal = Some("user:reviewer-b".to_string());
+        lane.lane_tickets.remove(0);
+        lane.active_ticket_id = Some("DEMO-103".to_string());
+        put_lane(&mut loom, workspace, lane).unwrap();
+
+        let workspace_id = workspace.to_string();
+        let old_owner_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace_id,
+            "lanes",
+            "owner-principal",
+            "user:reviewer-a",
+            "review-lane-a",
+        )
+        .unwrap();
+        let new_owner_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace_id,
+            "lanes",
+            "owner-principal",
+            "user:reviewer-b",
+            "review-lane-a",
+        )
+        .unwrap();
+        let old_ticket_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace_id,
+            "lanes",
+            "lane-ticket",
+            "DEMO-102",
+            "review-lane-a",
+        )
+        .unwrap();
+        let kept_ticket_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace_id,
+            "lanes",
+            "lane-ticket",
+            "DEMO-103",
+            "review-lane-a",
+        )
+        .unwrap();
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&old_owner_index)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&new_owner_index)
+                .unwrap()
+                .as_deref(),
+            Some("review-lane-a".as_bytes())
+        );
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&old_ticket_index)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&kept_ticket_index)
+                .unwrap()
+                .as_deref(),
+            Some(&b"V"[..])
+        );
+    }
+
+    #[test]
     fn lane_title_description_kind_and_owner_round_trip() {
         let lane = sample_lane();
-        assert_eq!(lane.title, "Agent 3 ergonomics lane");
+        assert_eq!(lane.title, "Review lane A");
         assert_eq!(lane.lane_kind, "assignment");
-        assert_eq!(lane.owner_principal.as_deref(), Some("agent:3"));
+        assert_eq!(lane.owner_principal.as_deref(), Some("user:reviewer-a"));
         let json = lane.to_json().unwrap();
         assert_eq!(Lane::from_json(&json).unwrap(), lane);
         let cbor = lane.encode().unwrap();
         assert_eq!(Lane::decode(&cbor).unwrap(), lane);
-    }
-
-    #[test]
-    fn lane_json_decode_accepts_pre_kind_documents_for_controlled_rewrite() {
-        let legacy = serde_json::json!({
-            "lane_id": "agent-9",
-            "lane_key": "agent-9",
-            "owner_principal": "agent:9",
-            "lane_status": "ready",
-            "lane_tickets": [],
-            "active_ticket_id": null,
-            "status_report": "",
-            "reviewer_feedback": "",
-            "updated_at": 1,
-            "updated_by": "agent:9"
-        })
-        .to_string();
-        let migrated = Lane::from_json(&legacy).unwrap();
-        assert_eq!(migrated.title, "");
-        assert_eq!(migrated.description, "");
-        assert_eq!(migrated.lane_kind, "assignment");
-        assert_eq!(migrated.owner_principal.as_deref(), Some("agent:9"));
     }
 
     #[test]
@@ -1079,17 +1570,42 @@ mod tests {
         let documents = vec![
             (good.lane_id.clone(), good_json.into_bytes()),
             (
-                "agent-broken".to_string(),
+                "lane-broken".to_string(),
                 b"{ this is not valid lane json".to_vec(),
             ),
-            ("agent-nonutf8".to_string(), vec![0xff, 0xfe, 0xfd]),
+            ("lane-nonutf8".to_string(), vec![0xff, 0xfe, 0xfd]),
         ];
         let (lanes, diagnostics) = partition_lane_documents(documents);
         assert_eq!(lanes.len(), 1);
         assert_eq!(lanes[0].lane_id, good.lane_id);
         let bad_ids: Vec<&str> = diagnostics.iter().map(|d| d.lane_id.as_str()).collect();
-        assert_eq!(bad_ids, vec!["agent-broken", "agent-nonutf8"]);
+        assert_eq!(bad_ids, vec!["lane-broken", "lane-nonutf8"]);
         assert!(diagnostics.iter().all(|d| !d.error.is_empty()));
+    }
+
+    #[test]
+    fn lane_text_closeout_event_classifies_review_and_closeout_phrases() {
+        assert_eq!(
+            lane_text_closeout_event("Waiting for arbiter review: MX-1"),
+            Some("review_request")
+        );
+        assert_eq!(
+            lane_text_closeout_event("Blocked: MX-1 command run requested"),
+            Some("command_requested")
+        );
+        assert_eq!(
+            lane_text_closeout_event("feedback addressed; re-verify"),
+            Some("feedback_addressed")
+        );
+        assert_eq!(
+            lane_text_closeout_event("closeout evidence recorded"),
+            Some("closeout_evidence")
+        );
+        assert_eq!(
+            lane_text_closeout_event("blocker: dependency not accepted"),
+            Some("blocker")
+        );
+        assert_eq!(lane_text_closeout_event("working on the next ticket"), None);
     }
 
     #[test]
@@ -1101,18 +1617,18 @@ mod tests {
         let mut lane = sample_lane();
         lane.lane_tickets = vec![
             LaneTicket {
-                ticket_id: "MX-103".to_string(),
+                ticket_id: "DEMO-103".to_string(),
                 order_key: "V".to_string(),
             },
             LaneTicket {
-                ticket_id: "MX-102".to_string(),
+                ticket_id: "DEMO-102".to_string(),
                 order_key: "F".to_string(),
             },
         ];
         assert_eq!(lane.validate().unwrap_err().code, Code::InvalidArgument);
 
         let mut lane = sample_lane();
-        lane.active_ticket_id = Some("MX-999".to_string());
+        lane.active_ticket_id = Some("DEMO-999".to_string());
         assert_eq!(lane.validate().unwrap_err().code, Code::InvalidArgument);
     }
 
@@ -1123,22 +1639,22 @@ mod tests {
         create_lane(&mut loom, workspace, sample_lane()).unwrap();
 
         let duplicate = Lane::new(LaneInput {
-            lane_id: "agent-4",
-            lane_key: "agent-4",
+            lane_id: "review-lane-b",
+            lane_key: "review-lane-b",
             title: "",
             description: "",
             lane_kind: LaneKind::Assignment,
             owner_principal: None,
             lane_status: LaneStatus::Ready,
             lane_tickets: &[LaneTicket {
-                ticket_id: "MX-102".to_string(),
+                ticket_id: "DEMO-102".to_string(),
                 order_key: "F".to_string(),
             }],
-            active_ticket_id: Some("MX-102"),
+            active_ticket_id: Some("DEMO-102"),
             status_report: "",
             reviewer_feedback: "",
             updated_at: 2,
-            updated_by: "agent:4",
+            updated_by: "user:reviewer-b",
         })
         .unwrap();
         assert_eq!(
@@ -1157,14 +1673,14 @@ mod tests {
             owner_principal: None,
             lane_status: LaneStatus::Ready,
             lane_tickets: &[LaneTicket {
-                ticket_id: "MX-102".to_string(),
+                ticket_id: "DEMO-102".to_string(),
                 order_key: "F".to_string(),
             }],
-            active_ticket_id: Some("MX-102"),
+            active_ticket_id: Some("DEMO-102"),
             status_report: "",
             reviewer_feedback: "",
             updated_at: 3,
-            updated_by: "agent:4",
+            updated_by: "user:reviewer-b",
         })
         .unwrap();
         create_lane(&mut loom, workspace, tracking).unwrap();
@@ -1174,7 +1690,7 @@ mod tests {
     fn lane_display_status_derives_from_aggregate_ticket_state_with_lane_overrides() {
         let mut lane = sample_lane();
         let review_counts = lane_status_counts(&[LaneTicketView {
-            ticket_id: "MX-1".to_string(),
+            ticket_id: "DEMO-1".to_string(),
             status: Some("waiting_for_review".to_string()),
             priority: None,
             title: None,
@@ -1184,7 +1700,7 @@ mod tests {
             "review_required"
         );
         let working_counts = lane_status_counts(&[LaneTicketView {
-            ticket_id: "MX-1".to_string(),
+            ticket_id: "DEMO-1".to_string(),
             status: Some("in_progress".to_string()),
             priority: None,
             title: None,
@@ -1196,7 +1712,120 @@ mod tests {
         );
 
         lane.lane_status = LaneStatus::Blocked.as_str().to_string();
-        assert_eq!(lane_display_status(&lane, &working_counts), "blocked");
+        assert_eq!(lane_display_status(&lane, &working_counts), "working");
+    }
+
+    #[test]
+    fn lane_display_status_prefers_actionable_next_work_over_blocked_count() {
+        let lane = sample_lane();
+        let mixed_counts = lane_status_counts(&[
+            LaneTicketView {
+                ticket_id: "DEMO-1".to_string(),
+                status: Some("accepted".to_string()),
+                priority: None,
+                title: None,
+            },
+            LaneTicketView {
+                ticket_id: "DEMO-2".to_string(),
+                status: Some("ready".to_string()),
+                priority: None,
+                title: None,
+            },
+            LaneTicketView {
+                ticket_id: "DEMO-3".to_string(),
+                status: Some("blocked".to_string()),
+                priority: None,
+                title: None,
+            },
+            LaneTicketView {
+                ticket_id: "DEMO-4".to_string(),
+                status: Some("waiting_for_review".to_string()),
+                priority: None,
+                title: None,
+            },
+        ]);
+
+        assert_eq!(mixed_counts.accepted, 1);
+        assert_eq!(mixed_counts.ready, 1);
+        assert_eq!(mixed_counts.blocked, 1);
+        assert_eq!(mixed_counts.waiting_for_review, 1);
+        assert_eq!(mixed_counts.next_ticket_id.as_deref(), Some("DEMO-2"));
+        assert_eq!(lane_display_status(&lane, &mixed_counts), "ready");
+    }
+
+    #[test]
+    fn lane_status_text_warnings_flag_stale_guidance_against_ticket_truth() {
+        let mut lane = sample_lane();
+        lane.active_ticket_id = Some("DEMO-2".to_string());
+        lane.status_report = "blocked waiting on owner".to_string();
+        lane.reviewer_feedback = "done".to_string();
+        let warnings = lane_status_text_warnings(
+            &lane,
+            &[
+                LaneTicketView {
+                    ticket_id: "DEMO-2".to_string(),
+                    status: Some("ready".to_string()),
+                    priority: None,
+                    title: None,
+                },
+                LaneTicketView {
+                    ticket_id: "DEMO-3".to_string(),
+                    status: Some("blocked".to_string()),
+                    priority: None,
+                    title: None,
+                },
+            ],
+        );
+
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].field, "status_report");
+        assert_eq!(warnings[0].stated_status, "blocked");
+        assert_eq!(warnings[0].ticket_id.as_deref(), Some("DEMO-2"));
+        assert_eq!(warnings[0].ticket_status.as_deref(), Some("ready"));
+        assert_eq!(warnings[1].field, "reviewer_feedback");
+        assert_eq!(warnings[1].stated_status, "done");
+    }
+
+    #[test]
+    fn lane_status_counts_uses_shared_ticket_status_classification() {
+        let ticket_views = [
+            ("DEMO-1", Some("backlog")),
+            ("DEMO-2", Some("planned")),
+            ("DEMO-3", Some("ready")),
+            ("DEMO-4", Some("in_progress")),
+            ("DEMO-5", Some("blocked")),
+            ("DEMO-6", Some("waiting_for_decision")),
+            ("DEMO-7", Some("feedback_available")),
+            ("DEMO-8", Some("waiting_for_review")),
+            ("DEMO-9", Some("accepted")),
+            ("DEMO-10", Some("rejected")),
+            ("DEMO-11", Some("closed")),
+            ("DEMO-12", Some("not_a_status")),
+            ("DEMO-13", None),
+        ]
+        .into_iter()
+        .map(|(ticket_id, status)| LaneTicketView {
+            ticket_id: ticket_id.to_string(),
+            status: status.map(str::to_string),
+            priority: None,
+            title: None,
+        })
+        .collect::<Vec<_>>();
+
+        let counts = lane_status_counts(&ticket_views);
+        assert_eq!(counts.backlog, 1);
+        assert_eq!(counts.planned, 1);
+        assert_eq!(counts.ready, 1);
+        assert_eq!(counts.in_progress, 1);
+        assert_eq!(counts.blocked, 1);
+        assert_eq!(counts.waiting_for_decision, 1);
+        assert_eq!(counts.feedback_available, 1);
+        assert_eq!(counts.waiting_for_review, 1);
+        assert_eq!(counts.accepted, 1);
+        assert_eq!(counts.rejected, 1);
+        assert_eq!(counts.closed, 1);
+        assert_eq!(counts.missing, 2);
+        assert_eq!(counts.next_ticket_id.as_deref(), Some("DEMO-1"));
     }
 
     #[test]
@@ -1204,13 +1833,13 @@ mod tests {
         let lane = sample_lane();
         let ticket_views = vec![
             LaneTicketView {
-                ticket_id: "MX-102".to_string(),
+                ticket_id: "DEMO-102".to_string(),
                 status: Some("in_progress".to_string()),
                 priority: Some("P1".to_string()),
                 title: Some("First".to_string()),
             },
             LaneTicketView {
-                ticket_id: "MX-103".to_string(),
+                ticket_id: "DEMO-103".to_string(),
                 status: Some("ready".to_string()),
                 priority: None,
                 title: Some("Second".to_string()),
@@ -1225,16 +1854,17 @@ mod tests {
         assert_eq!(compact.lane_key, view.lane_key);
         assert_eq!(compact.title, view.title);
         assert_eq!(compact.display_status, "working");
+        assert!(compact.status_warnings.is_empty());
         // Compact keeps only the ordered ticket ids and drops per-ticket status/priority/title.
         assert_eq!(
             compact.lane_tickets,
-            vec!["MX-102".to_string(), "MX-103".to_string()]
+            vec!["DEMO-102".to_string(), "DEMO-103".to_string()]
         );
     }
 
     #[test]
     fn lane_decode_rejects_unknown_fields() {
-        let text = r#"{"lane_id":"agent-3","lane_key":"agent-3","lane_kind":"assignment","owner_principal":"agent:3","lane_status":"ready","lane_tickets":[],"active_ticket_id":null,"status_report":"","reviewer_feedback":"","updated_at":1,"updated_by":"agent:3","added_by":"agent:3"}"#;
+        let text = r#"{"lane_id":"review-lane-a","lane_key":"review-lane-a","title":"Review lane A","description":"Review work","lane_kind":"assignment","owner_principal":"user:reviewer-a","lane_status":"ready","lane_tickets":[],"active_ticket_id":null,"status_report":"","reviewer_feedback":"","updated_at":1,"updated_by":"user:reviewer-a","added_by":"user:reviewer-a"}"#;
         assert_eq!(
             Lane::from_json(text).unwrap_err().code,
             Code::InvalidArgument
@@ -1248,7 +1878,7 @@ mod tests {
         // equivalent decision detail is recorded on the active ticket instead.
         for ad_hoc in ["decision_id", "decision_resource"] {
             let text = format!(
-                r#"{{"lane_id":"agent-3","lane_key":"agent-3","lane_kind":"assignment","owner_principal":"agent:3","lane_status":"ready","lane_tickets":[],"active_ticket_id":null,"status_report":"","reviewer_feedback":"","updated_at":1,"updated_by":"agent:3","{ad_hoc}":"x"}}"#
+                r#"{{"lane_id":"review-lane-a","lane_key":"review-lane-a","title":"Review lane A","description":"Review work","lane_kind":"assignment","owner_principal":"user:reviewer-a","lane_status":"ready","lane_tickets":[],"active_ticket_id":null,"status_report":"","reviewer_feedback":"","updated_at":1,"updated_by":"user:reviewer-a","{ad_hoc}":"x"}}"#
             );
             assert_eq!(
                 Lane::from_json(&text).unwrap_err().code,
@@ -1257,7 +1887,7 @@ mod tests {
             );
         }
         // The same document without the ad-hoc field decodes cleanly.
-        let ok = r#"{"lane_id":"agent-3","lane_key":"agent-3","lane_kind":"assignment","owner_principal":"agent:3","lane_status":"ready","lane_tickets":[],"active_ticket_id":null,"status_report":"","reviewer_feedback":"","updated_at":1,"updated_by":"agent:3"}"#;
+        let ok = r#"{"lane_id":"review-lane-a","lane_key":"review-lane-a","title":"Review lane A","description":"Review work","lane_kind":"assignment","owner_principal":"user:reviewer-a","lane_status":"ready","lane_tickets":[],"active_ticket_id":null,"status_report":"","reviewer_feedback":"","updated_at":1,"updated_by":"user:reviewer-a"}"#;
         assert!(Lane::from_json(ok).is_ok());
     }
 
@@ -1406,6 +2036,128 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ticket_ids(&lane), vec!["C", "A", "B"]);
+        lane.validate().unwrap();
+    }
+
+    fn ticket_view(ticket_id: &str, status: &str) -> LaneTicketView {
+        LaneTicketView {
+            ticket_id: ticket_id.to_string(),
+            status: Some(status.to_string()),
+            priority: None,
+            title: None,
+        }
+    }
+
+    #[test]
+    fn terminal_lane_ticket_ids_picks_terminal_members_in_order() {
+        let views = vec![
+            ticket_view("A", "accepted"),
+            ticket_view("B", "in_progress"),
+            ticket_view("C", "closed"),
+            ticket_view("D", "rejected"),
+            ticket_view("E", "ready"),
+        ];
+        // Accepted / Closed / Rejected are terminal; the rest are active/queued work.
+        assert_eq!(
+            terminal_lane_ticket_ids(&views),
+            vec!["A".to_string(), "C".to_string(), "D".to_string()]
+        );
+        assert!(is_terminal_ticket_status(Some("accepted")));
+        assert!(is_terminal_ticket_status(Some("rejected")));
+        assert!(is_terminal_ticket_status(Some("closed")));
+        assert!(!is_terminal_ticket_status(Some("in_progress")));
+        assert!(!is_terminal_ticket_status(Some("ready")));
+        assert!(!is_terminal_ticket_status(None));
+    }
+
+    #[test]
+    fn terminal_lane_ticket_ids_dry_run_preview_does_not_mutate_membership() {
+        let mut lane = empty_lane();
+        for id in ["A", "B", "C"] {
+            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Append).unwrap();
+        }
+        let before = ticket_ids(&lane)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let views = vec![
+            ticket_view("A", "accepted"),
+            ticket_view("B", "in_progress"),
+            ticket_view("C", "closed"),
+        ];
+        // Computing the preview must leave lane membership untouched.
+        let preview = terminal_lane_ticket_ids(&views);
+        assert_eq!(preview, vec!["A".to_string(), "C".to_string()]);
+        assert_eq!(
+            ticket_ids(&lane)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn remove_lane_tickets_preserves_remaining_order_and_clears_active_when_removed() {
+        let mut lane = empty_lane();
+        for id in ["A", "B", "C", "D"] {
+            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Append).unwrap();
+        }
+        lane.active_ticket_id = Some("C".to_string());
+        lane.validate().unwrap();
+
+        // Remove two members (one of which is the active ticket) plus one id that is not present.
+        let removed = remove_lane_tickets(
+            &mut lane,
+            &["A".to_string(), "C".to_string(), "Z".to_string()],
+        );
+        // Only the ids actually present are reported removed, in current order.
+        assert_eq!(removed, vec!["A".to_string(), "C".to_string()]);
+        // Remaining membership keeps its relative order and re-validates (monotonic order keys).
+        assert_eq!(ticket_ids(&lane), vec!["B", "D"]);
+        lane.validate().unwrap();
+        // The active ticket was removed, so it is cleared.
+        assert_eq!(lane.active_ticket_id, None);
+    }
+
+    #[test]
+    fn remove_lane_tickets_preserves_non_terminal_and_active_when_untouched() {
+        let mut lane = empty_lane();
+        for id in ["A", "B", "C"] {
+            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Append).unwrap();
+        }
+        lane.active_ticket_id = Some("B".to_string());
+        lane.validate().unwrap();
+
+        // Terminal ids computed from resolved statuses: only "A" is terminal here.
+        let views = vec![
+            ticket_view("A", "closed"),
+            ticket_view("B", "in_progress"),
+            ticket_view("C", "ready"),
+        ];
+        let terminal = terminal_lane_ticket_ids(&views);
+        let removed = remove_lane_tickets(&mut lane, &terminal);
+        assert_eq!(removed, vec!["A".to_string()]);
+        // Non-terminal members are preserved and the still-present active ticket is retained.
+        assert_eq!(ticket_ids(&lane), vec!["B", "C"]);
+        assert_eq!(lane.active_ticket_id.as_deref(), Some("B"));
+        lane.validate().unwrap();
+    }
+
+    #[test]
+    fn remove_lane_tickets_on_closed_lane_still_edits_membership() {
+        let mut lane = empty_lane();
+        for id in ["A", "B"] {
+            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Append).unwrap();
+        }
+        lane.lane_status = LaneStatus::Closed.as_str().to_string();
+        lane.validate().unwrap();
+
+        let removed = remove_lane_tickets(&mut lane, &["A".to_string()]);
+        assert_eq!(removed, vec!["A".to_string()]);
+        // Closed lanes still have their membership cleaned; the lane record stays valid.
+        assert_eq!(ticket_ids(&lane), vec!["B"]);
+        assert_eq!(lane.lane_status, "closed");
         lane.validate().unwrap();
     }
 }

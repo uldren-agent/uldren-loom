@@ -38,7 +38,7 @@ use loom_interchange_io::{
 };
 use loom_reference::{
     ReferenceArtifactCreateRequest, ReferenceArtifactSummary, remove_graph_edge_refs,
-    update_document_refs, update_graph_edge_refs,
+    update_graph_edge_refs,
 };
 use loom_sql::LoomSqlStore;
 use loom_store::{
@@ -60,7 +60,10 @@ use loom_substrate::search::{
     EmbeddingProjectionStamp,
 };
 use loom_substrate::versioning::{
-    BodyRef, ProfileRevisionUpdate, ProfileTransaction, ProfileTransactionState, RevisionIndex,
+    BodyRef, Checkpoint, EntityRevision, ProfileRevisionUpdate, ProfileTransaction,
+    ProfileTransactionState, RevisionIndexAppend, load_current_revision_index,
+    load_latest_entity_revision, persist_current_revision_index_with_owner_state,
+    persist_revision_index_append_with_owner_state_and_writes,
 };
 use loom_substrate::view::{FreshnessPolicy, ViewDefinition, ViewDefinitionInput};
 use loom_substrate::workgraph::{
@@ -69,7 +72,7 @@ use loom_substrate::workgraph::{
 };
 use loom_substrate::{OperationEnvelope, OperationEnvelopeInput};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::apps;
@@ -91,7 +94,6 @@ use crate::pages::{
 };
 use crate::reads::{SubstrateAliasSummary, resolve_ns};
 use crate::substrate_refs::{bind_alias, release_alias};
-use crate::substrate_revisions::{REVISION_INDEX_DIR, revision_index_path};
 use crate::substrate_views::{VIEW_DIR, ViewDefinitionSummary, view_path};
 use crate::{authorize_workgraph_task, now_ms, reject_stateless_ephemeral_kv};
 use loom_lanes::{Lane, LaneInput, LaneKind, LaneStatus, LaneTicket, LaneTicketPlacement};
@@ -253,6 +255,23 @@ pub struct LaneUpdateRequest<'a> {
     pub updated_by: Option<&'a str>,
 }
 
+/// Combined closeout: write a typed ticket comment and a short lane `status_report` summary together
+/// so a review/blocker/closeout handoff lands durably on the ticket, not only in lane text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneCloseoutRequest<'a> {
+    pub lane_id: &'a str,
+    pub ticket_workspace_id: &'a str,
+    pub ticket_id: &'a str,
+    pub comment_type: &'a str,
+    pub comment_body: &'a str,
+    /// Optional structured evidence recorded on the ticket comment (e.g. checks_run, source_anchors).
+    pub evidence: Option<loom_tickets::TicketCommentEvidence>,
+    pub status_report: &'a str,
+    /// optional explicit actor override; `None` derives from the effective principal.
+    pub updated_by: Option<&'a str>,
+    pub expected_root: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaneTicketUpdateRequest<'a> {
     pub lane_id: &'a str,
@@ -275,6 +294,30 @@ pub struct LaneTicketTransferRequest<'a> {
 pub struct LaneDeleteRequest<'a> {
     pub lane_id: &'a str,
     pub updated_by: &'a str,
+}
+
+/// Bulk cleanup of terminal tickets from assignment lane membership. `lane_id` scopes cleanup to one
+/// lane; `None` targets every assignment lane. `apply=false` is a non-mutating dry run that only
+/// reports what would be removed. Tickets are never deleted; only lane membership is edited.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneCleanupRequest<'a> {
+    pub lane_id: Option<&'a str>,
+    pub apply: bool,
+    /// optional explicit actor override; `None` derives from the effective principal.
+    pub updated_by: Option<&'a str>,
+}
+
+/// Per-lane result of a [`LaneCleanupRequest`]. In dry-run mode `would_remove` lists the terminal
+/// members that an apply would drop and `removed` is empty; in apply mode `removed` lists the members
+/// actually dropped and `would_remove` is empty. `remaining_count` and `status_counts` are derived
+/// from the members that remain (non-terminal) plus their live ticket statuses, never from lane text.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LaneCleanupReport {
+    pub lane_id: String,
+    pub would_remove: Vec<String>,
+    pub removed: Vec<String>,
+    pub remaining_count: usize,
+    pub status_counts: loom_lanes::LaneStatusCounts,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -584,70 +627,148 @@ fn require_meetings_snapshot(
         .ok_or_else(|| LoomError::not_found("meetings snapshot not found"))
 }
 
-fn save_meetings_snapshot(
+fn persist_meetings_review(
     loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
-    profile_id: &str,
-    snapshot: &MeetingsProfileSnapshot,
-    action: &str,
-    target_id: &str,
+    mutation: MeetingsReviewMutation<'_>,
 ) -> Result<()> {
-    let target = format!("{profile_id}/{target_id}");
-    loom.store().control_set_audited(
-        &meetings_profile_key(profile_id)?,
-        snapshot.encode()?,
-        loom.effective_principal()?.or(Some(workspace)),
-        action,
-        Some(&target),
+    let profile_id = mutation.profile_id;
+    let index = load_current_revision_index(loom, workspace, profile_id)?;
+    let (index, mut owner_state) = prepare_meetings_review(
+        loom,
+        workspace,
+        mutation,
+        index,
+        loom_core::WorkflowOwnerState::default(),
     )?;
-    Ok(())
+    let (reference_root, objects) = loom.save_state_objects()?;
+    owner_state.objects.extend(objects);
+    owner_state.reference = loom_core::WorkflowReferenceUpdate::Set(Some(reference_root));
+    persist_current_revision_index_with_owner_state(
+        loom,
+        workspace,
+        profile_id,
+        FacetKind::Document,
+        &index,
+        owner_state,
+    )
 }
 
-fn update_meetings_review_revision_index(
-    loom: &mut Loom<FileStore>,
-    workspace: WorkspaceId,
-    profile_id: &str,
+struct MeetingsReviewMutation<'a> {
+    profile_id: &'a str,
+    snapshot: &'a MeetingsProfileSnapshot,
+    action: &'a str,
+    target_id: &'a str,
     entity_id: String,
     operation_id: String,
-    body: &[u8],
-    media_type: &str,
+    body: &'a [u8],
+    media_type: &'a str,
     timestamp_ms: u64,
-) -> Result<()> {
-    let index_path = revision_index_path(profile_id)?;
-    let index = match loom.read_file_reserved(workspace, &index_path) {
-        Ok(bytes) => RevisionIndex::decode(&bytes)?,
-        Err(err) if err.code == Code::NotFound => RevisionIndex::new(),
-        Err(err) => return Err(err),
-    };
+}
+
+fn prepare_meetings_review(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    mutation: MeetingsReviewMutation<'_>,
+    index: loom_substrate::versioning::RevisionIndex,
+    mut owner_state: loom_core::WorkflowOwnerState,
+) -> Result<(
+    loom_substrate::versioning::RevisionIndex,
+    loom_core::WorkflowOwnerState,
+)> {
     let expected_latest_revision = index
-        .latest(&entity_id)
+        .latest(&mutation.entity_id)
         .map(|entry| entry.revision)
         .unwrap_or(0);
     let revision = expected_latest_revision.saturating_add(1);
-    let root = Digest::hash(loom.store().digest_algo(), body);
-    let logical_path = format!("meetings:{profile_id}:{entity_id}:{revision}");
+    let root = Digest::hash(loom.store().digest_algo(), mutation.body);
+    let logical_path = format!(
+        "meetings:{}:{}:{revision}",
+        mutation.profile_id, mutation.entity_id
+    );
     let mut state = ProfileTransactionState::new(root, index);
     let update = ProfileRevisionUpdate::new(
-        entity_id,
-        operation_id,
+        mutation.entity_id,
+        mutation.operation_id,
         BodyRef::new(
-            Digest::hash(loom.store().digest_algo(), body),
-            body.len() as u64,
-            media_type,
+            Digest::hash(loom.store().digest_algo(), mutation.body),
+            mutation.body.len() as u64,
+            mutation.media_type,
         )?,
-        timestamp_ms,
+        mutation.timestamp_ms,
         logical_path,
         Some(expected_latest_revision),
     )?;
     state.apply(ProfileTransaction::new(
-        profile_id,
+        mutation.profile_id,
         None,
         root,
         vec![update],
     )?)?;
-    let index = state.into_revision_index();
-    loom.create_directory_reserved(workspace, REVISION_INDEX_DIR, true)?;
-    loom.write_file_reserved(workspace, &index_path, &index.encode()?, 0o100644)
+    owner_state
+        .controls
+        .push(loom_core::WorkflowControlWrite::Put {
+            key: meetings_profile_key(mutation.profile_id)?,
+            payload: mutation.snapshot.encode()?,
+        });
+    owner_state.audits.push(loom_core::WorkflowAuditWrite {
+        principal: loom.effective_principal()?.or(Some(workspace)),
+        action: mutation.action.to_string(),
+        target: Some(format!("{}/{}", mutation.profile_id, mutation.target_id)),
+    });
+    Ok((state.into_revision_index(), owner_state))
+}
+
+fn prepare_meetings_review_append(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    mutation: MeetingsReviewMutation<'_>,
+    mut additions: RevisionIndexAppend,
+    mut owner_state: loom_core::WorkflowOwnerState,
+) -> Result<(RevisionIndexAppend, loom_core::WorkflowOwnerState)> {
+    let expected_latest_revision =
+        load_latest_entity_revision(loom, workspace, mutation.profile_id, &mutation.entity_id)?
+            .map(|entry| entry.revision)
+            .unwrap_or(0);
+    let revision = expected_latest_revision
+        .checked_add(1)
+        .ok_or_else(|| LoomError::invalid("meeting review entity revision overflow"))?;
+    let root = Digest::hash(loom.store().digest_algo(), mutation.body);
+    additions.push_revision(EntityRevision::new(
+        mutation.entity_id.clone(),
+        revision,
+        mutation.operation_id.clone(),
+        BodyRef::new(
+            Digest::hash(loom.store().digest_algo(), mutation.body),
+            mutation.body.len() as u64,
+            mutation.media_type,
+        )?,
+        root,
+        mutation.timestamp_ms,
+    )?)?;
+    additions.push_checkpoint(Checkpoint::new(
+        mutation.profile_id,
+        format!(
+            "meetings:{}:{}:{revision}",
+            mutation.profile_id, mutation.entity_id
+        ),
+        root,
+        revision,
+        mutation.operation_id.clone(),
+        mutation.timestamp_ms,
+    )?)?;
+    owner_state
+        .controls
+        .push(loom_core::WorkflowControlWrite::Put {
+            key: meetings_profile_key(mutation.profile_id)?,
+            payload: mutation.snapshot.encode()?,
+        });
+    owner_state.audits.push(loom_core::WorkflowAuditWrite {
+        principal: loom.effective_principal()?.or(Some(workspace)),
+        action: mutation.action.to_string(),
+        target: Some(format!("{}/{}", mutation.profile_id, mutation.target_id)),
+    });
+    Ok((additions, owner_state))
 }
 
 fn annotation_status(status: AnnotationStatus) -> &'static str {
@@ -978,6 +1099,75 @@ impl SubstrateTransactOp {
             Self::SubstrateViewDefine(_) => "substrate.view_define",
         }
     }
+
+    fn workspace(&self) -> &str {
+        match self {
+            Self::CasPut { workspace, .. }
+            | Self::CasDelete { workspace, .. }
+            | Self::DocumentPut { workspace, .. }
+            | Self::DocumentDelete { workspace, .. }
+            | Self::DocumentReplaceText { workspace, .. }
+            | Self::GraphUpsertNode { workspace, .. }
+            | Self::GraphRemoveNode { workspace, .. }
+            | Self::GraphUpsertEdge { workspace, .. }
+            | Self::GraphRemoveEdge { workspace, .. } => workspace,
+            Self::SubstrateViewDefine(request) => &request.workspace,
+        }
+    }
+}
+
+fn substrate_transaction_planning_scope(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    ops: &[SubstrateTransactOp],
+) -> Result<loom_core::EnginePlanningScope> {
+    let mut paths = BTreeSet::new();
+    let mut include_references = false;
+    for op in ops {
+        match op {
+            SubstrateTransactOp::CasPut { content, .. } => {
+                let digest = Digest::hash(loom.store().digest_algo(), content);
+                paths.insert(loom_core::EnginePathSelector::Exact(
+                    loom_core::workspace::facet_path(FacetKind::Cas, &digest.to_hex()),
+                ));
+            }
+            SubstrateTransactOp::CasDelete { digest, .. } => {
+                let digest = Digest::parse(digest)?;
+                paths.insert(loom_core::EnginePathSelector::Exact(
+                    loom_core::workspace::facet_path(FacetKind::Cas, &digest.to_hex()),
+                ));
+            }
+            SubstrateTransactOp::DocumentPut { collection, .. }
+            | SubstrateTransactOp::DocumentDelete { collection, .. }
+            | SubstrateTransactOp::DocumentReplaceText { collection, .. } => {
+                paths.extend(loom_core::document_engine_planning_paths(collection));
+                include_references = true;
+            }
+            SubstrateTransactOp::GraphUpsertNode { collection, .. }
+            | SubstrateTransactOp::GraphRemoveNode { collection, .. }
+            | SubstrateTransactOp::GraphUpsertEdge { collection, .. }
+            | SubstrateTransactOp::GraphRemoveEdge { collection, .. } => {
+                paths.insert(loom_core::EnginePathSelector::Exact(
+                    loom_core::workspace::facet_path(FacetKind::Graph, collection),
+                ));
+                include_references = true;
+            }
+            SubstrateTransactOp::SubstrateViewDefine(request) => {
+                paths.insert(loom_core::EnginePathSelector::Exact(view_path(
+                    &request.view_id,
+                )?));
+            }
+        }
+    }
+    if include_references {
+        paths.insert(loom_core::EnginePathSelector::Exact(
+            loom_reference::INDEX_PATH.to_string(),
+        ));
+        paths.insert(loom_core::EnginePathSelector::Exact(
+            loom_core::workspace::facet_path(FacetKind::Graph, loom_reference::REFERENCE_GRAPH),
+        ));
+    }
+    loom_core::EnginePlanningScope::new(workspace, paths)
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -1055,12 +1245,20 @@ pub struct VectorSourceWrite<'a> {
     pub weights_digest: Option<&'a str>,
 }
 
-fn apply_cas_put(loom: &mut Loom<FileStore>, workspace: &str, content: &[u8]) -> Result<String> {
+fn apply_cas_put<S: loom_core::ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: &str,
+    content: &[u8],
+) -> Result<String> {
     let ns = resolve_ns(loom, workspace)?;
     Ok(cas_put(loom, ns, content)?.to_string())
 }
 
-fn apply_cas_delete(loom: &mut Loom<FileStore>, workspace: &str, digest: &str) -> Result<bool> {
+fn apply_cas_delete<S: loom_core::ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: &str,
+    digest: &str,
+) -> Result<bool> {
     let digest = Digest::parse(digest)?;
     let ns = resolve_ns(loom, workspace)?;
     cas_delete(loom, ns, &digest)
@@ -1068,8 +1266,8 @@ fn apply_cas_delete(loom: &mut Loom<FileStore>, workspace: &str, digest: &str) -
 
 // The document write + reference-index overlay lives in `loom_reference` (shared by the local MCP host
 // and the remote server dispatch); these thin wrappers resolve the workspace and delegate.
-fn apply_document_put(
-    loom: &mut Loom<FileStore>,
+fn apply_document_put<S: loom_core::ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: &str,
     name: &str,
     id: &str,
@@ -1088,17 +1286,13 @@ fn apply_document_put_binary(
     expected_entity_tag: Option<&str>,
 ) -> Result<loom_core::document::DocumentPutResult> {
     let ns = resolve_ns(loom, workspace)?;
-    let text = std::str::from_utf8(&bytes).ok().map(str::to_string);
-    let result = loom_core::document::document_put_binary_with_entity_tag(
-        loom,
-        ns,
-        name,
-        id,
-        bytes,
-        expected_entity_tag,
-    )?;
-    update_document_refs(loom, ns, name, id, text.as_deref())?;
-    Ok(result)
+    enforce_document_entity_tag(loom, ns, name, id, expected_entity_tag)?;
+    let digest = Digest::hash(loom.store().digest_algo(), &bytes);
+    loom_reference::put_document_indexed(loom, ns, name, id, bytes)?;
+    Ok(loom_core::document::DocumentPutResult {
+        entity_tag: loom_core::document_entity_tag_string_from_digest(digest),
+        digest,
+    })
 }
 
 fn apply_document_put_text(
@@ -1110,20 +1304,37 @@ fn apply_document_put_text(
     expected_entity_tag: Option<&str>,
 ) -> Result<loom_core::document::DocumentPutResult> {
     let ns = resolve_ns(loom, workspace)?;
-    let result = loom_core::document::document_put_text_with_entity_tag(
-        loom,
-        ns,
-        name,
-        id,
-        text,
-        expected_entity_tag,
-    )?;
-    update_document_refs(loom, ns, name, id, Some(text))?;
-    Ok(result)
+    enforce_document_entity_tag(loom, ns, name, id, expected_entity_tag)?;
+    let bytes = text.as_bytes().to_vec();
+    let digest = Digest::hash(loom.store().digest_algo(), &bytes);
+    loom_reference::put_document_indexed(loom, ns, name, id, bytes)?;
+    Ok(loom_core::document::DocumentPutResult {
+        entity_tag: loom_core::document_entity_tag_string_from_digest(digest),
+        digest,
+    })
 }
 
-fn apply_document_delete(
-    loom: &mut Loom<FileStore>,
+fn enforce_document_entity_tag(
+    loom: &Loom<FileStore>,
+    ns: WorkspaceId,
+    collection: &str,
+    id: &str,
+    expected_entity_tag: Option<&str>,
+) -> Result<()> {
+    let Some(expected_entity_tag) = expected_entity_tag else {
+        return Ok(());
+    };
+    match loom_core::document::document_get_binary(loom, ns, collection, id)? {
+        Some(current) if current.entity_tag == expected_entity_tag => Ok(()),
+        Some(_) | None => Err(LoomError::new(
+            Code::Conflict,
+            loom_types::ConflictReason::ExpectedTagMismatch.as_str(),
+        )),
+    }
+}
+
+fn apply_document_delete<S: loom_core::ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: &str,
     name: &str,
     id: &str,
@@ -1132,8 +1343,31 @@ fn apply_document_delete(
     loom_reference::delete_document_indexed(loom, ns, name, id)
 }
 
-fn apply_document_replace_text(
+fn apply_document_delete_collection(
     loom: &mut Loom<FileStore>,
+    workspace: &str,
+    name: &str,
+) -> Result<bool> {
+    let ns = resolve_ns(loom, workspace)?;
+    let ids = match loom_core::document::doc_list(loom, ns, name) {
+        Ok(collection) => collection
+            .ids()
+            .map(str::to_string)
+            .collect::<Vec<String>>(),
+        Err(error) if error.code == loom_core::Code::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let deleted = loom_core::document::doc_delete_collection(loom, ns, name)?;
+    if deleted {
+        for id in ids {
+            loom_reference::update_document_refs(loom, ns, name, &id, None)?;
+        }
+    }
+    Ok(deleted)
+}
+
+fn apply_document_replace_text<S: loom_core::ObjectStore>(
+    loom: &mut Loom<S>,
     request: DocumentReplaceTextRequest<'_>,
 ) -> Result<DocumentReplaceTextResult> {
     let ns = resolve_ns(loom, request.workspace)?;
@@ -1212,8 +1446,8 @@ fn apply_workgraph_fact_put(
     loom.store().control_set(&key, log.encode()?)
 }
 
-fn apply_substrate_view_define(
-    loom: &mut Loom<FileStore>,
+fn apply_substrate_view_define<S: loom_core::ObjectStore>(
+    loom: &mut Loom<S>,
     request: SubstrateViewDefineRequest<'_>,
 ) -> Result<ViewDefinitionSummary> {
     let freshness_policy = FreshnessPolicy::parse(request.freshness_policy)?;
@@ -1241,8 +1475,8 @@ fn apply_substrate_view_define(
     Ok(ViewDefinitionSummary::from(view))
 }
 
-fn current_workspace_source_digests(
-    loom: &Loom<FileStore>,
+fn current_workspace_source_digests<S: loom_core::ObjectStore>(
+    loom: &Loom<S>,
     ns: WorkspaceId,
 ) -> Result<Vec<Digest>> {
     let branch = loom.registry().head_branch(ns)?;
@@ -1253,8 +1487,8 @@ fn current_workspace_source_digests(
         .collect())
 }
 
-fn apply_substrate_transact_op(
-    loom: &mut Loom<FileStore>,
+fn apply_substrate_transact_op<S: loom_core::ObjectStore>(
+    loom: &mut Loom<S>,
     op: SubstrateTransactOp,
 ) -> Result<SubstrateTransactOpResult> {
     let kind = op.kind();
@@ -1549,24 +1783,23 @@ impl crate::LoomMcp {
             let reviewed_at_ms = now_ms();
             let annotation =
                 snapshot.accept_annotation(annotation_id, principal, reviewed_at_ms)?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.annotation.accept",
-                annotation_id,
-            )?;
             let body = annotation.encode()?;
-            update_meetings_review_revision_index(
+            persist_meetings_review(
                 loom,
                 ns,
-                profile_id,
-                format!("meetings:annotation:{annotation_id}"),
-                format!("meetings.annotation.accept:{profile_id}:{annotation_id}"),
-                &body,
-                "application/vnd.uldren.loom.meetings.annotation+cbor",
-                reviewed_at_ms,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.annotation.accept",
+                    target_id: annotation_id,
+                    entity_id: format!("meetings:annotation:{annotation_id}"),
+                    operation_id: format!(
+                        "meetings.annotation.accept:{profile_id}:{annotation_id}"
+                    ),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.annotation+cbor",
+                    timestamp_ms: reviewed_at_ms,
+                },
             )?;
             annotation_review_summary(profile_id, annotation)
         })
@@ -1584,24 +1817,23 @@ impl crate::LoomMcp {
             let mut snapshot = require_meetings_snapshot(loom, profile_id)?;
             let reviewed_at_ms = now_ms();
             let annotation = snapshot.reject_annotation(annotation_id)?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.annotation.reject",
-                annotation_id,
-            )?;
             let body = annotation.encode()?;
-            update_meetings_review_revision_index(
+            persist_meetings_review(
                 loom,
                 ns,
-                profile_id,
-                format!("meetings:annotation:{annotation_id}"),
-                format!("meetings.annotation.reject:{profile_id}:{annotation_id}"),
-                &body,
-                "application/vnd.uldren.loom.meetings.annotation+cbor",
-                reviewed_at_ms,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.annotation.reject",
+                    target_id: annotation_id,
+                    entity_id: format!("meetings:annotation:{annotation_id}"),
+                    operation_id: format!(
+                        "meetings.annotation.reject:{profile_id}:{annotation_id}"
+                    ),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.annotation+cbor",
+                    timestamp_ms: reviewed_at_ms,
+                },
             )?;
             annotation_review_summary(profile_id, annotation)
         })
@@ -1621,24 +1853,24 @@ impl crate::LoomMcp {
             term.aliases = aliases;
             let mut snapshot = require_meetings_snapshot(loom, profile_id)?;
             let term = snapshot.add_vocabulary_term(term)?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.vocabulary.propose",
-                &term.term_id,
-            )?;
             let body = term.encode()?;
-            update_meetings_review_revision_index(
+            persist_meetings_review(
                 loom,
                 ns,
-                profile_id,
-                format!("meetings:vocabulary:{}", term.term_id),
-                format!("meetings.vocabulary.propose:{profile_id}:{}", term.term_id),
-                &body,
-                "application/vnd.uldren.loom.meetings.vocabulary-term+cbor",
-                term.created_at_ms,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.vocabulary.propose",
+                    target_id: &term.term_id,
+                    entity_id: format!("meetings:vocabulary:{}", term.term_id),
+                    operation_id: format!(
+                        "meetings.vocabulary.propose:{profile_id}:{}",
+                        term.term_id
+                    ),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.vocabulary-term+cbor",
+                    timestamp_ms: term.created_at_ms,
+                },
             )?;
             vocabulary_review_summary(profile_id, term)
         })
@@ -1657,24 +1889,21 @@ impl crate::LoomMcp {
             let mut snapshot = require_meetings_snapshot(loom, profile_id)?;
             let reviewed_at_ms = now_ms();
             let term = snapshot.accept_vocabulary_term(term_id, reviewer, reviewed_at_ms)?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.vocabulary.accept",
-                term_id,
-            )?;
             let body = term.encode()?;
-            update_meetings_review_revision_index(
+            persist_meetings_review(
                 loom,
                 ns,
-                profile_id,
-                format!("meetings:vocabulary:{term_id}"),
-                format!("meetings.vocabulary.accept:{profile_id}:{term_id}"),
-                &body,
-                "application/vnd.uldren.loom.meetings.vocabulary-term+cbor",
-                reviewed_at_ms,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.vocabulary.accept",
+                    target_id: term_id,
+                    entity_id: format!("meetings:vocabulary:{term_id}"),
+                    operation_id: format!("meetings.vocabulary.accept:{profile_id}:{term_id}"),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.vocabulary-term+cbor",
+                    timestamp_ms: reviewed_at_ms,
+                },
             )?;
             vocabulary_review_summary(profile_id, term)
         })
@@ -1693,24 +1922,21 @@ impl crate::LoomMcp {
             let mut snapshot = require_meetings_snapshot(loom, profile_id)?;
             let reviewed_at_ms = now_ms();
             let term = snapshot.reject_vocabulary_term(term_id, reviewer, reviewed_at_ms)?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.vocabulary.reject",
-                term_id,
-            )?;
             let body = term.encode()?;
-            update_meetings_review_revision_index(
+            persist_meetings_review(
                 loom,
                 ns,
-                profile_id,
-                format!("meetings:vocabulary:{term_id}"),
-                format!("meetings.vocabulary.reject:{profile_id}:{term_id}"),
-                &body,
-                "application/vnd.uldren.loom.meetings.vocabulary-term+cbor",
-                reviewed_at_ms,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.vocabulary.reject",
+                    target_id: term_id,
+                    entity_id: format!("meetings:vocabulary:{term_id}"),
+                    operation_id: format!("meetings.vocabulary.reject:{profile_id}:{term_id}"),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.vocabulary-term+cbor",
+                    timestamp_ms: reviewed_at_ms,
+                },
             )?;
             vocabulary_review_summary(profile_id, term)
         })
@@ -1739,24 +1965,21 @@ impl crate::LoomMcp {
             })?;
             let mut snapshot = require_meetings_snapshot(loom, profile_id)?;
             let merge = snapshot.add_entity_merge(merge)?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.entity.merge",
-                &merge.merge_id,
-            )?;
             let body = merge.encode()?;
-            update_meetings_review_revision_index(
+            persist_meetings_review(
                 loom,
                 ns,
-                profile_id,
-                format!("meetings:entity-merge:{}", merge.merge_id),
-                format!("meetings.entity.merge:{profile_id}:{}", merge.merge_id),
-                &body,
-                "application/vnd.uldren.loom.meetings.entity-merge+cbor",
-                merge.decided_at_ms,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.entity.merge",
+                    target_id: &merge.merge_id,
+                    entity_id: format!("meetings:entity-merge:{}", merge.merge_id),
+                    operation_id: format!("meetings.entity.merge:{profile_id}:{}", merge.merge_id),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.entity-merge+cbor",
+                    timestamp_ms: merge.decided_at_ms,
+                },
             )?;
             entity_merge_summary(profile_id, merge)
         })
@@ -1789,27 +2012,24 @@ impl crate::LoomMcp {
                     promoted_at_ms,
                 })?,
             )?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.promotion.add",
-                &promotion.promotion_id,
-            )?;
             let body = promotion.encode()?;
-            update_meetings_review_revision_index(
+            persist_meetings_review(
                 loom,
                 ns,
-                profile_id,
-                format!("meetings:promotion:{}", promotion.promotion_id),
-                format!(
-                    "meetings.promotion.add:{profile_id}:{}",
-                    promotion.promotion_id
-                ),
-                &body,
-                "application/vnd.uldren.loom.meetings.promotion+cbor",
-                promotion.promoted_at_ms,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.promotion.add",
+                    target_id: &promotion.promotion_id,
+                    entity_id: format!("meetings:promotion:{}", promotion.promotion_id),
+                    operation_id: format!(
+                        "meetings.promotion.add:{profile_id}:{}",
+                        promotion.promotion_id
+                    ),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.promotion+cbor",
+                    timestamp_ms: promotion.promoted_at_ms,
+                },
             )?;
             Ok(MeetingsPromotionWriteSummary {
                 workspace_id: profile_id.to_string(),
@@ -1829,7 +2049,7 @@ impl crate::LoomMcp {
         profile_id: &str,
         request: MeetingsPromoteTaskToTicketRequest<'_>,
     ) -> Result<MeetingsTicketPromotionWriteSummary> {
-        let (summary, queued) = self.store.write(|loom| {
+        let summary = self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
             loom.authorize_domain(ns, AclDomain::Meetings, AclRight::Write)?;
             let promoted_by = loom.effective_principal()?.unwrap_or(ns).to_string();
@@ -1888,7 +2108,7 @@ impl crate::LoomMcp {
                 "meeting_id": annotation.meeting_id,
                 "meeting_annotation_id": annotation.annotation_id
             });
-            let ticket = loom_tickets::create_ticket(
+            let prepared_ticket = loom_tickets::prepare_ticket_create(
                 loom,
                 ns,
                 TicketCreateRequest {
@@ -1902,29 +2122,7 @@ impl crate::LoomMcp {
                     expected_root: request.expected_ticket_root,
                 },
             )?;
-            loom_tickets::update_ticket_field_references(
-                loom,
-                ns,
-                &ticket.workspace_id,
-                &ticket.ticket_id,
-                &ticket.fields,
-            )?;
-            let queued = if let Some(operation_id) = ticket.operation_id.as_deref() {
-                loom_tickets::enqueue_ticket_reference_candidates(
-                    loom,
-                    ns,
-                    loom_tickets::TicketReferenceCandidateRequest {
-                        workspace_id: &ticket.workspace_id,
-                        ticket_id: &ticket.ticket_id,
-                        operation_id,
-                        source_root: Digest::parse(&ticket.profile_root)?,
-                        fields: &ticket.fields,
-                        now_ms: now_ms(),
-                    },
-                )?
-            } else {
-                false
-            };
+            let ticket = prepared_ticket.summary.clone();
             let target_entity_ref = format!("ticket:{}", ticket.ticket_id);
             let promotion = snapshot.add_promotion(
                 loom_substrate::meetings::PromotionRecord::new(PromotionInput {
@@ -1937,27 +2135,36 @@ impl crate::LoomMcp {
                     promoted_at_ms,
                 })?,
             )?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.promotion.add",
-                &promotion.promotion_id,
-            )?;
             let body = promotion.encode()?;
-            update_meetings_review_revision_index(
+            let (revision_index, owner_state) = prepare_meetings_review_append(
+                loom,
+                ns,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.promotion.add",
+                    target_id: &promotion.promotion_id,
+                    entity_id: format!("meetings:promotion:{}", promotion.promotion_id),
+                    operation_id: format!(
+                        "meetings.promotion.add:{profile_id}:{}",
+                        promotion.promotion_id
+                    ),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.promotion+cbor",
+                    timestamp_ms: promotion.promoted_at_ms,
+                },
+                prepared_ticket.revision_index,
+                prepared_ticket.owner_state,
+            )?;
+            persist_revision_index_append_with_owner_state_and_writes(
                 loom,
                 ns,
                 profile_id,
-                format!("meetings:promotion:{}", promotion.promotion_id),
-                format!(
-                    "meetings.promotion.add:{profile_id}:{}",
-                    promotion.promotion_id
-                ),
-                &body,
-                "application/vnd.uldren.loom.meetings.promotion+cbor",
-                promotion.promoted_at_ms,
+                FacetKind::Queue,
+                &revision_index,
+                prepared_ticket.writes,
+                prepared_ticket.idempotency,
+                owner_state,
             )?;
             let promotion = MeetingsPromotionWriteSummary {
                 workspace_id: profile_id.to_string(),
@@ -1968,14 +2175,9 @@ impl crate::LoomMcp {
                 target_entity_ref: promotion.target_entity_ref,
                 record_cbor_hex: hex::encode(body),
             };
-            Ok((
-                MeetingsTicketPromotionWriteSummary { promotion, ticket },
-                queued,
-            ))
+            Ok(MeetingsTicketPromotionWriteSummary { promotion, ticket })
         })?;
-        if queued {
-            self.store.signal_reference_reconcile()?;
-        }
+        self.store.signal_reference_reconcile()?;
         Ok(summary)
     }
 
@@ -2058,27 +2260,24 @@ impl crate::LoomMcp {
                     promoted_at_ms,
                 })?,
             )?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.promotion.add",
-                &promotion.promotion_id,
-            )?;
             let body = promotion.encode()?;
-            update_meetings_review_revision_index(
+            persist_meetings_review(
                 loom,
                 ns,
-                profile_id,
-                format!("meetings:promotion:{}", promotion.promotion_id),
-                format!(
-                    "meetings.promotion.add:{profile_id}:{}",
-                    promotion.promotion_id
-                ),
-                &body,
-                "application/vnd.uldren.loom.meetings.promotion+cbor",
-                promotion.promoted_at_ms,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.promotion.add",
+                    target_id: &promotion.promotion_id,
+                    entity_id: format!("meetings:promotion:{}", promotion.promotion_id),
+                    operation_id: format!(
+                        "meetings.promotion.add:{profile_id}:{}",
+                        promotion.promotion_id
+                    ),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.promotion+cbor",
+                    timestamp_ms: promotion.promoted_at_ms,
+                },
             )?;
             let promotion = MeetingsPromotionWriteSummary {
                 workspace_id: profile_id.to_string(),
@@ -2154,7 +2353,7 @@ impl crate::LoomMcp {
                 promoted_by: &promoted_by,
                 promoted_at_ms,
             })?;
-            let lifecycle = loom_lifecycle::instantiate(
+            let prepared_lifecycle = loom_lifecycle::prepare_instantiate(
                 loom,
                 ns,
                 profile_id,
@@ -2165,6 +2364,7 @@ impl crate::LoomMcp {
                     format!("meeting-annotation:{}", annotation.annotation_id),
                 ],
             )?;
+            let lifecycle = prepared_lifecycle.summary;
             let promotion = snapshot.add_promotion(
                 loom_substrate::meetings::PromotionRecord::new(PromotionInput {
                     promotion_id: request.promotion_id,
@@ -2176,27 +2376,34 @@ impl crate::LoomMcp {
                     promoted_at_ms,
                 })?,
             )?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.promotion.add",
-                &promotion.promotion_id,
-            )?;
             let body = promotion.encode()?;
-            update_meetings_review_revision_index(
+            let (revision_index, owner_state) = prepare_meetings_review(
+                loom,
+                ns,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.promotion.add",
+                    target_id: &promotion.promotion_id,
+                    entity_id: format!("meetings:promotion:{}", promotion.promotion_id),
+                    operation_id: format!(
+                        "meetings.promotion.add:{profile_id}:{}",
+                        promotion.promotion_id
+                    ),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.promotion+cbor",
+                    timestamp_ms: promotion.promoted_at_ms,
+                },
+                prepared_lifecycle.revision_index,
+                prepared_lifecycle.owner_state,
+            )?;
+            persist_current_revision_index_with_owner_state(
                 loom,
                 ns,
                 profile_id,
-                format!("meetings:promotion:{}", promotion.promotion_id),
-                format!(
-                    "meetings.promotion.add:{profile_id}:{}",
-                    promotion.promotion_id
-                ),
-                &body,
-                "application/vnd.uldren.loom.meetings.promotion+cbor",
-                promotion.promoted_at_ms,
+                FacetKind::Program,
+                &revision_index,
+                owner_state,
             )?;
             let promotion = MeetingsPromotionWriteSummary {
                 workspace_id: profile_id.to_string(),
@@ -2315,7 +2522,7 @@ impl crate::LoomMcp {
                 promoted_at_ms,
             })?;
             let source_ref = format!("meeting-annotation:{}", annotation.annotation_id);
-            let reference_artifact = loom_reference::create_reference_artifact(
+            let prepared_reference = loom_reference::prepare_reference_artifact(
                 loom,
                 ns,
                 ReferenceArtifactCreateRequest {
@@ -2330,6 +2537,7 @@ impl crate::LoomMcp {
                     created_at_ms: promoted_at_ms,
                 },
             )?;
+            let reference_artifact = prepared_reference.summary;
             let promotion = snapshot.add_promotion(
                 loom_substrate::meetings::PromotionRecord::new(PromotionInput {
                     promotion_id: input.promotion_id,
@@ -2341,27 +2549,41 @@ impl crate::LoomMcp {
                     promoted_at_ms,
                 })?,
             )?;
-            save_meetings_snapshot(
-                loom,
-                ns,
-                profile_id,
-                &snapshot,
-                "meetings.promotion.add",
-                &promotion.promotion_id,
-            )?;
             let body = promotion.encode()?;
-            update_meetings_review_revision_index(
+            let index = load_current_revision_index(loom, ns, profile_id)?;
+            let (reference_root, objects) = loom.save_state_objects()?;
+            let (revision_index, owner_state) = prepare_meetings_review(
+                loom,
+                ns,
+                MeetingsReviewMutation {
+                    profile_id,
+                    snapshot: &snapshot,
+                    action: "meetings.promotion.add",
+                    target_id: &promotion.promotion_id,
+                    entity_id: format!("meetings:promotion:{}", promotion.promotion_id),
+                    operation_id: format!(
+                        "meetings.promotion.add:{profile_id}:{}",
+                        promotion.promotion_id
+                    ),
+                    body: &body,
+                    media_type: "application/vnd.uldren.loom.meetings.promotion+cbor",
+                    timestamp_ms: promotion.promoted_at_ms,
+                },
+                index,
+                loom_core::WorkflowOwnerState {
+                    objects,
+                    reference: loom_core::WorkflowReferenceUpdate::Set(Some(reference_root)),
+                    controls: vec![prepared_reference.control],
+                    audits: Vec::new(),
+                },
+            )?;
+            persist_current_revision_index_with_owner_state(
                 loom,
                 ns,
                 profile_id,
-                format!("meetings:promotion:{}", promotion.promotion_id),
-                format!(
-                    "meetings.promotion.add:{profile_id}:{}",
-                    promotion.promotion_id
-                ),
-                &body,
-                "application/vnd.uldren.loom.meetings.promotion+cbor",
-                promotion.promoted_at_ms,
+                FacetKind::Document,
+                &revision_index,
+                owner_state,
             )?;
             let promotion = MeetingsPromotionWriteSummary {
                 workspace_id: profile_id.to_string(),
@@ -2878,6 +3100,15 @@ impl crate::LoomMcp {
             .write(|loom| apply_document_delete(loom, workspace, name, id))
     }
 
+    /// `document.delete_collection`: remove collection `name`; returns whether it existed.
+    pub fn write_document_delete_collection(&self, workspace: &str, name: &str) -> Result<bool> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.document_delete_collection(workspace, name);
+        }
+        self.store
+            .write(|loom| apply_document_delete_collection(loom, workspace, name))
+    }
+
     pub fn write_document_replace_text(
         &self,
         request: DocumentReplaceTextRequest<'_>,
@@ -3095,37 +3326,11 @@ impl crate::LoomMcp {
         workspace: &str,
         request: TicketCreateRequest<'_>,
     ) -> Result<TicketSummary> {
-        let (ticket, queued) = self.store.write(|loom| {
+        let ticket = self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
-            let ticket = loom_tickets::create_ticket(loom, ns, request)?;
-            loom_tickets::update_ticket_field_references(
-                loom,
-                ns,
-                &ticket.workspace_id,
-                &ticket.ticket_id,
-                &ticket.fields,
-            )?;
-            let queued = if let Some(operation_id) = ticket.operation_id.as_deref() {
-                loom_tickets::enqueue_ticket_reference_candidates(
-                    loom,
-                    ns,
-                    loom_tickets::TicketReferenceCandidateRequest {
-                        workspace_id: &ticket.workspace_id,
-                        ticket_id: &ticket.ticket_id,
-                        operation_id,
-                        source_root: Digest::parse(&ticket.profile_root)?,
-                        fields: &ticket.fields,
-                        now_ms: now_ms(),
-                    },
-                )?
-            } else {
-                false
-            };
-            Ok((ticket, queued))
+            loom_tickets::create_ticket(loom, ns, request)
         })?;
-        if queued {
-            self.store.signal_reference_reconcile()?;
-        }
+        self.store.signal_reference_reconcile()?;
         Ok(ticket)
     }
 
@@ -3134,37 +3339,11 @@ impl crate::LoomMcp {
         workspace: &str,
         request: TicketUpdateRequest<'_>,
     ) -> Result<TicketSummary> {
-        let (ticket, queued) = self.store.write(|loom| {
+        let ticket = self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
-            let ticket = loom_tickets::update_ticket(loom, ns, request)?;
-            loom_tickets::update_ticket_field_references(
-                loom,
-                ns,
-                &ticket.workspace_id,
-                &ticket.ticket_id,
-                &ticket.fields,
-            )?;
-            let queued = if let Some(operation_id) = ticket.operation_id.as_deref() {
-                loom_tickets::enqueue_ticket_reference_candidates(
-                    loom,
-                    ns,
-                    loom_tickets::TicketReferenceCandidateRequest {
-                        workspace_id: &ticket.workspace_id,
-                        ticket_id: &ticket.ticket_id,
-                        operation_id,
-                        source_root: Digest::parse(&ticket.profile_root)?,
-                        fields: &ticket.fields,
-                        now_ms: now_ms(),
-                    },
-                )?
-            } else {
-                false
-            };
-            Ok((ticket, queued))
+            loom_tickets::update_ticket(loom, ns, request)
         })?;
-        if queued {
-            self.store.signal_reference_reconcile()?;
-        }
+        self.store.signal_reference_reconcile()?;
         Ok(ticket)
     }
 
@@ -3175,15 +3354,7 @@ impl crate::LoomMcp {
     ) -> Result<TicketSummary> {
         self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
-            let ticket = loom_tickets::delete_ticket(loom, ns, request)?;
-            loom_tickets::update_ticket_field_references(
-                loom,
-                ns,
-                &ticket.workspace_id,
-                &ticket.ticket_id,
-                &ticket.fields,
-            )?;
-            Ok(ticket)
+            loom_tickets::delete_ticket(loom, ns, request)
         })
     }
 
@@ -3258,15 +3429,7 @@ impl crate::LoomMcp {
             .to_string();
         let ticket = self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
-            let ticket = loom_tickets::add_ticket_comment(loom, ns, request)?;
-            loom_tickets::update_ticket_field_references(
-                loom,
-                ns,
-                &ticket.workspace_id,
-                &ticket.ticket_id,
-                &ticket.fields,
-            )?;
-            Ok(ticket)
+            loom_tickets::add_ticket_comment(loom, ns, request)
         })?;
         let mut changes = vec![MutationChange::field_set("comment_type", comment_type)];
         if let Some(comment_id) = comment_id {
@@ -3302,15 +3465,7 @@ impl crate::LoomMcp {
         }
         let ticket = self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
-            let ticket = loom_tickets::update_ticket_comment(loom, ns, request)?;
-            loom_tickets::update_ticket_field_references(
-                loom,
-                ns,
-                &ticket.workspace_id,
-                &ticket.ticket_id,
-                &ticket.fields,
-            )?;
-            Ok(ticket)
+            loom_tickets::update_ticket_comment(loom, ns, request)
         })?;
         Ok(ticket_receipt(
             "ticket.comment_updated",
@@ -3329,15 +3484,7 @@ impl crate::LoomMcp {
         let comment_id = request.comment_id.to_string();
         let ticket = self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
-            let ticket = loom_tickets::delete_ticket_comment(loom, ns, request)?;
-            loom_tickets::update_ticket_field_references(
-                loom,
-                ns,
-                &ticket.workspace_id,
-                &ticket.ticket_id,
-                &ticket.fields,
-            )?;
-            Ok(ticket)
+            loom_tickets::delete_ticket_comment(loom, ns, request)
         })?;
         Ok(ticket_receipt(
             "ticket.comment_deleted",
@@ -3476,7 +3623,7 @@ impl crate::LoomMcp {
             })
         };
         if let Some(backend) = self.store.remote_backend() {
-            // TODO: remote host derives the actor; forward the provided override verbatim.
+            // Remote host derives the actor; forward the caller-provided override verbatim.
             return backend.lanes_create(workspace, build_lane(request.updated_by.unwrap_or(""))?);
         }
         self.store.write(|loom| {
@@ -3558,6 +3705,65 @@ impl crate::LoomMcp {
         )
     }
 
+    /// Combined closeout: in one transaction, write a typed ticket comment to the durable ticket and
+    /// set a short lane `status_report` summary. The ticket is the durable record; the lane text is
+    /// only a summary. Not available over a remote backend (local coordination operation).
+    pub fn write_lanes_closeout(
+        &self,
+        workspace: &str,
+        request: LaneCloseoutRequest<'_>,
+    ) -> Result<Lane> {
+        if request.comment_body.trim().is_empty() {
+            return Err(LoomError::invalid(
+                "lane closeout requires a non-empty ticket comment body",
+            ));
+        }
+        if self.store.remote_backend().is_some() {
+            return Err(LoomError::invalid(
+                "lane closeout is not available over a remote backend",
+            ));
+        }
+        self.write_lanes_mutation(
+            workspace,
+            request.lane_id,
+            "lane.closeout",
+            |lane, loom, ns| {
+                loom_tickets::add_ticket_comment(
+                    loom,
+                    ns,
+                    loom_tickets::TicketCommentRequest {
+                        workspace_id: request.ticket_workspace_id,
+                        ticket_id: request.ticket_id,
+                        comment_id: None,
+                        comment_type: Some(request.comment_type),
+                        body: request.comment_body,
+                        evidence: request.evidence,
+                        expected_root: request.expected_root,
+                    },
+                )?;
+                lane.status_report = request.status_report.to_string();
+                let actor = resolve_lane_actor(loom, ns, request.updated_by)?;
+                update_lane_metadata(lane, &actor);
+                Ok(())
+            },
+        )
+    }
+
+    pub fn write_lanes_closeout_receipt(
+        &self,
+        workspace: &str,
+        request: LaneCloseoutRequest<'_>,
+    ) -> Result<MutationEnvelope<Lane>> {
+        let comment_type = request.comment_type.to_string();
+        let status_report = request.status_report.to_string();
+        let lane = self.write_lanes_closeout(workspace, request)?;
+        let changes = vec![
+            MutationChange::field_set("comment_type", comment_type),
+            MutationChange::field_set("status_report", status_report),
+        ];
+        Ok(lane_receipt("lane.closeout", lane, changes))
+    }
+
     pub fn write_lanes_update_receipt(
         &self,
         workspace: &str,
@@ -3625,7 +3831,7 @@ impl crate::LoomMcp {
         request: LaneTicketUpdateRequest<'_>,
     ) -> Result<Lane> {
         if let Some(backend) = self.store.remote_backend() {
-            // TODO: remote host derives the actor; forward the provided override verbatim.
+            // Remote host derives the actor; forward the caller-provided override verbatim.
             return backend.lanes_ticket_remove(
                 workspace,
                 request.lane_id,
@@ -3733,6 +3939,75 @@ impl crate::LoomMcp {
         ))
     }
 
+    /// Remove terminal (accepted/rejected/closed) tickets from assignment lane membership. Reuses
+    /// `build_lane_view` to resolve each member's live ticket status and `loom_lanes` primitives to
+    /// compute and apply the removals, so counts stay derived from membership + statuses. Dry-run
+    /// (`apply=false`) reads only and reports what would be removed; apply edits membership and never
+    /// touches ticket records. Returns one report per target lane (single element when `lane_id` is
+    /// set, otherwise one per assignment lane).
+    pub fn write_lanes_cleanup(
+        &self,
+        workspace: &str,
+        request: LaneCleanupRequest<'_>,
+    ) -> Result<Vec<LaneCleanupReport>> {
+        if request.apply {
+            self.store.write(|loom| {
+                let ns = resolve_ns(loom, workspace)?;
+                let ticket_workspace_id = ns.to_string();
+                let mut reports = Vec::new();
+                for mut lane in cleanup_target_lanes(loom, ns, request.lane_id)? {
+                    let view =
+                        loom_client::local::build_lane_view(loom, ns, &ticket_workspace_id, &lane);
+                    let terminal_ids = loom_lanes::terminal_lane_ticket_ids(&view.lane_tickets);
+                    let (remaining_count, status_counts) =
+                        cleanup_remaining_summary(&view, &terminal_ids);
+                    let removed = loom_lanes::remove_lane_tickets(&mut lane, &terminal_ids);
+                    if !removed.is_empty() {
+                        let actor = resolve_lane_actor(loom, ns, request.updated_by)?;
+                        update_lane_metadata(&mut lane, &actor);
+                        let lane = loom_lanes::put_lane(loom, ns, lane)?;
+                        loom_lanes::emit_lane_change_notification(
+                            loom,
+                            ns,
+                            workspace,
+                            &lane,
+                            "lane.cleaned",
+                        )?;
+                    }
+                    reports.push(LaneCleanupReport {
+                        lane_id: view.lane_id.clone(),
+                        would_remove: Vec::new(),
+                        removed,
+                        remaining_count,
+                        status_counts,
+                    });
+                }
+                Ok(reports)
+            })
+        } else {
+            self.store.read(|loom| {
+                let ns = resolve_ns(loom, workspace)?;
+                let ticket_workspace_id = ns.to_string();
+                let mut reports = Vec::new();
+                for lane in cleanup_target_lanes(loom, ns, request.lane_id)? {
+                    let view =
+                        loom_client::local::build_lane_view(loom, ns, &ticket_workspace_id, &lane);
+                    let terminal_ids = loom_lanes::terminal_lane_ticket_ids(&view.lane_tickets);
+                    let (remaining_count, status_counts) =
+                        cleanup_remaining_summary(&view, &terminal_ids);
+                    reports.push(LaneCleanupReport {
+                        lane_id: view.lane_id.clone(),
+                        would_remove: terminal_ids,
+                        removed: Vec::new(),
+                        remaining_count,
+                        status_counts,
+                    });
+                }
+                Ok(reports)
+            })
+        }
+    }
+
     fn write_lanes_mutation<F>(
         &self,
         workspace: &str,
@@ -3749,7 +4024,9 @@ impl crate::LoomMcp {
                 .ok_or_else(|| LoomError::new(Code::NotFound, "lane not found"))?;
             mutate(&mut lane, loom, ns)?;
             let lane = loom_lanes::put_lane(loom, ns, lane)?;
-            loom_lanes::emit_lane_change_notification(loom, ns, workspace, &lane, event_kind)?;
+            if event_kind != "lane.updated" {
+                loom_lanes::emit_lane_change_notification(loom, ns, workspace, &lane, event_kind)?;
+            }
             Ok(lane)
         })
     }
@@ -4838,24 +5115,123 @@ impl crate::LoomMcp {
         &self,
         ops: Vec<SubstrateTransactOp>,
     ) -> Result<SubstrateTransactResult> {
-        self.store.write(|loom| {
-            let snapshot = loom.export_state();
+        self.store.write_durable_transaction(|loom| {
+            if ops.is_empty() {
+                return Ok(SubstrateTransactResult {
+                    applied: 0,
+                    results: Vec::new(),
+                });
+            }
+            let mut workspace = None;
+            let mut document_changes = BTreeMap::<(WorkspaceId, String), BTreeSet<String>>::new();
+            for op in &ops {
+                let resolved = resolve_ns(loom, op.workspace())?;
+                if workspace
+                    .replace(resolved)
+                    .is_some_and(|seen| seen != resolved)
+                {
+                    return Err(LoomError::invalid(
+                        "substrate transaction operations must target one workspace",
+                    ));
+                }
+                match op {
+                    SubstrateTransactOp::DocumentPut { collection, id, .. }
+                    | SubstrateTransactOp::DocumentDelete { collection, id, .. }
+                    | SubstrateTransactOp::DocumentReplaceText { collection, id, .. } => {
+                        document_changes
+                            .entry((resolved, collection.clone()))
+                            .or_default()
+                            .insert(id.clone());
+                    }
+                    _ => {}
+                }
+            }
+            let workspace = workspace.expect("non-empty operation list has a workspace");
+            loom_store::ensure_engine_state_base(loom)?;
+            let planning_snapshot = loom_core::WorkflowPlanningSnapshot::open(
+                loom.store(),
+                Some("mcp.substrate-transact.plan"),
+            )?;
+            let scope = substrate_transaction_planning_scope(loom, workspace, &ops)?;
+            let includes_references = ops.iter().any(|op| {
+                matches!(
+                    op,
+                    SubstrateTransactOp::DocumentPut { .. }
+                        | SubstrateTransactOp::DocumentDelete { .. }
+                        | SubstrateTransactOp::DocumentReplaceText { .. }
+                        | SubstrateTransactOp::GraphUpsertNode { .. }
+                        | SubstrateTransactOp::GraphRemoveNode { .. }
+                        | SubstrateTransactOp::GraphUpsertEdge { .. }
+                        | SubstrateTransactOp::GraphRemoveEdge { .. }
+                )
+            });
+            let base_root = planning_snapshot.immutable_base_root().ok_or_else(|| {
+                LoomError::new(
+                    Code::Conflict,
+                    "substrate transaction planning requires a durable engine-state base root",
+                )
+            })?;
+            let mut planner = if includes_references {
+                let (mut planner, index) = loom_reference::bounded_planner_with_reference_index(
+                    loom,
+                    scope,
+                    base_root,
+                    planning_snapshot.fork_overlay(),
+                )?;
+                loom_reference::save_index(planner.engine_mut(), workspace, &index)?;
+                planner
+            } else {
+                loom.bounded_engine_planner(scope, base_root, planning_snapshot.fork_overlay())?
+            };
+            let overlay_snapshot = planner.engine().mutable_overlay_snapshot();
             let mut results = Vec::with_capacity(ops.len());
             for op in ops {
-                match apply_substrate_transact_op(loom, op) {
-                    Ok(result) => results.push(result),
-                    Err(error) => {
-                        if let Err(rollback_error) = loom.import_state(&snapshot) {
-                            return Err(LoomError::new(
-                                Code::Internal,
-                                format!(
-                                    "transaction rollback failed after operation error {error}: {rollback_error}"
-                                ),
-                            ));
-                        }
-                        return Err(error);
-                    }
-                }
+                results.push(apply_substrate_transact_op(planner.engine_mut(), op)?);
+            }
+            let mut writes = Vec::new();
+            for ((workspace, collection), ids) in document_changes {
+                let value =
+                    loom_core::document::doc_list(planner.engine(), workspace, &collection)?;
+                writes.extend(loom_core::document::prepare_document_workflow_writes(
+                    &overlay_snapshot,
+                    workspace,
+                    &collection,
+                    &value,
+                    &ids,
+                )?);
+            }
+            let (live_state, planned_objects) = planner.finish()?;
+            let (reference_root, owner_objects) =
+                loom.prepare_engine_state_delta_reference(&live_state, base_root, planned_objects)?;
+            let actor = loom.effective_principal()?.unwrap_or(workspace);
+            let plan = loom_core::BoundedMutationPlan::new(
+                planning_snapshot,
+                workspace,
+                actor,
+                writes,
+                loom_core::WorkflowOwnerState {
+                    objects: owner_objects,
+                    reference: loom_core::WorkflowReferenceUpdate::Set(Some(reference_root)),
+                    controls: Vec::new(),
+                    audits: Vec::new(),
+                },
+                live_state,
+                loom_core::OverlayDurabilityPolicy::Normal,
+            );
+            let (transaction, live_state) = plan.into_transaction();
+            let receipt = loom.store().commit_workflow_transaction(transaction)?;
+            loom.apply_engine_state_delta(live_state)?;
+            for outcome in receipt.writes {
+                let current = loom
+                    .store()
+                    .mutable_overlay_current_entry(&outcome.target)?
+                    .ok_or_else(|| {
+                        LoomError::corrupt(
+                            "substrate transaction receipt target is absent after commit",
+                        )
+                    })?;
+                loom.mutable_overlay_mut()
+                    .synchronize_current_entry(current)?;
             }
             Ok(SubstrateTransactResult {
                 applied: results.len() as u64,
@@ -6037,6 +6413,43 @@ fn update_lane_metadata(lane: &mut Lane, updated_by: &str) {
     lane.updated_by = updated_by.to_string();
 }
 
+/// Resolve the lanes a cleanup targets: the single named lane, or every assignment lane when no id is
+/// given. A named lane that does not exist is a not-found error.
+fn cleanup_target_lanes(
+    loom: &Loom<FileStore>,
+    ns: WorkspaceId,
+    lane_id: Option<&str>,
+) -> Result<Vec<Lane>> {
+    match lane_id {
+        Some(lane_id) => {
+            let lane = loom_lanes::get_lane(loom, ns, lane_id)?
+                .ok_or_else(|| LoomError::new(Code::NotFound, "lane not found"))?;
+            Ok(vec![lane])
+        }
+        None => Ok(loom_lanes::list_lanes(loom, ns)?
+            .into_iter()
+            .filter(|lane| lane.lane_kind == LaneKind::Assignment.as_str())
+            .collect()),
+    }
+}
+
+/// The post-cleanup remaining member count and status counts for a lane: the members whose ids are not
+/// in `terminal_ids`, with counts recomputed over their live statuses. Identical for dry-run and apply
+/// because cleanup never mutates tickets, so a dry run predicts exactly what an apply produces.
+fn cleanup_remaining_summary(
+    view: &loom_lanes::LaneView,
+    terminal_ids: &[String],
+) -> (usize, loom_lanes::LaneStatusCounts) {
+    let remaining: Vec<loom_lanes::LaneTicketView> = view
+        .lane_tickets
+        .iter()
+        .filter(|ticket| !terminal_ids.iter().any(|id| id == &ticket.ticket_id))
+        .cloned()
+        .collect();
+    let counts = loom_lanes::lane_status_counts(&remaining);
+    (remaining.len(), counts)
+}
+
 fn ticket_receipt(
     operation: &str,
     ticket: TicketSummary,
@@ -6134,8 +6547,9 @@ fn ticket_update_changes(request: &TicketUpdateRequest<'_>) -> Vec<MutationChang
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentReplaceTextRequest, GraphEdgeWrite, LaneCreateRequest, LaneDeleteRequest,
-        LaneTicketUpdateRequest, MeetingsPromoteArtifactToReferenceArtifactRequest,
+        DocumentReplaceTextRequest, GraphEdgeWrite, LaneCleanupRequest, LaneCloseoutRequest,
+        LaneCreateRequest, LaneDeleteRequest, LaneTicketUpdateRequest, LaneUpdateRequest,
+        MeetingsPromoteArtifactToReferenceArtifactRequest,
         MeetingsPromoteReferenceToReferenceArtifactRequest, MeetingsPromoteTaskToTicketRequest,
         PageCreateRequest, StructureBindRequest, StructureCreateRequest, StructureDecomposeRequest,
         StructureLinkRequest, StructureMoveRequest, StructureNodeRequest,
@@ -8891,27 +9305,27 @@ mod tests {
             .write_lanes_create(
                 "repo",
                 LaneCreateRequest {
-                    lane_id: "agent-3",
-                    lane_key: "agent-3",
-                    title: "Agent 3 lane",
+                    lane_id: "review-lane-a",
+                    lane_key: "review-lane-a",
+                    title: "Review lane A",
                     description: "Durable intention for mcp write round-trip.",
                     lane_kind: loom_lanes::LaneKind::Assignment.as_str(),
-                    owner_principal: Some("agent:3"),
+                    owner_principal: Some("user:reviewer-a"),
                     lane_status: "ready",
                     lane_tickets: &[
                         LaneTicket {
-                            ticket_id: "MX-102".to_string(),
+                            ticket_id: "DEMO-102".to_string(),
                             order_key: "F".to_string(),
                         },
                         LaneTicket {
-                            ticket_id: "MX-103".to_string(),
+                            ticket_id: "DEMO-103".to_string(),
                             order_key: "V".to_string(),
                         },
                     ],
-                    active_ticket_id: Some("MX-102"),
+                    active_ticket_id: Some("DEMO-102"),
                     status_report: "ready",
                     reviewer_feedback: "",
-                    updated_by: Some("agent:3"),
+                    updated_by: Some("user:reviewer-a"),
                 },
             )
             .expect("create lane");
@@ -8920,11 +9334,11 @@ mod tests {
         m.write_lanes_update(
             "repo",
             crate::writes::LaneUpdateRequest {
-                lane_id: "agent-3",
+                lane_id: "review-lane-a",
                 title: None,
                 description: None,
                 lane_status: None,
-                status_report: Some("working MX-104"),
+                status_report: Some("working DEMO-104"),
                 reviewer_feedback: Some("revise order"),
                 updated_by: Some("reviewer"),
             },
@@ -8933,20 +9347,20 @@ mod tests {
         m.write_lanes_ticket_add(
             "repo",
             LaneTicketUpdateRequest {
-                lane_id: "agent-3",
-                ticket_id: "MX-104",
+                lane_id: "review-lane-a",
+                ticket_id: "DEMO-104",
                 placement: LaneTicketPlacement::First,
-                updated_by: Some("agent:3"),
+                updated_by: Some("user:reviewer-a"),
             },
         )
         .expect("add ticket");
         m.write_lanes_ticket_remove(
             "repo",
             LaneTicketUpdateRequest {
-                lane_id: "agent-3",
-                ticket_id: "MX-102",
+                lane_id: "review-lane-a",
+                ticket_id: "DEMO-102",
                 placement: LaneTicketPlacement::Append,
-                updated_by: Some("agent:3"),
+                updated_by: Some("user:reviewer-a"),
             },
         )
         .expect("remove ticket");
@@ -8967,7 +9381,7 @@ mod tests {
             .unwrap()
         });
         assert!(replay.messages.iter().any(|message| {
-            message.envelope.subject == "lane:agent-3"
+            message.envelope.subject == "lane:review-lane-a"
                 && serde_json::from_slice::<serde_json::Value>(&message.payload)
                     .unwrap()["event_kind"]
                     == "lane.ticket_removed"
@@ -8988,12 +9402,12 @@ mod tests {
         });
 
         let read = m
-            .read_lanes_get("repo", "agent-3")
+            .read_lanes_get("repo", "review-lane-a")
             .expect("read lane")
             .expect("lane present");
-        assert_eq!(read.status_report, "working MX-104");
+        assert_eq!(read.status_report, "working DEMO-104");
         assert_eq!(read.reviewer_feedback, "revise order");
-        assert_eq!(read.lane_tickets[0].ticket_id, "MX-104");
+        assert_eq!(read.lane_tickets[0].ticket_id, "DEMO-104");
         assert_eq!(m.read_lanes_list("repo").expect("list lanes"), vec![read]);
 
         let _ = std::fs::remove_file(&path);
@@ -9046,9 +9460,9 @@ mod tests {
         m.write_lanes_create(
             "repo",
             LaneCreateRequest {
-                lane_id: "agent-7",
-                lane_key: "agent-7",
-                title: "Agent 7",
+                lane_id: "review-lane-b",
+                lane_key: "review-lane-b",
+                title: "Review lane B",
                 description: "",
                 lane_kind: "assignment",
                 owner_principal: None,
@@ -9057,27 +9471,27 @@ mod tests {
                 active_ticket_id: None,
                 status_report: "",
                 reviewer_feedback: "",
-                updated_by: Some("agent:7"),
+                updated_by: Some("user:reviewer-b"),
             },
         )
         .expect("lane");
         m.write_lanes_ticket_add(
             "repo",
             LaneTicketUpdateRequest {
-                lane_id: "agent-7",
+                lane_id: "review-lane-b",
                 ticket_id: &backlog.primary_key,
                 placement: LaneTicketPlacement::Append,
-                updated_by: Some("agent:7"),
+                updated_by: Some("user:reviewer-b"),
             },
         )
         .expect("add backlog ticket");
         m.write_lanes_ticket_add(
             "repo",
             LaneTicketUpdateRequest {
-                lane_id: "agent-7",
+                lane_id: "review-lane-b",
                 ticket_id: &planned.primary_key,
                 placement: LaneTicketPlacement::Append,
-                updated_by: Some("agent:7"),
+                updated_by: Some("user:reviewer-b"),
             },
         )
         .expect("add planned ticket");
@@ -9136,7 +9550,7 @@ mod tests {
                 active_ticket_id: None,
                 status_report: "",
                 reviewer_feedback: "",
-                updated_by: Some("agent:3"),
+                updated_by: Some("user:reviewer-a"),
             },
         )
         .expect("closed lane");
@@ -9155,7 +9569,7 @@ mod tests {
                     active_ticket_id: None,
                     status_report: "",
                     reviewer_feedback: "",
-                    updated_by: Some("agent:3"),
+                    updated_by: Some("user:reviewer-b"),
                 },
             )
             .expect("open lane");
@@ -9164,7 +9578,7 @@ mod tests {
                 "repo",
                 LaneDeleteRequest {
                     lane_id: &open_lane.lane_id,
-                    updated_by: "agent:3",
+                    updated_by: "user:reviewer-a",
                 },
             )
             .unwrap_err()
@@ -9176,7 +9590,7 @@ mod tests {
                 "repo",
                 LaneDeleteRequest {
                     lane_id: "done-lane",
-                    updated_by: "agent:3",
+                    updated_by: "user:reviewer-a",
                 },
             )
             .expect("delete receipt");
@@ -9209,7 +9623,7 @@ mod tests {
                 "repo",
                 LaneDeleteRequest {
                     lane_id: "missing-lane",
-                    updated_by: "agent:3",
+                    updated_by: "user:reviewer-a",
                 },
             )
             .unwrap_err()
@@ -9217,6 +9631,301 @@ mod tests {
             Code::NotFound
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lanes_cleanup_dry_run_previews_then_apply_removes_only_terminal_members() {
+        let path = temp_path();
+        fresh(&path);
+        // Lanes resolve member ticket statuses through the repo workspace id, so create the tickets
+        // there (not under "studio"); add the Document/Queue facets the lane write path uses.
+        let pid = update_store(&path, |loom| {
+            let repo = loom
+                .registry()
+                .open(&loom_core::WsSelector::Name("repo".to_string()))
+                .unwrap();
+            loom.registry_mut()
+                .add_facet(repo, FacetKind::Document)
+                .unwrap();
+            loom.registry_mut()
+                .add_facet(repo, FacetKind::Queue)
+                .unwrap();
+            repo.to_string()
+        });
+        let m = mcp(&path);
+        let project = m
+            .write_tickets_project_create("repo", &pid, "eng", "ENG", "Engineering", None)
+            .expect("project");
+        let accepted = m
+            .write_tickets_create(
+                "repo",
+                TicketCreateRequest {
+                    workspace_id: &pid,
+                    project_id: "eng",
+                    ticket_type: "task",
+                    external_source: None,
+                    external_id: None,
+                    fields: &json!({ "title": "A", "status": "accepted" }),
+                    policy_labels: &[],
+                    expected_root: Some(&project.profile_root),
+                },
+            )
+            .expect("accepted ticket");
+        let working = m
+            .write_tickets_create(
+                "repo",
+                TicketCreateRequest {
+                    workspace_id: &pid,
+                    project_id: "eng",
+                    ticket_type: "task",
+                    external_source: None,
+                    external_id: None,
+                    fields: &json!({ "title": "B", "status": "in_progress" }),
+                    policy_labels: &[],
+                    expected_root: Some(&accepted.profile_root),
+                },
+            )
+            .expect("working ticket");
+        let closed = m
+            .write_tickets_create(
+                "repo",
+                TicketCreateRequest {
+                    workspace_id: &pid,
+                    project_id: "eng",
+                    ticket_type: "task",
+                    external_source: None,
+                    external_id: None,
+                    fields: &json!({ "title": "C", "status": "closed" }),
+                    policy_labels: &[],
+                    expected_root: Some(&working.profile_root),
+                },
+            )
+            .expect("closed ticket");
+        let ids = vec![
+            accepted.primary_key.clone(),
+            working.primary_key.clone(),
+            closed.primary_key.clone(),
+        ];
+        let lane_tickets = loom_lanes::lane_tickets_from_order(&ids).expect("lane tickets");
+        m.write_lanes_create(
+            "repo",
+            LaneCreateRequest {
+                lane_id: "clean-lane",
+                lane_key: "clean-lane",
+                title: "Clean lane",
+                description: "",
+                lane_kind: "assignment",
+                owner_principal: None,
+                lane_status: "working",
+                lane_tickets: &lane_tickets,
+                active_ticket_id: Some(&working.primary_key),
+                status_report: "",
+                reviewer_feedback: "",
+                updated_by: Some("user:reviewer-a"),
+            },
+        )
+        .expect("lane");
+
+        // Dry run: reports the two terminal members in order, removes nothing, and does not mutate.
+        let dry = m
+            .write_lanes_cleanup(
+                "repo",
+                LaneCleanupRequest {
+                    lane_id: Some("clean-lane"),
+                    apply: false,
+                    updated_by: Some("user:reviewer-a"),
+                },
+            )
+            .expect("dry run");
+        assert_eq!(dry.len(), 1);
+        assert_eq!(
+            dry[0].would_remove,
+            vec![accepted.primary_key.clone(), closed.primary_key.clone()]
+        );
+        assert!(dry[0].removed.is_empty());
+        assert_eq!(dry[0].remaining_count, 1);
+        assert_eq!(dry[0].status_counts.in_progress, 1);
+        assert_eq!(dry[0].status_counts.total, 1);
+        let lane = m
+            .read_lanes_get("repo", "clean-lane")
+            .expect("read")
+            .expect("lane");
+        assert_eq!(lane.lane_tickets.len(), 3);
+        assert_eq!(
+            lane.active_ticket_id.as_deref(),
+            Some(working.primary_key.as_str())
+        );
+
+        // Apply: removes only the terminal members, preserving the non-terminal (active) member.
+        let applied = m
+            .write_lanes_cleanup(
+                "repo",
+                LaneCleanupRequest {
+                    lane_id: Some("clean-lane"),
+                    apply: true,
+                    updated_by: Some("user:reviewer-a"),
+                },
+            )
+            .expect("apply");
+        assert_eq!(
+            applied[0].removed,
+            vec![accepted.primary_key.clone(), closed.primary_key.clone()]
+        );
+        assert!(applied[0].would_remove.is_empty());
+        assert_eq!(applied[0].remaining_count, 1);
+        let lane = m
+            .read_lanes_get("repo", "clean-lane")
+            .expect("read")
+            .expect("lane");
+        assert_eq!(
+            lane.lane_tickets
+                .iter()
+                .map(|t| t.ticket_id.clone())
+                .collect::<Vec<_>>(),
+            vec![working.primary_key.clone()]
+        );
+        assert_eq!(
+            lane.active_ticket_id.as_deref(),
+            Some(working.primary_key.as_str())
+        );
+
+        // History preserved: the removed tickets are never deleted, only dropped from membership.
+        for id in [&accepted.primary_key, &closed.primary_key] {
+            let ticket = m
+                .read_tickets_get("repo", &pid, id, None)
+                .expect("ticket read")
+                .expect("ticket remains after cleanup");
+            assert!(ticket.fields.contains_key("status"));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lanes_cleanup_all_assignment_lanes_cleans_closed_lane_and_skips_tracking() {
+        let path = temp_path();
+        fresh(&path);
+        let pid = update_store(&path, |loom| {
+            let repo = loom
+                .registry()
+                .open(&loom_core::WsSelector::Name("repo".to_string()))
+                .unwrap();
+            loom.registry_mut()
+                .add_facet(repo, FacetKind::Document)
+                .unwrap();
+            loom.registry_mut()
+                .add_facet(repo, FacetKind::Queue)
+                .unwrap();
+            repo.to_string()
+        });
+        let m = mcp(&path);
+        let project = m
+            .write_tickets_project_create("repo", &pid, "eng", "ENG", "Engineering", None)
+            .expect("project");
+        let done = m
+            .write_tickets_create(
+                "repo",
+                TicketCreateRequest {
+                    workspace_id: &pid,
+                    project_id: "eng",
+                    ticket_type: "task",
+                    external_source: None,
+                    external_id: None,
+                    fields: &json!({ "title": "done", "status": "accepted" }),
+                    policy_labels: &[],
+                    expected_root: Some(&project.profile_root),
+                },
+            )
+            .expect("accepted ticket");
+        let live = m
+            .write_tickets_create(
+                "repo",
+                TicketCreateRequest {
+                    workspace_id: &pid,
+                    project_id: "eng",
+                    ticket_type: "task",
+                    external_source: None,
+                    external_id: None,
+                    fields: &json!({ "title": "live", "status": "ready" }),
+                    policy_labels: &[],
+                    expected_root: Some(&done.profile_root),
+                },
+            )
+            .expect("ready ticket");
+        let ids = vec![done.primary_key.clone(), live.primary_key.clone()];
+        let lane_tickets = loom_lanes::lane_tickets_from_order(&ids).expect("lane tickets");
+        // Closed assignment lane holding one terminal and one live ticket.
+        m.write_lanes_create(
+            "repo",
+            LaneCreateRequest {
+                lane_id: "closed-lane",
+                lane_key: "closed-lane",
+                title: "Closed lane",
+                description: "",
+                lane_kind: "assignment",
+                owner_principal: None,
+                lane_status: "closed",
+                lane_tickets: &lane_tickets,
+                active_ticket_id: None,
+                status_report: "",
+                reviewer_feedback: "",
+                updated_by: Some("user:reviewer-a"),
+            },
+        )
+        .expect("closed lane");
+        // A tracking lane must be ignored by workspace-wide cleanup.
+        m.write_lanes_create(
+            "repo",
+            LaneCreateRequest {
+                lane_id: "watch",
+                lane_key: "watch",
+                title: "Watch",
+                description: "",
+                lane_kind: "tracking",
+                owner_principal: None,
+                lane_status: "ready",
+                lane_tickets: &[],
+                active_ticket_id: None,
+                status_report: "",
+                reviewer_feedback: "",
+                updated_by: Some("user:reviewer-a"),
+            },
+        )
+        .expect("tracking lane");
+
+        // No lane_id: clean every assignment lane. The closed lane is still cleaned.
+        let reports = m
+            .write_lanes_cleanup(
+                "repo",
+                LaneCleanupRequest {
+                    lane_id: None,
+                    apply: true,
+                    updated_by: Some("agent:cleanup"),
+                },
+            )
+            .expect("cleanup all");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].lane_id, "closed-lane");
+        assert_eq!(reports[0].removed, vec![done.primary_key.clone()]);
+        assert_eq!(reports[0].remaining_count, 1);
+        let lane = m
+            .read_lanes_get("repo", "closed-lane")
+            .expect("read")
+            .expect("lane");
+        assert_eq!(lane.lane_status, "closed");
+        assert_eq!(
+            lane.lane_tickets
+                .iter()
+                .map(|t| t.ticket_id.clone())
+                .collect::<Vec<_>>(),
+            vec![live.primary_key.clone()]
+        );
+        // The terminal ticket still exists; only its lane membership was removed.
+        assert!(
+            m.read_tickets_get("repo", &pid, &done.primary_key, None)
+                .expect("read")
+                .is_some()
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -9240,18 +9949,18 @@ mod tests {
         m.write_lanes_create(
             "repo",
             LaneCreateRequest {
-                lane_id: "agent-3",
-                lane_key: "agent-3",
-                title: "Agent 3 lane",
+                lane_id: "review-lane-a",
+                lane_key: "review-lane-a",
+                title: "Review lane A",
                 description: "Healthy coordination lane.",
                 lane_kind: loom_lanes::LaneKind::Assignment.as_str(),
-                owner_principal: Some("agent:3"),
+                owner_principal: Some("user:reviewer-a"),
                 lane_status: "ready",
                 lane_tickets: &[],
                 active_ticket_id: None,
                 status_report: "",
                 reviewer_feedback: "",
-                updated_by: Some("agent:3"),
+                updated_by: Some("user:reviewer-a"),
             },
         )
         .expect("create healthy lane");
@@ -9266,7 +9975,7 @@ mod tests {
                 loom,
                 repo,
                 loom_lanes::LANE_COLLECTION,
-                "agent-broken",
+                "lane-broken",
                 "{ this is not valid lane json",
                 None,
             )
@@ -9278,14 +9987,14 @@ mod tests {
             .read_lanes_list_views_with_diagnostics("repo")
             .expect("fail-soft lane list");
         assert_eq!(views.len(), 1);
-        assert_eq!(views[0].lane_id, "agent-3");
+        assert_eq!(views[0].lane_id, "review-lane-a");
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].lane_id, "agent-broken");
+        assert_eq!(diagnostics[0].lane_id, "lane-broken");
         assert!(!diagnostics[0].error.is_empty());
 
         // Targeted lanes_get on the malformed record returns an actionable error, not a silent drop.
         let error = m
-            .read_lanes_get_view("repo", "agent-broken")
+            .read_lanes_get_view("repo", "lane-broken")
             .expect_err("malformed targeted get must error");
         assert_eq!(error.code, Code::InvalidArgument);
 
@@ -9312,18 +10021,18 @@ mod tests {
         m.write_lanes_create(
             "repo",
             LaneCreateRequest {
-                lane_id: "agent-3",
-                lane_key: "agent-3",
+                lane_id: "review-lane-a",
+                lane_key: "review-lane-a",
                 title: "Original title",
                 description: "Original description",
                 lane_kind: loom_lanes::LaneKind::Assignment.as_str(),
-                owner_principal: Some("agent:3"),
+                owner_principal: Some("user:reviewer-a"),
                 lane_status: "ready",
                 lane_tickets: &[],
                 active_ticket_id: None,
                 status_report: "",
                 reviewer_feedback: "",
-                updated_by: Some("agent:3"),
+                updated_by: Some("user:reviewer-a"),
             },
         )
         .unwrap();
@@ -9333,52 +10042,52 @@ mod tests {
             .write_lanes_update(
                 "repo",
                 crate::writes::LaneUpdateRequest {
-                    lane_id: "agent-3",
+                    lane_id: "review-lane-a",
                     title: Some("New title"),
                     description: None,
                     lane_status: Some("working"),
                     status_report: None,
                     reviewer_feedback: None,
-                    updated_by: Some("agent:9"),
+                    updated_by: Some("user:reviewer-c"),
                 },
             )
             .unwrap();
         assert_eq!(lane.title, "New title");
         assert_eq!(lane.description, "Original description");
         assert_eq!(lane.lane_status, "working");
-        assert_eq!(lane.updated_by, "agent:9");
+        assert_eq!(lane.updated_by, "user:reviewer-c");
 
         // Clear the description explicitly with an empty string; title stays unchanged.
         let lane = m
             .write_lanes_update(
                 "repo",
                 crate::writes::LaneUpdateRequest {
-                    lane_id: "agent-3",
+                    lane_id: "review-lane-a",
                     title: None,
                     description: Some(""),
                     lane_status: None,
-                    status_report: Some("working MX-104"),
+                    status_report: Some("working DEMO-104"),
                     reviewer_feedback: Some("revise order"),
-                    updated_by: Some("agent:9"),
+                    updated_by: Some("user:reviewer-c"),
                 },
             )
             .unwrap();
         assert_eq!(lane.title, "New title");
         assert_eq!(lane.description, "");
-        assert_eq!(lane.status_report, "working MX-104");
+        assert_eq!(lane.status_report, "working DEMO-104");
         assert_eq!(lane.reviewer_feedback, "revise order");
 
         assert_eq!(
             m.write_lanes_update(
                 "repo",
                 crate::writes::LaneUpdateRequest {
-                    lane_id: "agent-3",
+                    lane_id: "review-lane-a",
                     title: None,
                     description: None,
                     lane_status: None,
                     status_report: None,
                     reviewer_feedback: None,
-                    updated_by: Some("agent:9"),
+                    updated_by: Some("user:reviewer-c"),
                 },
             )
             .unwrap_err()
@@ -9429,6 +10138,353 @@ mod tests {
             .expect("settings get")
             .expect("project");
         assert_eq!(read.lifecycle_authorization_policy, "assignee");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tickets_project_settings_carry_full_contract_details_through_matrix_facades() {
+        let path = temp_path();
+        fresh(&path);
+        let m = mcp(&path);
+        let project = m
+            .write_tickets_project_create("repo", "studio", "eng", "ENG", "Engineering", None)
+            .expect("project");
+        let owner_details =
+            "# Owner Contract\n\nAnswer recorded project decisions with full detail.";
+        let worker_details = "# Worker Contract\n\nRecord durable ticket state with full detail.";
+        let updated = m
+            .write_tickets_project_settings_set(
+                "repo",
+                loom_tickets::TicketProjectSettingsRequest {
+                    workspace_id: "studio",
+                    project_id: "eng",
+                    default_projection: None,
+                    enable_projections: &[],
+                    disable_projections: &[],
+                    actor_enforcement: None,
+                    project_owner_principal: None,
+                    clear_project_owner_principal: false,
+                    acceptance_authorities: None,
+                    acceptance_evidence_enforcement: None,
+                    required_acceptance_evidence_keys: None,
+                    owner_contract_summary: Some("Owner verifies work."),
+                    owner_contract_details: Some(owner_details),
+                    worker_contract_summary: Some("Worker records state."),
+                    worker_contract_details: Some(worker_details),
+                    expected_root: Some(&project.profile_root),
+                },
+            )
+            .expect("settings set");
+        // Summaries-by-default: the set result carries summaries and omits the full details.
+        assert_eq!(updated.contracts.owner.summary, "Owner verifies work.");
+        assert_eq!(updated.contracts.owner.details, None);
+
+        // Matrix get without contracts: summaries only, details omitted (not short placeholders).
+        let summary_only = m
+            .read_tickets_project_settings_get("repo", "studio", "eng", false)
+            .expect("get")
+            .expect("project");
+        assert_eq!(summary_only.contracts.owner.summary, "Owner verifies work.");
+        assert_eq!(summary_only.contracts.owner.details, None);
+
+        // Matrix get WITH contracts: full details carried through, not collapsed to placeholders.
+        let with_details = m
+            .read_tickets_project_settings_get("repo", "studio", "eng", true)
+            .expect("get with contracts")
+            .expect("project");
+        assert_eq!(
+            with_details.contracts.owner.details.as_deref(),
+            Some(owner_details)
+        );
+        assert_eq!(
+            with_details.contracts.worker.details.as_deref(),
+            Some(worker_details)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ticket_and_lane_hot_writes_keep_bounded_overlay_growth_through_real_persistence() {
+        let path = temp_path();
+        fresh(&path);
+        // Lanes need Document + Queue facets on the workspace.
+        update_store(&path, |loom| {
+            let repo = loom
+                .registry()
+                .open(&loom_core::WsSelector::Name("repo".to_string()))
+                .unwrap();
+            loom.registry_mut()
+                .add_facet(repo, FacetKind::Document)
+                .unwrap();
+            loom.registry_mut()
+                .add_facet(repo, FacetKind::Queue)
+                .unwrap();
+        });
+        let m = mcp(&path);
+        m.write_tickets_project_create("repo", "studio", "eng", "ENG", "Engineering", None)
+            .expect("project");
+        let created = m
+            .write_tickets_create(
+                "repo",
+                loom_tickets::TicketCreateRequest {
+                    workspace_id: "studio",
+                    project_id: "eng",
+                    ticket_type: "task",
+                    external_source: None,
+                    external_id: None,
+                    fields: &serde_json::json!({"status": "planned", "title": "v0"}),
+                    policy_labels: &[],
+                    expected_root: None,
+                },
+            )
+            .expect("ticket");
+        m.write_lanes_create(
+            "repo",
+            LaneCreateRequest {
+                lane_id: "agent-hot",
+                lane_key: "agent-hot",
+                title: "Hot",
+                description: "hot-write lane.",
+                lane_kind: loom_lanes::LaneKind::Assignment.as_str(),
+                owner_principal: Some("agent:9"),
+                lane_status: "ready",
+                lane_tickets: &[],
+                active_ticket_id: None,
+                status_report: "",
+                reviewer_feedback: "",
+                updated_by: Some("agent:9"),
+            },
+        )
+        .expect("lane");
+
+        // Repeatedly update the SAME ticket and lane through the real committing facades. A warmup
+        // lets the overlay and control roots reach steady state before the growth window.
+        let mut root = created.profile_root.clone();
+        let update_same_ticket = |m: &crate::LoomMcp, root: &str, title: String| {
+            m.write_tickets_update(
+                "repo",
+                loom_tickets::TicketUpdateRequest {
+                    workspace_id: "studio",
+                    ticket_id: &created.ticket_id,
+                    set_fields: Some(&serde_json::json!({ "title": title })),
+                    delete_fields: &[],
+                    action: None,
+                    target_status: None,
+                    observed_source_status: None,
+                    observed_workflow_version: None,
+                    assignee: None,
+                    expected_root: Some(root),
+                    comment: None,
+                    comments: &[],
+                    relation_sets: &[],
+                    relation_removes: &[],
+                },
+            )
+            .expect("update ticket")
+        };
+        let set_lane_status = |m: &crate::LoomMcp, status: &str| {
+            m.write_lanes_update(
+                "repo",
+                LaneUpdateRequest {
+                    lane_id: "agent-hot",
+                    title: None,
+                    description: None,
+                    lane_status: Some(status),
+                    status_report: None,
+                    reviewer_feedback: None,
+                    updated_by: Some("agent:9"),
+                },
+            )
+            .expect("lane status");
+        };
+        // A small warmup lets first-time overlay/control records settle so the baseline is stable.
+        for i in 0..3 {
+            root = update_same_ticket(&m, &root, format!("warm-{i}")).profile_root;
+            set_lane_status(&m, if i % 2 == 0 { "working" } else { "ready" });
+        }
+        let (base, base_working_tree_roots) = update_store(&path, |loom| {
+            let current_records = loom
+                .mutable_overlay()
+                .health()
+                .unwrap()
+                .current_record_count;
+            let diagnostics = loom
+                .live_root_diagnostics(loom.store().reference_root(), Vec::new(), 8)
+                .unwrap();
+            let working_tree_roots = diagnostics
+                .classes
+                .iter()
+                .find(|class| class.class == "persisted_working_tree_roots")
+                .map(|class| class.count)
+                .unwrap_or(0);
+            (current_records, working_tree_roots)
+        });
+
+        // A modest hot window keeps the unit test fast while still exercising many supersessions of
+        // the same ticket and lane keys; without reclaim each would add a current overlay record.
+        let hot = 12usize;
+        let mut last_ticket = None;
+        for i in 0..hot {
+            let updated = update_same_ticket(&m, &root, format!("hot-{i}"));
+            root = updated.profile_root.clone();
+            last_ticket = Some(updated);
+            set_lane_status(&m, if i % 2 == 0 { "working" } else { "ready" });
+        }
+        let last_ticket = last_ticket.unwrap();
+
+        let (after, reusable, working_tree_roots_after) = update_store(&path, |loom| {
+            let count = loom
+                .mutable_overlay()
+                .health()
+                .unwrap()
+                .current_record_count;
+            let reusable = loom
+                .store()
+                .maintenance_status()
+                .unwrap()
+                .reusable_free_pages;
+            let diagnostics = loom
+                .live_root_diagnostics(loom.store().reference_root(), Vec::new(), 8)
+                .unwrap();
+            let working_tree_roots = diagnostics
+                .classes
+                .iter()
+                .find(|class| class.class == "persisted_working_tree_roots")
+                .map(|class| class.count)
+                .unwrap_or(0);
+            (count, reusable, working_tree_roots)
+        });
+        // Repeated updates supersede prior overlay records for the same keys rather than adding new
+        // current records, so the live overlay record count stays bounded across many hot writes.
+        assert_eq!(
+            after, base,
+            "hot writes must not grow the current overlay record count"
+        );
+        // Superseded overlay pages become reusable instead of permanent physical growth.
+        assert!(
+            reusable > 0,
+            "superseded overlay pages should become reusable free pages"
+        );
+        assert_eq!(
+            working_tree_roots_after,
+            base_working_tree_roots + hot as u64,
+            "each ticket update retains one operation-log entry without adding unrelated working-tree roots"
+        );
+
+        // Current reads still return the latest values after the hot-write window.
+        let ticket = m
+            .read_tickets_get("repo", "studio", &created.ticket_id, None)
+            .expect("get ticket")
+            .expect("ticket present");
+        assert_eq!(ticket.fields.get("title"), last_ticket.fields.get("title"));
+        let lane = m
+            .read_lanes_get("repo", "agent-hot")
+            .expect("get lane")
+            .expect("lane present");
+        assert_eq!(lane.lane_status, "ready");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lanes_closeout_writes_ticket_comment_and_lane_summary_together() {
+        let path = temp_path();
+        fresh(&path);
+        update_store(&path, |loom| {
+            let repo = loom
+                .registry()
+                .open(&loom_core::WsSelector::Name("repo".to_string()))
+                .unwrap();
+            loom.registry_mut()
+                .add_facet(repo, FacetKind::Document)
+                .unwrap();
+            loom.registry_mut()
+                .add_facet(repo, FacetKind::Queue)
+                .unwrap();
+        });
+        let m = mcp(&path);
+        m.write_tickets_project_create("repo", "studio", "eng", "ENG", "Engineering", None)
+            .expect("project");
+        let ticket = m
+            .write_tickets_create(
+                "repo",
+                loom_tickets::TicketCreateRequest {
+                    workspace_id: "studio",
+                    project_id: "eng",
+                    ticket_type: "task",
+                    external_source: None,
+                    external_id: None,
+                    fields: &serde_json::json!({"status": "waiting_for_review", "title": "T"}),
+                    policy_labels: &[],
+                    expected_root: None,
+                },
+            )
+            .expect("ticket");
+        m.write_lanes_create(
+            "repo",
+            LaneCreateRequest {
+                lane_id: "agent-c",
+                lane_key: "agent-c",
+                title: "C",
+                description: "closeout lane.",
+                lane_kind: loom_lanes::LaneKind::Assignment.as_str(),
+                owner_principal: Some("agent:9"),
+                lane_status: "ready",
+                lane_tickets: &[],
+                active_ticket_id: None,
+                status_report: "",
+                reviewer_feedback: "",
+                updated_by: Some("agent:9"),
+            },
+        )
+        .expect("lane");
+
+        // Combined closeout: one call writes the typed ticket comment and the lane summary together.
+        m.write_lanes_closeout(
+            "repo",
+            LaneCloseoutRequest {
+                lane_id: "agent-c",
+                ticket_workspace_id: "studio",
+                ticket_id: &ticket.ticket_id,
+                comment_type: "review_request",
+                comment_body: "Ready for review with evidence.",
+                evidence: Some(
+                    loom_tickets::TicketCommentEvidence::from_json(
+                        &serde_json::json!({"checks_run": ["cargo test"]}),
+                    )
+                    .unwrap(),
+                ),
+                status_report: "Waiting for arbiter review: recorded on ticket",
+                updated_by: Some("agent:9"),
+                expected_root: None,
+            },
+        )
+        .expect("closeout");
+
+        // The typed comment is now durable on the ticket, carrying the structured evidence.
+        let comments = update_store(&path, |loom| {
+            let ns = loom
+                .registry()
+                .open(&loom_core::WsSelector::Name("repo".to_string()))
+                .unwrap();
+            loom_tickets::list_ticket_comments(loom, ns, "studio", &ticket.ticket_id).unwrap()
+        });
+        let comment = comments
+            .iter()
+            .find(|comment| comment.comment_type == "review_request")
+            .expect("closeout must record a typed review_request comment on the ticket");
+        assert!(
+            comment.evidence.is_some(),
+            "closeout must record the structured evidence on the ticket comment"
+        );
+        // The lane summary landed too.
+        let lane = m
+            .read_lanes_get("repo", "agent-c")
+            .expect("lane")
+            .expect("present");
+        assert_eq!(
+            lane.status_report,
+            "Waiting for arbiter review: recorded on ticket"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -10937,18 +11993,18 @@ mod tests {
         m.write_lanes_create(
             "repo",
             LaneCreateRequest {
-                lane_id: "agent-7",
-                lane_key: "agent-7",
-                title: "Agent 7",
+                lane_id: "review-lane-b",
+                lane_key: "review-lane-b",
+                title: "Review lane B",
                 description: "",
                 lane_kind: loom_lanes::LaneKind::Assignment.as_str(),
-                owner_principal: Some("agent:7"),
+                owner_principal: Some("user:reviewer-b"),
                 lane_status: "ready",
                 lane_tickets: &[],
                 active_ticket_id: None,
                 status_report: "",
                 reviewer_feedback: "",
-                updated_by: Some("agent:7"),
+                updated_by: Some("user:reviewer-b"),
             },
         )
         .expect("lane");
@@ -10956,21 +12012,21 @@ mod tests {
             .write_lanes_ticket_add_receipt(
                 "repo",
                 LaneTicketUpdateRequest {
-                    lane_id: "agent-7",
-                    ticket_id: "MX-700",
+                    lane_id: "review-lane-b",
+                    ticket_id: "DEMO-700",
                     placement: LaneTicketPlacement::Append,
-                    updated_by: Some("agent:7"),
+                    updated_by: Some("user:reviewer-b"),
                 },
             )
             .expect("lane receipt");
-        assert_eq!(envelope.resource.lane_id, "agent-7");
+        assert_eq!(envelope.resource.lane_id, "review-lane-b");
         assert_eq!(envelope.receipt.operation, "lane.ticket_added");
         assert_eq!(envelope.receipt.resource_kind, "lane");
-        assert_eq!(envelope.receipt.resource_id, "agent-7");
+        assert_eq!(envelope.receipt.resource_id, "review-lane-b");
         assert!(matches!(
             envelope.receipt.changes.as_slice(),
             [loom_types::MutationChange::FieldSet { field, after }]
-                if field == "ticket_id" && after == "MX-700"
+                if field == "ticket_id" && after == "DEMO-700"
         ));
         let _ = std::fs::remove_file(&path);
     }

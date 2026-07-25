@@ -2035,6 +2035,16 @@ pub const METHODS: &[MethodSig] = &[
     },
     MethodSig {
         interface: "Document",
+        method: "delete_collection",
+        args: &[
+            ("LoomSession", "handle"),
+            ("string", "workspace"),
+            ("string", "collection"),
+        ],
+        ret: "bool",
+    },
+    MethodSig {
+        interface: "Document",
         method: "delete_indexed",
         args: &[
             ("LoomSession", "handle"),

@@ -143,6 +143,27 @@ export function docDelete(
   );
 }
 
+/** Remove collection `collection` and its structured roots; resolves whether it was present. */
+export function docDeleteCollection(
+  loomPath: string,
+  workspace: string,
+  collection: string,
+  loomKey?: LoomKey,
+  auth?: LoomAuth
+): Promise<boolean> {
+  const [passphrase, kek] = keyArgs(loomKey);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.docDeleteCollection(
+    loomPath,
+    workspace,
+    collection,
+    passphrase,
+    kek,
+    authPrincipal,
+    authPassphrase
+  );
+}
+
 /** Collection `collection` of `workspace` as Loom Canonical CBOR binary. */
 export async function docListBinary(
   loomPath: string,

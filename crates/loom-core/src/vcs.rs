@@ -32,6 +32,9 @@ use crate::{
 pub use loom_types::vcs::ChangeKind;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub type SavedStateObjects = (Digest, Vec<(Digest, Vec<u8>)>);
 
 /// A file staged in the working tree: its content address and POSIX mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -65,6 +68,259 @@ pub(crate) enum StagedEntry {
 
 /// A workspace's working tree: a flat path -> staged-slot map.
 pub(crate) type WorkTree = BTreeMap<String, StagedEntry>;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EnginePathSelector {
+    Exact(String),
+    Prefix(String),
+}
+
+impl EnginePathSelector {
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            Self::Exact(expected) => path == expected,
+            Self::Prefix(prefix) => {
+                path == prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnginePlanningScope {
+    pub workspace: WorkspaceId,
+    pub paths: BTreeSet<EnginePathSelector>,
+    read_paths: BTreeSet<EnginePathSelector>,
+}
+
+impl EnginePlanningScope {
+    pub fn new(
+        workspace: WorkspaceId,
+        paths: impl IntoIterator<Item = EnginePathSelector>,
+    ) -> Result<Self> {
+        let paths = paths.into_iter().collect::<BTreeSet<_>>();
+        if paths.is_empty() {
+            return Err(LoomError::invalid(
+                "bounded engine planning scope requires at least one path",
+            ));
+        }
+        if paths.iter().any(|selector| match selector {
+            EnginePathSelector::Exact(path) | EnginePathSelector::Prefix(path) => path.is_empty(),
+        }) {
+            return Err(LoomError::invalid(
+                "bounded engine planning path must not be empty",
+            ));
+        }
+        Ok(Self {
+            workspace,
+            paths,
+            read_paths: BTreeSet::new(),
+        })
+    }
+
+    pub fn with_read_paths(
+        mut self,
+        paths: impl IntoIterator<Item = EnginePathSelector>,
+    ) -> Result<Self> {
+        let paths = paths.into_iter().collect::<BTreeSet<_>>();
+        if paths.iter().any(|selector| match selector {
+            EnginePathSelector::Exact(path) | EnginePathSelector::Prefix(path) => path.is_empty(),
+        }) {
+            return Err(LoomError::invalid(
+                "bounded engine planning read path must not be empty",
+            ));
+        }
+        self.read_paths.extend(paths);
+        Ok(self)
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        self.paths.iter().any(|selector| selector.matches(path))
+    }
+
+    fn matches_read(&self, path: &str) -> bool {
+        self.matches(path)
+            || self
+                .read_paths
+                .iter()
+                .any(|selector| selector.matches(path))
+    }
+
+    fn permits_directory(&self, directory: &str) -> bool {
+        self.matches(directory)
+            || self.paths.iter().any(|selector| {
+                let path = match selector {
+                    EnginePathSelector::Exact(path) | EnginePathSelector::Prefix(path) => path,
+                };
+                path.strip_prefix(directory)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+    }
+
+    fn permits_read_directory(&self, directory: &str) -> bool {
+        self.permits_directory(directory)
+            || self.read_paths.iter().any(|selector| {
+                let path = match selector {
+                    EnginePathSelector::Exact(path) | EnginePathSelector::Prefix(path) => path,
+                };
+                path.strip_prefix(directory)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineStateIoCounts {
+    pub full_exports: u64,
+    pub full_imports: u64,
+    pub bounded_plans: u64,
+    pub bounded_paths_applied: u64,
+    pub bounded_section_rewrites: u64,
+    pub unrelated_section_rewrites: u64,
+}
+
+#[derive(Debug, Default)]
+struct EngineStateInstrumentation {
+    full_exports: AtomicU64,
+    full_imports: AtomicU64,
+    bounded_plans: AtomicU64,
+    bounded_paths_applied: AtomicU64,
+    bounded_section_rewrites: AtomicU64,
+    unrelated_section_rewrites: AtomicU64,
+}
+
+impl EngineStateInstrumentation {
+    fn snapshot(&self) -> EngineStateIoCounts {
+        EngineStateIoCounts {
+            full_exports: self.full_exports.load(Ordering::Relaxed),
+            full_imports: self.full_imports.load(Ordering::Relaxed),
+            bounded_plans: self.bounded_plans.load(Ordering::Relaxed),
+            bounded_paths_applied: self.bounded_paths_applied.load(Ordering::Relaxed),
+            bounded_section_rewrites: self.bounded_section_rewrites.load(Ordering::Relaxed),
+            unrelated_section_rewrites: self.unrelated_section_rewrites.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EngineStateDelta {
+    workspace: WorkspaceId,
+    work: BTreeMap<String, Option<StagedEntry>>,
+    directories: BTreeMap<String, bool>,
+    content: BTreeMap<Digest, Digest>,
+}
+
+pub type PreparedEngineObjects = Vec<(Digest, Vec<u8>)>;
+pub type BoundedEnginePlanOutput = (EngineStateDelta, PreparedEngineObjects);
+
+impl EngineStateDelta {
+    pub fn changed_paths(&self) -> Vec<String> {
+        self.work.keys().cloned().collect()
+    }
+
+    pub fn changed_path_count(&self) -> usize {
+        self.work.len()
+    }
+
+    pub fn changed_content_count(&self) -> usize {
+        self.content.len()
+    }
+}
+
+pub struct BoundedEnginePlanner<'a, S: ObjectStore> {
+    engine: Loom<crate::provider::PlanningObjectStore<'a, S>>,
+    scope: EnginePlanningScope,
+    baseline_work: WorkTree,
+    baseline_dirs: BTreeSet<String>,
+    baseline_content: BTreeMap<Digest, Digest>,
+}
+
+struct BoundedEngineBase {
+    registry: Registry,
+    work: WorkTree,
+    directories: BTreeSet<String>,
+    content: BTreeMap<Digest, Digest>,
+}
+
+impl<'a, S: ObjectStore> BoundedEnginePlanner<'a, S> {
+    pub fn engine(&self) -> &Loom<crate::provider::PlanningObjectStore<'a, S>> {
+        &self.engine
+    }
+
+    pub fn engine_mut(&mut self) -> &mut Loom<crate::provider::PlanningObjectStore<'a, S>> {
+        &mut self.engine
+    }
+
+    pub fn finish(self) -> Result<BoundedEnginePlanOutput> {
+        let workspace = self.scope.workspace;
+        let planned_work = self
+            .engine
+            .work
+            .get(&workspace)
+            .cloned()
+            .unwrap_or_default();
+        let planned_dirs = self
+            .engine
+            .dirs
+            .get(&workspace)
+            .cloned()
+            .unwrap_or_default();
+        let mut work = BTreeMap::new();
+        for path in self
+            .baseline_work
+            .keys()
+            .chain(planned_work.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+        {
+            if self.baseline_work.get(&path) != planned_work.get(&path) {
+                if !self.scope.matches(&path) {
+                    return Err(LoomError::invalid(
+                        "bounded engine planner mutated a path outside its declared scope",
+                    ));
+                }
+                work.insert(path.clone(), planned_work.get(&path).copied());
+            }
+        }
+        let mut directories = BTreeMap::new();
+        for directory in self
+            .baseline_dirs
+            .iter()
+            .chain(planned_dirs.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+        {
+            if self.baseline_dirs.contains(&directory) != planned_dirs.contains(&directory) {
+                if !self.scope.permits_directory(&directory) {
+                    return Err(LoomError::invalid(
+                        "bounded engine planner mutated a directory outside its declared scope",
+                    ));
+                }
+                directories.insert(directory.clone(), planned_dirs.contains(&directory));
+            }
+        }
+        let content = self
+            .engine
+            .content
+            .iter()
+            .filter(|(address, object)| self.baseline_content.get(address) != Some(object))
+            .map(|(address, object)| (*address, *object))
+            .collect();
+        let objects = self.engine.store.objects()?;
+        Ok((
+            EngineStateDelta {
+                workspace,
+                work,
+                directories,
+                content,
+            },
+            objects,
+        ))
+    }
+}
 
 /// A flattened view of a commit: leaf path -> staged slot (same shape as a working tree).
 type FileMap = WorkTree;
@@ -166,6 +422,25 @@ pub struct Change {
     pub path: String,
     /// What changed.
     pub kind: ChangeKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VcsNamespacePreflight {
+    pub conflicts: Vec<VcsNamespaceCollision>,
+}
+
+impl VcsNamespacePreflight {
+    pub fn is_clean(&self) -> bool {
+        self.conflicts.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VcsNamespaceCollision {
+    pub path: String,
+    pub leaf_path: String,
+    pub child_path: String,
+    pub repair_options: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -582,10 +857,13 @@ pub struct Loom<S: ObjectStore> {
     ephemeral_kv: BTreeMap<(WorkspaceId, String), EphemeralKvMap>,
     /// Durable protected-ref policy records keyed by `(workspace, "branch/name" | "tag/name")`.
     protected_refs: BTreeMap<(WorkspaceId, String), ProtectedRefPolicy>,
+    mutable_overlay: crate::MutableOverlay,
     identity: Option<IdentityStore>,
     acl: AclStore,
     predicate_evaluator: Option<Arc<dyn AclPredicateEvaluator>>,
     session: Option<String>,
+    state_instrumentation: Arc<EngineStateInstrumentation>,
+    bounded_planner: bool,
 }
 
 mod access;

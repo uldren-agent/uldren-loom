@@ -573,7 +573,7 @@ impl<S: ObjectStore> Loom<S> {
         );
         let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         if let Some(work) = self.work.get(&ns) {
-            for (path, _) in work.iter() {
+            for path in work.keys() {
                 if let Some(rest) = path.strip_prefix(&prefix)
                     && let Some(seg) = rest.split('/').next()
                     && !seg.is_empty()

@@ -40,6 +40,8 @@ const TITLE_REPLACEMENTS: &[(&str, &str)] = &[
         "Store: Inspect capability matrix JSON",
     ),
     ("store_blob_digest", "Store: Calculate a content digest"),
+    ("store_policy_get", "Store: Inspect store policy"),
+    ("store_policy_set", "Store: Update store policy"),
     (
         "store_maintenance_status",
         "Store: Inspect maintenance status",
@@ -532,10 +534,18 @@ pub const TOOL_TITLES: &[(&str, &str)] = &[
     ("lanes_get", "Lanes: get a Lane"),
     ("lanes_list", "Lanes: list Lanes"),
     ("lanes_update", "Lanes: update a Lane"),
+    (
+        "lanes_closeout",
+        "Lanes: record closeout on ticket and lane",
+    ),
     ("lanes_ticket_add", "Lanes: add ticket"),
     ("lanes_ticket_remove", "Lanes: remove ticket"),
     ("lanes_ticket_transfer", "Lanes: transfer ticket"),
     ("lanes_delete", "Lanes: delete closed Lane"),
+    (
+        "lanes_cleanup",
+        "Lanes: remove terminal tickets from membership",
+    ),
     ("spaces_create", "Spaces: create a space"),
     ("spaces_get", "Spaces: get a space"),
     ("spaces_list", "Spaces: list spaces"),
@@ -664,6 +674,10 @@ pub const TOOL_TITLES: &[(&str, &str)] = &[
         "Document: replace text in a document",
     ),
     ("document_delete", "Document: delete a document"),
+    (
+        "document_delete_collection",
+        "Document: delete a collection",
+    ),
     ("document_list_binary", "Document: list binary collection"),
     ("document_list_collections", "Document: list collections"),
     ("timeseries_put", "TimeSeries: record a point"),

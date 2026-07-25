@@ -65,6 +65,18 @@ expect fun Loom.docDelete(
     ): Boolean
 
 
+    /** Remove collection [collection] and its structured roots; returns whether it was present. */
+expect fun Loom.docDeleteCollection(
+        path: String,
+        workspace: String,
+        collection: String,
+        passphrase: String? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: String? = null,
+    ): Boolean
+
+
 expect fun Loom.docListBinary(
         path: String,
         workspace: String,

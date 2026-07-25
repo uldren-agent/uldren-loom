@@ -1040,6 +1040,14 @@ impl PageOperationRecord {
         Ok(())
     }
 
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        loom_codec::encode(&self.to_value()).map_err(codec_error)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::from_value(loom_codec::decode(bytes).map_err(codec_error)?)
+    }
+
     fn to_value(&self) -> Value {
         Value::Array(vec![
             Value::Uint(self.sequence),

@@ -416,6 +416,9 @@ export declare function docIndexStatusJson(loomPath: string, workspace: string, 
 /** List collection `collection` as its canonical binary representation. */
 export declare function docListBinary(loomPath: string, workspace: string, collection: string, passphrase?: string | undefined | null): Uint8Array
 
+/** Remove collection `collection` and its structured roots; returns whether it was present. */
+export declare function docDeleteCollection(loomPath: string, workspace: string, collection: string, passphrase?: string | undefined | null): boolean
+
 export interface DocPutResult { digest: string, entityTag: string }
 
 /** Put binary bytes at string `id` in collection `collection` and return the new document tags. */

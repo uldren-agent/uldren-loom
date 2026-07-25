@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use loom_coordination::with_local_store_write_lock;
 use loom_core::error::{Code, LoomError, Result};
@@ -25,6 +26,13 @@ use loom_store::{
     open_loom_daemon_authorized_unlocked, open_loom_read_unlocked,
     open_loom_registry_read_unlocked, open_loom_unlocked, save_loom,
 };
+
+const STORE_WRITE_BUSY_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(20),
+    Duration::from_millis(40),
+    Duration::from_millis(80),
+    Duration::from_millis(160),
+];
 
 pub mod apps;
 mod chat;
@@ -938,6 +946,9 @@ pub trait RemoteMcpBackend: Send + Sync {
     /// Document delete + ref-index overlay (`Document.delete_indexed`): delete the document and drop its
     /// reference-index source; returns whether it existed.
     fn document_delete_indexed(&self, workspace: &str, collection: &str, id: &str) -> Result<bool>;
+    /// Document collection delete (`Document.delete_collection`): remove the collection and its
+    /// structured roots; returns whether it existed.
+    fn document_delete_collection(&self, workspace: &str, collection: &str) -> Result<bool>;
     /// Document replace-text + ref-index overlay (`Document.replace_text_indexed`): the timestamp-free
     /// find/replace the MCP tool performs, plus the reference-index refresh, returning the same
     /// `{replacements, digest}` the local tool returns.
@@ -1533,9 +1544,11 @@ impl StoreAccess {
         }
     }
 
-    /// Run `f` against a writable loom, persisting after `f` succeeds. In per-request mode this opens,
-    /// mutates, saves, and closes; in server mode it locks the held handle and saves.
-    pub fn write<T>(&self, f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>) -> Result<T> {
+    fn write_internal<T>(
+        &self,
+        persist_after: bool,
+        f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>,
+    ) -> Result<T> {
         match self {
             StoreAccess::PerRequest {
                 path,
@@ -1548,14 +1561,18 @@ impl StoreAccess {
                 }
                 *read_cache.lock().map_err(|_| lock_poisoned())? = None;
                 with_local_store_write_lock(path, || {
-                    let mut loom = if daemon_session.is_some() {
-                        open_loom_daemon_authorized_unlocked(path, auth.unlock_key.as_ref())?
-                    } else {
-                        open_loom_unlocked(path, auth.unlock_key.as_ref())?
-                    };
+                    let mut loom = retry_store_write_busy(|| {
+                        if daemon_session.is_some() {
+                            open_loom_daemon_authorized_unlocked(path, auth.unlock_key.as_ref())
+                        } else {
+                            open_loom_unlocked(path, auth.unlock_key.as_ref())
+                        }
+                    })?;
                     loom = attach_local_auth(loom, auth)?;
                     let out = f(&mut loom)?;
-                    save_loom(&mut loom)?;
+                    if persist_after {
+                        save_loom(&mut loom)?;
+                    }
                     drop(loom);
                     Ok(out)
                 })
@@ -1563,11 +1580,26 @@ impl StoreAccess {
             StoreAccess::Persistent(handle) => {
                 let mut loom = handle.lock().map_err(|_| lock_poisoned())?;
                 let out = f(&mut loom)?;
-                save_loom(&mut loom)?;
+                if persist_after {
+                    save_loom(&mut loom)?;
+                }
                 Ok(out)
             }
             StoreAccess::Remote(_) => Err(remote_local_handle_unsupported()),
         }
+    }
+
+    /// Run `f` against a writable loom, persisting after `f` succeeds. In per-request mode this opens,
+    /// mutates, saves, and closes; in server mode it locks the held handle and saves.
+    pub fn write<T>(&self, f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>) -> Result<T> {
+        self.write_internal(true, f)
+    }
+
+    pub(crate) fn write_durable_transaction<T>(
+        &self,
+        f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>,
+    ) -> Result<T> {
+        self.write_internal(false, f)
     }
 }
 
@@ -1669,6 +1701,23 @@ fn lock_poisoned() -> LoomError {
     LoomError::corrupt("loom handle lock poisoned")
 }
 
+fn retry_store_write_busy<T, F>(mut f: F) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    for delay in STORE_WRITE_BUSY_RETRY_DELAYS {
+        match f() {
+            Err(error) if is_store_write_busy(&error) => std::thread::sleep(delay),
+            other => return other,
+        }
+    }
+    f()
+}
+
+fn is_store_write_busy(error: &LoomError) -> bool {
+    error.code == Code::Conflict && error.message.contains("open for writing")
+}
+
 /// The engine facade the MCP wire host calls. It owns the [`StoreAccess`] and exposes engine
 /// operations; the `rmcp` layer (feature `server`) projects these as tools, resources, and prompts.
 pub struct LoomMcp {
@@ -1733,6 +1782,39 @@ mod tests {
             .as_nanos();
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("loom-mcp-{}-{seq}-{uniq}.loom", std::process::id()))
+    }
+
+    #[test]
+    fn store_busy_retry_retries_conflict_open_errors() {
+        let mut attempts = 0;
+        let out = retry_store_write_busy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                return Err(LoomError::new(
+                    Code::Conflict,
+                    "loom-store: loom is open for writing by another process",
+                ));
+            }
+            Ok("ok")
+        })
+        .unwrap();
+        assert_eq!(out, "ok");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn store_busy_retry_does_not_retry_other_conflicts() {
+        let mut attempts = 0;
+        let err = retry_store_write_busy(|| -> Result<()> {
+            attempts += 1;
+            Err(LoomError::new(
+                Code::Conflict,
+                "ticket profile root does not match expected_root",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(err.code, Code::Conflict);
+        assert_eq!(attempts, 1);
     }
 
     #[test]

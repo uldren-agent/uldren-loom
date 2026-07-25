@@ -258,6 +258,7 @@ import {
   type DocumentPutResult,
   type DocumentText,
   docDelete,
+  docDeleteCollection,
   docFindJson,
   docGetBinary,
   docGetText,
@@ -1069,6 +1070,10 @@ export class LoomSession {
 
   docDelete(workspace: string, collection: string, id: string): Promise<boolean> {
     return docDelete(this.loomPath, workspace, collection, id, this.key, this.auth);
+  }
+
+  docDeleteCollection(workspace: string, collection: string): Promise<boolean> {
+    return docDeleteCollection(this.loomPath, workspace, collection, this.key, this.auth);
   }
 
   docListBinary(workspace: string, collection: string): Promise<Uint8Array> {

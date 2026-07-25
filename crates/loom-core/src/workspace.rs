@@ -147,6 +147,15 @@ impl Registry {
         Self::default()
     }
 
+    pub(crate) fn selected(&self, id: WorkspaceId) -> Result<Self> {
+        let record = self.record(&id)?.clone();
+        let mut by_id = BTreeMap::new();
+        let mut by_name = BTreeMap::new();
+        by_name.insert(record.name.clone(), id);
+        by_id.insert(id, record);
+        Ok(Self { by_id, by_name })
+    }
+
     /// Create a workspace named `name` (or `"Default"` when `None`) with the caller-supplied `id`.
     /// Errors `ALREADY_EXISTS` if the name or id is already in use.
     pub fn create_workspace(&mut self, name: Option<&str>, id: WorkspaceId) -> Result<WorkspaceId> {

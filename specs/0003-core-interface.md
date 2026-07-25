@@ -715,6 +715,11 @@ The two mutating facades follow different, deliberately familiar models, and con
   them - are specified in **0036**. Lock state is per-coordinator control-plane state, kept out of the
   versioned object graph and never synced.
 
+The target mutable-overlay substrate in 0071 keeps these API semantics while changing the physical
+write path for high-churn current state. The overlay is a sparse current-state layer above immutable
+CAS/Merkle history; it is not a hidden per-handle filesystem overlay and not a mutable copy of the
+whole Loom.
+
 ### 9.1 Conditional mutation and comparison anchors
 
 0003 owns the shared public contract for conditional mutation. A facet owns its target identity,

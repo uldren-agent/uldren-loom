@@ -499,10 +499,11 @@ fn maintenance_report_text(
     diagnostics: Option<&LiveRootDiagnostics>,
 ) -> String {
     let mut text = format!(
-        "maintenance\teligible={}\treason={}\tphysical_bytes={}\tmarked_live_bytes={}\tcandidate_reclaimable_bytes={}\treusable_free_bytes={}\ttail_free_pages={}\ttail_free_bytes={}\ttail_trim_eligible={}\ttail_blocked_by_live_objects={}\ttail_compaction_eligible={}\tfull_compaction_required_for_shrink={}\ttail_trim_attempted={}\ttail_trim_pages={}\ttail_trim_bytes={}\ttail_compaction_attempted={}\ttail_compaction_relocated_objects={}\ttail_compaction_relocated_pages={}\ttail_compaction_relocated_bytes={}\ttail_compaction_truncated_pages={}\ttail_compaction_conflicts={}\tretained_control_roots={}\tderived_payload_count={}\tlast_shrink_skip_reason={}",
+        "maintenance\teligible={}\treason={}\tphysical_bytes={}\tlive_bytes={}\tmarked_live_bytes={}\tcandidate_reclaimable_bytes={}\treusable_free_bytes={}\ttail_free_pages={}\ttail_free_bytes={}\ttail_trim_eligible={}\ttail_blocked_by_live_objects={}\ttail_compaction_eligible={}\tfull_compaction_required_for_shrink={}\ttail_trim_attempted={}\ttail_trim_pages={}\ttail_trim_bytes={}\ttail_compaction_attempted={}\ttail_compaction_relocated_objects={}\ttail_compaction_relocated_pages={}\ttail_compaction_relocated_bytes={}\ttail_compaction_truncated_pages={}\ttail_compaction_conflicts={}\tretained_control_roots={}\tderived_payload_count={}\tlast_shrink_skip_reason={}",
         report.eligible,
         report.reason,
         report.status.physical_bytes,
+        report.live_bytes,
         report.marked_live_bytes,
         report.candidate_reclaimable_bytes,
         report.reusable_free_bytes,
@@ -525,6 +526,66 @@ fn maintenance_report_text(
         report.derived_payload_count,
         report.last_shrink_skip_reason.as_deref().unwrap_or("none")
     ) + "\n"
+        + &format!(
+            "maintenance_growth\tphysical_bytes={}\tlive_bytes={}\treusable_free_bytes={}\tcandidate_reclaimable_bytes={}\toverlay_current_records={}\toverlay_obsolete_records={}\toverlay_obsolete_pages={}",
+            report.status.physical_bytes,
+            report.live_bytes,
+            report.reusable_free_bytes,
+            report.candidate_reclaimable_bytes,
+            report.overlay_health.current_record_count,
+            report.overlay_obsolete_record_count,
+            report.overlay_obsolete_page_count
+        )
+        + "\n"
+        + &format!(
+            "maintenance_overlay\tgeneration={}\tcurrent_records={}\ttombstones={}\tobsolete_records={}\tlive_checkpoint_references={}\treclaimable_pages={}\tobsolete_pages={}\tblocked_reclamation_reasons={}\tretained_checkpoint_blockers={}\thot_write_count={}\tactive_writer_contention_indicators={}",
+            report.overlay_health.current_generation,
+            report.overlay_health.current_record_count,
+            report.overlay_health.tombstone_count,
+            report.overlay_obsolete_record_count,
+            report.overlay_health.live_checkpoint_references,
+            report.overlay_health.reclaimable_overlay_pages,
+            report.overlay_obsolete_page_count,
+            overlay_blocked_reclamation_reasons_text(report),
+            overlay_blocked_reclamation_reasons_text(report),
+            report.overlay_health.hot_write_count,
+            report.overlay_health.active_writer_contention_indicators
+        )
+        + "\n"
+        + &format!(
+            "maintenance_mvcc\tactive_snapshots={}\toldest_pinned_generation={}\tpinned_reader_reclaim_pressure={}",
+            report.mvcc_snapshots.active_snapshot_count,
+            optional_u64_text(
+                report
+                    .mvcc_snapshots
+                    .oldest_pinned_overlay_generation
+                    .map(|generation| generation.as_u64())
+            ),
+            report.mvcc_snapshots.active_snapshot_count > 0
+                && report.overlay_obsolete_record_count > 0
+        )
+        + "\n"
+        + &format!(
+            "maintenance_group_commit\tbatches_total={}\ttransactions_total={}\trecords_total={}\tfsync_total_micros={}\tfsync_count={}\twrite_lock_wait_total_micros={}\twrite_lock_wait_count={}\tpending_durable_window_transactions={}\tpending_durable_window_records={}\tpinned_reader_blockers={}",
+            report.status.group_commit.group_commit_batches_total,
+            report.status.group_commit.group_commit_transactions_total,
+            report.status.group_commit.group_commit_records_total,
+            report.status.group_commit.fsync_total_micros,
+            report.status.group_commit.fsync_count,
+            report.status.group_commit.write_lock_wait_total_micros,
+            report.status.group_commit.write_lock_wait_count,
+            report
+                .status
+                .group_commit
+                .pending_durable_window_transactions,
+            report.status.group_commit.pending_durable_window_records,
+            report
+                .status
+                .group_commit
+                .pinned_reader_blockers
+                .map_or_else(|| "unavailable".to_string(), |value| value.to_string())
+        )
+        + "\n"
         + &format!(
             "maintenance_policy\tmin_candidate_pages={}\tmin_reusable_pages={}\tinterval_ms={}\tbackoff_ms={}\tmax_segments={}\tmax_pages={}\tfull_compaction_enabled={}\ttail_trim_enabled={}\ttail_compaction_enabled={}\ttail_compaction_max_pages={}\ttail_compaction_max_objects={}\ttail_compaction_max_bytes={}\ttail_compaction_interval_ms={}\ttail_compaction_backoff_ms={}",
             report.policy.min_candidate_pages,
@@ -562,6 +623,12 @@ fn maintenance_report_text(
             optional_text(report.run_state.last_error.as_deref())
         )
         + "\n";
+    for domain in &report.growth_domains {
+        text.push_str(&format!(
+            "maintenance_growth_domain\tdomain={}\tcurrent_records={}\tobsolete_records={}\tpayload_bytes={}\n",
+            domain.domain, domain.current_records, domain.obsolete_records, domain.payload_bytes
+        ));
+    }
     if let Some(diagnostics) = diagnostics {
         for class in &diagnostics.classes {
             let examples = class
@@ -648,8 +715,6 @@ fn run_store_maintenance_once(
         .store()
         .store_maintenance_report(now)
         .map_err(|e| e.to_string())?;
-    let whole_file_allowed =
-        policy.full_compaction_enabled && maintenance_debt_thresholds_met(&policy, &report.status);
     if !manual && !report.eligible {
         return Ok("maintenance\tskipped\treason=not_eligible".to_string());
     }
@@ -695,6 +760,15 @@ fn run_store_maintenance_once(
             ));
         }
     }
+    let refreshed_report = loom
+        .store()
+        .store_maintenance_report(now)
+        .map_err(|e| e.to_string())?;
+    let whole_file_due = policy.full_compaction_enabled
+        && maintenance_debt_thresholds_met(&policy, &refreshed_report.status);
+    let whole_file_allowed = manual && whole_file_due;
+    let mut shrink_skip_reason =
+        (!manual && whole_file_due).then(|| "full_compaction_manual_only".to_string());
     let mut tail_trim_attempted = false;
     let mut tail_trim_pages = 0;
     let mut tail_trim_bytes = 0;
@@ -773,9 +847,11 @@ fn run_store_maintenance_once(
         last_tail_compaction_relocated_bytes: tail_compaction.relocated_bytes,
         last_tail_compaction_truncated_pages: tail_compaction.truncated_pages,
         last_tail_compaction_conflicts: tail_compaction.conflicts,
-        last_shrink_skip_reason: tail_compaction
-            .skipped
-            .then(|| "tail_compaction_skipped".to_string()),
+        last_shrink_skip_reason: shrink_skip_reason.take().or_else(|| {
+            tail_compaction
+                .skipped
+                .then(|| "tail_compaction_skipped".to_string())
+        }),
     };
     loom.store()
         .record_store_maintenance_run_state(state)
@@ -856,6 +932,69 @@ fn maintenance_report_json(
     report: &StoreMaintenanceReport,
     diagnostics: Option<&LiveRootDiagnostics>,
 ) -> serde_json::Value {
+    let overlay = serde_json::json!({
+        "generation": report.overlay_health.current_generation,
+        "current_records": report.overlay_health.current_record_count,
+        "tombstones": report.overlay_health.tombstone_count,
+        "obsolete_records": report.overlay_obsolete_record_count,
+        "live_checkpoint_references": report.overlay_health.live_checkpoint_references,
+        "reclaimable_pages": report.overlay_health.reclaimable_overlay_pages,
+        "obsolete_pages": report.overlay_obsolete_page_count,
+        "blocked_reclamation_reasons": report.overlay_health.blocked_reclamation_reasons,
+        "retained_checkpoint_blockers": report.overlay_health.blocked_reclamation_reasons,
+        "hot_write_count": report.overlay_health.hot_write_count,
+        "active_writer_contention_indicators": report.overlay_health.active_writer_contention_indicators,
+    });
+    let mvcc = serde_json::json!({
+        "active_snapshots": report.mvcc_snapshots.active_snapshot_count,
+        "oldest_pinned_generation": report
+            .mvcc_snapshots
+            .oldest_pinned_overlay_generation
+            .map(|generation| generation.as_u64()),
+        "pinned_reader_reclaim_pressure": report.mvcc_snapshots.active_snapshot_count > 0
+            && report.overlay_obsolete_record_count > 0,
+        "pins": report
+            .mvcc_snapshots
+            .pins
+            .iter()
+            .map(|pin| {
+                serde_json::json!({
+                    "pin_id": pin.pin_id,
+                    "overlay_generation": pin.identity.overlay_generation.as_u64(),
+                    "base_root": pin
+                        .identity
+                        .immutable_base_root
+                        .as_ref()
+                        .map(|root| root.to_string()),
+                    "owner": pin.owner,
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    let growth_domains = report
+        .growth_domains
+        .iter()
+        .map(|domain| {
+            serde_json::json!({
+                "domain": domain.domain,
+                "current_records": domain.current_records,
+                "obsolete_records": domain.obsolete_records,
+                "payload_bytes": domain.payload_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let group_commit = serde_json::json!({
+        "group_commit_batches_total": report.status.group_commit.group_commit_batches_total,
+        "group_commit_transactions_total": report.status.group_commit.group_commit_transactions_total,
+        "group_commit_records_total": report.status.group_commit.group_commit_records_total,
+        "fsync_total_micros": report.status.group_commit.fsync_total_micros,
+        "fsync_count": report.status.group_commit.fsync_count,
+        "write_lock_wait_total_micros": report.status.group_commit.write_lock_wait_total_micros,
+        "write_lock_wait_count": report.status.group_commit.write_lock_wait_count,
+        "pending_durable_window_transactions": report.status.group_commit.pending_durable_window_transactions,
+        "pending_durable_window_records": report.status.group_commit.pending_durable_window_records,
+        "pinned_reader_blockers": report.status.group_commit.pinned_reader_blockers,
+    });
     let policy = serde_json::json!({
         "min_candidate_pages": report.policy.min_candidate_pages,
         "min_reusable_pages": report.policy.min_reusable_pages,
@@ -892,6 +1031,7 @@ fn maintenance_report_json(
         "eligible": report.eligible,
         "reason": report.reason,
         "physical_bytes": report.status.physical_bytes,
+        "live_bytes": report.live_bytes,
         "reusable_free_pages": report.status.reusable_free_pages,
         "candidate_dead_pages": report.status.candidate_dead_pages,
         "candidate_reclaimable_bytes": report.candidate_reclaimable_bytes,
@@ -919,6 +1059,10 @@ fn maintenance_report_json(
         "last_validated_mark_epoch": report.status.last_validated_mark_epoch,
         "retained_control_roots": report.retained_control_roots,
         "derived_payload_count": report.derived_payload_count,
+        "overlay": overlay,
+        "mvcc": mvcc,
+        "group_commit": group_commit,
+        "growth_domains": growth_domains,
         "policy": policy,
         "run_state": run_state,
     });
@@ -926,6 +1070,14 @@ fn maintenance_report_json(
         value["live_root_diagnostics"] = live_root_diagnostics_json(diagnostics);
     }
     value
+}
+
+fn overlay_blocked_reclamation_reasons_text(report: &StoreMaintenanceReport) -> String {
+    if report.overlay_health.blocked_reclamation_reasons.is_empty() {
+        "none".to_string()
+    } else {
+        report.overlay_health.blocked_reclamation_reasons.join(",")
+    }
 }
 
 fn optional_u64_text(value: Option<u64>) -> String {
@@ -1059,10 +1211,11 @@ fn print_store_doctor_for_path(store: &str, keys: &KeyOpts) {
             match fs.store_maintenance_report(now_ms()) {
                 Ok(report) => {
                     println!(
-                        "store_maintenance\teligible={}\treason={}\tphysical_bytes={}\tmarked_live_bytes={}\tcandidate_reclaimable_bytes={}\treusable_free_bytes={}\ttail_free_pages={}\ttail_free_bytes={}\ttail_trim_eligible={}\ttail_blocked_by_live_objects={}\ttail_compaction_eligible={}\tfull_compaction_required_for_shrink={}\ttail_trim_attempted={}\ttail_trim_pages={}\ttail_trim_bytes={}\tretained_control_roots={}\tderived_payload_count={}\tmark_epoch={}\tmark_completed={}\tlast_validated_mark_epoch={}",
+                        "store_maintenance\teligible={}\treason={}\tphysical_bytes={}\tlive_bytes={}\tmarked_live_bytes={}\tcandidate_reclaimable_bytes={}\treusable_free_bytes={}\ttail_free_pages={}\ttail_free_bytes={}\ttail_trim_eligible={}\ttail_blocked_by_live_objects={}\ttail_compaction_eligible={}\tfull_compaction_required_for_shrink={}\ttail_trim_attempted={}\ttail_trim_pages={}\ttail_trim_bytes={}\tretained_control_roots={}\tderived_payload_count={}\tmark_epoch={}\tmark_completed={}\tlast_validated_mark_epoch={}",
                         report.eligible,
                         report.reason,
                         report.status.physical_bytes,
+                        report.live_bytes,
                         report.marked_live_bytes,
                         report.candidate_reclaimable_bytes,
                         report.reusable_free_bytes,
@@ -1084,6 +1237,71 @@ fn print_store_doctor_for_path(store: &str, keys: &KeyOpts) {
                         report.mark_completed,
                         report.status.last_validated_mark_epoch
                     );
+                    println!(
+                        "store_growth\tphysical_bytes={}\tlive_bytes={}\treusable_free_bytes={}\tcandidate_reclaimable_bytes={}\toverlay_current_records={}\toverlay_obsolete_records={}\toverlay_obsolete_pages={}",
+                        report.status.physical_bytes,
+                        report.live_bytes,
+                        report.reusable_free_bytes,
+                        report.candidate_reclaimable_bytes,
+                        report.overlay_health.current_record_count,
+                        report.overlay_obsolete_record_count,
+                        report.overlay_obsolete_page_count
+                    );
+                    println!(
+                        "store_maintenance_overlay\tgeneration={}\tcurrent_records={}\ttombstones={}\tobsolete_records={}\tlive_checkpoint_references={}\treclaimable_pages={}\tobsolete_pages={}\tblocked_reclamation_reasons={}\tretained_checkpoint_blockers={}\thot_write_count={}\tactive_writer_contention_indicators={}",
+                        report.overlay_health.current_generation,
+                        report.overlay_health.current_record_count,
+                        report.overlay_health.tombstone_count,
+                        report.overlay_obsolete_record_count,
+                        report.overlay_health.live_checkpoint_references,
+                        report.overlay_health.reclaimable_overlay_pages,
+                        report.overlay_obsolete_page_count,
+                        overlay_blocked_reclamation_reasons_text(&report),
+                        overlay_blocked_reclamation_reasons_text(&report),
+                        report.overlay_health.hot_write_count,
+                        report.overlay_health.active_writer_contention_indicators
+                    );
+                    println!(
+                        "store_maintenance_mvcc\tactive_snapshots={}\toldest_pinned_generation={}\tpinned_reader_reclaim_pressure={}",
+                        report.mvcc_snapshots.active_snapshot_count,
+                        optional_u64_text(
+                            report
+                                .mvcc_snapshots
+                                .oldest_pinned_overlay_generation
+                                .map(|generation| generation.as_u64())
+                        ),
+                        report.mvcc_snapshots.active_snapshot_count > 0
+                            && report.overlay_obsolete_record_count > 0
+                    );
+                    println!(
+                        "store_maintenance_group_commit\tbatches_total={}\ttransactions_total={}\trecords_total={}\tfsync_total_micros={}\tfsync_count={}\twrite_lock_wait_total_micros={}\twrite_lock_wait_count={}\tpending_durable_window_transactions={}\tpending_durable_window_records={}\tpinned_reader_blockers={}",
+                        report.status.group_commit.group_commit_batches_total,
+                        report.status.group_commit.group_commit_transactions_total,
+                        report.status.group_commit.group_commit_records_total,
+                        report.status.group_commit.fsync_total_micros,
+                        report.status.group_commit.fsync_count,
+                        report.status.group_commit.write_lock_wait_total_micros,
+                        report.status.group_commit.write_lock_wait_count,
+                        report
+                            .status
+                            .group_commit
+                            .pending_durable_window_transactions,
+                        report.status.group_commit.pending_durable_window_records,
+                        report
+                            .status
+                            .group_commit
+                            .pinned_reader_blockers
+                            .map_or_else(|| "unavailable".to_string(), |value| value.to_string())
+                    );
+                    for domain in &report.growth_domains {
+                        println!(
+                            "store_growth_domain\tdomain={}\tcurrent_records={}\tobsolete_records={}\tpayload_bytes={}",
+                            domain.domain,
+                            domain.current_records,
+                            domain.obsolete_records,
+                            domain.payload_bytes
+                        );
+                    }
                     match open_read_loom_for_diagnostics(store, &fs, keys)
                         .and_then(|loom| maintenance_live_root_diagnostics(&loom))
                     {
@@ -6840,6 +7058,7 @@ pub(crate) struct DaemonRuntime {
     pins: std::collections::BTreeMap<String, PinLease>,
     authority_replication_next: std::collections::BTreeMap<String, u64>,
     maintenance_next_ms: u64,
+    maintenance_worker: Option<std::thread::JoinHandle<Result<(), String>>>,
     #[cfg(feature = "serve")]
     hosted_listeners: std::collections::BTreeMap<String, HostedListenerRuntime>,
     #[cfg(feature = "serve")]
@@ -7446,6 +7665,23 @@ fn resolve_ticket_reference_candidate(
         .transpose()
 }
 
+fn record_daemon_maintenance_error(store: &str, now: u64, error: String) -> Result<(), String> {
+    let fs = FileStore::open_read(store).map_err(|e| e.to_string())?;
+    let policy = fs.store_maintenance_policy().map_err(|e| e.to_string())?;
+    drop(fs);
+    let next_eligible_ms = now.saturating_add(policy.backoff_ms);
+    let writable = FileStore::open_daemon_authorized(store).map_err(|e| e.to_string())?;
+    writable
+        .record_store_maintenance_run_state(StoreMaintenanceRunState {
+            last_run_ms: Some(now),
+            next_eligible_ms,
+            last_skip_reason: None,
+            last_error: Some(error),
+            ..StoreMaintenanceRunState::default()
+        })
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(feature = "serve")]
 fn ensure_service_grant(
     fs: &FileStore,
@@ -7549,6 +7785,25 @@ fn split_daemon_auth_fields(fields: Vec<&str>) -> Result<(Vec<&str>, DaemonReque
 impl DaemonRuntime {
     fn reconcile_store_maintenance(&mut self) -> Result<(), String> {
         let now = now_ms();
+        if self
+            .maintenance_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            let worker = self.maintenance_worker.take().expect("worker checked");
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => record_daemon_maintenance_error(&self.store, now, error)?,
+                Err(_) => record_daemon_maintenance_error(
+                    &self.store,
+                    now,
+                    "maintenance worker panicked".to_string(),
+                )?,
+            }
+        }
+        if self.maintenance_worker.is_some() {
+            return Ok(());
+        }
         if now < self.maintenance_next_ms {
             return Ok(());
         }
@@ -7560,29 +7815,13 @@ impl DaemonRuntime {
         if !report.eligible {
             return Ok(());
         }
-        let mut loom = loom_store::open_loom_daemon_authorized_unlocked(&self.store, None)
-            .map_err(|e| e.to_string())?;
-        match run_store_maintenance_once(&mut loom, now, false, None, None) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let fs = FileStore::open_read(&self.store).map_err(|e| e.to_string())?;
-                let policy = fs.store_maintenance_policy().map_err(|e| e.to_string())?;
-                drop(fs);
-                self.maintenance_next_ms = now.saturating_add(policy.backoff_ms);
-                let writable =
-                    FileStore::open_daemon_authorized(&self.store).map_err(|e| e.to_string())?;
-                writable
-                    .record_store_maintenance_run_state(StoreMaintenanceRunState {
-                        last_run_ms: Some(now),
-                        next_eligible_ms: self.maintenance_next_ms,
-                        last_skip_reason: None,
-                        last_error: Some(error),
-                        ..StoreMaintenanceRunState::default()
-                    })
-                    .map_err(|e| e.to_string())?;
-                Ok(())
-            }
-        }
+        let store = self.store.clone();
+        self.maintenance_worker = Some(std::thread::spawn(move || {
+            let mut loom = loom_store::open_loom_daemon_authorized_unlocked(&store, None)
+                .map_err(|e| e.to_string())?;
+            run_store_maintenance_once(&mut loom, now, false, None, None).map(|_| ())
+        }));
+        Ok(())
     }
 
     fn status_response(&mut self) -> String {
@@ -9206,6 +9445,7 @@ pub(crate) fn daemon_run(
         pins: std::collections::BTreeMap::new(),
         authority_replication_next: std::collections::BTreeMap::new(),
         maintenance_next_ms: 0,
+        maintenance_worker: None,
         #[cfg(feature = "serve")]
         hosted_listeners,
         #[cfg(feature = "serve")]
@@ -9222,12 +9462,12 @@ pub(crate) fn daemon_run(
     daemon::align_runtime_artifact_owner(std::path::Path::new(pid_file), "pid", &paths)
         .map_err(|e| e.to_string())?;
     loop {
+        runtime.reconcile_store_maintenance()?;
         runtime.reconcile_authority_replication()?;
         #[cfg(feature = "serve")]
         runtime.reconcile_hosted_listeners()?;
         runtime.reconcile_drive_policy_workers()?;
         runtime.reconcile_reference_workers()?;
-        runtime.reconcile_store_maintenance()?;
         let mut stream = match listener.accept(&paths)? {
             Some(stream) => stream,
             None => {
@@ -9312,6 +9552,7 @@ mod maintenance_tail_trim_tests {
                 pins: std::collections::BTreeMap::new(),
                 authority_replication_next: std::collections::BTreeMap::new(),
                 maintenance_next_ms: 0,
+                maintenance_worker: None,
                 #[cfg(feature = "serve")]
                 hosted_listeners: std::collections::BTreeMap::new(),
                 #[cfg(feature = "serve")]
@@ -9320,6 +9561,12 @@ mod maintenance_tail_trim_tests {
                 reference_reconcile_next_ms: 0,
             },
         )
+    }
+
+    fn wait_for_maintenance(runtime: &mut DaemonRuntime) {
+        if let Some(worker) = runtime.maintenance_worker.take() {
+            worker.join().unwrap().unwrap();
+        }
     }
 
     #[test]
@@ -9376,6 +9623,70 @@ mod maintenance_tail_trim_tests {
         assert!(status.contains("tail_compaction_max_pages="));
         assert!(status.contains("tail_compaction_max_objects="));
         assert!(status.contains("tail_compaction_max_bytes="));
+        assert!(status.contains("maintenance_overlay\tgeneration=0"));
+        assert!(status.contains("maintenance_mvcc\tactive_snapshots=0"));
+        assert!(status.contains("maintenance_group_commit\tbatches_total="));
+        assert!(status.contains("fsync_total_micros="));
+        assert!(status.contains("write_lock_wait_total_micros="));
+        assert!(status.contains("pinned_reader_blockers="));
+        assert!(status.contains("current_records=0"));
+        assert!(status.contains("obsolete_records=0"));
+        assert!(status.contains("reclaimable_pages=0"));
+        assert!(status.contains("retained_checkpoint_blockers=none"));
+        assert!(status.contains("blocked_reclamation_reasons=none"));
+        assert!(status.contains("maintenance_growth\tphysical_bytes="));
+    }
+
+    #[test]
+    fn maintenance_report_json_includes_store_overlay_health() {
+        let (store, _runtime) = test_runtime("maintenance-overlay-json-unit");
+        let fs = FileStore::open_daemon_authorized(&store).unwrap();
+        let key = loom_store::OverlayKey::from_segments([
+            b"workspace",
+            &[1; 16],
+            b"tickets",
+            b"matrix",
+            b"ticket",
+            b"MX-1",
+        ])
+        .unwrap();
+        fs.put_mutable_overlay_value(key, b"current".to_vec())
+            .unwrap();
+        drop(fs);
+
+        let reopened = FileStore::open_daemon_authorized(&store).unwrap();
+        let report = reopened.store_maintenance_report(100).unwrap();
+        let json = maintenance_report_json(&report, None);
+
+        assert_eq!(json["overlay"]["generation"], 1);
+        assert_eq!(json["mvcc"]["active_snapshots"], 0);
+        assert_eq!(
+            json["group_commit"]["group_commit_batches_total"],
+            report.status.group_commit.group_commit_batches_total
+        );
+        assert_eq!(
+            json["group_commit"]["fsync_total_micros"],
+            report.status.group_commit.fsync_total_micros
+        );
+        assert_eq!(
+            json["group_commit"]["write_lock_wait_total_micros"],
+            report.status.group_commit.write_lock_wait_total_micros
+        );
+        assert_eq!(json["overlay"]["current_records"], 1);
+        assert_eq!(json["overlay"]["obsolete_records"], 0);
+        assert_eq!(json["overlay"]["hot_write_count"], 1);
+        assert_eq!(json["growth_domains"][0]["domain"], "tickets");
+        assert_eq!(json["growth_domains"][0]["current_records"], 1);
+        assert_eq!(json["growth_domains"][0]["payload_bytes"], 7);
+        assert!(json["live_bytes"].as_u64().is_some());
+        assert_eq!(
+            json["reusable_free_pages"],
+            report.status.reusable_free_pages
+        );
+        assert_eq!(
+            json["candidate_reclaimable_bytes"],
+            report.candidate_reclaimable_bytes
+        );
     }
 
     #[test]
@@ -9412,6 +9723,7 @@ mod maintenance_tail_trim_tests {
         drop(fs);
 
         runtime.reconcile_store_maintenance().unwrap();
+        wait_for_maintenance(&mut runtime);
         let fs = FileStore::open_read(&store).unwrap();
         let run_state = fs.store_maintenance_run_state().unwrap();
         assert!(run_state.last_run_ms.is_some());
@@ -9419,6 +9731,83 @@ mod maintenance_tail_trim_tests {
         assert_eq!(run_state.last_skip_reason, None);
         assert_eq!(run_state.last_error, None);
         assert!(run_state.last_tail_trim_attempted);
+    }
+
+    #[test]
+    fn automatic_maintenance_defers_whole_file_compaction() {
+        let (store, mut runtime) = test_runtime("maintenance-auto-full-compact-unit");
+        let fs = FileStore::open_daemon_authorized(&store).unwrap();
+        let live_payload = vec![0xA5; 800 * 1024];
+        let live = fs.put(&live_payload).unwrap();
+        let state = loom_core::ReachabilityMarkState {
+            pinned: std::collections::BTreeSet::new(),
+            marked: std::collections::BTreeSet::from([live]),
+            queue: std::collections::VecDeque::new(),
+            stream_roots: std::collections::VecDeque::new(),
+            completed: true,
+        };
+        let epoch = fs
+            .begin_reachability_mark_epoch(None, std::collections::BTreeSet::new(), state)
+            .unwrap();
+        fs.complete_reachability_mark_epoch(&epoch).unwrap();
+        for i in 0..640usize {
+            fs.put(format!("auto-full-dead-{i:04}").as_bytes()).unwrap();
+        }
+        fs.set_store_maintenance_policy(loom_store::StoreMaintenancePolicy {
+            min_candidate_pages: 0,
+            min_reusable_pages: 0,
+            interval_ms: 1_000,
+            backoff_ms: 2_000,
+            max_segments: u64::MAX,
+            max_pages: u64::MAX,
+            full_compaction_enabled: true,
+            ..loom_store::StoreMaintenancePolicy::default()
+        })
+        .unwrap();
+        drop(fs);
+
+        runtime.reconcile_store_maintenance().unwrap();
+        wait_for_maintenance(&mut runtime);
+
+        let fs = FileStore::open_read(&store).unwrap();
+        let run_state = fs.store_maintenance_run_state().unwrap();
+        assert_eq!(
+            run_state.last_shrink_skip_reason.as_deref(),
+            Some("full_compaction_manual_only")
+        );
+        assert_eq!(run_state.last_error, None);
+    }
+
+    #[test]
+    fn daemon_runtime_starts_missing_reachability_mark_epoch() {
+        let (store, mut runtime) = test_runtime("maintenance-auto-mark-unit");
+        let fs = FileStore::open_daemon_authorized(&store).unwrap();
+        fs.set_store_maintenance_policy(loom_store::StoreMaintenancePolicy {
+            min_candidate_pages: 0,
+            min_reusable_pages: 0,
+            interval_ms: 1_000,
+            backoff_ms: 2_000,
+            ..loom_store::StoreMaintenancePolicy::default()
+        })
+        .unwrap();
+        assert!(fs.active_reachability_mark_epoch().unwrap().is_none());
+        drop(fs);
+
+        runtime.reconcile_store_maintenance().unwrap();
+        wait_for_maintenance(&mut runtime);
+
+        let fs = FileStore::open_read(&store).unwrap();
+        let epoch = fs
+            .active_reachability_mark_epoch()
+            .unwrap()
+            .expect("automatic maintenance must create a missing mark epoch");
+        assert!(epoch.state.completed);
+        assert!(
+            fs.store_maintenance_run_state()
+                .unwrap()
+                .last_run_ms
+                .is_some()
+        );
     }
 }
 
@@ -9554,6 +9943,7 @@ mod tests {
                 pins: std::collections::BTreeMap::new(),
                 authority_replication_next: std::collections::BTreeMap::new(),
                 maintenance_next_ms: 0,
+                maintenance_worker: None,
                 #[cfg(feature = "serve")]
                 hosted_listeners: std::collections::BTreeMap::new(),
                 #[cfg(feature = "serve")]
@@ -9575,6 +9965,12 @@ mod tests {
         assert!(status.contains("tail_compaction_eligible=false"));
         assert!(status.contains("tail_trim_enabled=true"));
         assert!(status.contains("tail_compaction_enabled=true"));
+        assert!(status.contains("maintenance_overlay\tgeneration=0"));
+        assert!(status.contains("current_records=0"));
+        assert!(status.contains("obsolete_records=0"));
+        assert!(status.contains("reclaimable_pages=0"));
+        assert!(status.contains("retained_checkpoint_blockers=none"));
+        assert!(status.contains("blocked_reclamation_reasons=none"));
 
         let loom = loom_store::open_loom_unlocked(&store, None).unwrap();
         loom.store()
@@ -9821,6 +10217,7 @@ mod tests {
                 pins: std::collections::BTreeMap::new(),
                 authority_replication_next: std::collections::BTreeMap::new(),
                 maintenance_next_ms: 0,
+                maintenance_worker: None,
                 #[cfg(feature = "serve")]
                 hosted_listeners: std::collections::BTreeMap::new(),
                 #[cfg(feature = "serve")]
@@ -9925,6 +10322,7 @@ mod tests {
             pins: std::collections::BTreeMap::new(),
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
+            maintenance_worker: None,
             #[cfg(feature = "serve")]
             hosted_listeners: std::collections::BTreeMap::new(),
             #[cfg(feature = "serve")]
@@ -11418,6 +11816,7 @@ mod tests {
             pins: std::collections::BTreeMap::new(),
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
+            maintenance_worker: None,
             hosted_listeners,
             drive_policy_next_ms: 0,
             reference_reconcile_next_ms: 0,
@@ -11498,6 +11897,7 @@ mod tests {
             pins: std::collections::BTreeMap::new(),
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
+            maintenance_worker: None,
             hosted_listeners,
             drive_policy_next_ms: 0,
             reference_reconcile_next_ms: 0,
@@ -11629,6 +12029,7 @@ mod tests {
             pins: std::collections::BTreeMap::new(),
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
+            maintenance_worker: None,
             hosted_listeners,
             drive_policy_next_ms: 0,
             reference_reconcile_next_ms: 0,
@@ -14453,6 +14854,7 @@ mod tests {
             pins: std::collections::BTreeMap::new(),
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
+            maintenance_worker: None,
             #[cfg(feature = "serve")]
             hosted_listeners: std::collections::BTreeMap::new(),
             #[cfg(feature = "serve")]
@@ -14554,6 +14956,7 @@ mod tests {
             pins: std::collections::BTreeMap::new(),
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
+            maintenance_worker: None,
             #[cfg(feature = "serve")]
             hosted_listeners: std::collections::BTreeMap::new(),
             #[cfg(feature = "serve")]
@@ -14600,6 +15003,7 @@ mod tests {
             pins: std::collections::BTreeMap::new(),
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
+            maintenance_worker: None,
             #[cfg(feature = "serve")]
             hosted_listeners: std::collections::BTreeMap::new(),
             #[cfg(feature = "serve")]
@@ -14720,6 +15124,7 @@ mod tests {
             pins: std::collections::BTreeMap::new(),
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
+            maintenance_worker: None,
             #[cfg(feature = "serve")]
             hosted_listeners: std::collections::BTreeMap::new(),
             #[cfg(feature = "serve")]

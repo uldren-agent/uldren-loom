@@ -2514,6 +2514,18 @@ int32_t loom_doc_delete(LoomSession *handle,
                         int32_t *out_found);
 
 /**
+ * Remove collection `collection` and its structured roots; writes presence (`1`/`0`) to
+ * `*out_found` and returns `0`.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `workspace`/`collection` valid C strings; `out_found` writable.
+ */
+int32_t loom_doc_delete_collection(LoomSession *handle,
+                                   const char *workspace,
+                                   const char *collection,
+                                   int32_t *out_found);
+
+/**
  * Create a native document index over a dotted JSON field path.
  *
  * # Safety

@@ -46,6 +46,25 @@ pub struct HostedDocumentPutResult {
     pub entity_tag: String,
 }
 
+fn enforce_document_entity_tag(
+    loom: &Loom<FileStore>,
+    ns: WorkspaceId,
+    collection: &str,
+    id: &str,
+    expected_entity_tag: Option<&str>,
+) -> Result<()> {
+    let Some(expected_entity_tag) = expected_entity_tag else {
+        return Ok(());
+    };
+    match document::document_get_binary(loom, ns, collection, id)? {
+        Some(current) if current.entity_tag == expected_entity_tag => Ok(()),
+        Some(_) | None => Err(LoomError::new(
+            Code::Conflict,
+            loom_types::ConflictReason::ExpectedTagMismatch.as_str(),
+        )),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostedEtcdKv {
     pub key: Vec<u8>,
@@ -857,7 +876,7 @@ impl HostedDataAdapter<'_> {
     ) -> HostedOutcome<()> {
         hosted_outcome(self.kernel.write(auth, |loom| {
             let ns = ensure_facet_ns(loom, FacetKind::Document, workspace)?;
-            document::doc_put(loom, ns, collection, id, document)
+            loom_reference::put_document_indexed(loom, ns, collection, id, document)
         }))
     }
 
@@ -884,17 +903,13 @@ impl HostedDataAdapter<'_> {
     ) -> HostedOutcome<HostedDocumentPutResult> {
         hosted_outcome(self.kernel.write(auth, |loom| {
             let ns = ensure_facet_ns(loom, FacetKind::Document, workspace)?;
-            document::document_put_text_with_entity_tag(
-                loom,
-                ns,
-                collection,
-                id,
-                text,
-                expected_entity_tag,
-            )
-            .map(|result| HostedDocumentPutResult {
-                digest: result.digest.to_string(),
-                entity_tag: result.entity_tag,
+            enforce_document_entity_tag(loom, ns, collection, id, expected_entity_tag)?;
+            let bytes = text.as_bytes().to_vec();
+            let digest = Digest::hash(loom.store().digest_algo(), &bytes);
+            loom_reference::put_document_indexed(loom, ns, collection, id, bytes)?;
+            Ok(HostedDocumentPutResult {
+                digest: digest.to_string(),
+                entity_tag: loom_core::document_entity_tag_string_from_digest(digest),
             })
         }))
     }
@@ -928,17 +943,12 @@ impl HostedDataAdapter<'_> {
     ) -> HostedOutcome<HostedDocumentPutResult> {
         hosted_outcome(self.kernel.write(auth, |loom| {
             let ns = ensure_facet_ns(loom, FacetKind::Document, workspace)?;
-            document::document_put_binary_with_entity_tag(
-                loom,
-                ns,
-                collection,
-                id,
-                bytes,
-                expected_entity_tag,
-            )
-            .map(|result| HostedDocumentPutResult {
-                digest: result.digest.to_string(),
-                entity_tag: result.entity_tag,
+            enforce_document_entity_tag(loom, ns, collection, id, expected_entity_tag)?;
+            let digest = Digest::hash(loom.store().digest_algo(), &bytes);
+            loom_reference::put_document_indexed(loom, ns, collection, id, bytes)?;
+            Ok(HostedDocumentPutResult {
+                digest: digest.to_string(),
+                entity_tag: loom_core::document_entity_tag_string_from_digest(digest),
             })
         }))
     }

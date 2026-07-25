@@ -59,12 +59,13 @@ use crate::LoomMcp;
 use crate::reads::{StoreSearchReadRequest, TsPoint, VectorSearchPolicyRead};
 use crate::tools::{ToolKind, ToolSpec};
 use crate::writes::{
-    DocumentReplaceTextRequest, GraphEdgeWrite, LaneCreateRequest, LaneDeleteRequest,
-    LaneTicketTransferRequest, LaneTicketUpdateRequest, LaneUpdateRequest,
-    MeetingsPromoteArtifactToReferenceArtifactRequest, MeetingsPromoteDecisionToDecisionLogRequest,
-    MeetingsPromoteQuestionToLifecycleRequest, MeetingsPromoteReferenceToReferenceArtifactRequest,
-    MeetingsPromoteTaskToTicketRequest, SubstrateTransactOp, SubstrateViewDefineOwned,
-    SubstrateViewDefineRequest, VectorSourceWrite, WriteAdmission, WriteAdmissionPolicyRequest,
+    DocumentReplaceTextRequest, GraphEdgeWrite, LaneCleanupRequest, LaneCloseoutRequest,
+    LaneCreateRequest, LaneDeleteRequest, LaneTicketTransferRequest, LaneTicketUpdateRequest,
+    LaneUpdateRequest, MeetingsPromoteArtifactToReferenceArtifactRequest,
+    MeetingsPromoteDecisionToDecisionLogRequest, MeetingsPromoteQuestionToLifecycleRequest,
+    MeetingsPromoteReferenceToReferenceArtifactRequest, MeetingsPromoteTaskToTicketRequest,
+    SubstrateTransactOp, SubstrateViewDefineOwned, SubstrateViewDefineRequest, VectorSourceWrite,
+    WriteAdmission, WriteAdmissionPolicyRequest,
 };
 use loom_tickets::{
     BoardCardMoveRequest, BoardColumn, BoardColumnConfigureRequest, BoardCreateRequest, BoardMode,
@@ -321,6 +322,58 @@ fn maintenance_report_json(
         "last_tail_compaction_conflicts": report.run_state.last_tail_compaction_conflicts,
         "last_shrink_skip_reason": report.run_state.last_shrink_skip_reason,
     });
+    let overlay = json!({
+        "generation": report.overlay_health.current_generation,
+        "current_records": report.overlay_health.current_record_count,
+        "tombstones": report.overlay_health.tombstone_count,
+        "obsolete_records": report.overlay_obsolete_record_count,
+        "live_checkpoint_references": report.overlay_health.live_checkpoint_references,
+        "reclaimable_pages": report.overlay_health.reclaimable_overlay_pages,
+        "obsolete_pages": report.overlay_obsolete_page_count,
+        "blocked_reclamation_reasons": report.overlay_health.blocked_reclamation_reasons,
+        "retained_checkpoint_blockers": report.overlay_health.blocked_reclamation_reasons,
+        "hot_write_count": report.overlay_health.hot_write_count,
+        "active_writer_contention_indicators": report.overlay_health.active_writer_contention_indicators,
+    });
+    let mvcc_pins = report
+        .mvcc_snapshots
+        .pins
+        .iter()
+        .map(|pin| {
+            json!({
+                "pin_id": pin.pin_id,
+                "overlay_generation": pin.identity.overlay_generation.as_u64(),
+                "base_root": pin
+                    .identity
+                    .immutable_base_root
+                    .as_ref()
+                    .map(|root| root.to_string()),
+                "owner": pin.owner,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mvcc = json!({
+        "active_snapshots": report.mvcc_snapshots.active_snapshot_count,
+        "oldest_pinned_generation": report
+            .mvcc_snapshots
+            .oldest_pinned_overlay_generation
+            .map(|generation| generation.as_u64()),
+        "pinned_reader_reclaim_pressure": report.mvcc_snapshots.active_snapshot_count > 0
+            && report.overlay_obsolete_record_count > 0,
+        "pins": mvcc_pins,
+    });
+    let group_commit = json!({
+        "group_commit_batches_total": report.status.group_commit.group_commit_batches_total,
+        "group_commit_transactions_total": report.status.group_commit.group_commit_transactions_total,
+        "group_commit_records_total": report.status.group_commit.group_commit_records_total,
+        "fsync_total_micros": report.status.group_commit.fsync_total_micros,
+        "fsync_count": report.status.group_commit.fsync_count,
+        "write_lock_wait_total_micros": report.status.group_commit.write_lock_wait_total_micros,
+        "write_lock_wait_count": report.status.group_commit.write_lock_wait_count,
+        "pending_durable_window_transactions": report.status.group_commit.pending_durable_window_transactions,
+        "pending_durable_window_records": report.status.group_commit.pending_durable_window_records,
+        "pinned_reader_blockers": report.status.group_commit.pinned_reader_blockers,
+    });
     let mut value = json!({
         "eligible": report.eligible,
         "reason": report.reason,
@@ -352,6 +405,9 @@ fn maintenance_report_json(
         "last_validated_mark_epoch": report.status.last_validated_mark_epoch,
         "retained_control_roots": report.retained_control_roots,
         "derived_payload_count": report.derived_payload_count,
+        "overlay": overlay,
+        "mvcc": mvcc,
+        "group_commit": group_commit,
         "policy": policy,
         "run_state": run_state,
     });
@@ -359,6 +415,59 @@ fn maintenance_report_json(
         value["live_root_diagnostics"] = live_root_diagnostics_json(diagnostics);
     }
     value
+}
+
+fn store_policy_json(policy: loom_store::StorePolicy, audit_seq: Option<u64>) -> Value {
+    let mut overrides = serde_json::Map::new();
+    for facet in FacetKind::ALL {
+        if let Some(durability) = policy.facet_durability_overrides[facet.stable_tag() as usize] {
+            overrides.insert(facet.as_str().to_string(), json!(durability.as_str()));
+        }
+    }
+    json!({
+        "fips_required": policy.fips_required,
+        "default_durability": policy.default_durability.as_str(),
+        "facet_durability_overrides": overrides,
+        "audit_seq": audit_seq,
+    })
+}
+
+fn apply_store_policy_mcp_updates(
+    policy: &mut loom_store::StorePolicy,
+    request: PStorePolicySet,
+) -> loom_core::Result<()> {
+    if let Some(value) = request.fips_required {
+        policy.fips_required = value;
+    }
+    if let Some(value) = request.default_durability {
+        policy.set_default_durability(loom_store::parse_store_durability_policy(&value)?)?;
+    }
+    for (facet, durability) in request.facet_durability_overrides {
+        let facet = FacetKind::parse(&facet)?;
+        let durability = loom_store::parse_store_durability_policy(&durability)?;
+        policy.set_facet_durability(facet, Some(durability))?;
+    }
+    for facet in request.clear_facet_durability_overrides {
+        policy.set_facet_durability(FacetKind::parse(&facet)?, None)?;
+    }
+    Ok(())
+}
+
+fn store_policy_audit_target(policy: &loom_store::StorePolicy) -> String {
+    let mut target = format!(
+        "fips_required={},default_durability={}",
+        policy.fips_required,
+        policy.default_durability.as_str()
+    );
+    for facet in FacetKind::ALL {
+        if let Some(durability) = policy.facet_durability_overrides[facet.stable_tag() as usize] {
+            target.push(',');
+            target.push_str(facet.as_str());
+            target.push('=');
+            target.push_str(durability.as_str());
+        }
+    }
+    target
 }
 
 fn run_mcp_store_maintenance_once(
@@ -2467,6 +2576,13 @@ pub fn execute_promoted_tool(
                     &a.ticket_id,
                     a.projection.as_deref(),
                 )?)
+            } else if a.compact {
+                promoted_result_bytes(mcp.read_tickets_get_compact(
+                    &a.workspace,
+                    &pid,
+                    &a.ticket_id,
+                    a.projection.as_deref(),
+                )?)
             } else {
                 promoted_result_bytes(mcp.read_tickets_get_readable(
                     &a.workspace,
@@ -2964,6 +3080,74 @@ fn string_array_map_schema() -> Value {
     json!({ "type": "object", "additionalProperties": string_array_schema() })
 }
 
+fn ticket_update_comment_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "comment_id": string_schema(),
+            "comment_type": string_schema(),
+            "body": string_schema(),
+            "evidence": string_array_map_schema()
+        },
+        "required": ["body"],
+        "additionalProperties": false
+    })
+}
+
+fn ticket_update_relation_set_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "relation_id": string_schema(),
+            "kind": string_schema(),
+            "target_id": string_schema()
+        },
+        "required": ["kind", "target_id"],
+        "additionalProperties": false
+    })
+}
+
+fn ticket_update_relation_remove_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "relation_id": string_schema()
+        },
+        "required": ["relation_id"],
+        "additionalProperties": false
+    })
+}
+
+fn ticket_board_column_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "column_id": string_schema(),
+            "name": string_schema(),
+            "mapped_statuses": string_array_schema(),
+            "wip_limit": integer_schema(),
+            "hidden": bool_schema(),
+            "rank": integer_schema()
+        },
+        "required": ["column_id", "name"],
+        "additionalProperties": false
+    })
+}
+
+fn ticket_board_swimlane_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "swimlane_id": string_schema(),
+            "name": string_schema(),
+            "predicate": string_schema(),
+            "rank": integer_schema()
+        },
+        "required": ["swimlane_id", "name"],
+        "additionalProperties": false
+    })
+}
+
 fn bytes_schema() -> Value {
     json!({ "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } })
 }
@@ -3452,6 +3636,94 @@ fn ticket_projects_schema() -> Value {
 
 fn ticket_schema() -> Value {
     json!({
+        "anyOf": [
+            compact_native_ticket_schema(),
+            native_ticket_schema(),
+            jira_ticket_schema(),
+            asana_ticket_schema(),
+            notion_ticket_schema(),
+            redmine_ticket_schema(),
+            compact_summary_ticket_schema()
+        ]
+    })
+}
+
+/// Schema branch for the lean ticket projection returned by `read_tickets_get_compact`. Matches
+/// `readable_ticket_compact_json` in `reads.rs`: same keys as `compact_native_ticket_schema()`
+/// minus `description` and `comments`. Any drift will fail runtime validation because this branch
+/// is `additionalProperties: false`.
+fn compact_summary_ticket_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "primary_key": string_schema(),
+            "title": nullable(string_schema()),
+            "status": nullable(string_schema()),
+            "priority": nullable(string_schema()),
+            "type": string_schema(),
+            "assignee": nullable(string_schema()),
+            "assignee_display": nullable(string_schema()),
+            "project": string_schema(),
+            "dependencies": ticket_dependencies_schema(),
+            "comment_count": integer_schema(),
+            "latest_update": nullable(readable_ticket_latest_update_schema())
+        },
+        "required": [
+            "primary_key",
+            "title",
+            "status",
+            "priority",
+            "type",
+            "assignee",
+            "assignee_display",
+            "project",
+            "dependencies",
+            "comment_count",
+            "latest_update"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn compact_native_ticket_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "primary_key": string_schema(),
+            "title": nullable(string_schema()),
+            "status": nullable(string_schema()),
+            "priority": nullable(string_schema()),
+            "type": string_schema(),
+            "assignee": nullable(string_schema()),
+            "assignee_display": nullable(string_schema()),
+            "project": string_schema(),
+            "description": nullable(string_schema()),
+            "dependencies": ticket_dependencies_schema(),
+            "comment_count": integer_schema(),
+            "comments": array_schema(ticket_comment_schema()),
+            "latest_update": nullable(readable_ticket_latest_update_schema())
+        },
+        "required": [
+            "primary_key",
+            "title",
+            "status",
+            "priority",
+            "type",
+            "assignee",
+            "assignee_display",
+            "project",
+            "description",
+            "dependencies",
+            "comment_count",
+            "comments",
+            "latest_update"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn native_ticket_schema() -> Value {
+    json!({
         "type": "object",
         "properties": {
             "workspace_id": string_schema(),
@@ -3459,10 +3731,7 @@ fn ticket_schema() -> Value {
             "project_id": string_schema(),
             "primary_key": string_schema(),
             "ticket_type": string_schema(),
-            "projection_profile": string_schema(),
-            "projection_kind": string_schema(),
-            "projection_source": string_schema(),
-            "projection_selection_source": string_schema(),
+            "projection": string_schema(),
             "external_source": nullable(string_schema()),
             "external_id": nullable(string_schema()),
             "fields": object_schema(),
@@ -3471,19 +3740,7 @@ fn ticket_schema() -> Value {
             "relation_rollup": ticket_relation_rollup_schema(),
             "depends_on": string_array_schema(),
             "blocks": string_array_schema(),
-            "comments": { "type": "array", "items": {
-                "type": "object",
-                "properties": {
-                    "comment_id": string_schema(),
-                    "comment_type": string_schema(),
-                    "author_principal": string_schema(),
-                    "created_at_ms": integer_schema(),
-                    "updated_at_ms": nullable(integer_schema()),
-                    "redacted": bool_schema()
-                },
-                "required": ["comment_id", "comment_type", "author_principal", "created_at_ms", "updated_at_ms", "redacted"],
-                "additionalProperties": false
-            } },
+            "comments": array_schema(ticket_comment_compact_schema()),
             "profile_root": digest_string_schema(),
             "operation_id": nullable(string_schema()),
             "sequence": nullable(integer_schema())
@@ -3494,10 +3751,7 @@ fn ticket_schema() -> Value {
             "project_id",
             "primary_key",
             "ticket_type",
-            "projection_profile",
-            "projection_kind",
-            "projection_source",
-            "projection_selection_source",
+            "projection",
             "external_source",
             "external_id",
             "fields",
@@ -3511,7 +3765,59 @@ fn ticket_schema() -> Value {
             "operation_id",
             "sequence"
         ],
-        "additionalProperties": true
+        "additionalProperties": false
+    })
+}
+
+fn jira_ticket_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "projection": string_schema(),
+            "id": string_schema(),
+            "key": string_schema(),
+            "fields": object_schema()
+        },
+        "required": ["projection", "id", "key", "fields"],
+        "additionalProperties": false
+    })
+}
+
+fn asana_ticket_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "projection": string_schema(),
+            "gid": string_schema(),
+            "data": object_schema()
+        },
+        "required": ["projection", "gid", "data"],
+        "additionalProperties": false
+    })
+}
+
+fn notion_ticket_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "projection": string_schema(),
+            "id": string_schema(),
+            "properties": object_schema()
+        },
+        "required": ["projection", "id", "properties"],
+        "additionalProperties": false
+    })
+}
+
+fn redmine_ticket_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "projection": string_schema(),
+            "issue": object_schema()
+        },
+        "required": ["projection", "issue"],
+        "additionalProperties": false
     })
 }
 
@@ -3574,6 +3880,7 @@ fn ticket_field_catalog_schema() -> Value {
             "operation": string_schema(),
             "strict_unknown_fields": bool_schema(),
             "custom_fields_source": string_schema(),
+            "unknown_field_write_behavior": string_schema(),
             "fields": {
                 "type": "array",
                 "items": {
@@ -3598,7 +3905,7 @@ fn ticket_field_catalog_schema() -> Value {
                 }
             }
         },
-        "required": ["projection", "operation", "strict_unknown_fields", "custom_fields_source", "fields"],
+        "required": ["projection", "operation", "strict_unknown_fields", "custom_fields_source", "unknown_field_write_behavior", "fields"],
         "additionalProperties": false
     })
 }
@@ -3710,32 +4017,37 @@ fn lane_ticket_view_schema() -> Value {
 }
 
 fn lane_status_counts_schema() -> Value {
+    let mut properties = serde_json::Map::new();
+    for field in loom_types::LANE_TICKET_STATUS_COUNT_FIELDS {
+        properties.insert(field.to_string(), integer_schema());
+    }
+    properties.insert("total".to_string(), integer_schema());
+    properties.insert("next_ticket_id".to_string(), nullable(string_schema()));
+    let mut required = loom_types::LANE_TICKET_STATUS_COUNT_FIELDS
+        .iter()
+        .map(|field| json!(field))
+        .collect::<Vec<_>>();
+    required.push(json!("total"));
+    required.push(json!("next_ticket_id"));
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn lane_status_text_warning_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "blocked": integer_schema(),
-            "waiting_for_decision": integer_schema(),
-            "feedback_available": integer_schema(),
-            "waiting_for_review": integer_schema(),
-            "in_progress": integer_schema(),
-            "backlog": integer_schema(),
-            "accepted": integer_schema(),
-            "missing": integer_schema(),
-            "total": integer_schema(),
-            "next_ticket_id": nullable(string_schema())
+            "field": string_schema(),
+            "stated_status": string_schema(),
+            "ticket_id": nullable(string_schema()),
+            "ticket_status": nullable(string_schema()),
+            "message": string_schema()
         },
-        "required": [
-            "blocked",
-            "waiting_for_decision",
-            "feedback_available",
-            "waiting_for_review",
-            "in_progress",
-            "backlog",
-            "accepted",
-            "missing",
-            "total",
-            "next_ticket_id"
-        ],
+        "required": ["field", "stated_status", "ticket_id", "ticket_status", "message"],
         "additionalProperties": false
     })
 }
@@ -3754,6 +4066,7 @@ fn lane_view_schema() -> Value {
             "stored_lane_status": string_schema(),
             "display_status": string_schema(),
             "status_counts": lane_status_counts_schema(),
+            "status_warnings": array_schema(lane_status_text_warning_schema()),
             "lane_tickets": array_schema(lane_ticket_view_schema()),
             "active_ticket_id": nullable(string_schema()),
             "status_report": string_schema(),
@@ -3761,7 +4074,7 @@ fn lane_view_schema() -> Value {
             "updated_at": integer_schema(),
             "updated_by": string_schema()
         },
-        "required": ["lane_id", "lane_key", "title", "description", "lane_kind", "owner_principal", "owner_display", "stored_lane_status", "display_status", "status_counts", "lane_tickets", "active_ticket_id", "status_report", "reviewer_feedback", "updated_at", "updated_by"],
+        "required": ["lane_id", "lane_key", "title", "description", "lane_kind", "owner_principal", "owner_display", "stored_lane_status", "display_status", "status_counts", "status_warnings", "lane_tickets", "active_ticket_id", "status_report", "reviewer_feedback", "updated_at", "updated_by"],
         "additionalProperties": false
     })
 }
@@ -3775,9 +4088,10 @@ fn lane_compact_view_schema() -> Value {
             "title": string_schema(),
             "display_status": string_schema(),
             "status_counts": lane_status_counts_schema(),
+            "status_warnings": array_schema(lane_status_text_warning_schema()),
             "lane_tickets": array_schema(string_schema())
         },
-        "required": ["lane_id", "lane_key", "title", "display_status", "status_counts", "lane_tickets"],
+        "required": ["lane_id", "lane_key", "title", "display_status", "status_counts", "status_warnings", "lane_tickets"],
         "additionalProperties": false
     })
 }
@@ -3802,6 +4116,25 @@ fn lane_decode_diagnostic_schema() -> Value {
     })
 }
 
+/// One per-lane `lanes_cleanup` report. In dry-run mode `would_remove` lists the terminal members an
+/// apply would drop (`removed` empty); in apply mode `removed` lists the members actually dropped
+/// (`would_remove` empty). `remaining_count` and `status_counts` describe the members that remain,
+/// derived from live ticket statuses. Tickets and their history are never mutated by cleanup.
+fn lane_cleanup_report_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "lane_id": string_schema(),
+            "would_remove": array_schema(string_schema()),
+            "removed": array_schema(string_schema()),
+            "remaining_count": integer_schema(),
+            "status_counts": lane_status_counts_schema()
+        },
+        "required": ["lane_id", "would_remove", "removed", "remaining_count", "status_counts"],
+        "additionalProperties": false
+    })
+}
+
 /// `lanes_list` returns the healthy lane views plus one diagnostic per record that failed to decode,
 /// so a single malformed lane never makes the whole coordination surface unreadable.
 fn lanes_list_result_schema() -> Value {
@@ -3816,22 +4149,100 @@ fn lanes_list_result_schema() -> Value {
     })
 }
 
+fn ticket_dependencies_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "depends_on": string_array_schema(),
+            "blocks": string_array_schema(),
+            "relations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": string_schema(),
+                        "target_id": string_schema()
+                    },
+                    "required": ["kind", "target_id"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["depends_on", "blocks", "relations"],
+        "additionalProperties": false
+    })
+}
+
+fn readable_ticket_latest_update_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "timestamp_ms": nullable(integer_schema()),
+            "actor": nullable(string_schema()),
+            "operation_kind": string_schema(),
+            "sequence": integer_schema(),
+            "operation_id": string_schema()
+        },
+        "required": ["timestamp_ms", "actor", "operation_kind", "sequence", "operation_id"],
+        "additionalProperties": false
+    })
+}
+
 fn ticket_history_schema() -> Value {
+    // `tickets_history` returns the compact readable projection by default and the raw detailed
+    // record shape when `detailed` is set, so the advertised schema is the union of both item shapes.
+    let readable = json!({
+        "type": "object",
+        "properties": {
+            "timestamp_ms": nullable(integer_schema()),
+            "actor": nullable(string_schema()),
+            "operation_kind": string_schema(),
+            "summary": string_schema(),
+            "sequence": integer_schema(),
+            "operation_id": nullable(string_schema())
+        },
+        "required": ["timestamp_ms", "actor", "operation_kind", "summary", "sequence", "operation_id"],
+        "additionalProperties": false
+    });
+    let detailed = json!({
+        "type": "object",
+        "properties": {
+            "sequence": integer_schema(),
+            "operation_id": string_schema(),
+            "operation_kind": string_schema(),
+            "target_entity_id": nullable(string_schema()),
+            "comments": array_schema(ticket_comment_compact_schema()),
+            "envelope": object_schema()
+        },
+        "required": ["sequence", "operation_id", "operation_kind", "target_entity_id", "comments", "envelope"],
+        "additionalProperties": false
+    });
     json!({
         "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {
-                "sequence": integer_schema(),
-                "operation_id": string_schema(),
-                "operation_kind": string_schema(),
-                "target_entity_id": nullable(string_schema()),
-                "comments": array_schema(ticket_comment_schema()),
-                "envelope": object_schema()
-            },
-            "required": ["sequence", "operation_id", "operation_kind", "target_entity_id", "comments", "envelope"],
-            "additionalProperties": false
-        }
+        "items": { "anyOf": [readable, detailed] }
+    })
+}
+
+fn ticket_comment_compact_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "comment_id": string_schema(),
+            "comment_type": string_schema(),
+            "author_principal": string_schema(),
+            "created_at_ms": integer_schema(),
+            "updated_at_ms": nullable(integer_schema()),
+            "redacted": bool_schema()
+        },
+        "required": [
+            "comment_id",
+            "comment_type",
+            "author_principal",
+            "created_at_ms",
+            "updated_at_ms",
+            "redacted"
+        ],
+        "additionalProperties": false
     })
 }
 
@@ -5766,6 +6177,7 @@ fn output_value_schema(name: &str) -> Option<Value> {
         | "vector_delete"
         | "kv_delete"
         | "document_delete"
+        | "document_delete_collection"
         | "fts_delete"
         | "vcs_merge_in_progress"
         | "calendar_delete_collection"
@@ -5782,6 +6194,8 @@ fn output_value_schema(name: &str) -> Option<Value> {
         | "queue_consumer_position" => integer_schema(),
         "store_capabilities"
         | "store_capabilities_json"
+        | "store_policy_get"
+        | "store_policy_set"
         | "store_maintenance_status"
         | "store_maintenance_policy_set"
         | "store_maintenance_run"
@@ -5851,17 +6265,19 @@ fn output_value_schema(name: &str) -> Option<Value> {
             "type": "object",
             "properties": {
                 "text": string_schema(),
-                "digest": digest_string_schema()
+                "digest": digest_string_schema(),
+                "entity_tag": string_schema()
             },
-            "required": ["text", "digest"]
+            "required": ["text", "digest", "entity_tag"]
         })),
         "document_get_binary" => nullable(json!({
             "type": "object",
             "properties": {
                 "bytes": bytes_schema(),
-                "digest": digest_string_schema()
+                "digest": digest_string_schema(),
+                "entity_tag": string_schema()
             },
-            "required": ["bytes", "digest"]
+            "required": ["bytes", "digest", "entity_tag"]
         })),
         "cas_list"
         | "vcs_log"
@@ -5888,8 +6304,8 @@ fn output_value_schema(name: &str) -> Option<Value> {
         }),
         "document_put_text" | "document_put_binary" => json!({
             "type": "object",
-            "properties": { "digest": digest_string_schema() },
-            "required": ["digest"]
+            "properties": { "digest": digest_string_schema(), "entity_tag": string_schema() },
+            "required": ["digest", "entity_tag"]
         }),
         "document_query" => document_query_schema(),
         "document_replace_text" => document_replace_text_schema(),
@@ -5946,17 +6362,20 @@ fn output_value_schema(name: &str) -> Option<Value> {
                 "total": integer_schema(),
                 "next_cursor": nullable(string_schema())
             },
-            "required": ["items", "total"]
+            "required": ["items", "total", "next_cursor"],
+            "additionalProperties": false
         }),
         "tickets_history" => ticket_history_schema(),
         "lanes_create"
         | "lanes_update"
+        | "lanes_closeout"
         | "lanes_ticket_add"
         | "lanes_ticket_remove"
         | "lanes_ticket_transfer"
         | "lanes_delete" => mutation_envelope_schema(lane_schema()),
         "lanes_get" => nullable(lane_view_result_schema()),
         "lanes_list" => lanes_list_result_schema(),
+        "lanes_cleanup" => array_schema(lane_cleanup_report_schema()),
         "spaces_create" => space_schema(),
         "spaces_get" => nullable(space_schema()),
         "spaces_list" => array_schema(space_schema()),
@@ -6746,10 +7165,9 @@ fn parse_app_uri_with_binding(rest: &str, binding: &Binding) -> Option<ResourceT
     let (workspace, tail) = if let Some(ns) = &binding.workspace {
         if let Some(tail) = rest.strip_prefix("mcp/apps/") {
             (ns.clone(), tail)
-        } else if let Some(tail) = rest.strip_prefix(&format!("{ns}/mcp/apps/")) {
-            (ns.clone(), tail)
         } else {
-            return None;
+            let tail = rest.strip_prefix(&format!("{ns}/mcp/apps/"))?;
+            (ns.clone(), tail)
         }
     } else {
         let (workspace, tail) = rest.split_once("/mcp/apps/")?;
@@ -7105,6 +7523,41 @@ impl LoomServer {
     )]
     fn store_blob_digest(&self, Parameters(a): Parameters<PData>) -> ToolResult {
         ser(self.mcp.read_blob_digest(&a.data))
+    }
+    #[tool(
+        name = "store_policy_get",
+        description = "Read store compliance and durability policy",
+        annotations(read_only_hint = true)
+    )]
+    fn store_policy_get(&self) -> ToolResult {
+        self.mcp
+            .store()
+            .read(|loom| loom.store().store_policy())
+            .map_err(err)
+            .map(|policy| out_value(store_policy_json(policy, None)))
+    }
+    #[tool(
+        name = "store_policy_set",
+        description = "Update store compliance and durability policy"
+    )]
+    fn store_policy_set(&self, Parameters(a): Parameters<PStorePolicySet>) -> ToolResult {
+        self.mcp
+            .store()
+            .write(|loom| {
+                let mut policy = loom.store().store_policy()?;
+                apply_store_policy_mcp_updates(&mut policy, a)?;
+                let actor = loom.effective_principal()?;
+                let target = store_policy_audit_target(&policy);
+                let seq = loom.store().save_store_policy_audited(
+                    policy,
+                    actor,
+                    "store.policy.set",
+                    Some(&target),
+                )?;
+                Ok((policy, seq))
+            })
+            .map_err(err)
+            .map(|(policy, seq)| out_value(store_policy_json(policy, Some(seq))))
     }
     #[tool(
         name = "store_maintenance_status",
@@ -8964,7 +9417,7 @@ impl LoomServer {
 
     #[tool(
         name = "tickets_get",
-        description = "Read a ticket by id or primary key",
+        description = "Read a ticket by id or primary key. Pass `compact: true` for a lean projection that omits the description and full comment bodies (keeps comment_count, dependency ids, and the latest_update summary); `detailed: true` takes precedence and returns the full native record.",
         annotations(read_only_hint = true)
     )]
     fn tickets_get(&self, Parameters(a): Parameters<PTicketsGet>) -> ToolResult {
@@ -8972,6 +9425,16 @@ impl LoomServer {
         if a.detailed {
             self.mcp
                 .read_tickets_get(
+                    &a.workspace,
+                    &profile_id,
+                    &a.ticket_id,
+                    a.projection.as_deref(),
+                )
+                .map_err(err)
+                .and_then(ser)
+        } else if a.compact {
+            self.mcp
+                .read_tickets_get_compact(
                     &a.workspace,
                     &profile_id,
                     &a.ticket_id,
@@ -9149,6 +9612,36 @@ impl LoomServer {
     }
 
     #[tool(
+        name = "lanes_closeout",
+        description = "Record a closeout handoff on the durable ticket and the lane together: write a typed ticket comment (review_request, blocker, closeout_evidence, etc.) and a short lane status_report summary in one operation. Treat tickets as the source of truth and Lane as coordination state."
+    )]
+    fn lanes_closeout(&self, Parameters(a): Parameters<PLanesCloseout>) -> ToolResult {
+        let evidence = a
+            .evidence
+            .as_ref()
+            .map(ticket_comment_evidence_from_map)
+            .transpose()
+            .map_err(err)?;
+        self.mcp
+            .write_lanes_closeout_receipt(
+                &a.workspace,
+                LaneCloseoutRequest {
+                    lane_id: &a.lane_id,
+                    ticket_workspace_id: &a.ticket_workspace_id,
+                    ticket_id: &a.ticket_id,
+                    comment_type: &a.comment_type,
+                    comment_body: &a.comment_body,
+                    evidence,
+                    status_report: &a.status_report,
+                    updated_by: a.updated_by.as_deref(),
+                    expected_root: a.expected_root.as_deref(),
+                },
+            )
+            .map_err(err)
+            .and_then(ser_public_lane_envelope)
+    }
+
+    #[tool(
         name = "lanes_ticket_add",
         description = "Add a ticket to Lane membership. Treat tickets as the source of truth and Lane as coordination state."
     )]
@@ -9222,6 +9715,24 @@ impl LoomServer {
             )
             .map_err(err)
             .and_then(ser_public_lane_envelope)
+    }
+
+    #[tool(
+        name = "lanes_cleanup",
+        description = "Remove terminal (accepted, rejected, closed) tickets from assignment Lane membership without deleting tickets or history; dry-run by default, apply to mutate. Treat tickets as the source of truth and Lane as coordination state."
+    )]
+    fn lanes_cleanup(&self, Parameters(a): Parameters<PLanesCleanup>) -> ToolResult {
+        self.mcp
+            .write_lanes_cleanup(
+                &a.workspace,
+                LaneCleanupRequest {
+                    lane_id: a.lane_id.as_deref(),
+                    apply: a.apply,
+                    updated_by: a.updated_by.as_deref(),
+                },
+            )
+            .map_err(err)
+            .and_then(ser)
     }
 
     // ===== spaces and pages =====
@@ -11168,8 +11679,10 @@ impl LoomServer {
             )
             .map(|result| {
                 json!({
-                    "digest": result.digest.to_string(),
-                    "entity_tag": result.entity_tag
+                    "value": {
+                        "digest": result.digest.to_string(),
+                        "entity_tag": result.entity_tag
+                    }
                 })
             })
             .map_err(err)
@@ -11210,8 +11723,10 @@ impl LoomServer {
             )
             .map(|result| {
                 json!({
-                    "digest": result.digest.to_string(),
-                    "entity_tag": result.entity_tag
+                    "value": {
+                        "digest": result.digest.to_string(),
+                        "entity_tag": result.entity_tag
+                    }
                 })
             })
             .map_err(err)
@@ -11289,6 +11804,16 @@ impl LoomServer {
     fn document_delete(&self, Parameters(a): Parameters<PDocId>) -> ToolResult {
         self.mcp
             .write_document_delete(&a.workspace, &a.collection, &a.id)
+            .map_err(err)
+            .and_then(ser)
+    }
+    #[tool(
+        name = "document_delete_collection",
+        description = "Delete a document collection and its structured roots"
+    )]
+    fn document_delete_collection(&self, Parameters(a): Parameters<PNsName>) -> ToolResult {
+        self.mcp
+            .write_document_delete_collection(&a.workspace, &a.collection)
             .map_err(err)
             .and_then(ser)
     }
@@ -13168,6 +13693,48 @@ const MODEL_TOOL_OBJECT_INPUT_FIELDS: &[(&str, &str)] = &[
     ("document_query", "predicate"),
 ];
 
+fn force_ticket_lane_structured_input_schemas(tool: &mut Tool) {
+    match tool.name.as_ref() {
+        "tickets_update" => {
+            force_input_property_schema(tool, "comment", ticket_update_comment_input_schema());
+            force_input_property_schema(
+                tool,
+                "comments",
+                array_schema(ticket_update_comment_input_schema()),
+            );
+            force_input_property_schema(
+                tool,
+                "relation_sets",
+                array_schema(ticket_update_relation_set_input_schema()),
+            );
+            force_input_property_schema(
+                tool,
+                "relation_removes",
+                array_schema(ticket_update_relation_remove_input_schema()),
+            );
+        }
+        "tickets_comment_add" => {
+            force_input_property_schema(tool, "evidence", string_array_map_schema());
+        }
+        "tickets_comment_update" => {
+            force_input_property_schema(tool, "evidence", nullable(string_array_map_schema()));
+        }
+        "tickets_board_create" | "tickets_board_configure_columns" => {
+            force_input_property_schema(
+                tool,
+                "columns",
+                array_schema(ticket_board_column_input_schema()),
+            );
+            force_input_property_schema(
+                tool,
+                "swimlanes",
+                array_schema(ticket_board_swimlane_input_schema()),
+            );
+        }
+        _ => {}
+    }
+}
+
 fn normalize_tool_schema_objects(tool: &mut Tool) {
     tool.input_schema = normalize_schema_object(tool.input_schema.clone());
     collapse_nullable_input_properties(Arc::make_mut(&mut tool.input_schema));
@@ -13181,6 +13748,7 @@ fn normalize_tool_schema_objects(tool: &mut Tool) {
             force_input_property_schema(tool, property, schema);
         }
     }
+    force_ticket_lane_structured_input_schemas(tool);
     if let Some(output_schema) = tool.output_schema.as_mut() {
         *output_schema = normalize_schema_object(output_schema.clone());
     }

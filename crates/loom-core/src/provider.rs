@@ -6,6 +6,13 @@ pub mod memory;
 
 use crate::digest::{Algo, Digest};
 use crate::error::Result;
+use crate::mutable_overlay::{
+    MutableOverlayEntrySnapshot, OverlayKey, OverlayOwnerToken, OverlayReadSnapshot,
+    OverlaySnapshot,
+};
+use crate::workflow_transaction::{CommitReceipt, WorkflowTransaction};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 /// A codec-agnostic compression intent the engine passes to a store on write. A store maps it to a
 /// frame; a store that does not compress ignores it. The address is over plaintext, so the choice
@@ -59,6 +66,180 @@ pub trait ObjectStore {
     fn digest_algo(&self) -> Algo {
         Algo::Blake3
     }
+
+    fn put_mutable_overlay_value(
+        &self,
+        key: OverlayKey,
+        payload: Vec<u8>,
+    ) -> Result<OverlayOwnerToken> {
+        let _ = key;
+        let _ = payload;
+        Ok(OverlayOwnerToken::from_bytes([0u8; 32]))
+    }
+
+    fn put_mutable_overlay_tombstone(&self, key: OverlayKey) -> Result<OverlayOwnerToken> {
+        let _ = key;
+        Ok(OverlayOwnerToken::from_bytes([0u8; 32]))
+    }
+
+    fn uses_mutable_overlay_current_records(&self) -> bool {
+        false
+    }
+
+    fn mutable_overlay_current_entries(&self) -> Result<Vec<MutableOverlayEntrySnapshot>> {
+        Ok(Vec::new())
+    }
+
+    fn mutable_overlay_current_entry(
+        &self,
+        key: &crate::OverlayKey,
+    ) -> Result<Option<MutableOverlayEntrySnapshot>> {
+        let _ = key;
+        Err(crate::LoomError::unsupported(
+            "mutable overlay point reads are not supported by this store",
+        ))
+    }
+
+    fn mutable_overlay_owner_token(
+        &self,
+        key: &crate::OverlayKey,
+    ) -> Result<Option<crate::OverlayOwnerToken>> {
+        Ok(self
+            .mutable_overlay_current_entry(key)?
+            .map(|entry| entry.owner_token))
+    }
+
+    fn mutable_overlay_generation(&self) -> Result<crate::OverlayGeneration> {
+        Err(crate::LoomError::unsupported(
+            "mutable overlay generation reads are not supported by this store",
+        ))
+    }
+
+    fn retained_history_head(&self, key: &[u8]) -> Result<u64> {
+        let _ = key;
+        Err(crate::LoomError::unsupported(
+            "retained history is not supported by this store",
+        ))
+    }
+
+    fn retained_history_records(
+        &self,
+        key: &[u8],
+        first_sequence: u64,
+        max: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let _ = key;
+        let _ = first_sequence;
+        let _ = max;
+        Err(crate::LoomError::unsupported(
+            "retained history is not supported by this store",
+        ))
+    }
+
+    fn open_mutable_overlay_read_snapshot(
+        &self,
+        snapshot: OverlaySnapshot,
+        owner: Option<&str>,
+    ) -> Result<OverlayReadSnapshot> {
+        let _ = owner;
+        Ok(OverlayReadSnapshot::new(snapshot, None, None))
+    }
+
+    fn open_workflow_planning_snapshot(&self, owner: Option<&str>) -> Result<OverlayReadSnapshot> {
+        let _ = owner;
+        Err(crate::LoomError::unsupported(
+            "coherent workflow planning snapshots are not supported by this store",
+        ))
+    }
+
+    fn commit_workflow_transaction(&self, txn: WorkflowTransaction) -> Result<CommitReceipt> {
+        let _ = txn;
+        Err(crate::LoomError::unsupported(
+            "workflow transactions are not supported by this store",
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct PlanningObjectStore<'a, S: ObjectStore> {
+    base: &'a S,
+    objects: Mutex<BTreeMap<[u8; 32], Vec<u8>>>,
+}
+
+impl<'a, S: ObjectStore> PlanningObjectStore<'a, S> {
+    pub fn new(base: &'a S) -> Self {
+        Self {
+            base,
+            objects: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn objects(&self) -> Result<Vec<(Digest, Vec<u8>)>> {
+        let objects = self.objects.lock().map_err(|_| {
+            crate::LoomError::new(crate::Code::Internal, "planning object store lock poisoned")
+        })?;
+        Ok(objects
+            .values()
+            .cloned()
+            .map(|bytes| (Digest::hash(self.digest_algo(), &bytes), bytes))
+            .collect())
+    }
+}
+
+impl<S: ObjectStore> ObjectStore for PlanningObjectStore<'_, S> {
+    fn put(&self, canonical: &[u8]) -> Result<Digest> {
+        let digest = Digest::hash(self.digest_algo(), canonical);
+        self.objects
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(crate::Code::Internal, "planning object store lock poisoned")
+            })?
+            .entry(*digest.bytes())
+            .or_insert_with(|| canonical.to_vec());
+        Ok(digest)
+    }
+
+    fn get(&self, digest: &Digest) -> Result<Option<Vec<u8>>> {
+        if let Some(bytes) = self
+            .objects
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(crate::Code::Internal, "planning object store lock poisoned")
+            })?
+            .get(digest.bytes())
+            .cloned()
+        {
+            return Ok(Some(bytes));
+        }
+        self.base.get(digest)
+    }
+
+    fn has(&self, digest: &Digest) -> Result<bool> {
+        if self
+            .objects
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(crate::Code::Internal, "planning object store lock poisoned")
+            })?
+            .contains_key(digest.bytes())
+        {
+            return Ok(true);
+        }
+        self.base.has(digest)
+    }
+
+    fn len(&self) -> usize {
+        self.base.len()
+            + self
+                .objects
+                .lock()
+                .map(|objects| objects.len())
+                .unwrap_or_default()
+    }
+
+    fn digest_algo(&self) -> Algo {
+        self.base.digest_algo()
+    }
 }
 
 /// A shared, type-erased object store. Lets a component own a readable store without being generic
@@ -87,5 +268,60 @@ impl ObjectStore for std::sync::Arc<dyn ObjectStore + Send + Sync> {
     }
     fn digest_algo(&self) -> Algo {
         (**self).digest_algo()
+    }
+    fn put_mutable_overlay_value(
+        &self,
+        key: OverlayKey,
+        payload: Vec<u8>,
+    ) -> Result<OverlayOwnerToken> {
+        (**self).put_mutable_overlay_value(key, payload)
+    }
+    fn put_mutable_overlay_tombstone(&self, key: OverlayKey) -> Result<OverlayOwnerToken> {
+        (**self).put_mutable_overlay_tombstone(key)
+    }
+    fn uses_mutable_overlay_current_records(&self) -> bool {
+        (**self).uses_mutable_overlay_current_records()
+    }
+    fn mutable_overlay_current_entries(&self) -> Result<Vec<MutableOverlayEntrySnapshot>> {
+        (**self).mutable_overlay_current_entries()
+    }
+    fn mutable_overlay_current_entry(
+        &self,
+        key: &crate::OverlayKey,
+    ) -> Result<Option<MutableOverlayEntrySnapshot>> {
+        (**self).mutable_overlay_current_entry(key)
+    }
+    fn mutable_overlay_owner_token(
+        &self,
+        key: &crate::OverlayKey,
+    ) -> Result<Option<crate::OverlayOwnerToken>> {
+        (**self).mutable_overlay_owner_token(key)
+    }
+    fn mutable_overlay_generation(&self) -> Result<crate::OverlayGeneration> {
+        (**self).mutable_overlay_generation()
+    }
+    fn retained_history_head(&self, key: &[u8]) -> Result<u64> {
+        (**self).retained_history_head(key)
+    }
+    fn retained_history_records(
+        &self,
+        key: &[u8],
+        first_sequence: u64,
+        max: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        (**self).retained_history_records(key, first_sequence, max)
+    }
+    fn open_mutable_overlay_read_snapshot(
+        &self,
+        snapshot: OverlaySnapshot,
+        owner: Option<&str>,
+    ) -> Result<OverlayReadSnapshot> {
+        (**self).open_mutable_overlay_read_snapshot(snapshot, owner)
+    }
+    fn open_workflow_planning_snapshot(&self, owner: Option<&str>) -> Result<OverlayReadSnapshot> {
+        (**self).open_workflow_planning_snapshot(owner)
+    }
+    fn commit_workflow_transaction(&self, txn: WorkflowTransaction) -> Result<CommitReceipt> {
+        (**self).commit_workflow_transaction(txn)
     }
 }

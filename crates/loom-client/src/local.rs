@@ -32,16 +32,16 @@ use loom_core::{
     columnar_compact, columnar_create, columnar_inspect, columnar_rows, columnar_scan,
     columnar_select, columnar_source_digest, dataframe_collect, dataframe_create,
     dataframe_materialize, dataframe_plan_digest, dataframe_preview, dataframe_source_digests,
-    doc_delete, doc_list_collections, document_get_binary, document_get_text, document_list_binary,
-    document_put_binary_with_entity_tag, document_put_text_with_entity_tag, fire_record_to_cbor,
-    graph_explain_query, graph_get_edge, graph_get_node, graph_in_edges, graph_neighbors,
-    graph_out_edges, graph_query, graph_reachable, graph_remove_edge, graph_remove_node,
-    graph_shortest_path, graph_upsert_edge, graph_upsert_node, ledger_append, ledger_get,
-    ledger_head, ledger_len, ledger_list_collections, ledger_verify, trigger_binding_from_cbor,
-    trigger_binding_to_cbor, ts_get, ts_latest, ts_list_collections, ts_put, ts_range,
-    vector_create, vector_create_metadata_index, vector_delete, vector_drop_metadata_index,
-    vector_embedding_model, vector_get, vector_ids, vector_metadata_index_keys, vector_search,
-    vector_search_with_pq_policy, vector_source_text, vector_upsert, vector_upsert_with_source,
+    doc_delete, doc_delete_collection, doc_list_collections, document_get_binary,
+    document_get_text, document_list_binary, fire_record_to_cbor, graph_explain_query,
+    graph_get_edge, graph_get_node, graph_in_edges, graph_neighbors, graph_out_edges, graph_query,
+    graph_reachable, graph_remove_edge, graph_remove_node, graph_shortest_path, graph_upsert_edge,
+    graph_upsert_node, ledger_append, ledger_get, ledger_head, ledger_len, ledger_list_collections,
+    ledger_verify, trigger_binding_from_cbor, trigger_binding_to_cbor, ts_get, ts_latest,
+    ts_list_collections, ts_put, ts_range, vector_create, vector_create_metadata_index,
+    vector_delete, vector_drop_metadata_index, vector_embedding_model, vector_get, vector_ids,
+    vector_metadata_index_keys, vector_search, vector_search_with_pq_policy, vector_source_text,
+    vector_upsert, vector_upsert_with_source,
 };
 use loom_core::{
     ConflictResolution, MergeOutcome, ReplayOutcome, Status, calendar, contacts, kv, log, mail,
@@ -53,7 +53,7 @@ use loom_core::{
     logs_query, metrics_get_descriptor, metrics_put_descriptor, metrics_put_observation,
     metrics_query_observations, traces_get_span, traces_put_span, traces_query, traces_trace_spans,
 };
-use loom_lanes::Lane;
+use loom_lanes::{Lane, LaneStatusTextWarning, LaneTicketView, LaneView};
 use loom_sql::LoomSqlStore;
 use loom_store::{
     FileStore, LocalOpenAuth, attach_local_auth, open_loom, open_loom_read,
@@ -86,6 +86,136 @@ pub struct LaneUpdateInput<'a> {
     pub status_report: Option<&'a str>,
     pub reviewer_feedback: Option<&'a str>,
     pub updated_by: &'a str,
+}
+
+pub fn build_lane_view(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    ticket_workspace_id: &str,
+    lane: &Lane,
+) -> LaneView {
+    let lane_tickets = lane
+        .lane_tickets
+        .iter()
+        .map(|lane_ticket| {
+            let ticket = loom_tickets::get_ticket(
+                loom,
+                workspace,
+                ticket_workspace_id,
+                &lane_ticket.ticket_id,
+            )
+            .ok()
+            .flatten();
+            LaneTicketView {
+                ticket_id: lane_ticket.ticket_id.clone(),
+                status: Some(
+                    ticket
+                        .as_ref()
+                        .map(ticket_status)
+                        .unwrap_or_else(|| "missing".to_string()),
+                ),
+                priority: ticket
+                    .as_ref()
+                    .and_then(|ticket| ticket_text_field(ticket, "priority")),
+                title: ticket.as_ref().map(ticket_title),
+            }
+        })
+        .collect();
+    let mut view = loom_lanes::lane_view(lane, lane_tickets);
+    view.owner_display = view
+        .owner_principal
+        .as_deref()
+        .map(|id| loom_tickets::resolve_principal_display(loom.identity_store(), id));
+    // If lane text describes a review/closeout handoff but the active ticket has no matching typed
+    // comment, the durable record is missing: surface it as a status warning so agents record it on
+    // the ticket (e.g. via the lanes_closeout helper) rather than leaving it only in lane text.
+    if let Some(active) = lane.active_ticket_id.as_deref() {
+        for (field, text) in [
+            ("status_report", lane.status_report.as_str()),
+            ("reviewer_feedback", lane.reviewer_feedback.as_str()),
+        ] {
+            let Some(event) = loom_lanes::lane_text_closeout_event(text) else {
+                continue;
+            };
+            let has_matching_comment =
+                loom_tickets::list_ticket_comments(loom, workspace, ticket_workspace_id, active)
+                    .map(|comments| {
+                        comments
+                            .iter()
+                            .any(|comment| closeout_comment_matches(event, &comment.comment_type))
+                    })
+                    .unwrap_or(false);
+            if !has_matching_comment {
+                view.status_warnings.push(LaneStatusTextWarning {
+                    field: field.to_string(),
+                    stated_status: event.to_string(),
+                    ticket_id: Some(active.to_string()),
+                    ticket_status: None,
+                    message: format!(
+                        "{field} describes a {event} handoff but ticket {active} has no matching comment; record it on the ticket (lanes_closeout)"
+                    ),
+                });
+            }
+        }
+    }
+    view
+}
+
+/// Whether a ticket comment of `comment_type` records the closeout `event` detected in lane text.
+fn closeout_comment_matches(event: &str, comment_type: &str) -> bool {
+    match event {
+        "review_request" => comment_type == "review_request",
+        "blocker" => comment_type == "blocker",
+        "closeout_evidence" => matches!(comment_type, "closeout_evidence" | "acceptance_evidence"),
+        "command_requested" => matches!(comment_type, "blocker" | "decision" | "progress"),
+        "feedback_addressed" => {
+            matches!(comment_type, "resolution" | "progress" | "review_feedback")
+        }
+        _ => false,
+    }
+}
+
+fn ticket_text_field(ticket: &loom_tickets::TicketSummary, field: &str) -> Option<String> {
+    match ticket.fields.get(field)? {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Object(map) => map
+            .get("String")
+            .or_else(|| map.get("Text"))
+            .or_else(|| map.get("EnumOption"))
+            .or_else(|| map.get("Principal"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn ticket_status(ticket: &loom_tickets::TicketSummary) -> String {
+    ticket_text_field(ticket, "status").unwrap_or_else(|| "unknown".to_string())
+}
+
+fn ticket_title(ticket: &loom_tickets::TicketSummary) -> String {
+    ticket_text_field(ticket, "title")
+        .or_else(|| ticket_text_field(ticket, "summary"))
+        .unwrap_or_default()
+}
+
+fn enforce_document_entity_tag(
+    loom: &Loom<FileStore>,
+    ns: WorkspaceId,
+    collection: &str,
+    id: &str,
+    expected_entity_tag: Option<&str>,
+) -> Result<(), LoomError> {
+    let Some(expected_entity_tag) = expected_entity_tag else {
+        return Ok(());
+    };
+    match loom_core::document::document_get_binary(loom, ns, collection, id)? {
+        Some(current) if current.entity_tag == expected_entity_tag => Ok(()),
+        Some(_) | None => Err(LoomError::new(
+            Code::Conflict,
+            loom_types::ConflictReason::ExpectedTagMismatch.as_str(),
+        )),
+    }
 }
 
 fn mint_workspace_id() -> Result<WorkspaceId, LoomError> {
@@ -1378,6 +1508,23 @@ impl LocalLoomClient {
         })
     }
 
+    pub fn lanes_get_view(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        ticket_workspace_id: &str,
+        lane_id: &str,
+    ) -> Result<Option<LaneView>, LoomError> {
+        self.with_session(session, |loom| {
+            match read_ns(loom, workspace, FacetKind::Document)? {
+                Some(ns) => loom_lanes::get_lane(loom, ns, lane_id).map(|lane| {
+                    lane.map(|lane| build_lane_view(loom, ns, ticket_workspace_id, &lane))
+                }),
+                None => Ok(None),
+            }
+        })
+    }
+
     pub fn lanes_list(
         &self,
         session: &LoomSession,
@@ -1386,6 +1533,25 @@ impl LocalLoomClient {
         self.with_session(session, |loom| {
             match read_ns(loom, workspace, FacetKind::Document)? {
                 Some(ns) => loom_lanes::list_lanes(loom, ns),
+                None => Ok(Vec::new()),
+            }
+        })
+    }
+
+    pub fn lanes_list_views(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        ticket_workspace_id: &str,
+    ) -> Result<Vec<LaneView>, LoomError> {
+        self.with_session(session, |loom| {
+            match read_ns(loom, workspace, FacetKind::Document)? {
+                Some(ns) => loom_lanes::list_lanes(loom, ns).map(|lanes| {
+                    lanes
+                        .into_iter()
+                        .map(|lane| build_lane_view(loom, ns, ticket_workspace_id, &lane))
+                        .collect()
+                }),
                 None => Ok(Vec::new()),
             }
         })
@@ -1407,7 +1573,12 @@ impl LocalLoomClient {
                 "lane update requires at least one field",
             ));
         }
-        self.lanes_mutate(session, workspace, input.lane_id, |lane| {
+        self.with_session(session, |loom| {
+            let ns = read_ns(loom, workspace, FacetKind::Document)?
+                .ok_or_else(|| LoomError::new(Code::NotFound, "lane workspace not found"))?;
+            let mut lane = loom_lanes::get_lane(loom, ns, input.lane_id)?
+                .ok_or_else(|| LoomError::new(Code::NotFound, "lane not found"))?;
+            let prior_lane = lane.clone();
             if let Some(title) = input.title {
                 lane.title = title.to_string();
             }
@@ -1425,8 +1596,9 @@ impl LocalLoomClient {
             if let Some(reviewer_feedback) = input.reviewer_feedback {
                 lane.reviewer_feedback = reviewer_feedback.to_string();
             }
-            update_lane_metadata(lane, input.updated_by);
-            Ok(())
+            update_lane_metadata(&mut lane, input.updated_by);
+            loom_lanes::put_lane_current_record(loom, ns, &lane, Some(&prior_lane))?;
+            Ok(lane)
         })
     }
 
@@ -1642,16 +1814,14 @@ impl LocalLoomClient {
                 &ns_selector(workspace, FacetKind::Document),
                 mint_workspace_id()?,
             )?;
-            let result = document_put_text_with_entity_tag(
-                loom,
-                ns,
-                collection,
-                id,
-                text,
-                expected_entity_tag,
-            )?;
-            save_loom(loom)?;
-            loom_wire::document::put_result_to_cbor(&result.digest.to_string(), &result.entity_tag)
+            enforce_document_entity_tag(loom, ns, collection, id, expected_entity_tag)?;
+            let bytes = text.as_bytes().to_vec();
+            let digest = Digest::hash(loom.store().digest_algo(), &bytes);
+            loom_reference::put_document_indexed(loom, ns, collection, id, bytes)?;
+            loom_wire::document::put_result_to_cbor(
+                &digest.to_string(),
+                &loom_core::document_entity_tag_string_from_digest(digest),
+            )
         })
     }
 
@@ -1708,16 +1878,14 @@ impl LocalLoomClient {
                 &ns_selector(workspace, FacetKind::Document),
                 mint_workspace_id()?,
             )?;
-            let result = document_put_binary_with_entity_tag(
-                loom,
-                ns,
-                collection,
-                id,
-                bytes.to_vec(),
-                expected_entity_tag,
-            )?;
-            save_loom(loom)?;
-            loom_wire::document::put_result_to_cbor(&result.digest.to_string(), &result.entity_tag)
+            enforce_document_entity_tag(loom, ns, collection, id, expected_entity_tag)?;
+            let bytes = bytes.to_vec();
+            let digest = Digest::hash(loom.store().digest_algo(), &bytes);
+            loom_reference::put_document_indexed(loom, ns, collection, id, bytes)?;
+            loom_wire::document::put_result_to_cbor(
+                &digest.to_string(),
+                &loom_core::document_entity_tag_string_from_digest(digest),
+            )
         })
     }
 
@@ -1786,8 +1954,7 @@ impl LocalLoomClient {
                 &ns_selector(workspace, FacetKind::Document),
                 mint_workspace_id()?,
             )?;
-            loom_reference::put_document_indexed(loom, ns, collection, id, doc)?;
-            save_loom(loom)
+            loom_reference::put_document_indexed(loom, ns, collection, id, doc)
         })
     }
 
@@ -1804,9 +1971,6 @@ impl LocalLoomClient {
                 Some(ns) => {
                     let present =
                         loom_reference::delete_document_indexed(loom, ns, collection, id)?;
-                    if present {
-                        save_loom(loom)?;
-                    }
                     Ok(present)
                 }
                 None => Ok(false),
@@ -2027,6 +2191,31 @@ impl LocalLoomClient {
             match read_ns(loom, workspace, FacetKind::Document)? {
                 Some(ns) => {
                     let present = doc_delete(loom, ns, collection, id)?;
+                    if present {
+                        save_loom(loom)?;
+                    }
+                    Ok(present)
+                }
+                None => Ok(false),
+            }
+        })
+    }
+
+    /// Delete `collection` and its structured document roots; returns whether it existed. Persists on
+    /// a change.
+    ///
+    /// # Errors
+    /// Returns [`LoomError`] for an unknown session or an engine or save failure.
+    pub fn document_delete_collection(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        collection: &str,
+    ) -> Result<bool, LoomError> {
+        self.with_session(session, |loom| {
+            match read_ns(loom, workspace, FacetKind::Document)? {
+                Some(ns) => {
+                    let present = doc_delete_collection(loom, ns, collection)?;
                     if present {
                         save_loom(loom)?;
                     }
@@ -6564,8 +6753,10 @@ impl LocalLoomClient {
             loom.authorize_global_admin()?;
             let actor = loom.effective_principal()?;
             let target = format!("fips_required={fips_required}");
+            let mut policy = loom.store().store_policy()?;
+            policy.fips_required = fips_required;
             let seq = loom.store().save_store_policy_audited(
-                loom_store::StorePolicy { fips_required },
+                policy,
                 actor,
                 "store.policy.set",
                 Some(&target),
@@ -8419,6 +8610,9 @@ mod tests {
         client
             .write_file(&session, "src", "hello.txt", b"hello transfer", 0o644)
             .expect("write");
+        client
+            .commit(&session, "src", "test", "promote transfer source", 1)
+            .expect("promote transfer source");
         let payload = client
             .transfer_export_bytes(&session, "src", "tar", None, &[])
             .expect("export tar");
@@ -10248,7 +10442,7 @@ mod tests {
         // Sync import: 8 bytes in, at least one operation applied.
         let report = decode_arr(
             &client
-                .import_fs(&session, "w", src_str, false, false)
+                .import_fs(&session, "w", src_str, true, false)
                 .expect("import_fs"),
         );
         assert_eq!(uint(&report[4]), 8, "bytes_in");
@@ -10355,7 +10549,7 @@ mod tests {
         client.create().expect("create");
         let session = client.open().expect("open");
         client
-            .import_fs(&session, "w", src.to_str().unwrap(), false, false)
+            .import_fs(&session, "w", src.to_str().unwrap(), true, false)
             .expect("seed import");
 
         // Sync export to a plain tar archive; the manifest reports the kind and entries.

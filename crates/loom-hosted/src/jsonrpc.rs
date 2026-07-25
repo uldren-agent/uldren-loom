@@ -402,7 +402,7 @@ impl JsonRpcAdapter<'_> {
     ) -> JsonRpcResult<MutationEnvelope<TicketSummary>> {
         let root_before = expected_root.map(str::to_string);
         let changes = jsonrpc_ticket_field_value_changes(fields);
-        jsonrpc_result(self.kernel.write(auth, |loom| {
+        jsonrpc_result(self.kernel.write_current_state(auth, |loom| {
             crate::tickets::update_fields(
                 loom,
                 workspace,
@@ -425,7 +425,7 @@ impl JsonRpcAdapter<'_> {
         let changes = jsonrpc_ticket_update_changes(&input);
         jsonrpc_result(
             self.kernel
-                .write(auth, |loom| crate::tickets::update(loom, workspace, input)),
+                .write_current_state(auth, |loom| crate::tickets::update(loom, workspace, input)),
         )
         .map(|response| jsonrpc_ticket_response(response, "ticket.updated", root_before, changes))
     }
@@ -652,7 +652,7 @@ impl JsonRpcAdapter<'_> {
     ) -> JsonRpcResult<PublicLane> {
         jsonrpc_result(
             self.kernel
-                .write(auth, |loom| crate::lanes::update(loom, workspace, input)),
+                .write_current_state(auth, |loom| crate::lanes::update(loom, workspace, input)),
         )
         .map(public_lane_response)
     }
@@ -2249,7 +2249,7 @@ mod tests {
 
     use loom_core::{Code, Digest, WorkspaceId};
     use loom_interchange::{ExportReport, ImportReport};
-    use loom_substrate::versioning::{RevisionIndex, revision_index_path};
+    use loom_substrate::versioning::{RevisionIndex, load_current_revision_index};
 
     use crate::drive::{HostedDriveGrantShare, HostedDrivePinRetention};
     use crate::jsonrpc::JsonRpcWatchStreamInput;
@@ -2268,11 +2268,9 @@ mod tests {
         workspace: WorkspaceId,
         scope_id: &str,
     ) -> RevisionIndex {
-        let path = revision_index_path(scope_id).unwrap();
         kernel
             .read(auth, |loom| {
-                loom.read_file_reserved(workspace, &path)
-                    .and_then(|bytes| RevisionIndex::decode(&bytes))
+                load_current_revision_index(loom, workspace, scope_id)
             })
             .unwrap()
     }

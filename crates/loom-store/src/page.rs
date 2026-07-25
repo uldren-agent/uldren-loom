@@ -21,13 +21,15 @@ pub(crate) const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// in-segment page index is the remainder.
 pub(crate) const PAGES_PER_SEGMENT: u64 = SEGMENT_BYTES / PAGE_SIZE;
 
-/// On-disk size of an encoded region table: `magic(1) page_size(8) 3*root{flag(1) id(8)}
+/// On-disk size of an encoded region table: `magic(1) page_size(8) 4*root{flag(1) id(8)}
 /// open_segment(8) crc32c(4)`.
-pub(crate) const REGION_TABLE_LEN: usize = 1 + 8 + 3 * 9 + 8 + 4;
+pub(crate) const REGION_TABLE_LEN: usize = 1 + 8 + 4 * 9 + 8 + 4;
+const LEGACY_REGION_TABLE_LEN: usize = 1 + 8 + 3 * 9 + 8 + 4;
 
 const _: () = assert!(REGION_TABLE_LEN as u64 <= PAGE_SIZE);
 
 const REGION_TABLE_MAGIC_V2: u8 = 0xB6;
+const REGION_TABLE_MAGIC_V3: u8 = 0xB8;
 
 /// A page's zero-based index in the file's page array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -50,6 +52,7 @@ pub(crate) struct RegionTable {
     pub(crate) index_root: Option<PageId>,
     pub(crate) freemap_root: Option<PageId>,
     pub(crate) maintenance_root: Option<PageId>,
+    pub(crate) overlay_root: Option<PageId>,
     pub(crate) open_segment: u64,
 }
 
@@ -57,10 +60,15 @@ impl RegionTable {
     /// Encode into a fixed-size, CRC'd blob suitable for writing into the region-table page.
     pub(crate) fn encode(&self) -> [u8; REGION_TABLE_LEN] {
         let mut r = [0u8; REGION_TABLE_LEN];
-        r[0] = REGION_TABLE_MAGIC_V2;
+        r[0] = REGION_TABLE_MAGIC_V3;
         r[1..9].copy_from_slice(&self.page_size.to_le_bytes());
         let mut p = 9;
-        for root in [self.index_root, self.freemap_root, self.maintenance_root] {
+        for root in [
+            self.index_root,
+            self.freemap_root,
+            self.maintenance_root,
+            self.overlay_root,
+        ] {
             if let Some(PageId(id)) = root {
                 r[p] = 1;
                 r[p + 1..p + 9].copy_from_slice(&id.to_le_bytes());
@@ -75,21 +83,24 @@ impl RegionTable {
 
     /// Decode a region table, or `None` on short buffer, bad magic, bad presence byte, or CRC mismatch.
     pub(crate) fn decode(buf: &[u8]) -> Option<RegionTable> {
-        if buf.first().copied()? != REGION_TABLE_MAGIC_V2 || buf.len() < REGION_TABLE_LEN {
+        let magic = buf.first().copied()?;
+        let encoded_len = match magic {
+            REGION_TABLE_MAGIC_V3 => REGION_TABLE_LEN,
+            REGION_TABLE_MAGIC_V2 => LEGACY_REGION_TABLE_LEN,
+            _ => return None,
+        };
+        if buf.len() < encoded_len {
             return None;
         }
-        let stored = u32::from_le_bytes(
-            buf[REGION_TABLE_LEN - 4..REGION_TABLE_LEN]
-                .try_into()
-                .ok()?,
-        );
-        if crc32c(&buf[..REGION_TABLE_LEN - 4]) != stored {
+        let stored = u32::from_le_bytes(buf[encoded_len - 4..encoded_len].try_into().ok()?);
+        if crc32c(&buf[..encoded_len - 4]) != stored {
             return None;
         }
         let page_size = u64::from_le_bytes(buf[1..9].try_into().ok()?);
-        let mut roots = [None; 3];
+        let mut roots = [None; 4];
         let mut p = 9;
-        for slot in &mut roots {
+        let root_count = if magic == REGION_TABLE_MAGIC_V3 { 4 } else { 3 };
+        for slot in roots.iter_mut().take(root_count) {
             *slot = match buf[p] {
                 0 => None,
                 1 => Some(PageId(u64::from_le_bytes(
@@ -105,6 +116,7 @@ impl RegionTable {
             index_root: roots[0],
             freemap_root: roots[1],
             maintenance_root: roots[2],
+            overlay_root: roots[3],
             open_segment,
         })
     }
@@ -120,6 +132,7 @@ mod tests {
             index_root: Some(PageId(7)),
             freemap_root: None,
             maintenance_root: Some(PageId(11)),
+            overlay_root: Some(PageId(13)),
             open_segment: 3,
         }
     }
@@ -141,6 +154,7 @@ mod tests {
                 index_root: None,
                 freemap_root: None,
                 maintenance_root: None,
+                overlay_root: None,
                 open_segment: 0,
             },
             RegionTable {

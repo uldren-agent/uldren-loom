@@ -8,9 +8,18 @@ use loom_core::graph::{
     GraphValue, Props, graph_remove_edge, graph_upsert_edge, graph_upsert_node,
 };
 use loom_core::tabular::{ColumnType, Predicate, Row, Schema, Table, Value};
-use loom_core::workspace::WorkspaceId;
-use loom_core::{Code, Digest, Loom, LoomError, Result};
+use loom_core::workspace::{FacetKind, WorkspaceId};
+use loom_core::{
+    AtomicityBoundary, AuditIntent, Code, CompareToken, Digest, FacetSideEffects, FacetWrite,
+    FacetWriteOp, IdentityStore, Loom, LoomError, OverlayDurabilityPolicy, Result,
+    SecondaryIndexWrite, WorkflowTransaction,
+};
 use loom_store::FileStore;
+use loom_substrate::OperationEnvelope;
+use loom_substrate::versioning::{
+    BodyRef, Checkpoint, EntityRevision, RevisionIndexAppend, load_latest_entity_revision,
+    persist_revision_index_append_with_owner_state_and_writes,
+};
 
 const STORAGE_ROOT: &str = ".loom/substrate/tickets/v2";
 const PROJECTS_TABLE: &str = "projects";
@@ -81,6 +90,8 @@ pub struct IndexedTicketProfile<'a> {
     namespace: WorkspaceId,
     workspace_id: String,
     state: TicketProfileState,
+    pending_workflow_writes: Vec<FacetWrite>,
+    pending_workflow_idempotency: Option<loom_core::IdempotencyKey>,
 }
 
 pub struct TicketProfileReader<'a> {
@@ -251,6 +262,8 @@ impl<'a> IndexedTicketProfile<'a> {
             namespace,
             workspace_id: workspace_id.to_string(),
             state,
+            pending_workflow_writes: Vec::new(),
+            pending_workflow_idempotency: None,
         })
     }
 
@@ -259,6 +272,10 @@ impl<'a> IndexedTicketProfile<'a> {
             self.loom.store().digest_algo(),
             &self.state.encode()?,
         ))
+    }
+
+    pub(crate) fn loom_mut(&mut self) -> &mut Loom<FileStore> {
+        self.loom
     }
 
     pub fn enforce_expected_root(&self, expected_root: Option<&str>) -> Result<()> {
@@ -280,6 +297,11 @@ impl<'a> IndexedTicketProfile<'a> {
 
     pub fn effective_principal(&self) -> Result<Option<WorkspaceId>> {
         self.loom.effective_principal()
+    }
+
+    /// Identity store for principal handle/alias resolution, when configured.
+    pub fn identity_store(&self) -> Option<&IdentityStore> {
+        self.loom.identity_store()
     }
 
     pub fn digest_algo(&self) -> loom_types::Algo {
@@ -636,6 +658,126 @@ impl<'a> IndexedTicketProfile<'a> {
         self.finish_operation_with_audit(None, None, None)
     }
 
+    pub fn put_workflow_current_record(
+        &mut self,
+        record: &crate::WorkflowCurrentRecord,
+    ) -> Result<()> {
+        self.commit_workflow_current_records(std::slice::from_ref(record), Vec::new(), None)
+            .map(|_| ())
+    }
+
+    pub fn put_workflow_current_records(
+        &mut self,
+        records: &[crate::WorkflowCurrentRecord],
+    ) -> Result<()> {
+        self.commit_workflow_current_records(records, Vec::new(), None)
+            .map(|_| ())
+    }
+
+    pub fn delete_workflow_current_record(
+        &mut self,
+        workspace_id: &str,
+        project_id: &str,
+        kind: crate::WorkflowCurrentRecordKind,
+        record_id: &str,
+    ) -> Result<()> {
+        self.delete_workflow_current_record_indexed(
+            workspace_id,
+            project_id,
+            kind,
+            record_id,
+            Vec::new(),
+        )
+    }
+
+    pub fn delete_workflow_current_record_indexed(
+        &mut self,
+        workspace_id: &str,
+        project_id: &str,
+        kind: crate::WorkflowCurrentRecordKind,
+        record_id: &str,
+        secondary_indexes: Vec<SecondaryIndexWrite>,
+    ) -> Result<()> {
+        let key = crate::workflow_current_key(workspace_id, project_id, kind, record_id)?;
+        let snapshot = self.loom.mutable_overlay_snapshot();
+        self.stage_workflow_writes(vec![FacetWrite {
+            facet: FacetKind::Queue,
+            target: key.clone(),
+            op: FacetWriteOp::Delete,
+            secondary_indexes,
+            expected: snapshot.owner_token(&key)?.map(CompareToken),
+            durability: None,
+            audit: Some(AuditIntent {
+                operation: "workflow.current.delete".to_string(),
+            }),
+            side_effects: FacetSideEffects::default(),
+        }]);
+        Ok(())
+    }
+
+    pub fn put_workflow_current_records_indexed(
+        &mut self,
+        records: &[crate::WorkflowCurrentRecord],
+        secondary_indexes: Vec<SecondaryIndexWrite>,
+        idempotency_suffix: Option<&str>,
+    ) -> Result<()> {
+        self.commit_workflow_current_records(records, secondary_indexes, idempotency_suffix)
+    }
+
+    fn commit_workflow_current_records(
+        &mut self,
+        records: &[crate::WorkflowCurrentRecord],
+        secondary_indexes: Vec<SecondaryIndexWrite>,
+        idempotency_suffix: Option<&str>,
+    ) -> Result<()> {
+        let (writes, idempotency) = self.prepare_workflow_current_records_indexed(
+            records,
+            secondary_indexes,
+            idempotency_suffix,
+        )?;
+        self.stage_workflow_writes(writes);
+        if self.pending_workflow_idempotency.is_none() {
+            self.pending_workflow_idempotency = idempotency;
+        }
+        Ok(())
+    }
+
+    pub fn prepare_workflow_current_records_indexed(
+        &self,
+        records: &[crate::WorkflowCurrentRecord],
+        mut secondary_indexes: Vec<SecondaryIndexWrite>,
+        idempotency_suffix: Option<&str>,
+    ) -> Result<(Vec<FacetWrite>, Option<loom_core::IdempotencyKey>)> {
+        let snapshot = self.loom.mutable_overlay_snapshot();
+        let mut writes = Vec::with_capacity(records.len());
+        for (index, record) in records.iter().enumerate() {
+            let key = record.overlay_key()?;
+            let indexes = if index + 1 == records.len() {
+                std::mem::take(&mut secondary_indexes)
+            } else {
+                Vec::new()
+            };
+            writes.push(FacetWrite {
+                facet: FacetKind::Queue,
+                target: key.clone(),
+                op: FacetWriteOp::Put {
+                    payload: record.encode()?,
+                },
+                secondary_indexes: indexes,
+                expected: snapshot.owner_token(&key)?.map(CompareToken),
+                durability: None,
+                audit: Some(AuditIntent {
+                    operation: "workflow.current.put".to_string(),
+                }),
+                side_effects: FacetSideEffects::default(),
+            });
+        }
+        let idempotency = idempotency_suffix.map(|suffix| {
+            loom_core::IdempotencyKey::opaque(format!("tickets:{}:{suffix}", self.workspace_id))
+        });
+        Ok((writes, idempotency))
+    }
+
     pub fn finish_operation_with_audit(
         &mut self,
         principal: Option<WorkspaceId>,
@@ -653,29 +795,206 @@ impl<'a> IndexedTicketProfile<'a> {
         )?;
         let key = ticket_profile_state_key(&self.workspace_id)?;
         let value = self.state.encode()?;
-        // Flush the staged indexed tables to a reference (engine working-tree) root, then commit
-        // that reference root AND the new TicketProfileState control record in ONE superblock
-        // transaction. This is the prevention invariant: a successful ticket mutation can never
-        // leave the indexed-table roots and the stored profile state mismatched, because both are
-        // published by a single atomic commit rather than two separate ones. An interruption
-        // exposes either the fully-old or fully-new committed state.
-        let reference_root = self.loom.save_state()?;
-        if let Some(action) = action {
-            self.loom.store().control_set_audited_with_reference(
-                &key,
-                value,
-                principal,
-                action,
-                target,
-                Some(reference_root),
-            )?;
-        } else {
-            self.loom
-                .store()
-                .control_set_with_reference(&key, value, Some(reference_root))?;
-        }
+        let snapshot = loom_core::WorkflowPlanningSnapshot::open(
+            self.loom.store(),
+            Some("tickets.operation.finish"),
+        )?;
+        let (reference_root, objects) = match snapshot.immutable_base_root() {
+            Some(base_root) => self
+                .loom
+                .prepare_current_facet_state_reference(self.namespace, base_root)?,
+            None => self.loom.save_state_objects()?,
+        };
+        let audits = action
+            .map(|action| {
+                vec![loom_core::WorkflowAuditWrite {
+                    principal,
+                    action: action.to_string(),
+                    target: target.map(str::to_string),
+                }]
+            })
+            .unwrap_or_default();
+        let expected_generation = snapshot.expected_generation();
+        snapshot.release()?;
+        self.loom
+            .store()
+            .commit_workflow_transaction(WorkflowTransaction {
+                workspace: self.namespace,
+                actor: self.loom.effective_principal()?.unwrap_or(self.namespace),
+                expected_generation: Some(expected_generation),
+                writes: std::mem::take(&mut self.pending_workflow_writes),
+                durability: OverlayDurabilityPolicy::Normal,
+                boundary: AtomicityBoundary::Single,
+                idempotency: self.pending_workflow_idempotency.take(),
+                owner_state: loom_core::WorkflowOwnerState {
+                    objects,
+                    reference: loom_core::WorkflowReferenceUpdate::Set(Some(reference_root)),
+                    controls: vec![loom_core::WorkflowControlWrite::Put {
+                        key,
+                        payload: value,
+                    }],
+                    audits,
+                },
+            })?;
+        self.refresh_mutable_overlay()?;
         self.profile_root()
     }
+
+    pub fn finish_ticket_operation(
+        &mut self,
+        record: &TicketOperationRecord,
+        ticket_id: &str,
+        payload: &[u8],
+    ) -> Result<Digest> {
+        let (root, index, owner_state) =
+            self.prepare_ticket_operation(record, ticket_id, payload)?;
+        persist_revision_index_append_with_owner_state_and_writes(
+            self.loom,
+            self.namespace,
+            &self.workspace_id,
+            FacetKind::Queue,
+            &index,
+            std::mem::take(&mut self.pending_workflow_writes),
+            self.pending_workflow_idempotency.take(),
+            owner_state,
+        )?;
+        Ok(root)
+    }
+
+    pub fn prepare_ticket_operation(
+        &mut self,
+        record: &TicketOperationRecord,
+        ticket_id: &str,
+        payload: &[u8],
+    ) -> Result<(Digest, RevisionIndexAppend, loom_core::WorkflowOwnerState)> {
+        self.state = state_from_tables(
+            self.loom,
+            self.namespace,
+            &self.workspace_id,
+            self.state
+                .next_sequence
+                .checked_add(1)
+                .ok_or_else(|| LoomError::invalid("ticket operation sequence overflow"))?,
+        )?;
+        let profile_key = ticket_profile_state_key(&self.workspace_id)?;
+        let profile_payload = self.state.encode()?;
+        let snapshot = loom_core::WorkflowPlanningSnapshot::open(
+            self.loom.store(),
+            Some("tickets.operation.prepare"),
+        )?;
+        let (reference_root, objects) = match snapshot.immutable_base_root() {
+            Some(base_root) => self
+                .loom
+                .prepare_current_facet_state_reference(self.namespace, base_root)?,
+            None => self.loom.save_state_objects()?,
+        };
+        let index = next_ticket_revision_index(
+            self.loom,
+            self.namespace,
+            &self.workspace_id,
+            ticket_id,
+            record,
+            payload,
+        )?;
+        let root = self.profile_root()?;
+        Ok((
+            root,
+            index,
+            loom_core::WorkflowOwnerState {
+                objects,
+                reference: loom_core::WorkflowReferenceUpdate::Set(Some(reference_root)),
+                controls: vec![loom_core::WorkflowControlWrite::Put {
+                    key: profile_key,
+                    payload: profile_payload,
+                }],
+                audits: Vec::new(),
+            },
+        ))
+    }
+
+    pub fn finish_prepared_ticket_operation(
+        &mut self,
+        index: &RevisionIndexAppend,
+        writes: Vec<FacetWrite>,
+        idempotency: Option<loom_core::IdempotencyKey>,
+        owner_state: loom_core::WorkflowOwnerState,
+    ) -> Result<()> {
+        persist_revision_index_append_with_owner_state_and_writes(
+            self.loom,
+            self.namespace,
+            &self.workspace_id,
+            FacetKind::Queue,
+            index,
+            writes,
+            idempotency,
+            owner_state,
+        )
+    }
+
+    fn refresh_mutable_overlay(&mut self) -> Result<()> {
+        let current = self.loom.store().mutable_overlay_entries()?;
+        if !current.is_empty() {
+            *self.loom.mutable_overlay_mut() = loom_core::MutableOverlay::import_entries(&current)?;
+        }
+        Ok(())
+    }
+
+    fn stage_workflow_writes(&mut self, writes: Vec<FacetWrite>) {
+        for mut write in writes {
+            if let Some(index) = self
+                .pending_workflow_writes
+                .iter()
+                .position(|pending| pending.target == write.target)
+            {
+                let prior = self.pending_workflow_writes.remove(index);
+                let mut secondary_indexes = prior.secondary_indexes;
+                secondary_indexes.append(&mut write.secondary_indexes);
+                write.secondary_indexes = secondary_indexes;
+            }
+            self.pending_workflow_writes.push(write);
+        }
+    }
+}
+
+fn next_ticket_revision_index(
+    loom: &Loom<FileStore>,
+    namespace: WorkspaceId,
+    workspace_id: &str,
+    ticket_id: &str,
+    record: &TicketOperationRecord,
+    payload: &[u8],
+) -> Result<RevisionIndexAppend> {
+    let envelope = OperationEnvelope::decode(&record.envelope)?;
+    let entity_id = format!("ticket:{ticket_id}");
+    let expected_latest_revision =
+        load_latest_entity_revision(loom, namespace, workspace_id, &entity_id)?
+            .map(|entry| entry.revision)
+            .unwrap_or(0);
+    let revision = expected_latest_revision
+        .checked_add(1)
+        .ok_or_else(|| LoomError::invalid("ticket entity revision overflow"))?;
+    let mut index = RevisionIndexAppend::new();
+    index.push_revision(EntityRevision::new(
+        entity_id,
+        revision,
+        record.operation_id.clone(),
+        BodyRef::new(
+            Digest::hash(loom.store().digest_algo(), payload),
+            payload.len() as u64,
+            "application/vnd.uldren.loom.ticket.ticket+cbor",
+        )?,
+        record.root_after,
+        envelope.timestamp_ms,
+    )?)?;
+    index.push_checkpoint(Checkpoint::new(
+        workspace_id,
+        format!("{ticket_id}:{}", record.sequence),
+        record.root_after,
+        revision,
+        record.operation_id.clone(),
+        envelope.timestamp_ms,
+    )?)?;
+    Ok(index)
 }
 
 pub fn ticket_relation_edge_id(source_ticket_id: &str, relation: &TicketRelation) -> String {
@@ -1006,13 +1325,11 @@ fn mismatched_state_tables(
     if actual.external_ids_root != state.external_ids_root {
         mismatches.push(EXTERNAL_IDS_TABLE);
     }
-    if state.board_roots_present {
-        if actual.boards_root != state.boards_root {
-            mismatches.push(BOARDS_TABLE);
-        }
-        if actual.board_cards_root != state.board_cards_root {
-            mismatches.push(BOARD_CARDS_TABLE);
-        }
+    if actual.boards_root != state.boards_root {
+        mismatches.push(BOARDS_TABLE);
+    }
+    if actual.board_cards_root != state.board_cards_root {
+        mismatches.push(BOARD_CARDS_TABLE);
     }
     mismatches
 }

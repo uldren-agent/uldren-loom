@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use loom_core::error::{Code, LoomError};
-use loom_core::workspace::{AclDomain, WorkspaceId};
+use loom_core::workspace::{AclDomain, FacetKind, WorkspaceId};
 use loom_core::{AclRight, Digest, Loom};
 use loom_store::FileStore;
 use loom_substrate::annotation::{EMOJI_REGISTRY_DIR, EmojiRegistry, emoji_registry_path};
@@ -15,7 +15,7 @@ use loom_substrate::chat::{
 use loom_substrate::refs::{EntityRef, MarkdownReferenceKind, ReferenceSource};
 use loom_substrate::versioning::{
     BodyRef, ProfileRevisionUpdate, ProfileTransaction, ProfileTransactionState,
-    REVISION_INDEX_DIR, RevisionIndex, revision_index_path,
+    load_current_revision_index, persist_current_revision_index_with_owner_state,
 };
 use loom_substrate::{ActorKind, OperationEnvelope, OperationEnvelopeInput};
 
@@ -883,12 +883,7 @@ fn update_message_revision_index(
         | ChatOperationPayload::MessageRedacted { message_id, .. } => message_id,
         _ => return Ok(()),
     };
-    let index_path = revision_index_path(workspace_id)?;
-    let index = match loom.read_file_reserved(workspace, &index_path) {
-        Ok(bytes) => RevisionIndex::decode(&bytes)?,
-        Err(err) if err.code == Code::NotFound => RevisionIndex::new(),
-        Err(err) => return Err(err),
-    };
+    let index = load_current_revision_index(loom, workspace, workspace_id)?;
     let envelope = OperationEnvelope::decode(&record.envelope)?;
     let entity_id = format!("chat:{channel_id}:message:{message_id}");
     let expected_latest_revision = index
@@ -914,9 +909,20 @@ fn update_message_revision_index(
         record.root_after,
         vec![update],
     )?)?;
-    let index = state.into_revision_index();
-    loom.create_directory_reserved(workspace, REVISION_INDEX_DIR, true)?;
-    loom.write_file_reserved(workspace, &index_path, &index.encode()?, 0o100644)
+    let (reference_root, objects) = loom.save_state_objects()?;
+    persist_current_revision_index_with_owner_state(
+        loom,
+        workspace,
+        workspace_id,
+        FacetKind::Queue,
+        &state.into_revision_index(),
+        loom_core::WorkflowOwnerState {
+            objects,
+            reference: loom_core::WorkflowReferenceUpdate::Set(Some(reference_root)),
+            controls: Vec::new(),
+            audits: Vec::new(),
+        },
+    )
 }
 
 fn append_record(
@@ -1210,6 +1216,55 @@ fn handoff_summary(handoff: ChatHandoffRequest) -> HostedChatHandoff {
         requested_by: handoff.requested_by.to_string(),
         requested_at_ms: handoff.requested_at_ms,
         reason: handoff.reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loom_core::Algo;
+
+    #[test]
+    fn message_revision_index_survives_store_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "uldren-loom-chat-revision-{}-{}.loom",
+            std::process::id(),
+            now_ms()
+        ));
+        let workspace = WorkspaceId::v4_from_bytes([5; 16]);
+        let channel = WorkspaceId::v4_from_bytes([6; 16]);
+        let mut loom = Loom::new(FileStore::create_with_profile(&path, Algo::Blake3).unwrap());
+        ensure_channel(&mut loom, workspace, "chat", channel, "general", "General").unwrap();
+        post_message(
+            &mut loom,
+            workspace,
+            "chat",
+            "general",
+            "message-1",
+            None,
+            b"first".to_vec(),
+        )
+        .unwrap();
+        edit_message(
+            &mut loom,
+            workspace,
+            "chat",
+            "general",
+            "message-1",
+            b"second".to_vec(),
+        )
+        .unwrap();
+
+        let entity_id = format!("chat:{channel}:message:message-1");
+        let index = load_current_revision_index(&loom, workspace, "chat").unwrap();
+        assert_eq!(index.latest(&entity_id).unwrap().revision, 2);
+        drop(loom);
+
+        let reopened = Loom::new(FileStore::open(&path).unwrap());
+        let index = load_current_revision_index(&reopened, workspace, "chat").unwrap();
+        assert_eq!(index.latest(&entity_id).unwrap().revision, 2);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
     }
 }
 

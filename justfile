@@ -142,6 +142,10 @@ test-integration:
     just test-native-integration
     just test-inference-integration
 
+# Run bounded manual storage-growth, timing, latency, concurrency, durability, and VCS-promotion probes.
+test-performance:
+    cargo run -p uldren-loom-store --example performance_harness --offline
+
 # Fast type-check (no codegen). FUSE backend skipped where it can't build (a Mac without macFUSE).
 check:
     #!/usr/bin/env bash

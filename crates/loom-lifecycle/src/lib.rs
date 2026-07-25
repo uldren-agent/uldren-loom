@@ -13,7 +13,7 @@ use loom_substrate::lifecycle::{
 };
 use loom_substrate::versioning::{
     BodyRef, ProfileRevisionUpdate, ProfileTransaction, ProfileTransactionState,
-    REVISION_INDEX_DIR, RevisionIndex, revision_index_path,
+    load_current_revision_index, persist_current_revision_index_with_owner_state,
 };
 use loom_substrate::{ActorKind, OperationEnvelope, OperationEnvelopeInput};
 use serde::Serialize;
@@ -186,9 +186,16 @@ pub fn define_lifecycle(
 ) -> Result<LifecycleDefinitionSummary> {
     loom.authorize_domain(workspace, AclDomain::Lifecycle, AclRight::Write)?;
     let definition = LifecycleDefinition::decode(definition_cbor)?;
-    save_definition(loom.store(), workspace_id, &definition)?;
-    recompute_surfaces_for_definition(loom.store(), workspace_id, &definition)?;
-    record_lifecycle_revision(
+    let mut controls = vec![loom_core::WorkflowControlWrite::Put {
+        key: definition_key(workspace_id, &definition.definition_id)?,
+        payload: definition.encode()?,
+    }];
+    controls.extend(surface_writes_for_definition(
+        loom.store(),
+        workspace_id,
+        &definition,
+    )?);
+    record_lifecycle_revision_with_controls(
         loom,
         workspace,
         workspace_id,
@@ -200,6 +207,7 @@ pub fn define_lifecycle(
         &definition.encode()?,
         "application/vnd.uldren.loom.lifecycle.definition+cbor",
         now_ms(),
+        controls,
     )?;
     definition_summary(workspace_id, &definition)
 }
@@ -215,9 +223,16 @@ pub fn define_standard_lifecycle(
         version: request.version.to_string(),
         completion_predicate_digest: Digest::parse(request.completion_predicate_digest)?,
     })?;
-    save_definition(loom.store(), request.workspace_id, &definition)?;
-    recompute_surfaces_for_definition(loom.store(), request.workspace_id, &definition)?;
-    record_lifecycle_revision(
+    let mut controls = vec![loom_core::WorkflowControlWrite::Put {
+        key: definition_key(request.workspace_id, &definition.definition_id)?,
+        payload: definition.encode()?,
+    }];
+    controls.extend(surface_writes_for_definition(
+        loom.store(),
+        request.workspace_id,
+        &definition,
+    )?);
+    record_lifecycle_revision_with_controls(
         loom,
         workspace,
         request.workspace_id,
@@ -229,6 +244,7 @@ pub fn define_standard_lifecycle(
         &definition.encode()?,
         "application/vnd.uldren.loom.lifecycle.definition+cbor",
         now_ms(),
+        controls,
     )?;
     definition_summary(request.workspace_id, &definition)
 }
@@ -272,6 +288,39 @@ pub fn instantiate(
     definition_id: &str,
     subject_refs: Vec<String>,
 ) -> Result<LifecycleInstanceSummary> {
+    let prepared = prepare_instantiate(
+        loom,
+        workspace,
+        workspace_id,
+        instance_id,
+        definition_id,
+        subject_refs,
+    )?;
+    persist_current_revision_index_with_owner_state(
+        loom,
+        workspace,
+        workspace_id,
+        FacetKind::Program,
+        &prepared.revision_index,
+        prepared.owner_state,
+    )?;
+    Ok(prepared.summary)
+}
+
+pub struct PreparedLifecycleInstantiate {
+    pub summary: LifecycleInstanceSummary,
+    pub revision_index: loom_substrate::versioning::RevisionIndex,
+    pub owner_state: loom_core::WorkflowOwnerState,
+}
+
+pub fn prepare_instantiate(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    instance_id: &str,
+    definition_id: &str,
+    subject_refs: Vec<String>,
+) -> Result<PreparedLifecycleInstantiate> {
     loom.authorize_domain(workspace, AclDomain::Lifecycle, AclRight::Write)?;
     if load_instance(loom.store(), workspace_id, instance_id)?.is_some() {
         return Err(LoomError::new(
@@ -282,10 +331,8 @@ pub fn instantiate(
     let definition = load_definition(loom.store(), workspace_id, definition_id)?
         .ok_or_else(|| LoomError::not_found("lifecycle definition not found"))?;
     let instance = LifecycleInstance::new(instance_id, &definition, subject_refs)?;
-    save_instance(loom.store(), workspace_id, &instance)?;
     let surface = StageSurface::for_instance(&definition, &instance)?;
-    save_surface(loom.store(), workspace_id, &surface)?;
-    record_lifecycle_revision(
+    let (revision_index, owner_state) = prepare_lifecycle_revision_with_controls(
         loom,
         workspace,
         workspace_id,
@@ -297,8 +344,22 @@ pub fn instantiate(
         &instance.encode()?,
         "application/vnd.uldren.loom.lifecycle.instance+cbor",
         now_ms(),
+        vec![
+            loom_core::WorkflowControlWrite::Put {
+                key: instance_key(workspace_id, &instance.instance_id)?,
+                payload: instance.encode()?,
+            },
+            loom_core::WorkflowControlWrite::Put {
+                key: surface_key(workspace_id, &surface.instance_id)?,
+                payload: surface.encode()?,
+            },
+        ],
     )?;
-    instance_summary(workspace_id, &instance)
+    Ok(PreparedLifecycleInstantiate {
+        summary: instance_summary(workspace_id, &instance)?,
+        revision_index,
+        owner_state,
+    })
 }
 
 pub fn get_instance(
@@ -438,9 +499,6 @@ pub fn transition(
         root_after,
         envelope.encode()?,
     )?)?;
-    save_instance(loom.store(), request.workspace_id, &next)?;
-    save_surface(loom.store(), request.workspace_id, &surface)?;
-    save_log(loom.store(), request.workspace_id, &log)?;
     append_lifecycle_trigger_record(
         loom,
         workspace,
@@ -448,7 +506,38 @@ pub fn transition(
         &transition,
         root_after,
     )?;
-    record_lifecycle_revision(
+    let snapshot = if let Some(digest) = snapshot_digest {
+        let plan = SnapshotPlan::for_transition(&definition, &instance, request.to_stage_id)?;
+        Some(SnapshotRecord::from_plan(
+            &plan,
+            request.transition_id,
+            digest,
+            request.recorded_at_ms,
+        )?)
+    } else {
+        None
+    };
+    let mut controls = vec![
+        loom_core::WorkflowControlWrite::Put {
+            key: instance_key(request.workspace_id, &next.instance_id)?,
+            payload: next.encode()?,
+        },
+        loom_core::WorkflowControlWrite::Put {
+            key: surface_key(request.workspace_id, &surface.instance_id)?,
+            payload: surface.encode()?,
+        },
+        loom_core::WorkflowControlWrite::Put {
+            key: lifecycle_operation_log_key(request.workspace_id)?,
+            payload: log.encode()?,
+        },
+    ];
+    if let Some(snapshot) = &snapshot {
+        controls.push(loom_core::WorkflowControlWrite::Put {
+            key: snapshot_key(request.workspace_id, &snapshot.snapshot_id)?,
+            payload: snapshot.encode()?,
+        });
+    }
+    record_lifecycle_revision_with_controls(
         loom,
         workspace,
         request.workspace_id,
@@ -457,20 +546,12 @@ pub fn transition(
         &next_bytes,
         "application/vnd.uldren.loom.lifecycle.instance+cbor",
         request.recorded_at_ms,
+        controls,
     )?;
-    let snapshot = if let Some(digest) = snapshot_digest {
-        let plan = SnapshotPlan::for_transition(&definition, &instance, request.to_stage_id)?;
-        let record = SnapshotRecord::from_plan(
-            &plan,
-            request.transition_id,
-            digest,
-            request.recorded_at_ms,
-        )?;
-        save_snapshot(loom.store(), request.workspace_id, &record)?;
-        Some(snapshot_record_summary(request.workspace_id, &record)?)
-    } else {
-        None
-    };
+    let snapshot = snapshot
+        .as_ref()
+        .map(|record| snapshot_record_summary(request.workspace_id, record))
+        .transpose()?;
     Ok(LifecycleTransitionResult {
         instance: instance_summary(request.workspace_id, &next)?,
         transition: transition_summary(&transition),
@@ -535,7 +616,7 @@ pub fn operation_log(
     )?))
 }
 
-fn record_lifecycle_revision(
+fn record_lifecycle_revision_with_controls(
     loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
     workspace_id: &str,
@@ -544,13 +625,44 @@ fn record_lifecycle_revision(
     body: &[u8],
     media_type: &str,
     timestamp_ms: u64,
+    controls: Vec<loom_core::WorkflowControlWrite>,
 ) -> Result<()> {
-    let index_path = revision_index_path(workspace_id)?;
-    let index = match loom.read_file_reserved(workspace, &index_path) {
-        Ok(bytes) => RevisionIndex::decode(&bytes)?,
-        Err(err) if err.code == Code::NotFound => RevisionIndex::new(),
-        Err(err) => return Err(err),
-    };
+    let (index, owner_state) = prepare_lifecycle_revision_with_controls(
+        loom,
+        workspace,
+        workspace_id,
+        entity_id,
+        operation_id,
+        body,
+        media_type,
+        timestamp_ms,
+        controls,
+    )?;
+    persist_current_revision_index_with_owner_state(
+        loom,
+        workspace,
+        workspace_id,
+        FacetKind::Program,
+        &index,
+        owner_state,
+    )
+}
+
+fn prepare_lifecycle_revision_with_controls(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    entity_id: &str,
+    operation_id: &str,
+    body: &[u8],
+    media_type: &str,
+    timestamp_ms: u64,
+    controls: Vec<loom_core::WorkflowControlWrite>,
+) -> Result<(
+    loom_substrate::versioning::RevisionIndex,
+    loom_core::WorkflowOwnerState,
+)> {
+    let index = load_current_revision_index(loom, workspace, workspace_id)?;
     let expected_latest_revision = index
         .latest(entity_id)
         .map(|entry| entry.revision)
@@ -576,9 +688,16 @@ fn record_lifecycle_revision(
         root,
         vec![update],
     )?)?;
-    let index = state.into_revision_index();
-    loom.create_directory_reserved(workspace, REVISION_INDEX_DIR, true)?;
-    loom.write_file_reserved(workspace, &index_path, &index.encode()?, 0o100644)
+    let (reference_root, objects) = loom.save_state_objects()?;
+    Ok((
+        state.into_revision_index(),
+        loom_core::WorkflowOwnerState {
+            objects,
+            reference: loom_core::WorkflowReferenceUpdate::Set(Some(reference_root)),
+            controls,
+            audits: Vec::new(),
+        },
+    ))
 }
 
 fn now_ms() -> u64 {
@@ -637,17 +756,6 @@ fn load_definition(
         .transpose()
 }
 
-fn save_definition(
-    store: &FileStore,
-    workspace_id: &str,
-    definition: &LifecycleDefinition,
-) -> Result<()> {
-    store.control_set(
-        &definition_key(workspace_id, &definition.definition_id)?,
-        definition.encode()?,
-    )
-}
-
 fn load_instance(
     store: &FileStore,
     workspace_id: &str,
@@ -657,17 +765,6 @@ fn load_instance(
         .control_get(&instance_key(workspace_id, instance_id)?)?
         .map(|bytes| LifecycleInstance::decode(&bytes))
         .transpose()
-}
-
-fn save_instance(
-    store: &FileStore,
-    workspace_id: &str,
-    instance: &LifecycleInstance,
-) -> Result<()> {
-    store.control_set(
-        &instance_key(workspace_id, &instance.instance_id)?,
-        instance.encode()?,
-    )
 }
 
 fn surface_prefix(workspace_id: &str) -> Result<Vec<u8>> {
@@ -693,31 +790,25 @@ fn load_surface(
         .transpose()
 }
 
-fn save_surface(store: &FileStore, workspace_id: &str, surface: &StageSurface) -> Result<()> {
-    store.control_set(
-        &surface_key(workspace_id, &surface.instance_id)?,
-        surface.encode()?,
-    )
-}
-
-fn recompute_surfaces_for_definition(
+fn surface_writes_for_definition(
     store: &FileStore,
     workspace_id: &str,
     definition: &LifecycleDefinition,
-) -> Result<()> {
+) -> Result<Vec<loom_core::WorkflowControlWrite>> {
+    let mut writes = Vec::new();
     for (_, bytes) in store.control_scan_prefix(&instance_prefix(workspace_id)?)? {
         let instance = LifecycleInstance::decode(&bytes)?;
         if instance.definition_id == definition.definition_id
             && instance.definition_version == definition.version
         {
-            save_surface(
-                store,
-                workspace_id,
-                &StageSurface::for_instance(definition, &instance)?,
-            )?;
+            let surface = StageSurface::for_instance(definition, &instance)?;
+            writes.push(loom_core::WorkflowControlWrite::Put {
+                key: surface_key(workspace_id, &surface.instance_id)?,
+                payload: surface.encode()?,
+            });
         }
     }
-    Ok(())
+    Ok(writes)
 }
 
 fn lifecycle_trigger_binding_id(workspace_id: &str) -> WorkspaceId {
@@ -776,13 +867,6 @@ fn load_snapshot(
         .transpose()
 }
 
-fn save_snapshot(store: &FileStore, workspace_id: &str, snapshot: &SnapshotRecord) -> Result<()> {
-    store.control_set(
-        &snapshot_key(workspace_id, &snapshot.snapshot_id)?,
-        snapshot.encode()?,
-    )
-}
-
 fn read_snapshot_content(
     loom: &Loom<FileStore>,
     workspace: WorkspaceId,
@@ -819,10 +903,6 @@ fn load_log(store: &FileStore, workspace_id: &str) -> Result<LifecycleOperationL
         Some(bytes) => LifecycleOperationLog::decode(&bytes),
         None => LifecycleOperationLog::new(workspace_id, Vec::new()),
     }
-}
-
-fn save_log(store: &FileStore, workspace_id: &str, log: &LifecycleOperationLog) -> Result<()> {
-    store.control_set(&lifecycle_operation_log_key(workspace_id)?, log.encode()?)
 }
 
 fn standard_kind(value: &str) -> Result<StandardLifecycleKind> {
@@ -1201,6 +1281,19 @@ mod tests {
             3
         );
         assert!(list_instances(&loom, workspace, "studio").unwrap().len() == 1);
+        let index = load_current_revision_index(&loom, workspace, "studio").unwrap();
+        assert_eq!(
+            index.latest("lifecycle:instance:feat-1").unwrap().revision,
+            4
+        );
+        drop(loom);
+        let reopened = Loom::new(FileStore::open(&path).unwrap());
+        let index = load_current_revision_index(&reopened, workspace, "studio").unwrap();
+        assert_eq!(
+            index.latest("lifecycle:instance:feat-1").unwrap().revision,
+            4
+        );
+        drop(reopened);
         std::fs::remove_file(path).unwrap();
     }
 }

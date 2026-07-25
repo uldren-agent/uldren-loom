@@ -4804,6 +4804,29 @@ impl<T: Transport + Send + Sync> Document for RemoteLoomClient<T> {
             crate::wire::from_wire::<bool>(&value)
         }
     }
+    fn delete_collection(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        collection: String,
+    ) -> impl ::core::future::Future<Output = Result<bool, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&collection),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Document",
+                    "delete_collection",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<bool>(&value)
+        }
+    }
     fn delete_indexed(
         &self,
         handle: LoomSession,

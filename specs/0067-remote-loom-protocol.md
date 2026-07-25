@@ -1254,6 +1254,7 @@ server-held cursor, so they carry idempotency keys, while the positional `read_a
 | get_binary | U | Sess | read | n/a | none | CO |
 | list_binary | U | Sess | read | n/a | none | CO |
 | delete | U | Sess | write | idem | none | CO |
+| delete_collection | U | Sess | write | idem | none | CO |
 | list_collections | U | Sess | read | n/a | none | CO |
 
 Document text/binary note: `put_text`/`put_binary` store a document by id (a keyed replace, so `idem`,
@@ -1265,6 +1266,9 @@ canonical CBOR `[text, digest, entity_tag]`, and fails with `DOCUMENT_NOT_TEXT` 
 are not valid UTF-8; `get_binary` returns `optional DocumentBinaryResult`, canonical CBOR
 `[bytes, digest, entity_tag]`. `list_binary` returns the canonical-CBOR encoded collection. None are
 section-6 `key` methods.
+
+`delete_collection` removes a workspace-scoped document collection plus its structured document roots
+and returns whether the collection existed. It is not principal-scoped calendar semantics.
 
 Native document surfaces MUST NOT mint a facet-specific compare-token name such as
 `expected_digest`. Compatibility facades may keep protocol-specific vocabulary only as an explicit

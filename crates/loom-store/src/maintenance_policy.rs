@@ -1,5 +1,6 @@
 use crate::{FileStore, PAGE_SIZE, corrupt};
 use loom_core::error::{Code, LoomError, Result};
+use std::collections::BTreeMap;
 
 pub(crate) const MAINTENANCE_POLICY_KEY: &[u8] = b"maintenance/v1/policy";
 pub(crate) const MAINTENANCE_RUN_KEY: &[u8] = b"maintenance/v1/run-state";
@@ -35,8 +36,8 @@ impl Default for StoreMaintenancePolicy {
         Self {
             min_candidate_pages: 256,
             min_reusable_pages: 256,
-            interval_ms: 60_000,
-            backoff_ms: 300_000,
+            interval_ms: 10_000,
+            backoff_ms: 60_000,
             max_segments: 1,
             max_pages: 1024,
             full_compaction_enabled: false,
@@ -93,14 +94,23 @@ impl Default for StoreMaintenanceRunState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreMaintenanceReport {
     pub status: crate::MaintenanceStatus,
+    pub overlay_health: crate::MutableOverlayHealth,
+    /// MVCC snapshot pins currently held against the store: active snapshot count, oldest pinned
+    /// overlay generation, and per-pin identity (overlay generation + base root). Pinned snapshots
+    /// hold back reclamation of superseded overlay records, so they are surfaced alongside overlay
+    /// retention pressure.
+    pub mvcc_snapshots: crate::StoreMvccSnapshotDiagnostics,
     pub policy: StoreMaintenancePolicy,
     pub run_state: StoreMaintenanceRunState,
     pub mark_epoch: Option<u64>,
     pub mark_completed: bool,
     pub marked_live_objects: u64,
     pub marked_live_bytes: u64,
+    pub live_bytes: u64,
     pub candidate_reclaimable_bytes: u64,
     pub reusable_free_bytes: u64,
+    pub overlay_obsolete_record_count: u64,
+    pub overlay_obsolete_page_count: u64,
     pub tail_free_pages: u64,
     pub tail_free_bytes: u64,
     pub tail_trim_eligible: bool,
@@ -122,8 +132,17 @@ pub struct StoreMaintenanceReport {
     pub retained_control_roots: u64,
     /// Count of durable-local derived-artifact payload records (rebuildable, identity-excluded).
     pub derived_payload_count: u64,
+    pub growth_domains: Vec<StoreGrowthDomain>,
     pub eligible: bool,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreGrowthDomain {
+    pub domain: String,
+    pub current_records: u64,
+    pub obsolete_records: u64,
+    pub payload_bytes: u64,
 }
 
 impl FileStore {
@@ -177,8 +196,17 @@ impl FileStore {
             mark_completed = epoch.state.completed;
             marked_live_objects = epoch.state.marked.len() as u64;
         }
+        let overlay_health = self.mutable_overlay_health()?;
+        let overlay_entries = self.mutable_overlay_entries()?;
         let candidate_reclaimable_bytes = status.candidate_dead_pages.saturating_mul(PAGE_SIZE);
         let reusable_free_bytes = status.reusable_free_pages.saturating_mul(PAGE_SIZE);
+        let live_bytes = status
+            .physical_bytes
+            .saturating_sub(candidate_reclaimable_bytes.max(reusable_free_bytes));
+        let overlay_obsolete_record_count = overlay_health
+            .hot_write_count
+            .saturating_sub(overlay_health.current_record_count);
+        let overlay_obsolete_page_count = overlay_health.reclaimable_overlay_pages;
         let tail_free_pages = status.tail_free_pages;
         let tail_free_bytes = status.tail_free_bytes;
         let tail_trim_eligible = policy.tail_trim_enabled && tail_free_pages > 0;
@@ -214,16 +242,22 @@ impl FileStore {
         let tail_compaction_truncated_pages = run_state.last_tail_compaction_truncated_pages;
         let tail_compaction_conflicts = run_state.last_tail_compaction_conflicts;
         let last_shrink_skip_reason = run_state.last_shrink_skip_reason.clone();
+        let mvcc_snapshots = self.mvcc_snapshot_diagnostics()?;
         Ok(StoreMaintenanceReport {
             status,
+            overlay_health,
+            mvcc_snapshots,
             policy,
             run_state,
             mark_epoch,
             mark_completed,
             marked_live_objects,
             marked_live_bytes,
+            live_bytes,
             candidate_reclaimable_bytes,
             reusable_free_bytes,
+            overlay_obsolete_record_count,
+            overlay_obsolete_page_count,
             tail_free_pages,
             tail_free_bytes,
             tail_trim_eligible,
@@ -242,6 +276,7 @@ impl FileStore {
             last_shrink_skip_reason,
             retained_control_roots,
             derived_payload_count,
+            growth_domains: overlay_growth_domains(&overlay_entries)?,
             eligible: matches!(
                 reason.as_str(),
                 "eligible" | "mark_epoch_incomplete" | "mark_epoch_missing" | "mark_epoch_stale"
@@ -249,6 +284,75 @@ impl FileStore {
             reason,
         })
     }
+}
+
+fn overlay_growth_domains(
+    entries: &[loom_core::MutableOverlayEntrySnapshot],
+) -> Result<Vec<StoreGrowthDomain>> {
+    let mut domains = BTreeMap::<String, StoreGrowthDomain>::new();
+    let mut latest_seen = BTreeMap::<Vec<u8>, u64>::new();
+    for entry in entries {
+        *latest_seen
+            .entry(entry.key.as_bytes().to_vec())
+            .or_default() += 1;
+        let domain = overlay_growth_domain_name(&entry.key)?;
+        let summary = domains
+            .entry(domain.clone())
+            .or_insert_with(|| StoreGrowthDomain {
+                domain,
+                current_records: 0,
+                obsolete_records: 0,
+                payload_bytes: 0,
+            });
+        summary.payload_bytes = summary
+            .payload_bytes
+            .saturating_add(entry.payload.len() as u64);
+    }
+    for entry in entries {
+        let domain = overlay_growth_domain_name(&entry.key)?;
+        let summary = domains
+            .get_mut(&domain)
+            .ok_or_else(|| corrupt("overlay growth domain missing"))?;
+        let count = latest_seen
+            .get_mut(entry.key.as_bytes())
+            .ok_or_else(|| corrupt("overlay growth key missing"))?;
+        if *count == 1 {
+            summary.current_records = summary.current_records.saturating_add(1);
+        } else {
+            summary.obsolete_records = summary.obsolete_records.saturating_add(1);
+            *count -= 1;
+        }
+    }
+    let mut out: Vec<StoreGrowthDomain> = domains.into_values().collect();
+    out.sort_by(|a, b| {
+        b.payload_bytes
+            .cmp(&a.payload_bytes)
+            .then_with(|| b.current_records.cmp(&a.current_records))
+            .then_with(|| a.domain.cmp(&b.domain))
+    });
+    Ok(out)
+}
+
+fn overlay_growth_domain_name(key: &loom_core::OverlayKey) -> Result<String> {
+    let segments = key.segments()?;
+    if segments.len() != 6 {
+        return Ok("overlay:unknown".to_string());
+    }
+    let domain = diagnostic_segment(segments[2]);
+    let kind = diagnostic_segment(segments[4]);
+    Ok(match (domain.as_str(), kind.as_str()) {
+        ("tickets", "ticket") => "tickets".to_string(),
+        ("tickets", "comment") => "comments".to_string(),
+        ("tickets", "lane" | "board" | "active-assignment") => "lanes".to_string(),
+        ("tickets", "relation" | "project" | "project-contract") => "workflow".to_string(),
+        ("loom.document.current.v1", _) | ("document", _) => "documents".to_string(),
+        ("queue", _) | ("chat", _) => "operation_logs".to_string(),
+        _ => domain,
+    })
+}
+
+fn diagnostic_segment(bytes: &[u8]) -> String {
+    String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| "binary".to_string())
 }
 
 fn maintenance_eligibility_reason(

@@ -1,0 +1,31 @@
+{
+  "backup_store": "matrix/matrix.before-compacted-replacement.loom",
+  "canonical_bytes_equal": true,
+  "current_store": "matrix/matrix.loom",
+  "decoded_indexes_equal": true,
+  "destination": {
+    "canonical_byte_length": 1728568,
+    "canonical_digest": "blake3:e58ea8c85d000dd692ac206bf20e2d8ac7932f17206652b839dea406742322eb",
+    "checkpoint_count": 2880,
+    "overlay_generation": 4206,
+    "revision_count": 2880
+  },
+  "destination_key_hex": "6c6f6f6d2e6d757461626c652d6f7665726c61792e6b65792e763106000000286c6f6f6d2e7375627374726174652e7265766973696f6e2d696e6465782e63757272656e742e763100000010baa779e9685e4fb195cb03ddb65eb0300000002462616137373965392d363835652d346662312d393563622d3033646462363565623033300000000e7265766973696f6e2d696e64657800000000000000027631",
+  "equal": true,
+  "legacy": {
+    "canonical_byte_length": 1728568,
+    "canonical_digest": "blake3:e58ea8c85d000dd692ac206bf20e2d8ac7932f17206652b839dea406742322eb",
+    "checkpoint_count": 2880,
+    "revision_count": 2880
+  },
+  "legacy_absent_from_current_store": true,
+  "legacy_path": ".loom/substrate/revisions/baa779e9-685e-4fb1-95cb-03ddb65eb030.lri",
+  "schema": "loom.0071.matrix-revision-migration-evidence.v1",
+  "scope_id": "baa779e9-685e-4fb1-95cb-03ddb65eb030",
+  "verification_mode": "read_only",
+  "workspace": {
+    "backup_name": "matrix2",
+    "current_name": "matrix2",
+    "id": "baa779e9-685e-4fb1-95cb-03ddb65eb030"
+  }
+}

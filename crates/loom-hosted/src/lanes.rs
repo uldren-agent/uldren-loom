@@ -207,8 +207,17 @@ where
 {
     let mut lane = loom_lanes::get_lane(loom, workspace, lane_id)?
         .ok_or_else(|| LoomError::new(Code::NotFound, "lane not found"))?;
+    let prior_lane = lane.clone();
     mutation(&mut lane)?;
-    let lane = loom_lanes::put_lane(loom, workspace, lane)?;
+    let lane = if event_kind == "lane.updated" {
+        loom_lanes::put_lane_current_record(loom, workspace, &lane, Some(&prior_lane))?;
+        lane
+    } else {
+        loom_lanes::put_lane(loom, workspace, lane)?
+    };
+    if event_kind == "lane.updated" {
+        return Ok(lane);
+    }
     loom_lanes::emit_lane_change_notification(
         loom,
         workspace,

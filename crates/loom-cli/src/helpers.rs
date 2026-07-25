@@ -153,6 +153,12 @@ pub(crate) fn open_loom_from(
     if let Some(root) = root {
         loom.load_state(root).map_err(|e| e.to_string())?;
     }
+    let entries = loom
+        .store()
+        .mutable_overlay_entries()
+        .map_err(|e| e.to_string())?;
+    *loom.mutable_overlay_mut() =
+        loom_core::MutableOverlay::import_entries(&entries).map_err(|e| e.to_string())?;
     attach_control_state(loom, keys)
 }
 
@@ -1679,6 +1685,7 @@ mod tests {
                 .save_store_policy_audited(
                     loom_store::StorePolicy {
                         fips_required: true,
+                        ..loom_store::StorePolicy::default()
                     },
                     None,
                     "store.policy.set",

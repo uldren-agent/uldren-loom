@@ -221,6 +221,37 @@ static NSString *loomStringFromOwnedString(char *ptr) {
   });
 }
 
+- (void)docDeleteCollection:(NSString *)loomPath
+                  workspace:(NSString *)ns
+                 collection:(NSString *)collection
+                 passphrase:(NSString *)passphrase
+                        kek:(NSArray *)kek
+              authPrincipal:(NSString *)authPrincipal
+             authPassphrase:(NSString *)authPassphrase
+                    resolve:(RCTPromiseResolveBlock)resolve
+                     reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    int32_t found = 0;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_doc_delete_collection(h, ns.UTF8String, collection.UTF8String, &found);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    resolve(@(found != 0));
+  });
+}
+
 - (void)docListBinary:(NSString *)loomPath
             workspace:(NSString *)ns
            collection:(NSString *)collection

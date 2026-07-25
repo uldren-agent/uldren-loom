@@ -85,6 +85,7 @@ ctrlc = { version = "3", optional = true }
 # supplies the `Payload`/`Value` result types the verb prints.
 gluesql-core = "0.19"
 futures = "0.3"
+hex.workspace = true
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 # OS trust store for the `--tls system` trust selector (remote-client only).

@@ -9,9 +9,10 @@ use crate::{
     TicketInput, TicketLifecycleAction, TicketLifecycleAuthorizationPolicy, TicketOperationRecord,
     TicketProfileReader, TicketProject, TicketProjectionProfile, TicketProjectionRequestContext,
     TicketProjectionSelection, TicketProjectionSelectionSource, TicketRelation, TicketRelationKind,
-    TicketRelationTargetType, TicketType, TransitionOperation, WorkflowDefinition,
-    WorkflowValidationContext, WorkflowValidationRecord, WorkflowValidationState,
-    validate_ticket_comment_type, validate_transition,
+    TicketRelationTargetType, TicketType, TransitionOperation, WorkflowCurrentRecord,
+    WorkflowCurrentRecordKind, WorkflowDefinition, WorkflowValidationContext,
+    WorkflowValidationRecord, WorkflowValidationState, validate_ticket_comment_type,
+    validate_transition,
 };
 use loom_core::delivery::{DeliveryEnvelope, DeliveryProduceRequest, delivery_produce};
 use loom_core::error::{Code, LoomError, Result};
@@ -19,10 +20,11 @@ use loom_core::graph::{
     GraphValue, graph_edges, graph_in_edges, graph_remove_edge, graph_upsert_edge,
     graph_upsert_node,
 };
-#[cfg(test)]
-use loom_core::workspace::FacetKind;
 use loom_core::workspace::WorkspaceId;
-use loom_core::{AclDomain, AclRight, Digest, IdentityStore, Loom};
+use loom_core::{
+    AclDomain, AclRight, Digest, FacetWrite, IdempotencyKey, IdentityStore, Loom,
+    SecondaryIndexWrite, WorkflowOwnerState,
+};
 use loom_store::FileStore;
 use loom_substrate::changes::{OperationChangeBatch, OperationChangeCursor};
 use loom_substrate::facilities::{DateTimeValue, FieldDefinition, FieldType};
@@ -31,19 +33,12 @@ use loom_substrate::refs::{
     UnresolvedReference, extract_markdown_reference_candidates,
 };
 use loom_substrate::versioning::{
-    BodyRef, ProfileRevisionUpdate, ProfileTransaction, ProfileTransactionState, RevisionIndex,
+    RevisionIndexAppend, persist_revision_index_append_with_owner_state_and_writes,
 };
 use loom_substrate::{ActorKind, OperationEnvelope, OperationEnvelopeInput};
 use serde::Serialize;
 use serde_json::json;
 use serde_json::{Map, Value};
-
-const REVISION_INDEX_DIR: &str = ".loom/substrate/revisions";
-
-fn revision_index_path(scope_id: &str) -> Result<String> {
-    loom_substrate::view::validate_view_id(scope_id)?;
-    Ok(format!("{REVISION_INDEX_DIR}/{scope_id}.lri"))
-}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -268,8 +263,17 @@ pub struct TicketFieldCatalog {
     pub operation: String,
     pub strict_unknown_fields: bool,
     pub custom_fields_source: String,
+    /// Human-readable contract for how create/update handle fields not listed
+    /// in this catalog, so an agent can understand strict-vs-infer without
+    /// reading source. See [`UNKNOWN_FIELD_WRITE_BEHAVIOR`].
+    pub unknown_field_write_behavior: String,
     pub fields: Vec<TicketFieldCatalogEntry>,
 }
+
+/// Canonical documentation of unknown-field handling, surfaced through the field
+/// catalog (MCP `tickets_fields` / CLI `tickets fields`). Normal writes are
+/// strict; the `infer` policy is import-only.
+pub const UNKNOWN_FIELD_WRITE_BEHAVIOR: &str = "Normal create/update writes are strict: only the core fields listed here plus defined project custom fields are accepted. An unknown field is rejected with guidance to inspect `tickets fields` and define a project custom-field first (see put_ticket_field_definition). The `infer` field policy, which auto-creates field definitions from payload keys, is available for imports only (redmine/asana/jira import surfaces) and defaults to strict; it is never applied to interactive create/update.";
 
 impl Serialize for TicketSummary {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -306,6 +310,16 @@ impl Serialize for TicketProjectSummary {
         object.insert(
             "default_projection".to_string(),
             Value::String(self.default_projection.clone()),
+        );
+        object.insert(
+            "enabled_projections".to_string(),
+            Value::Array(
+                self.enabled_projections
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
         );
         object.insert(
             "lifecycle_authorization_policy".to_string(),
@@ -402,6 +416,15 @@ pub struct TicketCreateRequest<'a> {
     pub fields: &'a Value,
     pub policy_labels: &'a [String],
     pub expected_root: Option<&'a str>,
+}
+
+pub struct PreparedTicketCreate {
+    pub workspace_id: String,
+    pub summary: TicketSummary,
+    pub revision_index: RevisionIndexAppend,
+    pub writes: Vec<FacetWrite>,
+    pub idempotency: Option<IdempotencyKey>,
+    pub owner_state: WorkflowOwnerState,
 }
 
 pub struct TicketUpdateFieldsRequest<'a> {
@@ -572,6 +595,7 @@ pub fn ticket_field_catalog(
         operation: operation.to_string(),
         strict_unknown_fields: false,
         custom_fields_source: "project custom-field persistence is not surfaced yet".to_string(),
+        unknown_field_write_behavior: UNKNOWN_FIELD_WRITE_BEHAVIOR.to_string(),
         fields,
     })
 }
@@ -671,6 +695,7 @@ pub fn put_ticket_field_definition(
             validation: None,
         },
     )?;
+    put_project_current_record(&mut profile, request.workspace_id, &project, root_after)?;
     profile.append_operation(&record)?;
     let persisted_root = profile.finish_operation()?;
     debug_assert_eq!(persisted_root, root_after);
@@ -708,6 +733,7 @@ pub fn retire_ticket_field_definition(
             validation: None,
         },
     )?;
+    put_project_current_record(&mut profile, request.workspace_id, &project, root_after)?;
     profile.append_operation(&record)?;
     let persisted_root = profile.finish_operation()?;
     debug_assert_eq!(persisted_root, root_after);
@@ -1495,6 +1521,7 @@ pub fn create_project(
             validation: None,
         },
     )?;
+    put_project_current_record(&mut profile, workspace_id, &project, root_after)?;
     profile.append_operation(&record)?;
     let persisted_root = profile.finish_operation()?;
     debug_assert_eq!(persisted_root, root_after);
@@ -1561,6 +1588,7 @@ pub fn create_board(
             validation: None,
         },
     )?;
+    put_board_current_record(&mut profile, request.workspace_id, &board, root_after)?;
     profile.append_operation(&record)?;
     let persisted_root = profile.finish_operation()?;
     debug_assert_eq!(persisted_root, root_after);
@@ -1587,6 +1615,27 @@ pub fn get_board(
     let Some(board) = profile.board(board_id)? else {
         return Ok(None);
     };
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("tickets.board.get"))?;
+    let board = crate::read_workflow_current_record(
+        &snapshot,
+        workspace_id,
+        &board.project_id,
+        WorkflowCurrentRecordKind::Board,
+        &board.board_id,
+        |_| {
+            workflow_current_base_payload(
+                workspace_id,
+                &board.project_id,
+                WorkflowCurrentRecordKind::Board,
+                &board.board_id,
+                board.encode()?,
+            )
+            .map(Some)
+        },
+    )?
+    .map(|record| TicketBoard::decode(&record.payload))
+    .transpose()?
+    .unwrap_or(board);
     let cards = profile.board_cards(&board.board_id)?;
     Ok(Some(board_summary(
         workspace_id,
@@ -1609,11 +1658,32 @@ pub fn list_boards(
         return Ok(Vec::new());
     };
     let profile_root = profile.profile_root()?;
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("tickets.board.list"))?;
     let mut boards = profile
         .boards()?
         .into_iter()
         .filter(|board| include_deleted || board.board_status != BoardStatus::Deleted)
         .map(|board| {
+            let board = crate::read_workflow_current_record(
+                &snapshot,
+                workspace_id,
+                &board.project_id,
+                WorkflowCurrentRecordKind::Board,
+                &board.board_id,
+                |_| {
+                    workflow_current_base_payload(
+                        workspace_id,
+                        &board.project_id,
+                        WorkflowCurrentRecordKind::Board,
+                        &board.board_id,
+                        board.encode()?,
+                    )
+                    .map(Some)
+                },
+            )?
+            .map(|record| TicketBoard::decode(&record.payload))
+            .transpose()?
+            .unwrap_or(board);
             let cards = profile.board_cards(&board.board_id)?;
             Ok(board_summary(
                 workspace_id,
@@ -1766,6 +1836,7 @@ pub fn move_board_card(
             validation: None,
         },
     )?;
+    put_board_current_record(&mut profile, request.workspace_id, &board, root_after)?;
     profile.append_operation(&record)?;
     let persisted_root = profile.finish_operation()?;
     debug_assert_eq!(persisted_root, root_after);
@@ -1785,6 +1856,25 @@ pub fn create_ticket(
     workspace: WorkspaceId,
     request: TicketCreateRequest<'_>,
 ) -> Result<TicketSummary> {
+    let prepared = prepare_ticket_create(loom, workspace, request)?;
+    persist_revision_index_append_with_owner_state_and_writes(
+        loom,
+        workspace,
+        &prepared.workspace_id,
+        loom_core::FacetKind::Queue,
+        &prepared.revision_index,
+        prepared.writes,
+        prepared.idempotency,
+        prepared.owner_state,
+    )?;
+    Ok(prepared.summary)
+}
+
+pub fn prepare_ticket_create(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    request: TicketCreateRequest<'_>,
+) -> Result<PreparedTicketCreate> {
     loom.authorize_domain(workspace, AclDomain::Tickets, AclRight::Write)?;
     // resolve any assignee alias/handle set on create (including importer-supplied values)
     // to the canonical principal id before opening the profile, which borrows `loom` mutably.
@@ -1843,17 +1933,42 @@ pub fn create_ticket(
             validation: None,
         },
     )?;
+    let current_records = [
+        WorkflowCurrentRecord::new(
+            request.workspace_id,
+            &project.project_id,
+            WorkflowCurrentRecordKind::Project,
+            &project.project_id,
+            project.encode()?,
+            Some(root_after),
+        )?,
+        WorkflowCurrentRecord::new(
+            request.workspace_id,
+            &ticket.project_id,
+            WorkflowCurrentRecordKind::Ticket,
+            &ticket.ticket_id,
+            ticket.encode()?,
+            Some(root_after),
+        )?,
+    ];
+    let (writes, idempotency) = profile.prepare_workflow_current_records_indexed(
+        &current_records,
+        ticket_workflow_secondary_indexes(request.workspace_id, &ticket)?,
+        Some(&format!("ticket-create:{}:{root_after}", ticket.ticket_id)),
+    )?;
     profile.append_operation(&record)?;
-    let persisted_root = profile.finish_operation()?;
-    debug_assert_eq!(persisted_root, root_after);
-    update_ticket_revision_index(
-        loom,
+    stage_ticket_reference_state(
+        &mut profile,
         workspace,
         request.workspace_id,
-        &ticket.ticket_id,
+        &ticket,
         &record,
-        &payload,
+        root_after,
+        true,
     )?;
+    let (prepared_root, revision_index, owner_state) =
+        profile.prepare_ticket_operation(&record, &ticket.ticket_id, &payload)?;
+    debug_assert_eq!(prepared_root, root_after);
     let mut summary = ticket_summary(
         request.workspace_id,
         &ticket,
@@ -1863,10 +1978,15 @@ pub fn create_ticket(
         root_after,
         None,
     );
-    // surface the additive display alias for the (already canonicalized) assignee on the
-    // create response too, consistent with read projections.
     attach_assignee_display(loom.identity_store(), &ticket, &mut summary);
-    Ok(summary)
+    Ok(PreparedTicketCreate {
+        workspace_id: request.workspace_id.to_string(),
+        summary,
+        revision_index,
+        writes,
+        idempotency,
+        owner_state,
+    })
 }
 
 pub fn rekey_project(
@@ -1910,6 +2030,7 @@ pub fn rekey_project(
         },
     )?;
     let principal = profile.effective_principal()?;
+    put_project_current_record(&mut profile, workspace_id, &project, root_after)?;
     profile.append_operation(&record)?;
     let persisted_root = profile.finish_operation_with_audit(
         principal,
@@ -1980,6 +2101,7 @@ pub fn set_project_lifecycle_policy(
             validation: None,
         },
     )?;
+    put_project_current_record(&mut profile, request.workspace_id, &project, root_after)?;
     profile.append_operation(&record)?;
     let persisted_root = profile.finish_operation()?;
     debug_assert_eq!(persisted_root, root_after);
@@ -2104,6 +2226,7 @@ pub fn set_project_settings(
             validation: None,
         },
     )?;
+    put_project_current_record(&mut profile, request.workspace_id, &project, root_after)?;
     profile.append_operation(&record)?;
     let persisted_root = profile.finish_operation()?;
     debug_assert_eq!(persisted_root, root_after);
@@ -2150,6 +2273,7 @@ pub fn set_project_workflow(
             validation: None,
         },
     )?;
+    put_project_current_record(&mut profile, request.workspace_id, &project, root_after)?;
     profile.append_operation(&record)?;
     let persisted_root = profile.finish_operation()?;
     debug_assert_eq!(persisted_root, root_after);
@@ -2183,9 +2307,31 @@ pub fn get_project_with_contract_details(
     let Some(profile) = TicketProfileReader::open(loom, workspace, workspace_id)? else {
         return Ok(None);
     };
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("tickets.relations.list"))?;
     profile
         .project(project_id)?
-        .map(|project| {
+        .map(|base_project| {
+            let current = crate::read_workflow_current_record(
+                &snapshot,
+                workspace_id,
+                project_id,
+                WorkflowCurrentRecordKind::Project,
+                project_id,
+                |_| {
+                    workflow_current_base_payload(
+                        workspace_id,
+                        project_id,
+                        WorkflowCurrentRecordKind::Project,
+                        project_id,
+                        base_project.encode()?,
+                    )
+                    .map(Some)
+                },
+            )?;
+            let project = current
+                .map(|record| TicketProject::decode(&record.payload))
+                .transpose()?
+                .unwrap_or(base_project);
             Ok(project_summary(
                 workspace_id,
                 &project,
@@ -2331,8 +2477,30 @@ pub fn list_ticket_relations(
     let Some(ticket) = profile.ticket(&resolved_ticket_id)? else {
         return Err(LoomError::not_found(format!("ticket {ticket_id:?}")));
     };
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("tickets.relation.get"))?;
     let mut out = Vec::new();
-    for relation in ticket.relations.values() {
+    for base_relation in ticket.relations.values() {
+        let record_id = relation_current_record_id(&ticket.ticket_id, &base_relation.relation_id);
+        let relation = crate::read_workflow_current_record(
+            &snapshot,
+            workspace_id,
+            &ticket.project_id,
+            WorkflowCurrentRecordKind::Relation,
+            &record_id,
+            |_| {
+                workflow_current_base_payload(
+                    workspace_id,
+                    &ticket.project_id,
+                    WorkflowCurrentRecordKind::Relation,
+                    &record_id,
+                    base_relation.encode()?,
+                )
+                .map(Some)
+            },
+        )?
+        .map(|record| TicketRelation::decode(&record.payload))
+        .transpose()?
+        .unwrap_or_else(|| base_relation.clone());
         let target_title = if relation.target_type == TicketRelationTargetType::Ticket {
             profile
                 .ticket(&relation.target_id)?
@@ -2387,6 +2555,11 @@ pub fn update_ticket(
     let has_comments = request.comment.is_some() || !request.comments.is_empty();
     let has_relation_mutations =
         !request.relation_sets.is_empty() || !request.relation_removes.is_empty();
+    let changes_ticket_fields = request.set_fields.is_some()
+        || !request.delete_fields.is_empty()
+        || request.action.is_some()
+        || request.target_status.is_some()
+        || request.assignee.is_some();
     let actor = if has_comments {
         Some(ticket_actor(loom, workspace)?)
     } else {
@@ -2398,8 +2571,24 @@ pub fn update_ticket(
     let canonical_assignee = request
         .assignee
         .map(|assignee| canonicalize_assignee(loom, assignee));
+    let reader = TicketProfileReader::open(loom, workspace, request.workspace_id)?
+        .ok_or_else(|| LoomError::not_found("ticket profile not found"))?;
+    let ticket_id = resolve_ticket_id(&reader, request.ticket_id)?;
+    let base_ticket = reader
+        .ticket(&ticket_id)?
+        .ok_or_else(|| LoomError::corrupt("ticket resolved to a missing record"))?;
+    let current = current_ticket_record(loom, request.workspace_id, &base_ticket)?;
+    let mut ticket = current
+        .as_ref()
+        .map(|(ticket, _)| ticket.clone())
+        .unwrap_or(base_ticket);
+    let prior_ticket = ticket.clone();
+    let project = reader
+        .project(&ticket.project_id)?
+        .ok_or_else(|| LoomError::corrupt("ticket project is missing"))?;
+    drop(reader);
     let mut profile = IndexedTicketProfile::open(loom, workspace, request.workspace_id)?;
-    profile.enforce_expected_root(request.expected_root)?;
+    enforce_current_expected_root(&profile, current.as_ref(), request.expected_root)?;
     let mut set_fields = match request.set_fields {
         Some(fields) => fields_from_json(fields)?,
         None => BTreeMap::new(),
@@ -2473,13 +2662,6 @@ pub fn update_ticket(
         update_comments.push(comment);
     }
     update_comments.extend_from_slice(request.comments);
-    let ticket_id = resolve_ticket_id(&profile, request.ticket_id)?;
-    let mut ticket = profile
-        .ticket(&ticket_id)?
-        .ok_or_else(|| LoomError::corrupt("ticket resolved to a missing record"))?;
-    let project = profile
-        .project(&ticket.project_id)?
-        .ok_or_else(|| LoomError::corrupt("ticket project is missing"))?;
     validate_ticket_update_fields_against_project(
         &project,
         &ticket,
@@ -2603,6 +2785,7 @@ pub fn update_ticket(
     ticket.validate()?;
     let base_root = profile.profile_root()?;
     profile.put_ticket(&ticket)?;
+    let mut written_comments = Vec::new();
     for comment in update_comments {
         let comment_type = comment
             .comment_type
@@ -2630,6 +2813,7 @@ pub fn update_ticket(
         comment_record.evidence = comment.evidence;
         comment_record.validate()?;
         profile.put_comment(&ticket.ticket_id, &comment_record)?;
+        written_comments.push(comment_record);
         if operation_kind == "ticket.updated" {
             operation_kind = "ticket.comment_added";
         }
@@ -2665,6 +2849,42 @@ pub fn update_ticket(
             validation: transition_validation.as_ref(),
         },
     )?;
+    put_ticket_current_record(
+        &mut profile,
+        request.workspace_id,
+        &ticket,
+        root_after,
+        Some(&prior_ticket),
+    )?;
+    for relation in &relation_projection_removals {
+        delete_relation_current_record(
+            &mut profile,
+            request.workspace_id,
+            &ticket.project_id,
+            &ticket.ticket_id,
+            relation,
+        )?;
+    }
+    for relation in &relation_projection_sets {
+        put_relation_current_record(
+            &mut profile,
+            request.workspace_id,
+            &ticket.project_id,
+            &ticket.ticket_id,
+            relation,
+            root_after,
+        )?;
+    }
+    for comment in &written_comments {
+        put_comment_current_record(
+            &mut profile,
+            request.workspace_id,
+            &ticket.project_id,
+            &ticket.ticket_id,
+            comment,
+            root_after,
+        )?;
+    }
     let primary_key = ticket_key(&profile, &ticket)?;
     let mut ticket_summary = ticket_summary(
         request.workspace_id,
@@ -2678,21 +2898,77 @@ pub fn update_ticket(
     ticket_summary.comments = compact_ticket_comments(&profile.comments(&ticket.ticket_id)?);
     let ticket_id = ticket.ticket_id.clone();
     profile.append_operation(&record)?;
-    let persisted_root = profile.finish_operation()?;
-    debug_assert_eq!(persisted_root, root_after);
-    update_ticket_revision_index(
-        loom,
+    emit_ticket_change_notification(
+        profile.loom_mut(),
         workspace,
         request.workspace_id,
         &ticket_id,
         &record,
-        &payload,
     )?;
-    emit_ticket_change_notification(loom, workspace, request.workspace_id, &ticket_id, &record)?;
+    if changes_ticket_fields {
+        stage_ticket_reference_state(
+            &mut profile,
+            workspace,
+            request.workspace_id,
+            &ticket,
+            &record,
+            root_after,
+            true,
+        )?;
+    }
+    let persisted_root = profile.finish_ticket_operation(&record, &ticket_id, &payload)?;
+    debug_assert_eq!(persisted_root, root_after);
     // the profile borrow of `loom` has ended, so resolve the additive display alias for the
     // final assignee on the response summary too (keeps write responses consistent with reads).
     attach_assignee_display(loom.identity_store(), &ticket, &mut ticket_summary);
     Ok(ticket_summary)
+}
+
+fn current_ticket_record(
+    loom: &Loom<FileStore>,
+    workspace_id: &str,
+    base: &Ticket,
+) -> Result<Option<(Ticket, Option<Digest>)>> {
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("tickets.comment.get"))?;
+    crate::read_workflow_current_record(
+        &snapshot,
+        workspace_id,
+        &base.project_id,
+        WorkflowCurrentRecordKind::Ticket,
+        &base.ticket_id,
+        |_| {
+            workflow_current_base_payload(
+                workspace_id,
+                &base.project_id,
+                WorkflowCurrentRecordKind::Ticket,
+                &base.ticket_id,
+                base.encode()?,
+            )
+            .map(Some)
+        },
+    )?
+    .map(|record| Ticket::decode(&record.payload).map(|ticket| (ticket, record.operation_root)))
+    .transpose()
+}
+
+fn enforce_current_expected_root(
+    profile: &IndexedTicketProfile<'_>,
+    current: Option<&(Ticket, Option<Digest>)>,
+    expected_root: Option<&str>,
+) -> Result<()> {
+    let Some(expected_root) = expected_root else {
+        return Ok(());
+    };
+    let expected = Digest::parse(expected_root)?;
+    let profile_root = profile.profile_root()?;
+    let current_root = current.and_then(|(_, root)| *root);
+    if expected != profile_root && current_root.is_none_or(|root| expected != root) {
+        return Err(LoomError::new(
+            Code::Conflict,
+            "ticket profile root does not match expected_root",
+        ));
+    }
+    Ok(())
 }
 
 fn extract_status_target_from_fields(
@@ -2751,6 +3027,7 @@ pub fn delete_ticket(
     let mut ticket = profile
         .ticket(&ticket_id)?
         .ok_or_else(|| LoomError::corrupt("ticket resolved to a missing record"))?;
+    let prior_ticket = ticket.clone();
     if matches!(
         ticket.fields.get("resolution"),
         Some(TicketFieldValue::EnumOption(value) | TicketFieldValue::String(value))
@@ -2806,6 +3083,23 @@ pub fn delete_ticket(
             validation: None,
         },
     )?;
+    put_ticket_current_record(
+        &mut profile,
+        request.workspace_id,
+        &ticket,
+        root_after,
+        Some(&prior_ticket),
+    )?;
+    for comment in profile.comments(&ticket.ticket_id)? {
+        put_comment_current_record(
+            &mut profile,
+            request.workspace_id,
+            &ticket.project_id,
+            &ticket.ticket_id,
+            &comment,
+            root_after,
+        )?;
+    }
     let primary_key = ticket_key(&profile, &ticket)?;
     let mut ticket_summary = ticket_summary(
         request.workspace_id,
@@ -2819,17 +3113,24 @@ pub fn delete_ticket(
     ticket_summary.comments = compact_ticket_comments(&profile.comments(&ticket.ticket_id)?);
     let ticket_id = ticket.ticket_id.clone();
     profile.append_operation(&record)?;
-    let persisted_root = profile.finish_operation()?;
-    debug_assert_eq!(persisted_root, root_after);
-    update_ticket_revision_index(
-        loom,
+    emit_ticket_change_notification(
+        profile.loom_mut(),
         workspace,
         request.workspace_id,
         &ticket_id,
         &record,
-        &payload,
     )?;
-    emit_ticket_change_notification(loom, workspace, request.workspace_id, &ticket_id, &record)?;
+    stage_ticket_reference_state(
+        &mut profile,
+        workspace,
+        request.workspace_id,
+        &ticket,
+        &record,
+        root_after,
+        false,
+    )?;
+    let persisted_root = profile.finish_ticket_operation(&record, &ticket_id, &payload)?;
+    debug_assert_eq!(persisted_root, root_after);
     Ok(ticket_summary)
 }
 
@@ -2859,8 +3160,8 @@ pub fn add_ticket_relation(
     let payload = ticket.encode()?;
     let base_root = profile.profile_root()?;
     profile.put_ticket(&ticket)?;
-    if let Some(replaced) = replaced {
-        profile.remove_relation_projection(&ticket.ticket_id, &replaced)?;
+    if let Some(replaced) = &replaced {
+        profile.remove_relation_projection(&ticket.ticket_id, replaced)?;
     }
     let edge_id = profile.upsert_relation_projection(&ticket.ticket_id, &relation)?;
     let root_after = profile.next_profile_root()?;
@@ -2884,17 +3185,33 @@ pub fn add_ticket_relation(
             validation: None,
         },
     )?;
-    profile.append_operation(&record)?;
-    let persisted_root = profile.finish_operation()?;
-    debug_assert_eq!(persisted_root, root_after);
-    update_ticket_revision_index(
-        loom,
-        workspace,
+    put_ticket_current_record(
+        &mut profile,
         request.workspace_id,
-        &ticket.ticket_id,
-        &record,
-        &payload,
+        &ticket,
+        root_after,
+        None,
     )?;
+    if let Some(replaced) = &replaced {
+        delete_relation_current_record(
+            &mut profile,
+            request.workspace_id,
+            &ticket.project_id,
+            &ticket.ticket_id,
+            replaced,
+        )?;
+    }
+    put_relation_current_record(
+        &mut profile,
+        request.workspace_id,
+        &ticket.project_id,
+        &ticket.ticket_id,
+        &relation,
+        root_after,
+    )?;
+    profile.append_operation(&record)?;
+    let persisted_root = profile.finish_ticket_operation(&record, &ticket.ticket_id, &payload)?;
+    debug_assert_eq!(persisted_root, root_after);
     Ok(relation_summary(
         request.workspace_id,
         &ticket.ticket_id,
@@ -2948,17 +3265,23 @@ pub fn remove_ticket_relation(
             validation: None,
         },
     )?;
-    profile.append_operation(&record)?;
-    let persisted_root = profile.finish_operation()?;
-    debug_assert_eq!(persisted_root, root_after);
-    update_ticket_revision_index(
-        loom,
-        workspace,
+    put_ticket_current_record(
+        &mut profile,
         request.workspace_id,
-        &ticket.ticket_id,
-        &record,
-        &payload,
+        &ticket,
+        root_after,
+        None,
     )?;
+    delete_relation_current_record(
+        &mut profile,
+        request.workspace_id,
+        &ticket.project_id,
+        &ticket.ticket_id,
+        &relation,
+    )?;
+    profile.append_operation(&record)?;
+    let persisted_root = profile.finish_ticket_operation(&record, &ticket.ticket_id, &payload)?;
+    debug_assert_eq!(persisted_root, root_after);
     Ok(relation_summary(
         request.workspace_id,
         &ticket.ticket_id,
@@ -3024,7 +3347,38 @@ pub fn list_ticket_comments(
         Err(error) if error.code == Code::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    profile.comments(&ticket_id)
+    let Some(ticket) = profile.ticket(&ticket_id)? else {
+        return Ok(Vec::new());
+    };
+    let project_id = ticket.project_id;
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("tickets.comments.list"))?;
+    profile
+        .comments(&ticket_id)?
+        .into_iter()
+        .map(|base_comment| {
+            let record_id = format!("{ticket_id}/{}", base_comment.comment_id);
+            crate::read_workflow_current_record(
+                &snapshot,
+                workspace_id,
+                &project_id,
+                WorkflowCurrentRecordKind::Comment,
+                &record_id,
+                |_| {
+                    workflow_current_base_payload(
+                        workspace_id,
+                        &project_id,
+                        WorkflowCurrentRecordKind::Comment,
+                        &record_id,
+                        base_comment.encode()?,
+                    )
+                    .map(Some)
+                },
+            )?
+            .map(|record| TicketComment::decode(&record.payload))
+            .transpose()
+            .map(|current| current.unwrap_or(base_comment))
+        })
+        .collect()
 }
 
 pub fn update_ticket_comment(
@@ -3263,7 +3617,36 @@ pub fn get_ticket_with_projection(
     };
     let resolved = resolve_ticket_id(&profile, ticket_id);
     let ticket = match resolved {
-        Ok(ticket_id) => profile.ticket(&ticket_id)?,
+        Ok(ticket_id) => {
+            let base_ticket = profile.ticket(&ticket_id)?;
+            match base_ticket {
+                Some(ticket) => {
+                    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("tickets.get"))?;
+                    let current = crate::read_workflow_current_record(
+                        &snapshot,
+                        workspace_id,
+                        &ticket.project_id,
+                        WorkflowCurrentRecordKind::Ticket,
+                        &ticket.ticket_id,
+                        |_| {
+                            workflow_current_base_payload(
+                                workspace_id,
+                                &ticket.project_id,
+                                WorkflowCurrentRecordKind::Ticket,
+                                &ticket.ticket_id,
+                                ticket.encode()?,
+                            )
+                            .map(Some)
+                        },
+                    )?;
+                    match current {
+                        Some(record) => Some(Ticket::decode(&record.payload)?),
+                        None => None,
+                    }
+                }
+                None => None,
+            }
+        }
         Err(error) if error.code == Code::NotFound => None,
         Err(error) => return Err(error),
     };
@@ -3937,11 +4320,15 @@ where
     summary.comments = compact_ticket_comments(&profile.comments(&ticket.ticket_id)?);
     let ticket_id = ticket.ticket_id.clone();
     profile.append_operation(&record)?;
-    let persisted_root = profile.finish_operation()?;
+    emit_ticket_change_notification(
+        profile.loom_mut(),
+        workspace,
+        workspace_id,
+        &ticket_id,
+        &record,
+    )?;
+    let persisted_root = profile.finish_ticket_operation(&record, &ticket_id, &payload)?;
     debug_assert_eq!(persisted_root, root_after);
-    drop(profile);
-    update_ticket_revision_index(loom, workspace, workspace_id, &ticket_id, &record, &payload)?;
-    emit_ticket_change_notification(loom, workspace, workspace_id, &ticket_id, &record)?;
     Ok(summary)
 }
 
@@ -3986,48 +4373,274 @@ fn ticket_change_stream(workspace_id: &str) -> String {
     format!("tickets:{workspace_id}:changes")
 }
 
-fn update_ticket_revision_index(
-    loom: &mut Loom<FileStore>,
-    workspace: WorkspaceId,
+fn put_project_current_record(
+    profile: &mut IndexedTicketProfile<'_>,
     workspace_id: &str,
-    ticket_id: &str,
-    record: &TicketOperationRecord,
-    payload: &[u8],
+    project: &TicketProject,
+    operation_root: Digest,
 ) -> Result<()> {
-    let index_path = revision_index_path(workspace_id)?;
-    let index = match loom.read_file_reserved(workspace, &index_path) {
-        Ok(bytes) => RevisionIndex::decode(&bytes)?,
-        Err(e) if e.code == Code::NotFound => RevisionIndex::new(),
-        Err(e) => return Err(e),
-    };
-    let envelope = OperationEnvelope::decode(&record.envelope)?;
-    let entity_id = format!("ticket:{ticket_id}");
-    let expected_latest_revision = index
-        .latest(&entity_id)
-        .map(|entry| entry.revision)
-        .unwrap_or(0);
-    let mut state = ProfileTransactionState::new(record.root_after, index);
-    let update = ProfileRevisionUpdate::new(
-        entity_id,
-        record.operation_id.clone(),
-        BodyRef::new(
-            Digest::hash(loom.store().digest_algo(), payload),
-            payload.len() as u64,
-            "application/vnd.uldren.loom.ticket.ticket+cbor",
-        )?,
-        envelope.timestamp_ms,
-        format!("{ticket_id}:{}", record.sequence),
-        Some(expected_latest_revision),
-    )?;
-    state.apply(ProfileTransaction::new(
+    let record = WorkflowCurrentRecord::new(
         workspace_id,
-        None,
-        record.root_after,
-        vec![update],
-    )?)?;
-    let index = state.into_revision_index();
-    loom.create_directory_reserved(workspace, REVISION_INDEX_DIR, true)?;
-    loom.write_file_reserved(workspace, &index_path, &index.encode()?, 0o100644)
+        &project.project_id,
+        WorkflowCurrentRecordKind::Project,
+        &project.project_id,
+        project.encode()?,
+        Some(operation_root),
+    )?;
+    profile.put_workflow_current_record(&record)
+}
+
+fn put_ticket_current_record(
+    profile: &mut IndexedTicketProfile<'_>,
+    workspace_id: &str,
+    ticket: &Ticket,
+    operation_root: Digest,
+    prior_ticket: Option<&Ticket>,
+) -> Result<()> {
+    let record = WorkflowCurrentRecord::new(
+        workspace_id,
+        &ticket.project_id,
+        WorkflowCurrentRecordKind::Ticket,
+        &ticket.ticket_id,
+        ticket.encode()?,
+        Some(operation_root),
+    )?;
+    let indexes = ticket_workflow_secondary_index_updates(workspace_id, prior_ticket, ticket)?;
+    profile
+        .put_workflow_current_records_indexed(
+            &[record],
+            indexes,
+            Some(&format!("ticket:{}:{operation_root}", ticket.ticket_id)),
+        )
+        .map(|_| ())
+}
+
+fn put_comment_current_record(
+    profile: &mut IndexedTicketProfile<'_>,
+    workspace_id: &str,
+    project_id: &str,
+    ticket_id: &str,
+    comment: &TicketComment,
+    operation_root: Digest,
+) -> Result<()> {
+    let record_id = format!("{ticket_id}/{}", comment.comment_id);
+    let record = WorkflowCurrentRecord::new(
+        workspace_id,
+        project_id,
+        WorkflowCurrentRecordKind::Comment,
+        &record_id,
+        comment.encode()?,
+        Some(operation_root),
+    )?;
+    profile
+        .put_workflow_current_records_indexed(
+            &[record],
+            vec![crate::workflow_current_secondary_index_put(
+                workspace_id,
+                project_id,
+                "comment-by-ticket",
+                ticket_id,
+                &comment.comment_id,
+                comment.comment_id.as_bytes().to_vec(),
+            )?],
+            Some(&format!(
+                "comment:{ticket_id}:{}:{operation_root}",
+                comment.comment_id
+            )),
+        )
+        .map(|_| ())
+}
+
+fn relation_current_record_id(ticket_id: &str, relation_id: &str) -> String {
+    format!("{ticket_id}/{relation_id}")
+}
+
+fn put_relation_current_record(
+    profile: &mut IndexedTicketProfile<'_>,
+    workspace_id: &str,
+    project_id: &str,
+    ticket_id: &str,
+    relation: &TicketRelation,
+    operation_root: Digest,
+) -> Result<()> {
+    let record_id = relation_current_record_id(ticket_id, &relation.relation_id);
+    let record = WorkflowCurrentRecord::new(
+        workspace_id,
+        project_id,
+        WorkflowCurrentRecordKind::Relation,
+        &record_id,
+        relation.encode()?,
+        Some(operation_root),
+    )?;
+    profile
+        .put_workflow_current_records_indexed(
+            &[record],
+            vec![
+                crate::workflow_current_secondary_index_put(
+                    workspace_id,
+                    project_id,
+                    "relation-by-source",
+                    ticket_id,
+                    &record_id,
+                    record_id.as_bytes().to_vec(),
+                )?,
+                crate::workflow_current_secondary_index_put(
+                    workspace_id,
+                    project_id,
+                    "relation-by-target",
+                    &relation.target_id,
+                    &record_id,
+                    ticket_id.as_bytes().to_vec(),
+                )?,
+            ],
+            Some(&format!(
+                "relation:{ticket_id}:{}:{operation_root}",
+                relation.relation_id
+            )),
+        )
+        .map(|_| ())
+}
+
+fn delete_relation_current_record(
+    profile: &mut IndexedTicketProfile<'_>,
+    workspace_id: &str,
+    project_id: &str,
+    ticket_id: &str,
+    relation: &TicketRelation,
+) -> Result<()> {
+    let record_id = relation_current_record_id(ticket_id, &relation.relation_id);
+    profile.delete_workflow_current_record_indexed(
+        workspace_id,
+        project_id,
+        WorkflowCurrentRecordKind::Relation,
+        &record_id,
+        vec![
+            crate::workflow_current_secondary_index_delete(
+                workspace_id,
+                project_id,
+                "relation-by-source",
+                ticket_id,
+                &record_id,
+            )?,
+            crate::workflow_current_secondary_index_delete(
+                workspace_id,
+                project_id,
+                "relation-by-target",
+                &relation.target_id,
+                &record_id,
+            )?,
+        ],
+    )
+}
+
+fn put_board_current_record(
+    profile: &mut IndexedTicketProfile<'_>,
+    workspace_id: &str,
+    board: &TicketBoard,
+    operation_root: Digest,
+) -> Result<()> {
+    let record = WorkflowCurrentRecord::new(
+        workspace_id,
+        &board.project_id,
+        WorkflowCurrentRecordKind::Board,
+        &board.board_id,
+        board.encode()?,
+        Some(operation_root),
+    )?;
+    profile.put_workflow_current_record(&record)
+}
+
+fn ticket_workflow_secondary_indexes(
+    workspace_id: &str,
+    ticket: &Ticket,
+) -> Result<Vec<SecondaryIndexWrite>> {
+    let mut indexes = Vec::new();
+    indexes.push(crate::workflow_current_secondary_index_put(
+        workspace_id,
+        &ticket.project_id,
+        "ticket-id",
+        &ticket.ticket_id,
+        &ticket.ticket_id,
+        ticket.ticket_id.as_bytes().to_vec(),
+    )?);
+    for field in [
+        "status",
+        "assignee",
+        "priority",
+        "bucket",
+        "lane_owner",
+        "parent_ticket",
+        "queue_lane",
+    ] {
+        if let Some(value) =
+            ticket_named_field_text(ticket, field).filter(|value| !value.is_empty())
+        {
+            indexes.push(crate::workflow_current_secondary_index_put(
+                workspace_id,
+                &ticket.project_id,
+                field,
+                &value,
+                &ticket.ticket_id,
+                ticket.ticket_id.as_bytes().to_vec(),
+            )?);
+        }
+    }
+    for label in &ticket.policy_labels {
+        indexes.push(crate::workflow_current_secondary_index_put(
+            workspace_id,
+            &ticket.project_id,
+            "policy-label",
+            label,
+            &ticket.ticket_id,
+            ticket.ticket_id.as_bytes().to_vec(),
+        )?);
+    }
+    Ok(indexes)
+}
+
+fn ticket_workflow_secondary_index_updates(
+    workspace_id: &str,
+    prior_ticket: Option<&Ticket>,
+    ticket: &Ticket,
+) -> Result<Vec<SecondaryIndexWrite>> {
+    let mut indexes = ticket_workflow_secondary_indexes(workspace_id, ticket)?;
+    if let Some(prior_ticket) = prior_ticket {
+        let current_keys = indexes
+            .iter()
+            .map(|write| write.index.clone())
+            .collect::<BTreeSet<_>>();
+        for write in ticket_workflow_secondary_index_deletes(workspace_id, prior_ticket)? {
+            if !current_keys.contains(&write.index) {
+                indexes.push(write);
+            }
+        }
+    }
+    Ok(indexes)
+}
+
+fn ticket_workflow_secondary_index_deletes(
+    workspace_id: &str,
+    ticket: &Ticket,
+) -> Result<Vec<SecondaryIndexWrite>> {
+    ticket_workflow_secondary_indexes(workspace_id, ticket)?
+        .into_iter()
+        .map(|write| {
+            Ok(SecondaryIndexWrite {
+                index: write.index,
+                op: loom_core::SecondaryIndexWriteOp::Delete,
+            })
+        })
+        .collect()
+}
+
+fn workflow_current_base_payload(
+    workspace_id: &str,
+    project_id: &str,
+    kind: WorkflowCurrentRecordKind,
+    record_id: &str,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>> {
+    WorkflowCurrentRecord::new(workspace_id, project_id, kind, record_id, payload, None)?.encode()
 }
 
 fn operation_record(
@@ -5091,7 +5704,12 @@ fn enforce_acceptance_evidence(
         }
         return Err(LoomError::new(
             Code::InvalidArgument,
-            format!("ticket acceptance requires structured evidence key `{field_name}`"),
+            format!(
+                "ticket acceptance requires structured evidence key `{field_name}` ({}); \
+                 allowed keys: {}",
+                key.meaning(),
+                TicketAcceptanceEvidenceKey::allowed_keys_display()
+            ),
         ));
     }
     Ok(())
@@ -5340,6 +5958,31 @@ pub fn enqueue_ticket_reference_candidates(
     workspace: WorkspaceId,
     request: TicketReferenceCandidateRequest<'_>,
 ) -> Result<bool> {
+    let mut resolutions = BTreeMap::new();
+    if let Some(profile) = TicketProfileReader::open(loom, workspace, request.workspace_id)? {
+        for value in request.fields.values() {
+            let Some(text) = json_field_text(value) else {
+                continue;
+            };
+            for (_, _, key, _) in ticket_key_occurrences(&text) {
+                if resolutions.contains_key(&key) {
+                    continue;
+                }
+                if let Some(resolution) = profile.resolve_ticket_key(&key)? {
+                    resolutions.insert(key, resolution.ticket_id);
+                }
+            }
+        }
+    }
+    enqueue_ticket_reference_candidates_with_resolutions(loom, workspace, request, &resolutions)
+}
+
+fn enqueue_ticket_reference_candidates_with_resolutions(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    request: TicketReferenceCandidateRequest<'_>,
+    resolutions: &BTreeMap<String, String>,
+) -> Result<bool> {
     let mut queued = false;
     for (field, value) in request.fields {
         let Some(text) = json_field_text(value) else {
@@ -5348,14 +5991,12 @@ pub fn enqueue_ticket_reference_candidates(
         let source =
             ReferenceSource::new("tickets", request.workspace_id, request.ticket_id, field)?;
         for (span_start, span_end, key, evidence) in ticket_key_occurrences(&text) {
-            if let Some(profile) = TicketProfileReader::open(loom, workspace, request.workspace_id)?
-                && let Some(resolution) = profile.resolve_ticket_key(&key)?
-            {
+            if let Some(ticket_id) = resolutions.get(&key) {
                 let mut index = loom_reference::load_index(loom, workspace)?
                     .unwrap_or_else(ReferenceIndex::new);
                 index.add(ReferenceEdge::new(
                     source.clone(),
-                    EntityRef::parse(&format!("ticket:{}", resolution.ticket_id))?,
+                    EntityRef::parse(&format!("ticket:{ticket_id}"))?,
                     "refers_to",
                     span_start,
                     span_end,
@@ -5384,6 +6025,61 @@ pub fn enqueue_ticket_reference_candidates(
         }
     }
     Ok(queued)
+}
+
+fn stage_ticket_reference_state(
+    profile: &mut IndexedTicketProfile<'_>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    ticket: &Ticket,
+    record: &TicketOperationRecord,
+    source_root: Digest,
+    enqueue_candidates: bool,
+) -> Result<()> {
+    let fields = ticket
+        .fields
+        .iter()
+        .map(|(field, value)| (field.clone(), value.to_json()))
+        .collect::<BTreeMap<_, _>>();
+    let mut resolutions = BTreeMap::new();
+    if enqueue_candidates {
+        for value in fields.values() {
+            let Some(text) = json_field_text(value) else {
+                continue;
+            };
+            for (_, _, key, _) in ticket_key_occurrences(&text) {
+                if resolutions.contains_key(&key) {
+                    continue;
+                }
+                if let Some(resolution) = profile.resolve_ticket_key(&key)? {
+                    resolutions.insert(key, resolution.ticket_id);
+                }
+            }
+        }
+    }
+    update_ticket_field_references(
+        profile.loom_mut(),
+        workspace,
+        workspace_id,
+        &ticket.ticket_id,
+        &fields,
+    )?;
+    if enqueue_candidates {
+        enqueue_ticket_reference_candidates_with_resolutions(
+            profile.loom_mut(),
+            workspace,
+            TicketReferenceCandidateRequest {
+                workspace_id,
+                ticket_id: &ticket.ticket_id,
+                operation_id: &record.operation_id,
+                source_root,
+                fields: &fields,
+                now_ms: now_ms(),
+            },
+            &resolutions,
+        )?;
+    }
+    Ok(())
 }
 
 trait TicketProfileLookup {
@@ -5586,10 +6282,58 @@ fn ticket_key_occurrences(text: &str) -> Vec<(usize, usize, String, String)> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
-    use loom_core::{AclEffect, AclGrant, AclScope, AclSubject, IdentityStore, PrincipalKind};
-    use loom_store::{FileStore, MemoryBacking};
+    use loom_core::workspace::FacetKind;
+    use loom_core::{
+        AclEffect, AclGrant, AclScope, AclSubject, Algo, IdentityStore, PrincipalKind,
+    };
+    use loom_store::{BackingIo, FileStore, MemoryBacking, loom_over_backing, save_loom};
+    use loom_substrate::versioning::load_current_revision_index;
+
+    #[derive(Clone, Debug, Default)]
+    struct SharedBacking(Arc<Mutex<Vec<u8>>>);
+
+    impl BackingIo for SharedBacking {
+        fn pread(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            let g = self.0.lock().unwrap();
+            let off = off as usize;
+            let end = off + buf.len();
+            if end > g.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "eof",
+                ));
+            }
+            buf.copy_from_slice(&g[off..end]);
+            Ok(())
+        }
+
+        fn pwrite(&mut self, off: u64, buf: &[u8]) -> std::io::Result<()> {
+            let mut g = self.0.lock().unwrap();
+            let off = off as usize;
+            let end = off + buf.len();
+            if end > g.len() {
+                g.resize(end, 0);
+            }
+            g[off..end].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn size(&self) -> std::io::Result<u64> {
+            Ok(self.0.lock().unwrap().len() as u64)
+        }
+
+        fn grow(&mut self, len: u64) -> std::io::Result<()> {
+            self.0.lock().unwrap().resize(len as usize, 0);
+            Ok(())
+        }
+
+        fn fsync(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn ticket_list_cursor_round_trips_and_rejects_garbage() {
@@ -6342,6 +7086,34 @@ mod tests {
     }
 
     #[test]
+    fn ticket_field_catalog_documents_strict_writes_and_import_only_infer() {
+        let catalog = ticket_field_catalog(None, Some("create")).unwrap();
+        // The catalog carries a human-readable write contract so agents do not
+        // have to read source to learn strict-vs-infer behavior.
+        assert_eq!(
+            catalog.unknown_field_write_behavior,
+            UNKNOWN_FIELD_WRITE_BEHAVIOR
+        );
+        let behavior = catalog.unknown_field_write_behavior.to_lowercase();
+        assert!(behavior.contains("strict"), "{behavior}");
+        assert!(behavior.contains("infer"), "{behavior}");
+        assert!(
+            behavior.contains("import"),
+            "infer must be documented as import-only: {behavior}"
+        );
+        // The fields an agent is told not to guess about are present and typed.
+        for name in ["title", "description", "assignee", "status"] {
+            assert!(
+                catalog
+                    .fields
+                    .iter()
+                    .any(|field| field.native_field == name),
+                "core field `{name}` must be discoverable"
+            );
+        }
+    }
+
+    #[test]
     fn ticket_field_definition_write_updates_project_catalog() {
         let (mut loom, namespace, _admin, _writer) = authenticated_ticket_loom();
         let workspace_id = namespace.to_string();
@@ -6939,6 +7711,100 @@ mod tests {
     }
 
     #[test]
+    fn ticket_revision_index_survives_store_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "uldren-loom-ticket-revision-{}-{}.loom",
+            std::process::id(),
+            now_ms()
+        ));
+        let namespace = pid(9);
+        let workspace_id = namespace.to_string();
+        let mut loom = Loom::new(FileStore::create_with_profile(&path, Algo::Blake3).unwrap());
+        create_project(
+            &mut loom,
+            namespace,
+            &workspace_id,
+            "matrix",
+            "MX",
+            "Matrix",
+            None,
+        )
+        .unwrap();
+        let ticket = create_ticket(
+            &mut loom,
+            namespace,
+            TicketCreateRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                ticket_type: "task",
+                external_source: None,
+                external_id: None,
+                fields: &serde_json::json!({"status": "ready"}),
+                policy_labels: &[],
+                expected_root: None,
+            },
+        )
+        .unwrap();
+        let entity_id = format!("ticket:{}", ticket.ticket_id);
+        let index = load_current_revision_index(&loom, namespace, &workspace_id).unwrap();
+        assert_eq!(index.latest(&entity_id).unwrap().revision, 1);
+        drop(loom);
+
+        let reopened = Loom::new(FileStore::open(&path).unwrap());
+        let index = load_current_revision_index(&reopened, namespace, &workspace_id).unwrap();
+        assert_eq!(index.latest(&entity_id).unwrap().revision, 1);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ticket_reference_state_survives_store_reopen_without_facade_sync() {
+        let shared = SharedBacking::default();
+        let mut loom = loom_over_backing(Box::new(shared.clone()), true).unwrap();
+        let namespace = pid(10);
+        let workspace_id = namespace.to_string();
+        create_project(
+            &mut loom,
+            namespace,
+            &workspace_id,
+            "matrix",
+            "MX",
+            "Matrix",
+            None,
+        )
+        .unwrap();
+        create_ticket(
+            &mut loom,
+            namespace,
+            TicketCreateRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                ticket_type: "task",
+                external_source: None,
+                external_id: None,
+                fields: &serde_json::json!({
+                    "status": "ready",
+                    "description": "Waiting for !ticket:OTHER-42"
+                }),
+                policy_labels: &[],
+                expected_root: None,
+            },
+        )
+        .unwrap();
+        save_loom(&mut loom).unwrap();
+        drop(loom);
+
+        let reopened = loom_over_backing(Box::new(shared), true).unwrap();
+        let index = loom_reference::load_index(&reopened, namespace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.edges().len(), 1);
+        let targets = loom_reference::targets(&reopened, namespace).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].pending, 1);
+    }
+
+    #[test]
     fn lifecycle_policy_configuration_requires_admin_authorization() {
         let (mut loom, namespace, _admin, writer) = authenticated_ticket_loom();
         let workspace_id = namespace.to_string();
@@ -7217,6 +8083,21 @@ mod tests {
         assert_eq!(updated.default_projection, "jira");
         assert!(updated.enabled_projections.contains(&"jira".to_string()));
         assert!(!updated.enabled_projections.contains(&"asana".to_string()));
+        let updated_json = serde_json::to_value(&updated).unwrap();
+        assert_eq!(
+            updated_json["enabled_projections"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(
+            updated_json["enabled_projections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|profile| profile == "jira")
+        );
         assert_eq!(updated.lifecycle_authorization_policy, "review_authority");
         assert_eq!(
             updated.project_owner_principal.as_deref(),
@@ -8212,7 +9093,7 @@ mod tests {
                 external_id: None,
                 fields: &serde_json::json!({"status": "planned"}),
                 policy_labels: &[],
-                expected_root: Some(&source.profile_root),
+                expected_root: None,
             },
         )
         .unwrap();
@@ -8323,6 +9204,539 @@ mod tests {
         let comments =
             list_ticket_comments(&loom, namespace, &workspace_id, &failing.ticket_id).unwrap();
         assert!(comments.is_empty());
+    }
+
+    #[test]
+    fn relation_current_record_survives_reopen() {
+        let shared = SharedBacking::default();
+        let mut loom = loom_over_backing(Box::new(shared.clone()), true).unwrap();
+        let namespace = pid(44);
+        let workspace_id = namespace.to_string();
+        create_project(
+            &mut loom,
+            namespace,
+            &workspace_id,
+            "matrix",
+            "MX",
+            "Matrix",
+            None,
+        )
+        .unwrap();
+        let source = create_ticket(
+            &mut loom,
+            namespace,
+            TicketCreateRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                ticket_type: "task",
+                external_source: None,
+                external_id: None,
+                fields: &serde_json::json!({"status": "planned", "title": "Blocked"}),
+                policy_labels: &[],
+                expected_root: None,
+            },
+        )
+        .unwrap();
+        let target = create_ticket(
+            &mut loom,
+            namespace,
+            TicketCreateRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                ticket_type: "task",
+                external_source: None,
+                external_id: None,
+                fields: &serde_json::json!({"status": "planned", "title": "Dependency"}),
+                policy_labels: &[],
+                expected_root: Some(&source.profile_root),
+            },
+        )
+        .unwrap();
+        add_ticket_relation(
+            &mut loom,
+            namespace,
+            TicketRelationRequest {
+                workspace_id: &workspace_id,
+                ticket_id: &source.ticket_id,
+                relation_id: Some("dependency"),
+                kind: TicketRelationKind::DependsOn,
+                target_id: &target.ticket_id,
+                expected_root: Some(&target.profile_root),
+            },
+        )
+        .unwrap();
+        save_loom(&mut loom).unwrap();
+        drop(loom);
+
+        let reopened = loom_over_backing(Box::new(shared), true).unwrap();
+        let snapshot = reopened
+            .open_mutable_overlay_read_snapshot(Some("tickets.relation-current.test"))
+            .unwrap();
+        let current = crate::read_workflow_current_record(
+            &snapshot,
+            &workspace_id,
+            "matrix",
+            WorkflowCurrentRecordKind::Relation,
+            &relation_current_record_id(&source.ticket_id, "dependency"),
+            |_| Ok(None),
+        )
+        .unwrap()
+        .unwrap();
+        let relation = TicketRelation::decode(&current.payload).unwrap();
+        assert_eq!(relation.kind, TicketRelationKind::DependsOn);
+        assert_eq!(relation.target_id, target.ticket_id);
+    }
+
+    #[test]
+    fn project_settings_writes_project_current_record() {
+        let (mut loom, namespace, admin, _writer) = authenticated_ticket_loom();
+        let workspace_id = namespace.to_string();
+        let project = create_project(
+            &mut loom,
+            namespace,
+            &workspace_id,
+            "matrix",
+            "MX",
+            "Matrix",
+            None,
+        )
+        .unwrap();
+        let admin_principal = admin.to_string();
+        set_project_settings(
+            &mut loom,
+            namespace,
+            TicketProjectSettingsRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                default_projection: Some(TicketProjectionProfile::Jira),
+                enable_projections: &[TicketProjectionProfile::Jira],
+                disable_projections: &[],
+                actor_enforcement: Some(TicketLifecycleAuthorizationPolicy::ReviewAuthority),
+                project_owner_principal: Some(&admin_principal),
+                clear_project_owner_principal: false,
+                acceptance_authorities: None,
+                acceptance_evidence_enforcement: None,
+                required_acceptance_evidence_keys: None,
+                owner_contract_summary: Some("Owner checks finished work."),
+                owner_contract_details: None,
+                worker_contract_summary: None,
+                worker_contract_details: None,
+                expected_root: Some(&project.profile_root),
+            },
+        )
+        .unwrap();
+        let snapshot = loom
+            .open_mutable_overlay_read_snapshot(Some("tickets.project-current.test"))
+            .unwrap();
+        let current = crate::read_workflow_current_record(
+            &snapshot,
+            &workspace_id,
+            "matrix",
+            WorkflowCurrentRecordKind::Project,
+            "matrix",
+            |_| Ok(None),
+        )
+        .unwrap()
+        .unwrap();
+        let project = TicketProject::decode(&current.payload).unwrap();
+        assert_eq!(
+            project.projection_config.default_display_projection,
+            TicketProjectionProfile::Jira
+        );
+        assert_eq!(
+            project.contracts.owner.summary,
+            "Owner checks finished work."
+        );
+    }
+
+    #[test]
+    fn ticket_update_writes_overlay_current_record() {
+        let (mut loom, namespace, _admin, _writer) = authenticated_ticket_loom();
+        let workspace_id = namespace.to_string();
+        create_project(
+            &mut loom,
+            namespace,
+            &workspace_id,
+            "matrix",
+            "MX",
+            "Matrix",
+            None,
+        )
+        .unwrap();
+        let created = create_ticket(
+            &mut loom,
+            namespace,
+            TicketCreateRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                ticket_type: "task",
+                external_source: None,
+                external_id: None,
+                fields: &serde_json::json!({"status": "planned", "title": "Before"}),
+                policy_labels: &[],
+                expected_root: None,
+            },
+        )
+        .unwrap();
+        let updated = update_ticket(
+            &mut loom,
+            namespace,
+            TicketUpdateRequest {
+                workspace_id: &workspace_id,
+                ticket_id: &created.ticket_id,
+                set_fields: Some(&serde_json::json!({"title": "After"})),
+                delete_fields: &[],
+                action: None,
+                target_status: None,
+                observed_source_status: None,
+                observed_workflow_version: None,
+                assignee: None,
+                expected_root: Some(&created.profile_root),
+                comment: None,
+                comments: &[],
+                relation_sets: &[],
+                relation_removes: &[],
+            },
+        )
+        .unwrap();
+        let health = loom.mutable_overlay().health().unwrap();
+        assert!(health.current_record_count >= 2);
+        assert!(health.hot_write_count >= 3);
+        let maintenance = loom.store().store_maintenance_report(100).unwrap();
+        assert!(maintenance.overlay_health.current_record_count >= 2);
+        assert!(maintenance.overlay_health.hot_write_count >= 3);
+        let snapshot = loom
+            .open_mutable_overlay_read_snapshot(Some("tickets.update-current.test"))
+            .unwrap();
+        let record = crate::read_workflow_current_record(
+            &snapshot,
+            &workspace_id,
+            "matrix",
+            WorkflowCurrentRecordKind::Ticket,
+            &created.ticket_id,
+            |_| Ok(None),
+        )
+        .unwrap()
+        .unwrap();
+        let ticket = Ticket::decode(&record.payload).unwrap();
+        assert_eq!(ticket.fields["title"].to_json(), serde_json::json!("After"));
+        let status_index = crate::workflow_current_secondary_index_key(
+            &workspace_id,
+            "matrix",
+            "status",
+            "planned",
+            &created.ticket_id,
+        )
+        .unwrap();
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&status_index)
+                .unwrap()
+                .as_deref(),
+            Some(created.ticket_id.as_bytes())
+        );
+        let read = get_ticket(&loom, namespace, &workspace_id, &created.ticket_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.fields["title"], updated.fields["title"]);
+    }
+
+    #[test]
+    fn ticket_stale_index_entries_are_tombstoned_on_status_change() {
+        let (mut loom, namespace, _admin, _writer) = authenticated_ticket_loom();
+        let workspace_id = namespace.to_string();
+        create_project(
+            &mut loom,
+            namespace,
+            &workspace_id,
+            "matrix",
+            "MX",
+            "Matrix",
+            None,
+        )
+        .unwrap();
+        let created = create_ticket(
+            &mut loom,
+            namespace,
+            TicketCreateRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                ticket_type: "task",
+                external_source: None,
+                external_id: None,
+                fields: &serde_json::json!({"status": "planned", "title": "Before"}),
+                policy_labels: &[],
+                expected_root: None,
+            },
+        )
+        .unwrap();
+        update_ticket(
+            &mut loom,
+            namespace,
+            TicketUpdateRequest {
+                workspace_id: &workspace_id,
+                ticket_id: &created.ticket_id,
+                set_fields: None,
+                delete_fields: &[],
+                action: None,
+                target_status: Some("in_progress"),
+                observed_source_status: None,
+                observed_workflow_version: None,
+                assignee: None,
+                expected_root: Some(&created.profile_root),
+                comment: None,
+                comments: &[],
+                relation_sets: &[],
+                relation_removes: &[],
+            },
+        )
+        .unwrap();
+
+        let old_status_index = crate::workflow_current_secondary_index_key(
+            &workspace_id,
+            "matrix",
+            "status",
+            "planned",
+            &created.ticket_id,
+        )
+        .unwrap();
+        let new_status_index = crate::workflow_current_secondary_index_key(
+            &workspace_id,
+            "matrix",
+            "status",
+            "in_progress",
+            &created.ticket_id,
+        )
+        .unwrap();
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&old_status_index)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&new_status_index)
+                .unwrap()
+                .as_deref(),
+            Some(created.ticket_id.as_bytes())
+        );
+    }
+
+    #[test]
+    fn ticket_stale_relation_indexes_are_tombstoned_on_replacement() {
+        let (mut loom, namespace, _admin, _writer) = authenticated_ticket_loom();
+        let workspace_id = namespace.to_string();
+        create_project(
+            &mut loom,
+            namespace,
+            &workspace_id,
+            "matrix",
+            "MX",
+            "Matrix",
+            None,
+        )
+        .unwrap();
+        let source = create_ticket(
+            &mut loom,
+            namespace,
+            TicketCreateRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                ticket_type: "task",
+                external_source: None,
+                external_id: None,
+                fields: &serde_json::json!({"status": "planned", "title": "Source"}),
+                policy_labels: &[],
+                expected_root: None,
+            },
+        )
+        .unwrap();
+        let first_target = create_ticket(
+            &mut loom,
+            namespace,
+            TicketCreateRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                ticket_type: "task",
+                external_source: None,
+                external_id: None,
+                fields: &serde_json::json!({"status": "planned", "title": "First"}),
+                policy_labels: &[],
+                expected_root: Some(&source.profile_root),
+            },
+        )
+        .unwrap();
+        let second_target = create_ticket(
+            &mut loom,
+            namespace,
+            TicketCreateRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                ticket_type: "task",
+                external_source: None,
+                external_id: None,
+                fields: &serde_json::json!({"status": "planned", "title": "Second"}),
+                policy_labels: &[],
+                expected_root: None,
+            },
+        )
+        .unwrap();
+
+        let first_relation = [TicketUpdateRelationSetRequest {
+            relation_id: Some("dependency"),
+            kind: TicketRelationKind::DependsOn,
+            target_id: &first_target.ticket_id,
+        }];
+        let related = update_ticket(
+            &mut loom,
+            namespace,
+            TicketUpdateRequest {
+                workspace_id: &workspace_id,
+                ticket_id: &source.ticket_id,
+                set_fields: None,
+                delete_fields: &[],
+                action: None,
+                target_status: None,
+                observed_source_status: None,
+                observed_workflow_version: None,
+                assignee: None,
+                expected_root: None,
+                comment: None,
+                comments: &[],
+                relation_sets: &first_relation,
+                relation_removes: &[],
+            },
+        )
+        .unwrap();
+        let replacement = [TicketUpdateRelationSetRequest {
+            relation_id: Some("dependency"),
+            kind: TicketRelationKind::DependsOn,
+            target_id: &second_target.ticket_id,
+        }];
+        update_ticket(
+            &mut loom,
+            namespace,
+            TicketUpdateRequest {
+                workspace_id: &workspace_id,
+                ticket_id: &source.ticket_id,
+                set_fields: None,
+                delete_fields: &[],
+                action: None,
+                target_status: None,
+                observed_source_status: None,
+                observed_workflow_version: None,
+                assignee: None,
+                expected_root: Some(&related.profile_root),
+                comment: None,
+                comments: &[],
+                relation_sets: &replacement,
+                relation_removes: &[],
+            },
+        )
+        .unwrap();
+
+        let record_id = relation_current_record_id(&source.ticket_id, "dependency");
+        let old_target_index = crate::workflow_current_secondary_index_key(
+            &workspace_id,
+            "matrix",
+            "relation-by-target",
+            &first_target.ticket_id,
+            &record_id,
+        )
+        .unwrap();
+        let new_target_index = crate::workflow_current_secondary_index_key(
+            &workspace_id,
+            "matrix",
+            "relation-by-target",
+            &second_target.ticket_id,
+            &record_id,
+        )
+        .unwrap();
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&old_target_index)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&new_target_index)
+                .unwrap()
+                .as_deref(),
+            Some(source.ticket_id.as_bytes())
+        );
+    }
+
+    #[test]
+    fn ticket_overlay_update_assignee_keeps_assignee_and_display() {
+        // A scalar assignee update on an overlay-current-records store returns through
+        // finish_overlay_only_ticket_update. That return path must expose both the canonical
+        // `assignee` and the resolved `assignee_display`, matching every other projection path.
+        let (mut loom, namespace, _admin, _writer) = authenticated_ticket_loom();
+        let workspace_id = namespace.to_string();
+        create_project(
+            &mut loom,
+            namespace,
+            &workspace_id,
+            "matrix",
+            "MX",
+            "Matrix",
+            None,
+        )
+        .unwrap();
+        let created = create_ticket(
+            &mut loom,
+            namespace,
+            TicketCreateRequest {
+                workspace_id: &workspace_id,
+                project_id: "matrix",
+                ticket_type: "task",
+                external_source: None,
+                external_id: None,
+                fields: &serde_json::json!({"status": "planned", "title": "Assign me"}),
+                policy_labels: &[],
+                expected_root: None,
+            },
+        )
+        .unwrap();
+        let updated = update_ticket(
+            &mut loom,
+            namespace,
+            TicketUpdateRequest {
+                workspace_id: &workspace_id,
+                ticket_id: &created.ticket_id,
+                set_fields: None,
+                delete_fields: &[],
+                action: None,
+                target_status: None,
+                observed_source_status: None,
+                observed_workflow_version: None,
+                assignee: Some("agent:9"),
+                expected_root: Some(&created.profile_root),
+                comment: None,
+                comments: &[],
+                relation_sets: &[],
+                relation_removes: &[],
+            },
+        )
+        .unwrap();
+        // Canonical assignee must be present after the scalar update.
+        assert_eq!(updated.fields["assignee"], serde_json::json!("agent:9"));
+        // The additive display alias must also be present (regression: overlay path used to omit it).
+        assert_eq!(
+            updated.fields.get("assignee_display"),
+            Some(&serde_json::json!("agent:9"))
+        );
+        // Read-back projection stays consistent.
+        let read = get_ticket(&loom, namespace, &workspace_id, &created.ticket_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.fields["assignee"], serde_json::json!("agent:9"));
+        assert_eq!(
+            read.fields.get("assignee_display"),
+            Some(&serde_json::json!("agent:9"))
+        );
     }
 
     #[test]

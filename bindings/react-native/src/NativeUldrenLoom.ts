@@ -911,6 +911,15 @@ export interface Spec extends TurboModule {
     authPrincipal: string,
     authPassphrase: string
   ): Promise<boolean>;
+  docDeleteCollection(
+    loomPath: string,
+    workspace: string,
+    collection: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<boolean>;
   docListBinary(
     loomPath: string,
     workspace: string,

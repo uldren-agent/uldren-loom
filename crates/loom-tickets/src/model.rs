@@ -29,13 +29,21 @@ The owner coordinates the project, reviews completed ticket work, manages lane a
 
 ## Go Contract
 
-When the owner is told to go, read the current project settings, inspect lanes with tickets that are waiting for review, verify completed work, record feedback or acceptance on the ticket, and then decide whether the existing queues need more work. If no completed work needs review, prepare the next useful ticket batch and ask the human owner before adding new scope.
+When starting an owner session, read the project settings and this owner contract once. Acknowledge that the contract has been adopted. Do not reread the contract on every go unless project settings or lane feedback says the contract changed.
+
+When the owner is told to go, inspect lanes with tickets that are waiting for review, verify completed work, record feedback or acceptance on the ticket, and then decide whether the existing queues need more work. If no completed work needs review, prepare the next useful ticket batch and ask the human owner before adding new scope.
 
 ## Review Rules
 
 Accepting a ticket is a correctness and code-review pass, not a cursory source-link inspection. Before accepting, personally inspect the relevant source anchors and verify that the changed code implements the requested behavior, follows the intended architecture, handles relevant edge cases and error paths, and updates public, generated, binding, protocol, test, and documentation surfaces together when contracts change.
 
+If completed work does not meet the original ticket requirement as written, do not accept it as close enough and do not silently redefine the ticket around the delivered implementation. Record the unmet requirement on the ticket with source-backed evidence, move the ticket to feedback_available, blocked, or waiting_for_decision as appropriate, and state the exact owner or worker action needed. If the original requirement appears impossible, unsafe, or materially wrong, ask the human owner before changing scope.
+
 Review feedback belongs on the ticket as a ticket comment. Do not rely on chat-only feedback. Feedback must name the issue, cite the source anchor when source is involved, and state the next action needed from the worker.
+
+## Be Skeptical
+
+Treat all completion claims as suspect. Independently verify the original requirements against the source and real behavior. Do not accept work when requirements, hidden dependencies, failure cases, performance consequences, or unfinished remediation remain unverified.
 
 ## Lane Management
 
@@ -63,7 +71,11 @@ The worker completes tickets assigned to its lane. The worker reads the lane, se
 
 ## Go Contract
 
-When the worker is told to go, read the current project settings and this worker contract, read the assigned lane, check whether the active ticket has feedback, resolve that feedback first, and then continue with the next available ticket in the lane. Do not invent scope. Do not skip dependency or blocker notes on the ticket.
+When starting a worker session or after explicit contract-reset feedback, read the project settings and this worker contract once. Acknowledge that the contract has been adopted on the lane or active ticket. Do not reread the contract on every go unless project settings or lane feedback says the contract changed.
+
+When the worker is told to go, read the assigned lane, check whether the active ticket has feedback, resolve that feedback first, and then continue with the next available ticket in the lane. Do not invent scope. Do not skip dependency or blocker notes on the ticket.
+
+If the original ticket requirement cannot be met as written, do not substitute a narrower implementation, partial workaround, or adjacent solution and present it as complete. Stop work on that ticket, record the unmet requirement on the ticket with source-backed evidence, explain why it cannot be met, and set the ticket to blocked or waiting_for_decision as appropriate. If there is a viable alternative, record it as an option with the tradeoff, but wait for owner or arbiter direction before changing scope.
 
 ## Ticket Source Of Truth
 
@@ -75,9 +87,13 @@ Before changing code, read the authoritative source for every cross-boundary con
 
 Implementation choices must prefer enterprise-quality design, clear contracts, maintainable structure, reusable patterns, efficient execution, source-backed behavior, operational reliability, and long-term project health over short-term convenience.
 
+## Expect Skeptical Review
+
+Assume every completion claim will be challenged against the original requirements, source, and real behavior. Build and verify the work accordingly. Check hidden dependencies, failure cases, performance consequences, and unfinished remediation before requesting review. Do not rely on plausible summaries or passing tests to conceal incomplete behavior.
+
 ## Questions And Blockers
 
-If a real design decision or blocker prevents correct work, stop the ticket, record the question or blocker on the ticket, and summarize it in chat. Questions include Context, Options, and Recommendation. Recommendations must identify the long-term enterprise choice, not merely the easiest implementation.
+If a real design decision, blocker, or unmet original requirement prevents correct work, stop the ticket, record the question or blocker on the ticket, and summarize it in chat. Questions include Context, Options, and Recommendation. Recommendations must identify the long-term enterprise choice, not merely the easiest implementation.
 
 ## Checks And Handoff
 
@@ -179,14 +195,12 @@ impl TicketProjectContracts {
         };
         outer.end("ticket project contracts")?;
         let mut values = raw_fields.into_iter();
-        let first = read_required_value(values.next(), "project contracts note or owner")?;
-        let (note, owner_value) = match first {
-            Value::Text(note) => (note, read_required_value(values.next(), "owner contract")?),
-            value => (TICKET_CONTRACTS_NOTE.to_string(), value),
-        };
         let contracts = Self {
-            note,
-            owner: TicketProjectContract::from_value(owner_value)?,
+            note: read_text_value(values.next(), "project contracts note")?,
+            owner: TicketProjectContract::from_value(read_required_value(
+                values.next(),
+                "owner contract",
+            )?)?,
             worker: TicketProjectContract::from_value(read_required_value(
                 values.next(),
                 "worker contract",
@@ -222,15 +236,6 @@ impl TicketProjectContract {
     }
 
     pub fn from_value(value: Value) -> Result<Self> {
-        if matches!(value, Value::Text(_)) {
-            let details = read_text_value(Some(value), "project contract details")?;
-            let contract = Self {
-                summary: contract_summary_from_details(&details),
-                details,
-            };
-            contract.validate("legacy")?;
-            return Ok(contract);
-        }
         let mut outer = Fields::array(value, "ticket project contract")?;
         outer.expect_text(Self::SCHEMA)?;
         let raw_fields = match outer.next("ticket project contract fields")? {
@@ -255,16 +260,6 @@ impl TicketProjectContract {
         contract.validate("project")?;
         Ok(contract)
     }
-}
-
-fn contract_summary_from_details(details: &str) -> String {
-    details
-        .lines()
-        .find_map(|line| {
-            let line = line.trim();
-            (!line.is_empty() && !line.starts_with('#')).then(|| line.to_string())
-        })
-        .unwrap_or_else(|| "Project contract".to_string())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -426,7 +421,6 @@ pub struct TicketProfileState {
     pub external_ids_root: Digest,
     pub boards_root: Digest,
     pub board_cards_root: Digest,
-    pub board_roots_present: bool,
 }
 
 impl TicketProfileState {
@@ -452,7 +446,6 @@ impl TicketProfileState {
             external_ids_root,
             boards_root,
             board_cards_root,
-            board_roots_present: true,
         };
         validate_text("ticket profile workspace_id", &state.workspace_id)?;
         if state.next_sequence == 0 {
@@ -498,7 +491,6 @@ impl TicketProfileState {
                 "ticket profile state fields must be an array",
             ));
         };
-        let legacy_tail = values.len() == 7;
         let mut fields = Fields::array(Value::Array(values), "ticket profile state")?;
         let workspace_id = fields.text("workspace_id")?;
         let next_sequence = fields.uint("next_sequence")?;
@@ -507,18 +499,10 @@ impl TicketProfileState {
         let tickets_root = fields.digest("tickets_root")?;
         let ticket_numbers_root = fields.digest("ticket_numbers_root")?;
         let external_ids_root = fields.digest("external_ids_root")?;
-        let boards_root = if legacy_tail {
-            external_ids_root
-        } else {
-            fields.digest("boards_root")?
-        };
-        let board_cards_root = if legacy_tail {
-            external_ids_root
-        } else {
-            fields.digest("board_cards_root")?
-        };
+        let boards_root = fields.digest("boards_root")?;
+        let board_cards_root = fields.digest("board_cards_root")?;
         fields.end("ticket profile state")?;
-        let mut state = Self::new(
+        Self::new(
             workspace_id,
             next_sequence,
             projects_root,
@@ -528,9 +512,7 @@ impl TicketProfileState {
             external_ids_root,
             boards_root,
             board_cards_root,
-        )?;
-        state.board_roots_present = !legacy_tail;
-        Ok(state)
+        )
     }
 }
 
@@ -1107,18 +1089,46 @@ impl TicketAcceptanceEvidencePolicy {
     }
 }
 
+/// Canonical, closed set of structured acceptance-evidence keys.
+///
+/// These are the ONLY keys accepted anywhere structured acceptance evidence is
+/// supplied (MCP `tickets_update` comment evidence, CLI comment evidence, and
+/// project `required_acceptance_evidence_keys`). Each key is snake_case and its
+/// meaning is documented next to the variant via [`meaning`](Self::meaning); the
+/// full catalog is exposed for discovery via [`ALL`](Self::ALL) and
+/// [`catalog`](Self::catalog) so callers never have to guess the enum strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TicketAcceptanceEvidenceKey {
+    /// `source_anchors`: authoritative file and line references checked before acceptance.
     SourceAnchors,
+    /// `checks_run`: commands or automated validations executed before acceptance.
     ChecksRun,
+    /// `not_run_rationale`: why expected checks were not run.
     NotRunRationale,
+    /// `files_changed`: files materially changed by the ticket.
     FilesChanged,
+    /// `followups`: known follow-up work left outside this ticket.
     Followups,
+    /// `decision_points`: owner decisions raised or resolved for this ticket.
     DecisionPoints,
+    /// `risk_notes`: risks, caveats, or rollback notes relevant to acceptance.
     RiskNotes,
 }
 
 impl TicketAcceptanceEvidenceKey {
+    /// Every acceptance-evidence key, in canonical order. Discovery surfaces
+    /// (MCP/CLI field catalogs, validation messages) enumerate this rather than
+    /// hard-coding key strings, so the set has exactly one source of truth.
+    pub const ALL: [Self; 7] = [
+        Self::SourceAnchors,
+        Self::ChecksRun,
+        Self::NotRunRationale,
+        Self::FilesChanged,
+        Self::Followups,
+        Self::DecisionPoints,
+        Self::RiskNotes,
+    ];
+
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "source_anchors" => Ok(Self::SourceAnchors),
@@ -1128,8 +1138,46 @@ impl TicketAcceptanceEvidenceKey {
             "followups" => Ok(Self::Followups),
             "decision_points" => Ok(Self::DecisionPoints),
             "risk_notes" => Ok(Self::RiskNotes),
-            _ => Err(LoomError::invalid("unknown ticket acceptance evidence key")),
+            other => Err(LoomError::invalid(format!(
+                "unknown ticket acceptance evidence key `{other}`; allowed keys: {}",
+                Self::allowed_keys_display()
+            ))
+            .with_detail(loom_types::error::ErrorDetail::invalid_field(
+                "acceptance_evidence_key",
+                Some(other.to_string()),
+                Self::ALL.iter().map(|key| key.as_str().to_string()),
+            ))),
         }
+    }
+
+    /// Backtick-quoted, comma-separated list of every allowed key, for use in
+    /// validation error messages so callers see the exact accepted strings.
+    pub fn allowed_keys_display() -> String {
+        Self::ALL
+            .iter()
+            .map(|key| format!("`{}`", key.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The full `(key, meaning)` catalog, for MCP/CLI discovery surfaces that
+    /// document what each structured evidence key is for.
+    pub fn catalog() -> [(&'static str, &'static str); 7] {
+        [
+            (Self::SourceAnchors.as_str(), Self::SourceAnchors.meaning()),
+            (Self::ChecksRun.as_str(), Self::ChecksRun.meaning()),
+            (
+                Self::NotRunRationale.as_str(),
+                Self::NotRunRationale.meaning(),
+            ),
+            (Self::FilesChanged.as_str(), Self::FilesChanged.meaning()),
+            (Self::Followups.as_str(), Self::Followups.meaning()),
+            (
+                Self::DecisionPoints.as_str(),
+                Self::DecisionPoints.meaning(),
+            ),
+            (Self::RiskNotes.as_str(), Self::RiskNotes.meaning()),
+        ]
     }
 
     pub const fn as_str(self) -> &'static str {
@@ -2141,18 +2189,7 @@ impl TicketCoreFields {
     }
 }
 
-pub const NORMALIZED_TICKET_STATUSES: [&str; 10] = [
-    "backlog",
-    "planned",
-    "ready",
-    "in_progress",
-    "blocked",
-    "waiting_for_review",
-    "feedback_available",
-    "accepted",
-    "rejected",
-    "closed",
-];
+pub use loom_types::NORMALIZED_TICKET_STATUSES;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TicketComment {
@@ -2696,6 +2733,16 @@ impl TicketRelation {
             ));
         }
         Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        loom_codec::encode(&self.to_value()).map_err(codec_error)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let value = loom_codec::decode(bytes).map_err(codec_error)?;
+        Self::from_value(value)
     }
 
     fn to_value(&self) -> Value {
@@ -3886,23 +3933,6 @@ impl TicketBoard {
         let Value::Array(values) = value else {
             return Err(LoomError::corrupt("ticket board is not an array"));
         };
-        if values.len() == 4 {
-            let mut fields = Fields::array(Value::Array(values), "ticket board")?;
-            let board_id = fields.text("board_id")?;
-            let project_id = fields.text("project_id")?;
-            let mode = match fields.uint("board mode")? {
-                0 => BoardMode::StatusMapped,
-                1 => BoardMode::Manual,
-                other => {
-                    return Err(LoomError::corrupt(format!(
-                        "unknown board mode tag {other}"
-                    )));
-                }
-            };
-            let columns = board_column_list(fields.next("board columns")?)?;
-            fields.end("ticket board")?;
-            return Self::new(board_id, project_id, mode, columns);
-        }
         let mut fields = Fields::array(Value::Array(values), "ticket board")?;
         let board_id = fields.text("board_id")?;
         let board_key = fields.text("board_key")?;
@@ -4018,18 +4048,13 @@ impl BoardColumn {
         let Value::Array(values) = value else {
             return Err(LoomError::corrupt("board column is not an array"));
         };
-        let legacy = values.len() == 4;
         let mut fields = Fields::array(Value::Array(values), "board column")?;
         let column_id = fields.text("column_id")?;
         let name = fields.text("name")?;
         let mapped_statuses = string_set(fields.next("mapped_statuses")?, "mapped_statuses")?;
         let wip_limit = read_optional_u32_field(&mut fields, "wip_limit")?;
-        let hidden = if legacy {
-            false
-        } else {
-            bool_value(fields.next("hidden")?, "hidden")?
-        };
-        let rank = if legacy { 0 } else { fields.uint("rank")? };
+        let hidden = bool_value(fields.next("hidden")?, "hidden")?;
+        let rank = fields.uint("rank")?;
         fields.end("board column")?;
         Self::with_display(column_id, name, mapped_statuses, wip_limit, hidden, rank)
     }
@@ -5668,6 +5693,83 @@ mod tests {
     use loom_substrate::facilities::DateValue;
     use loom_types::Algo;
 
+    #[test]
+    fn default_project_contracts_match_intended_shape_and_round_trip() {
+        let contracts = TicketProjectContracts::default();
+        // Source defaults: note and full details come from the canonical const contracts.
+        assert_eq!(contracts.note, TICKET_CONTRACTS_NOTE);
+        assert_eq!(contracts.owner.details, TICKET_DEFAULT_OWNER_CONTRACT);
+        assert_eq!(contracts.worker.details, TICKET_DEFAULT_WORKER_CONTRACT);
+        // Summaries are short, non-empty, and distinct from the full details.
+        assert!(!contracts.owner.summary.is_empty());
+        assert!(!contracts.worker.summary.is_empty());
+        assert_ne!(contracts.owner.summary, contracts.owner.details);
+        assert_ne!(contracts.worker.summary, contracts.worker.details);
+        // Intended contract shape: required section headings present for both roles.
+        assert!(contracts.owner.details.contains("# Project Owner Contract"));
+        assert!(
+            contracts
+                .worker
+                .details
+                .contains("# Project Worker Contract")
+        );
+        for details in [&contracts.owner.details, &contracts.worker.details] {
+            assert!(details.contains("## Role"), "missing Role section");
+            assert!(
+                details.contains("## Go Contract"),
+                "missing Go Contract section"
+            );
+            // One-time read contract documented in the source defaults.
+            assert!(
+                details.contains("contract once"),
+                "missing one-time read language"
+            );
+            assert!(
+                details.contains("Do not reread the contract on every go"),
+                "missing do-not-reread language"
+            );
+        }
+        // Encode/decode preserves full details (no collapse to summary/placeholder).
+        let decoded = TicketProjectContracts::from_value(contracts.to_value()).unwrap();
+        assert_eq!(decoded, contracts);
+        assert_eq!(decoded.owner.details, TICKET_DEFAULT_OWNER_CONTRACT);
+        assert_eq!(decoded.worker.details, TICKET_DEFAULT_WORKER_CONTRACT);
+    }
+
+    #[test]
+    fn default_contracts_mandate_ticket_sourced_evidence_not_result_documents() {
+        // The lane/worker guidance delivered at runtime (the project contracts) must direct closeout
+        // evidence to typed ticket comments and first-class ticket fields, and must not instruct the
+        // legacy "write results into a result document" handoff.
+        let worker = TICKET_DEFAULT_WORKER_CONTRACT;
+        assert!(
+            worker.contains("belongs on tickets and ticket comments"),
+            "worker contract must state evidence belongs on tickets and comments"
+        );
+        assert!(
+            worker.contains("closeout evidence on the ticket"),
+            "worker contract must direct closeout evidence to the ticket"
+        );
+        for (role, details) in [
+            ("owner", TICKET_DEFAULT_OWNER_CONTRACT),
+            ("worker", TICKET_DEFAULT_WORKER_CONTRACT),
+        ] {
+            let lowered = details.to_lowercase();
+            assert!(
+                !lowered.contains("result document"),
+                "{role} contract must not instruct writing a result document"
+            );
+            assert!(
+                !lowered.contains("results/"),
+                "{role} contract must not reference results/ handoff documents"
+            );
+            assert!(
+                !lowered.contains("results section"),
+                "{role} contract must not instruct writing a results section document"
+            );
+        }
+    }
+
     fn digest(value: &[u8]) -> Digest {
         Digest::hash(Algo::Blake3, value)
     }
@@ -5684,6 +5786,64 @@ mod tests {
                 TicketFieldValue::List(vec![TicketFieldValue::EnumOption("infra".to_string())]),
             ),
         ])
+    }
+
+    #[test]
+    fn evidence_key_parse_round_trips_all_canonical_keys() {
+        for key in TicketAcceptanceEvidenceKey::ALL {
+            assert_eq!(
+                TicketAcceptanceEvidenceKey::parse(key.as_str()).unwrap(),
+                key
+            );
+            assert!(!key.meaning().is_empty());
+        }
+    }
+
+    #[test]
+    fn evidence_key_parse_error_names_the_bad_key_and_allowed_keys() {
+        let err = TicketAcceptanceEvidenceKey::parse("sourceAnchors").unwrap_err();
+        assert_eq!(err.code, Code::InvalidArgument);
+        // The offending input is echoed back...
+        assert!(
+            err.message.contains("`sourceAnchors`"),
+            "got: {}",
+            err.message
+        );
+        // ...and every allowed key is named so callers do not have to guess.
+        for key in TicketAcceptanceEvidenceKey::ALL {
+            assert!(
+                err.message.contains(key.as_str()),
+                "error should name `{}`, got: {}",
+                key.as_str(),
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_key_catalog_covers_every_key_with_meaning() {
+        let catalog = TicketAcceptanceEvidenceKey::catalog();
+        assert_eq!(catalog.len(), TicketAcceptanceEvidenceKey::ALL.len());
+        for ((key_str, meaning), key) in catalog.iter().zip(TicketAcceptanceEvidenceKey::ALL) {
+            assert_eq!(*key_str, key.as_str());
+            assert_eq!(*meaning, key.meaning());
+            assert!(!meaning.is_empty());
+        }
+    }
+
+    #[test]
+    fn evidence_from_json_rejects_unknown_key_with_actionable_message() {
+        let err = TicketCommentEvidence::from_json(&serde_json::json!({
+            "sources": ["crates/loom-tickets/src/model.rs:1"]
+        }))
+        .unwrap_err();
+        assert_eq!(err.code, Code::InvalidArgument);
+        assert!(err.message.contains("`sources`"), "got: {}", err.message);
+        assert!(
+            err.message.contains("source_anchors"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -5710,7 +5870,7 @@ mod tests {
         assert!(
             definitions
                 .iter()
-                .all(|definition| definition.is_applicable_to_project("matrix"))
+                .all(|definition| definition.is_applicable_to_project("demo-project"))
         );
         assert_eq!(
             definitions
@@ -5729,11 +5889,11 @@ mod tests {
             "jira-change",
             "Change Request",
             TicketTypeSemanticKind::Custom,
-            BTreeSet::from(["matrix".to_string()]),
+            BTreeSet::from(["demo-project".to_string()]),
         )
         .unwrap();
         assert_eq!(definition.type_id, "jira-change");
-        assert!(definition.is_applicable_to_project("matrix"));
+        assert!(definition.is_applicable_to_project("demo-project"));
         assert!(!definition.is_applicable_to_project("other"));
         definition.retire();
         assert!(definition.retired);
@@ -5775,11 +5935,11 @@ mod tests {
                 ),
                 (
                     "assignee".to_string(),
-                    TicketFieldValue::Principal("agent:3".to_string()),
+                    TicketFieldValue::Principal("user:assignee-a".to_string()),
                 ),
                 (
                     "reporter".to_string(),
-                    TicketFieldValue::Principal("agent:arbiter".to_string()),
+                    TicketFieldValue::Principal("user:reporter-a".to_string()),
                 ),
                 (
                     "priority".to_string(),
@@ -5835,13 +5995,13 @@ mod tests {
         assert_eq!(core.description.as_deref(), Some("Native description"));
         assert_eq!(core.status.as_deref(), Some("waiting_for_review"));
         assert_eq!(core.status_category.as_deref(), Some("active"));
-        assert_eq!(core.assignee.as_deref(), Some("agent:3"));
+        assert_eq!(core.assignee.as_deref(), Some("user:assignee-a"));
         // `from_ticket` leaves the display alias unresolved; resolving with no identity
         // store falls the display back to the canonical id string.
         assert_eq!(core.assignee_display, None);
         core.resolve_displays(None);
-        assert_eq!(core.assignee_display.as_deref(), Some("agent:3"));
-        assert_eq!(core.reporter.as_deref(), Some("agent:arbiter"));
+        assert_eq!(core.assignee_display.as_deref(), Some("user:assignee-a"));
+        assert_eq!(core.reporter.as_deref(), Some("user:reporter-a"));
         assert_eq!(core.priority.as_deref(), Some("high"));
         assert_eq!(core.resolution.as_deref(), Some("fixed"));
         assert_eq!(core.labels, vec!["schema", "core"]);
@@ -5879,13 +6039,13 @@ mod tests {
             true,
             TicketFieldCardinality::Single,
             Some(TicketFieldValue::EnumOption("high".to_string())),
-            BTreeSet::from(["matrix".to_string()]),
+            BTreeSet::from(["demo-project".to_string()]),
             BTreeSet::from(["bug".to_string(), "task".to_string()]),
         )
         .unwrap();
-        assert!(field.is_applicable("matrix", "Bug"));
+        assert!(field.is_applicable("demo-project", "Bug"));
         assert!(!field.is_applicable("other", "bug"));
-        assert!(!field.is_applicable("matrix", "epic"));
+        assert!(!field.is_applicable("demo-project", "epic"));
 
         assert!(
             TicketCustomFieldDefinition::new(
@@ -5936,7 +6096,7 @@ mod tests {
 
     #[test]
     fn ticket_project_custom_field_definitions_round_trip() {
-        let mut project = TicketProject::new("matrix", "MX", "Matrix").unwrap();
+        let mut project = TicketProject::new("demo-project", "DEMO", "Demo Project").unwrap();
         let field = TicketCustomFieldDefinition::new(
             FieldDefinition::new(
                 "severity",
@@ -5952,7 +6112,7 @@ mod tests {
             true,
             TicketFieldCardinality::Optional,
             Some(TicketFieldValue::EnumOption("medium".to_string())),
-            BTreeSet::from(["matrix".to_string()]),
+            BTreeSet::from(["demo-project".to_string()]),
             BTreeSet::from(["bug".to_string()]),
         )
         .unwrap();
@@ -6016,7 +6176,8 @@ mod tests {
             .is_err()
         );
 
-        let comment = TicketComment::new("comment:1", "agent:3", long_body.clone(), 1).unwrap();
+        let comment =
+            TicketComment::new("comment:1", "user:commenter-a", long_body.clone(), 1).unwrap();
         assert_eq!(comment.content_type, TICKET_DEFAULT_BODY_CONTENT_TYPE);
         assert_eq!(
             TicketComment::decode(&comment.encode().unwrap()).unwrap(),
@@ -6047,7 +6208,7 @@ mod tests {
             BTreeSet::from(["task".to_string()]),
         )
         .unwrap();
-        assert!(field.is_applicable("matrix", "task"));
+        assert!(field.is_applicable("demo-project", "task"));
 
         assert!(
             TicketCustomFieldDefinition::new(

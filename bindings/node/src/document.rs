@@ -142,6 +142,26 @@ pub fn doc_delete(
     }
     Ok(present)
 }
+
+/// Remove collection `collection` and its structured roots; returns whether it was present.
+#[napi]
+pub fn doc_delete_collection(
+    loom_path: String,
+    workspace: String,
+    collection: String,
+    passphrase: Option<String>,
+) -> napi::Result<bool> {
+    let mut loom =
+        open_loom_unlocked(&loom_path, key_spec(passphrase.as_deref()).as_ref()).map_err(reason)?;
+    let ns = resolve_workspace_arg(&loom, &workspace)?;
+    let present =
+        loom_core::doc_delete_collection(&mut loom, ns, &collection).map_err(reason)?;
+    if present {
+        save_loom(&mut loom).map_err(reason)?;
+    }
+    Ok(present)
+}
+
 /// List collection `collection` as its canonical binary representation.
 #[napi]
 pub fn doc_list_binary(

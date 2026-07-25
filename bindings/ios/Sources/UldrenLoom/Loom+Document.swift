@@ -88,6 +88,14 @@ extension Loom {
         return found != 0
     }
 
+    /// Remove collection `collection` and its structured roots; returns whether it was present.
+    public func docDeleteCollection(workspace: String, collection: String) throws -> Bool {
+        var found: Int32 = 0
+        let status = loom_doc_delete_collection(session, workspace, collection, &found)
+        guard status == 0 else { throw LoomSql.lastError() }
+        return found != 0
+    }
+
     public func docListBinary(workspace: String, collection: String) throws -> Data {
         var ptr: UnsafeMutablePointer<UInt8>?
         var len: UInt = 0

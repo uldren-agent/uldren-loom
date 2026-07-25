@@ -15,8 +15,13 @@ use crate::derived::{
     search_embedding_artifact_key, search_embedding_artifact_stamp, vector_hnsw_artifact_key,
     vector_hnsw_artifact_stamp, vector_pq_artifact_key, vector_pq_artifact_stamp,
 };
-use loom_core::Object;
-use std::sync::atomic::{AtomicU64, Ordering};
+use loom_core::{
+    AtomicityBoundary, AuditIntent, CompareToken, FacetSideEffect, FacetSideEffects, FacetWrite,
+    FacetWriteOp, Object, OverlayDurabilityPolicy, SecondaryIndexWrite, SecondaryIndexWriteOp,
+    WorkflowPlanningSnapshot, WorkflowTransaction, document, workspace::FacetKind,
+};
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -64,6 +69,439 @@ impl BackingIo for SharedMem {
     fn fsync(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FsyncGateMem {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    gate: Arc<FsyncGate>,
+}
+
+#[derive(Debug, Default)]
+struct FsyncGate {
+    enabled: AtomicBool,
+    first_blocked: AtomicBool,
+    fsyncs: AtomicU64,
+    release: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl FsyncGate {
+    fn enable(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    fn wait_until_first_blocked(&self) {
+        let mut release = self.release.lock().unwrap();
+        for _ in 0..10 {
+            if self.first_blocked.load(Ordering::SeqCst) {
+                return;
+            }
+            let (next, _) = self
+                .cv
+                .wait_timeout(release, std::time::Duration::from_millis(100))
+                .unwrap();
+            release = next;
+        }
+        panic!("first fsync did not block");
+    }
+
+    fn release(&self) {
+        *self.release.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+
+impl BackingIo for FsyncGateMem {
+    fn pread(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let g = self.bytes.lock().unwrap();
+        let (off, end) = (off as usize, off as usize + buf.len());
+        if end > g.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "eof",
+            ));
+        }
+        buf.copy_from_slice(&g[off..end]);
+        Ok(())
+    }
+    fn pwrite(&mut self, off: u64, buf: &[u8]) -> std::io::Result<()> {
+        let mut g = self.bytes.lock().unwrap();
+        let (off, end) = (off as usize, off as usize + buf.len());
+        if end > g.len() {
+            g.resize(end, 0);
+        }
+        g[off..end].copy_from_slice(buf);
+        Ok(())
+    }
+    fn size(&self) -> std::io::Result<u64> {
+        Ok(self.bytes.lock().unwrap().len() as u64)
+    }
+    fn grow(&mut self, len: u64) -> std::io::Result<()> {
+        self.bytes.lock().unwrap().resize(len as usize, 0);
+        Ok(())
+    }
+    fn fsync(&mut self) -> std::io::Result<()> {
+        self.gate.fsyncs.fetch_add(1, Ordering::SeqCst);
+        if self.gate.enabled.load(Ordering::SeqCst)
+            && !self.gate.first_blocked.swap(true, Ordering::SeqCst)
+        {
+            self.gate.cv.notify_all();
+            let mut release = self.gate.release.lock().unwrap();
+            while !*release {
+                release = self.gate.cv.wait(release).unwrap();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn hot_mutable_record(seed: u8) -> ([u8; 32], Vec<u8>) {
+    ([seed; 32], vec![seed, seed.wrapping_add(1)])
+}
+
+#[test]
+fn hot_mutable_commit_queue_preserves_order_and_generation_window() {
+    let mut queue = HotMutableCommitQueue::default();
+
+    let first = queue
+        .enqueue(
+            7,
+            StoreDurabilityPolicy::Normal,
+            vec![hot_mutable_record(1), hot_mutable_record(2)],
+        )
+        .unwrap();
+    let second = queue
+        .enqueue(
+            7,
+            StoreDurabilityPolicy::Normal,
+            vec![hot_mutable_record(3)],
+        )
+        .unwrap();
+
+    assert_eq!(
+        first,
+        HotMutableCommitWindow {
+            first_sequence: 0,
+            last_sequence: 0,
+            base_generation: 7,
+            pending_generation: 8,
+            transaction_count: 1,
+            record_count: 2,
+        }
+    );
+    assert_eq!(
+        second,
+        HotMutableCommitWindow {
+            first_sequence: 0,
+            last_sequence: 1,
+            base_generation: 7,
+            pending_generation: 9,
+            transaction_count: 2,
+            record_count: 3,
+        }
+    );
+}
+
+#[test]
+fn hot_mutable_commit_queue_rejects_strict_boundaries_and_invalid_entries() {
+    let mut queue = HotMutableCommitQueue::default();
+    let empty = queue
+        .enqueue(0, StoreDurabilityPolicy::Normal, Vec::new())
+        .unwrap_err();
+    let strict = queue
+        .enqueue(
+            0,
+            StoreDurabilityPolicy::Strict,
+            vec![hot_mutable_record(1)],
+        )
+        .unwrap_err();
+    let relaxed = queue
+        .enqueue(
+            0,
+            StoreDurabilityPolicy::Relaxed,
+            vec![hot_mutable_record(1)],
+        )
+        .unwrap_err();
+    let ephemeral = queue
+        .enqueue(
+            0,
+            StoreDurabilityPolicy::Ephemeral,
+            vec![hot_mutable_record(1)],
+        )
+        .unwrap_err();
+
+    assert_eq!(empty.code, Code::InvalidArgument);
+    assert_eq!(strict.code, Code::InvalidArgument);
+    assert_eq!(relaxed.code, Code::InvalidArgument);
+    assert_eq!(ephemeral.code, Code::InvalidArgument);
+    assert!(queue.pending_window().is_none());
+}
+
+#[test]
+fn hot_mutable_commit_queue_drains_ordered_batches_without_torn_entries() {
+    let mut queue = HotMutableCommitQueue::default();
+    queue
+        .enqueue(
+            11,
+            StoreDurabilityPolicy::Normal,
+            vec![hot_mutable_record(1), hot_mutable_record(2)],
+        )
+        .unwrap();
+    queue
+        .enqueue(
+            11,
+            StoreDurabilityPolicy::Normal,
+            vec![hot_mutable_record(3), hot_mutable_record(4)],
+        )
+        .unwrap();
+    queue
+        .enqueue(
+            11,
+            StoreDurabilityPolicy::Normal,
+            vec![hot_mutable_record(5)],
+        )
+        .unwrap();
+
+    let first_batch = queue.drain_ready(2);
+    let window = queue.pending_window().unwrap();
+    let second_batch = queue.drain_ready(8);
+
+    assert_eq!(first_batch.len(), 1);
+    assert_eq!(first_batch[0].sequence, 0);
+    assert_eq!(first_batch[0].pending_generation, 12);
+    assert_eq!(first_batch[0].records.len(), 2);
+    assert_eq!(window.first_sequence, 1);
+    assert_eq!(window.last_sequence, 2);
+    assert_eq!(window.pending_generation, 14);
+    assert_eq!(window.transaction_count, 2);
+    assert_eq!(window.record_count, 3);
+    assert_eq!(
+        second_batch
+            .iter()
+            .map(|commit| commit.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(queue.pending_window().is_none());
+}
+
+#[test]
+fn normal_hot_mutable_publisher_drains_queue_and_publishes_complete_records() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let first = hot_mutable_record(61);
+    let second = hot_mutable_record(62);
+
+    store
+        .enqueue_hot_mutable_commit_for_test(vec![first.clone(), second.clone()])
+        .unwrap();
+    assert_eq!(
+        store
+            .hot_mutable_commit_window()
+            .unwrap()
+            .unwrap()
+            .record_count,
+        2
+    );
+    store.flush_hot_mutable_commits().unwrap();
+
+    assert!(store.hot_mutable_commit_window().unwrap().is_none());
+    assert_eq!(
+        store.mutable_overlay_record_payload(&first.0).unwrap(),
+        Some(first.1)
+    );
+    assert_eq!(
+        store.mutable_overlay_record_payload(&second.0).unwrap(),
+        Some(second.1)
+    );
+}
+
+#[test]
+fn group_commit_diagnostics_reflect_hot_mutable_commits() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let first = hot_mutable_record(71);
+    let second = hot_mutable_record(72);
+    let third = hot_mutable_record(73);
+
+    // Enqueued but not yet drained: the point-in-time pending-window gauges reflect the queued
+    // transactions/records, and no batch has been published yet.
+    store
+        .enqueue_hot_mutable_commit_for_test(vec![first.clone(), second.clone()])
+        .unwrap();
+    store
+        .enqueue_hot_mutable_commit_for_test(vec![third.clone()])
+        .unwrap();
+    let pending = store.group_commit_diagnostics().unwrap();
+    assert_eq!(pending.pending_durable_window_transactions, 2);
+    assert_eq!(pending.pending_durable_window_records, 3);
+    assert_eq!(pending.group_commit_batches_total, 0);
+
+    // Drain and publish the queued transactions.
+    store.flush_hot_mutable_commits().unwrap();
+
+    let after = store.group_commit_diagnostics().unwrap();
+    assert!(after.group_commit_batches_total > 0);
+    assert_eq!(after.group_commit_transactions_total, 2);
+    assert_eq!(after.group_commit_records_total, 3);
+    assert!(after.fsync_count > 0);
+    assert_eq!(after.pending_durable_window_transactions, 0);
+    assert_eq!(after.pending_durable_window_records, 0);
+    assert_eq!(after.pinned_reader_blockers, None);
+
+    // The diagnostics are surfaced through the maintenance-status surface and serialize (Debug).
+    let status = store.maintenance_status().unwrap();
+    assert_eq!(status.group_commit, after);
+    assert!(format!("{:?}", status.group_commit).contains("group_commit_batches_total"));
+}
+
+#[test]
+fn strict_mutable_publication_flushes_pending_normal_queue_first() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let normal = hot_mutable_record(63);
+    let strict = hot_mutable_record(64);
+
+    store
+        .enqueue_hot_mutable_commit_for_test(vec![normal.clone()])
+        .unwrap();
+    store
+        .publish_mutable_overlay_records_for_test(
+            StoreDurabilityPolicy::Strict,
+            vec![strict.clone()],
+        )
+        .unwrap();
+
+    assert!(store.hot_mutable_commit_window().unwrap().is_none());
+    assert_eq!(
+        store.mutable_overlay_record_payload(&normal.0).unwrap(),
+        Some(normal.1)
+    );
+    assert_eq!(
+        store.mutable_overlay_record_payload(&strict.0).unwrap(),
+        Some(strict.1)
+    );
+}
+
+#[test]
+fn normal_hot_mutable_public_writes_batch_under_contention() {
+    let backing = FsyncGateMem::default();
+    let reopened_backing = backing.clone();
+    let gate = Arc::clone(&backing.gate);
+    let store = Arc::new(FileStore::with_backing(Box::new(backing), true).unwrap());
+    gate.enable();
+    let barrier = Arc::new(std::sync::Barrier::new(9));
+    let mut threads = Vec::new();
+    for worker in 0..8u8 {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            let key = OverlayKey::from_segments([
+                b"workspace",
+                &[worker; 16],
+                b"tickets",
+                b"matrix",
+                b"ticket",
+                b"MX-433",
+            ])
+            .unwrap();
+            barrier.wait();
+            store.put_mutable_overlay_value(key, vec![worker])
+        }));
+    }
+    barrier.wait();
+    gate.wait_until_first_blocked();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    gate.release();
+    for thread in threads {
+        thread.join().unwrap().unwrap();
+    }
+    let committed_generation = store.generation();
+    assert!(committed_generation < 8);
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(reopened_backing), true).unwrap();
+    assert_eq!(reopened.generation(), committed_generation);
+    for worker in 0..8u8 {
+        let key = OverlayKey::from_segments([
+            b"workspace",
+            &[worker; 16],
+            b"tickets",
+            b"matrix",
+            b"ticket",
+            b"MX-433",
+        ])
+        .unwrap();
+        assert_eq!(
+            reopened
+                .mutable_overlay_snapshot()
+                .unwrap()
+                .read_composite(&key, |_| Ok(None))
+                .unwrap(),
+            Some(vec![worker])
+        );
+    }
+}
+
+#[test]
+fn unpublished_hot_mutable_queue_entries_do_not_recover_as_partial_state() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let pending = hot_mutable_record(65);
+
+    store
+        .enqueue_hot_mutable_commit_for_test(vec![pending.clone()])
+        .unwrap();
+    assert!(store.hot_mutable_commit_window().unwrap().is_some());
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+
+    assert!(reopened.hot_mutable_commit_window().unwrap().is_none());
+    assert_eq!(
+        reopened.mutable_overlay_record_payload(&pending.0).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn strict_boundary_flushes_pending_normal_batch_and_survives_reopen() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let normal_key = durability_test_key("strict-boundary-normal");
+    let strict_key = durability_test_key("strict-boundary-strict");
+    let normal_token = loom_core::OverlayOwnerToken::from_bytes([66; 32]);
+    let strict_token = loom_core::OverlayOwnerToken::from_bytes([67; 32]);
+    let normal = (
+        mutable_overlay_owner_token_address(&normal_key),
+        encode_mutable_overlay_owner_token_record(&normal_token),
+    );
+    let strict = (
+        mutable_overlay_owner_token_address(&strict_key),
+        encode_mutable_overlay_owner_token_record(&strict_token),
+    );
+
+    store
+        .enqueue_hot_mutable_commit_for_test(vec![normal.clone()])
+        .unwrap();
+    store
+        .publish_mutable_overlay_records_for_test(
+            StoreDurabilityPolicy::Strict,
+            vec![strict.clone()],
+        )
+        .unwrap();
+    let committed_generation = store.generation();
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+
+    assert_eq!(reopened.generation(), committed_generation);
+    assert_eq!(
+        reopened.mutable_overlay_record_payload(&normal.0).unwrap(),
+        Some(normal.1)
+    );
+    assert_eq!(
+        reopened.mutable_overlay_record_payload(&strict.0).unwrap(),
+        Some(strict.1)
+    );
 }
 
 #[test]
@@ -123,7 +561,38 @@ fn maintenance_status_is_persisted_and_rejects_corrupt_record() {
     drop(store);
 
     let reopened = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
-    assert_eq!(reopened.maintenance_status().unwrap(), second);
+    let reopened_status = reopened.maintenance_status().unwrap();
+    assert_eq!(reopened_status.generation, second.generation);
+    assert_eq!(reopened_status.object_count, second.object_count);
+    assert_eq!(
+        reopened_status.physical_page_count,
+        second.physical_page_count
+    );
+    assert_eq!(reopened_status.physical_bytes, second.physical_bytes);
+    assert_eq!(
+        reopened_status.reusable_free_pages,
+        second.reusable_free_pages
+    );
+    assert_eq!(
+        reopened_status.candidate_dead_pages,
+        second.candidate_dead_pages
+    );
+    assert_eq!(reopened_status.tail_free_pages, second.tail_free_pages);
+    assert_eq!(reopened_status.tail_free_bytes, second.tail_free_bytes);
+    assert_eq!(
+        reopened_status.last_validated_mark_epoch,
+        second.last_validated_mark_epoch
+    );
+    assert_eq!(reopened_status.touched_segments, second.touched_segments);
+    assert_eq!(
+        reopened_status.candidate_segments,
+        second.candidate_segments
+    );
+    assert_eq!(reopened_status.segment_overflow, second.segment_overflow);
+    assert_eq!(
+        reopened_status.group_commit,
+        GroupCommitDiagnostics::default()
+    );
     drop(reopened);
 
     shared.mutate_bytes(|bytes| {
@@ -255,6 +724,24 @@ fn store_maintenance_report_projects_debt_and_mark_readiness() {
     let default_report = store.store_maintenance_report(100).unwrap();
     assert_eq!(default_report.reason, "mark_epoch_missing");
     assert!(default_report.eligible);
+    assert_eq!(default_report.overlay_health.current_generation, 0);
+    assert_eq!(default_report.overlay_health.current_record_count, 0);
+    assert_eq!(default_report.overlay_health.tombstone_count, 0);
+    assert_eq!(default_report.overlay_health.live_checkpoint_references, 0);
+    assert_eq!(default_report.overlay_health.reclaimable_overlay_pages, 0);
+    assert!(
+        default_report
+            .overlay_health
+            .blocked_reclamation_reasons
+            .is_empty()
+    );
+    assert_eq!(default_report.overlay_health.hot_write_count, 0);
+    assert_eq!(
+        default_report
+            .overlay_health
+            .active_writer_contention_indicators,
+        0
+    );
     assert_eq!(
         default_report.candidate_reclaimable_bytes,
         status.candidate_dead_pages * PAGE_SIZE
@@ -262,6 +749,13 @@ fn store_maintenance_report_projects_debt_and_mark_readiness() {
     assert_eq!(
         default_report.reusable_free_bytes,
         status.reusable_free_pages * PAGE_SIZE
+    );
+    assert_eq!(
+        default_report.live_bytes,
+        status.physical_bytes
+            - default_report
+                .candidate_reclaimable_bytes
+                .max(default_report.reusable_free_bytes)
     );
     assert_eq!(default_report.tail_free_pages, status.tail_free_pages);
     assert_eq!(default_report.tail_free_bytes, status.tail_free_bytes);
@@ -296,6 +790,1329 @@ fn store_maintenance_report_projects_debt_and_mark_readiness() {
     assert!(enabled.eligible);
     assert!(enabled.policy.tail_trim_enabled);
     assert!(enabled.policy.tail_compaction_enabled);
+}
+
+#[test]
+fn mutable_overlay_entries_survive_file_store_reopen() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[1; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"MX-388",
+    ])
+    .unwrap();
+    store
+        .put_mutable_overlay_value(key.clone(), b"current".to_vec())
+        .unwrap();
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let snapshot = reopened.mutable_overlay_snapshot().unwrap();
+    let read = snapshot
+        .read_composite(&key, |_| Ok(Some(b"base".to_vec())))
+        .unwrap();
+    let report = reopened.store_maintenance_report(100).unwrap();
+
+    assert_eq!(read.as_deref(), Some(&b"current"[..]));
+    assert_eq!(report.overlay_health.current_generation, 1);
+    assert_eq!(report.overlay_health.current_record_count, 1);
+    assert_eq!(report.overlay_health.hot_write_count, 1);
+    assert_eq!(report.overlay_obsolete_record_count, 0);
+    assert_eq!(report.growth_domains[0].domain, "tickets");
+    assert_eq!(report.growth_domains[0].current_records, 1);
+    assert_eq!(report.growth_domains[0].payload_bytes, 7);
+}
+
+#[test]
+fn mvcc_snapshot_identity_pins_generation_and_base_root() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let first_root = store.put(b"first-root").unwrap();
+    let second_root = store.put(b"second-root").unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[43; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"MX-442",
+    ])
+    .unwrap();
+
+    store.set_reference_root(Some(first_root)).unwrap();
+    store
+        .put_mutable_overlay_value(key.clone(), b"current-1".to_vec())
+        .unwrap();
+    let snapshot = store.open_mvcc_snapshot_with_owner(Some("mx-442")).unwrap();
+    store.set_reference_root(Some(second_root)).unwrap();
+    store
+        .put_mutable_overlay_value(key.clone(), b"current-2".to_vec())
+        .unwrap();
+
+    assert_eq!(snapshot.overlay_generation().as_u64(), 1);
+    assert_eq!(snapshot.immutable_base_root(), Some(first_root));
+    assert_eq!(
+        snapshot
+            .read_composite(&key, |base_root, _| {
+                assert_eq!(base_root, Some(first_root));
+                Ok(Some(b"base".to_vec()))
+            })
+            .unwrap()
+            .as_deref(),
+        Some(&b"current-1"[..])
+    );
+    assert_eq!(
+        store
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"current-2"[..])
+    );
+
+    let diagnostics = store.mvcc_snapshot_diagnostics().unwrap();
+    assert_eq!(diagnostics.active_snapshot_count, 1);
+    assert_eq!(
+        diagnostics.oldest_pinned_overlay_generation,
+        Some(snapshot.overlay_generation())
+    );
+    assert_eq!(diagnostics.pins[0].pin_id, snapshot.pin_id());
+    assert_eq!(diagnostics.pins[0].identity, snapshot.identity());
+    assert_eq!(diagnostics.pins[0].owner.as_deref(), Some("mx-442"));
+
+    assert!(snapshot.release().unwrap());
+    assert!(!snapshot.release().unwrap());
+    assert!(snapshot.is_released());
+    assert_eq!(
+        store
+            .mvcc_snapshot_diagnostics()
+            .unwrap()
+            .active_snapshot_count,
+        0
+    );
+}
+
+#[test]
+fn store_maintenance_report_surfaces_mvcc_snapshot_diagnostics() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared), true).unwrap();
+    // No pins: the maintenance report shows zero active MVCC snapshots.
+    let report = store.store_maintenance_report(0).unwrap();
+    assert_eq!(report.mvcc_snapshots.active_snapshot_count, 0);
+    assert_eq!(report.mvcc_snapshots.oldest_pinned_overlay_generation, None);
+    // An open snapshot is surfaced through the same maintenance report path.
+    let snapshot = store.open_mvcc_snapshot().unwrap();
+    let report = store.store_maintenance_report(0).unwrap();
+    assert_eq!(report.mvcc_snapshots.active_snapshot_count, 1);
+    assert_eq!(
+        report.mvcc_snapshots.oldest_pinned_overlay_generation,
+        Some(snapshot.overlay_generation())
+    );
+    assert_eq!(report.mvcc_snapshots.pins.len(), 1);
+    // Releasing the pin clears it from the report.
+    assert!(snapshot.release().unwrap());
+    let report = store.store_maintenance_report(0).unwrap();
+    assert_eq!(report.mvcc_snapshots.active_snapshot_count, 0);
+}
+
+#[test]
+fn mvcc_snapshot_lifetime_releases_pins_and_tracks_oldest_generation() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[44; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"MX-442",
+    ])
+    .unwrap();
+
+    store
+        .put_mutable_overlay_value(key.clone(), b"current-1".to_vec())
+        .unwrap();
+    let first = store.open_mvcc_snapshot().unwrap();
+    store.put_mutable_overlay_tombstone(key.clone()).unwrap();
+    let second = store.open_mvcc_snapshot().unwrap();
+
+    assert_eq!(
+        first
+            .read_composite(&key, |_, _| Ok(Some(b"base".to_vec())))
+            .unwrap()
+            .as_deref(),
+        Some(&b"current-1"[..])
+    );
+    assert_eq!(
+        second
+            .read_composite(&key, |_, _| Ok(Some(b"base".to_vec())))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store.oldest_pinned_mvcc_snapshot_generation().unwrap(),
+        Some(first.overlay_generation())
+    );
+
+    assert!(first.release().unwrap());
+    assert_eq!(
+        store.oldest_pinned_mvcc_snapshot_generation().unwrap(),
+        Some(second.overlay_generation())
+    );
+    drop(second);
+    assert_eq!(
+        store.oldest_pinned_mvcc_snapshot_generation().unwrap(),
+        None
+    );
+}
+
+#[test]
+fn mvcc_snapshot_read_path_stays_stable_while_writer_publishes() {
+    let shared = SharedMem::default();
+    let store = Arc::new(FileStore::with_backing(Box::new(shared), true).unwrap());
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[45; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"MX-443",
+    ])
+    .unwrap();
+    store
+        .put_mutable_overlay_value(key.clone(), b"current-0".to_vec())
+        .unwrap();
+    let snapshot = store
+        .open_mvcc_snapshot_with_owner(Some("mx-443.concurrent-read"))
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_store = Arc::clone(&store);
+    let writer_key = key.clone();
+    let writer_barrier = Arc::clone(&barrier);
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        for update in 1..=32u64 {
+            writer_store
+                .put_mutable_overlay_value(
+                    writer_key.clone(),
+                    format!("current-{update}").into_bytes(),
+                )
+                .unwrap();
+        }
+    });
+
+    barrier.wait();
+    writer.join().unwrap();
+
+    assert_eq!(snapshot.overlay_generation().as_u64(), 1);
+    assert_eq!(
+        snapshot
+            .read_composite(&key, |_, _| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"current-0"[..])
+    );
+    assert_eq!(
+        store
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"current-32"[..])
+    );
+    assert_eq!(
+        store.oldest_pinned_mvcc_snapshot_generation().unwrap(),
+        Some(snapshot.overlay_generation())
+    );
+    snapshot.release().unwrap();
+}
+
+#[test]
+fn mutable_overlay_owner_token_index_survives_reopen() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[41; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"MX-429",
+    ])
+    .unwrap();
+    let first = store
+        .put_mutable_overlay_value(key.clone(), b"current".to_vec())
+        .unwrap();
+    let second = store
+        .put_mutable_overlay_value(key.clone(), b"current-2".to_vec())
+        .unwrap();
+
+    assert_ne!(first.as_bytes(), second.as_bytes());
+    assert_eq!(
+        store
+            .mutable_overlay_durable_owner_token(&key)
+            .unwrap()
+            .as_ref()
+            .map(|token| token.as_bytes()),
+        Some(second.as_bytes())
+    );
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+
+    assert_eq!(
+        reopened
+            .mutable_overlay_durable_owner_token(&key)
+            .unwrap()
+            .as_ref()
+            .map(|token| token.as_bytes()),
+        Some(second.as_bytes())
+    );
+    assert_eq!(
+        reopened
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .owner_token(&key)
+            .unwrap()
+            .as_ref()
+            .map(|token| token.as_bytes()),
+        Some(second.as_bytes())
+    );
+}
+
+#[test]
+fn mutable_overlay_idempotency_key_retries_survive_reopen() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[42; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"MX-429",
+    ])
+    .unwrap();
+    let first = store
+        .put_mutable_overlay_value_idempotent(key.clone(), b"current".to_vec(), "retry-1")
+        .unwrap();
+    let retry = store
+        .put_mutable_overlay_value_idempotent(key.clone(), b"current".to_vec(), "retry-1")
+        .unwrap();
+
+    assert_eq!(first.as_bytes(), retry.as_bytes());
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let reopened_retry = reopened
+        .put_mutable_overlay_value_idempotent(key.clone(), b"current".to_vec(), "retry-1")
+        .unwrap();
+    let conflict = reopened
+        .put_mutable_overlay_value_idempotent(key, b"different".to_vec(), "retry-1")
+        .unwrap_err();
+
+    assert_eq!(reopened_retry.as_bytes(), first.as_bytes());
+    assert_eq!(conflict.code, Code::Conflict);
+}
+
+#[test]
+fn concurrent_idempotency_key_with_different_payload_serializes_conflict() {
+    let shared = SharedMem::default();
+    let store = Arc::new(FileStore::with_backing(Box::new(shared), true).unwrap());
+    let barrier = Arc::new(std::sync::Barrier::new(16));
+    let mut threads = Vec::new();
+    for worker in 0..16u8 {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            let key = OverlayKey::from_segments([
+                b"workspace",
+                &[44; 16],
+                b"tickets",
+                b"matrix",
+                b"ticket",
+                b"MX-429",
+            ])
+            .unwrap();
+            let payload = if worker == 0 {
+                b"winner".to_vec()
+            } else {
+                format!("loser-{worker}").into_bytes()
+            };
+            barrier.wait();
+            store.put_mutable_overlay_value_idempotent(key, payload, "race-key")
+        }));
+    }
+
+    let mut successes = 0;
+    let mut conflicts = 0;
+    for thread in threads {
+        match thread.join().unwrap() {
+            Ok(_) => successes += 1,
+            Err(error) if error.code == Code::Conflict => conflicts += 1,
+            Err(error) => panic!("unexpected error: {error:?}"),
+        }
+    }
+
+    assert_eq!(successes, 1);
+    assert_eq!(conflicts, 15);
+}
+
+#[test]
+fn concurrent_idempotent_regular_and_tombstone_writes_keep_owner_index_consistent() {
+    let shared = SharedMem::default();
+    let store = Arc::new(FileStore::with_backing(Box::new(shared), true).unwrap());
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[45; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"MX-429",
+    ])
+    .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(18));
+    let mut threads = Vec::new();
+    for worker in 0..18u8 {
+        let store = Arc::clone(&store);
+        let key = key.clone();
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            let result = match worker % 3 {
+                0 => store.put_mutable_overlay_value_idempotent(
+                    key,
+                    b"idempotent".to_vec(),
+                    "mixed-race-key",
+                ),
+                1 => store.put_mutable_overlay_value(key, format!("regular-{worker}").into_bytes()),
+                _ => store.put_mutable_overlay_tombstone(key),
+            };
+            (worker, result)
+        }));
+    }
+
+    let mut idempotent_token: Option<loom_core::OverlayOwnerToken> = None;
+    for thread in threads {
+        let (worker, result) = thread.join().unwrap();
+        let token = result.unwrap();
+        if worker % 3 == 0 {
+            if let Some(expected) = &idempotent_token {
+                assert_eq!(token.as_bytes(), expected.as_bytes());
+            } else {
+                idempotent_token = Some(token);
+            }
+        }
+    }
+
+    let durable = store
+        .mutable_overlay_durable_owner_token(&key)
+        .unwrap()
+        .unwrap();
+    let current = store
+        .mutable_overlay_snapshot()
+        .unwrap()
+        .owner_token(&key)
+        .unwrap()
+        .unwrap();
+    let retry = store
+        .put_mutable_overlay_value_idempotent(key.clone(), b"idempotent".to_vec(), "mixed-race-key")
+        .unwrap();
+    let conflict = store
+        .put_mutable_overlay_value_idempotent(key, b"different".to_vec(), "mixed-race-key")
+        .unwrap_err();
+
+    assert_eq!(durable.as_bytes(), current.as_bytes());
+    assert_eq!(retry.as_bytes(), idempotent_token.unwrap().as_bytes());
+    assert_eq!(conflict.code, Code::Conflict);
+}
+
+#[test]
+fn malformed_durable_owner_token_index_is_rejected() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[43; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"MX-429",
+    ])
+    .unwrap();
+    store
+        .commit_mutable_overlay_records(&[(
+            mutable_overlay_owner_token_address(&key),
+            b"bad".to_vec(),
+        )])
+        .unwrap();
+
+    let error = store.mutable_overlay_durable_owner_token(&key).unwrap_err();
+
+    assert_eq!(error.code, Code::CorruptObject);
+}
+
+#[test]
+fn mutable_overlay_entries_hydrate_opened_loom() {
+    let shared = SharedMem::default();
+    let mut loom = loom_over_backing(Box::new(shared.clone()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[2; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"MX-388",
+    ])
+    .unwrap();
+    loom.store()
+        .put_mutable_overlay_value(key.clone(), b"current".to_vec())
+        .unwrap();
+    save_loom(&mut loom).unwrap();
+    drop(loom);
+
+    let reopened = loom_over_backing(Box::new(shared), true).unwrap();
+    let read = reopened
+        .mutable_overlay()
+        .snapshot()
+        .read_composite(&key, |_| Ok(Some(b"base".to_vec())))
+        .unwrap();
+    let report = reopened.store().store_maintenance_report(100).unwrap();
+
+    assert_eq!(read.as_deref(), Some(&b"current"[..]));
+    assert_eq!(report.overlay_health.current_record_count, 1);
+    assert_eq!(report.overlay_obsolete_record_count, 0);
+}
+
+#[test]
+fn mutable_overlay_hot_updates_keep_one_durable_current_entry() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[3; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"MX-388",
+    ])
+    .unwrap();
+    for update in 0..64u64 {
+        store
+            .put_mutable_overlay_value(key.clone(), format!("current-{update}").into_bytes())
+            .unwrap();
+    }
+    store
+        .control_set(b"unrelated-control-entry", vec![1])
+        .unwrap();
+    let control_root = store.control_root();
+    for update in 64..128u64 {
+        store
+            .put_mutable_overlay_value(key.clone(), format!("current-{update}").into_bytes())
+            .unwrap();
+    }
+    assert_eq!(store.control_root(), control_root);
+    let report = store.store_maintenance_report(100).unwrap();
+    assert_eq!(report.overlay_health.current_record_count, 1);
+    assert_eq!(report.overlay_obsolete_record_count, 127);
+    assert_eq!(report.growth_domains[0].domain, "tickets");
+    assert_eq!(report.growth_domains[0].current_records, 1);
+    assert_eq!(report.growth_domains[0].obsolete_records, 127);
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let read = reopened
+        .mutable_overlay_snapshot()
+        .unwrap()
+        .read_composite(&key, |_| Ok(None))
+        .unwrap();
+    let report = reopened.store_maintenance_report(100).unwrap();
+
+    assert_eq!(read.as_deref(), Some(&b"current-127"[..]));
+    assert_eq!(report.overlay_health.current_generation, 128);
+    assert_eq!(report.overlay_health.current_record_count, 1);
+    assert_eq!(report.overlay_health.hot_write_count, 1);
+}
+
+#[test]
+fn mutable_overlay_superseded_current_pages_return_to_allocator_and_attribution() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[46; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"allocator-reuse",
+    ])
+    .unwrap();
+    for update in 0..24u64 {
+        store
+            .put_mutable_overlay_value(
+                key.clone(),
+                format!("reclaimable-current-{update}").into_bytes(),
+            )
+            .unwrap();
+    }
+
+    let report = store.store_maintenance_report(100).unwrap();
+    let attribution = store.page_class_attribution(100).unwrap();
+    let stale_records = attribution
+        .classes
+        .iter()
+        .filter(|class| class.class.starts_with("stale_record_"))
+        .map(|class| class.bytes)
+        .sum::<u64>();
+    let current = attribution
+        .classes
+        .iter()
+        .find(|class| class.class.starts_with("mutable_overlay_record_"))
+        .unwrap();
+    let reusable = attribution
+        .classes
+        .iter()
+        .find(|class| class.class == "reusable_free_page")
+        .unwrap();
+
+    assert_eq!(report.overlay_health.current_record_count, 1);
+    assert_eq!(report.overlay_obsolete_record_count, 23);
+    assert_eq!(reusable.bytes, report.reusable_free_bytes);
+    assert!(report.reusable_free_bytes > 0);
+    assert!(current.pages > 0);
+    assert_eq!(stale_records, 0);
+    let pages_before_reuse = report.status.physical_page_count;
+
+    store
+        .put_mutable_overlay_value(key.clone(), b"reclaimable-current-24".to_vec())
+        .unwrap();
+    let reused = store.store_maintenance_report(100).unwrap();
+    assert!(reused.status.physical_page_count <= pages_before_reuse + 4);
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let read = reopened
+        .mutable_overlay_snapshot()
+        .unwrap()
+        .read_composite(&key, |_| Ok(None))
+        .unwrap();
+
+    assert_eq!(read.as_deref(), Some(&b"reclaimable-current-24"[..]));
+}
+
+#[test]
+fn document_workflow_releases_planning_pin_before_reclaiming_current_records() {
+    let shared = SharedMem::default();
+    let mut loom = loom_over_backing(Box::new(shared.clone()), true).unwrap();
+    let workspace = loom
+        .registry_mut()
+        .create(
+            FacetKind::Document,
+            Some("documents"),
+            WorkspaceId::from_bytes([61; 16]),
+        )
+        .unwrap();
+
+    for update in 0..24u64 {
+        document::document_put_text(
+            &mut loom,
+            workspace,
+            "notes",
+            "current",
+            &format!("current-{update}"),
+            None,
+        )
+        .unwrap();
+    }
+
+    let stale_record_bytes = loom
+        .store()
+        .page_class_attribution(0)
+        .unwrap()
+        .classes
+        .iter()
+        .filter(|class| class.class.starts_with("stale_record_"))
+        .map(|class| class.bytes)
+        .sum::<u64>();
+    assert_eq!(
+        stale_record_bytes,
+        0,
+        "page classes: {:?}",
+        loom.store().page_class_attribution(0).unwrap().classes
+    );
+    assert_eq!(
+        document::document_get_text(&loom, workspace, "notes", "current")
+            .unwrap()
+            .unwrap()
+            .text,
+        "current-23"
+    );
+
+    drop(loom);
+    let reopened = loom_over_backing(Box::new(shared), true).unwrap();
+    assert_eq!(
+        document::document_get_text(&reopened, workspace, "notes", "current")
+            .unwrap()
+            .unwrap()
+            .text,
+        "current-23"
+    );
+}
+
+#[test]
+fn mutable_overlay_reclaim_preserves_pinned_mvcc_snapshot_window() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[47; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"pinned-reclaim",
+    ])
+    .unwrap();
+
+    store
+        .put_mutable_overlay_value(key.clone(), b"pinned-current-0".to_vec())
+        .unwrap();
+    let pinned = store.open_mvcc_snapshot().unwrap();
+    store
+        .put_mutable_overlay_value(key.clone(), b"pinned-current-1".to_vec())
+        .unwrap();
+
+    let blocked = store.page_class_attribution(100).unwrap();
+    let stale_while_pinned = blocked
+        .classes
+        .iter()
+        .filter(|class| class.class.starts_with("stale_record_"))
+        .map(|class| class.bytes)
+        .sum::<u64>();
+    assert!(stale_while_pinned > 0);
+    assert_eq!(
+        pinned
+            .read_composite(&key, |_, _| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"pinned-current-0"[..])
+    );
+
+    drop(pinned);
+    store
+        .put_mutable_overlay_value(key.clone(), b"pinned-current-2".to_vec())
+        .unwrap();
+    let unpinned = store.store_maintenance_report(100).unwrap();
+    assert!(unpinned.reusable_free_bytes > 0);
+}
+
+#[test]
+fn mutable_overlay_reclaim_blocks_audit_retention_and_tombstone_entries() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared), true).unwrap();
+    store
+        .save_audit_config_audited(
+            AuditConfig {
+                retention_days: 365,
+                legal_hold: true,
+            },
+            None,
+            "audit.config.set",
+            Some("legal_hold=true"),
+        )
+        .unwrap();
+    let audit_key = OverlayKey::from_segments([
+        b"workspace",
+        &[48; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"audit-retention",
+    ])
+    .unwrap();
+
+    store
+        .put_mutable_overlay_value(audit_key.clone(), b"audit-current-0".to_vec())
+        .unwrap();
+    store
+        .put_mutable_overlay_value(audit_key, b"audit-current-1".to_vec())
+        .unwrap();
+    let audit_blocked = store.page_class_attribution(100).unwrap();
+    let audit_stale_records = audit_blocked
+        .classes
+        .iter()
+        .filter(|class| class.class.starts_with("stale_record_"))
+        .map(|class| class.bytes)
+        .sum::<u64>();
+    assert!(audit_stale_records > 0);
+
+    let tombstone_key = OverlayKey::from_segments([
+        b"workspace",
+        &[49; 16],
+        b"documents",
+        b"matrix",
+        b"doc",
+        b"tombstone-retention",
+    ])
+    .unwrap();
+    store
+        .save_audit_config_audited(
+            AuditConfig {
+                retention_days: 365,
+                legal_hold: false,
+            },
+            None,
+            "audit.config.set",
+            Some("legal_hold=false"),
+        )
+        .unwrap();
+    store
+        .put_mutable_overlay_value(tombstone_key.clone(), b"document-current".to_vec())
+        .unwrap();
+    store.put_mutable_overlay_tombstone(tombstone_key).unwrap();
+    let tombstone_blocked = store.page_class_attribution(100).unwrap();
+    let tombstone_stale_records = tombstone_blocked
+        .classes
+        .iter()
+        .filter(|class| class.class.starts_with("stale_record_"))
+        .map(|class| class.bytes)
+        .sum::<u64>();
+    assert!(tombstone_stale_records >= audit_stale_records);
+}
+
+#[test]
+fn mutable_overlay_checkpoint_plan_reports_compactable_current_records_and_page_classes() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[51; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"checkpoint-planner",
+    ])
+    .unwrap();
+
+    for update in 0..16u64 {
+        store
+            .put_mutable_overlay_value(key.clone(), format!("current-{update}").into_bytes())
+            .unwrap();
+    }
+
+    let plan = store.mutable_overlay_checkpoint_plan(100).unwrap();
+    assert_eq!(plan.current_record_count, 1);
+    assert_eq!(plan.compactable_current_records, 1);
+    assert_eq!(plan.blocked_current_records, 0);
+    assert_eq!(plan.stale_record_bytes, 0);
+    assert!(plan.reusable_free_bytes > 0);
+    assert_eq!(plan.current_records.len(), 1);
+    assert_eq!(plan.current_records[0].key, key);
+    assert_eq!(plan.current_records[0].kind, OverlayEntryKind::Value);
+    assert_eq!(plan.current_records[0].blockers, Vec::new());
+
+    drop(store);
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let reopened_plan = reopened.mutable_overlay_checkpoint_plan(100).unwrap();
+    assert_eq!(reopened_plan.current_records[0].generation.as_u64(), 16);
+}
+
+#[test]
+fn mutable_overlay_checkpoint_plan_reports_pinned_generations_and_retention_blockers() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[52; 16],
+        b"documents",
+        b"matrix",
+        b"doc",
+        b"checkpoint-retention",
+    ])
+    .unwrap();
+
+    store
+        .put_mutable_overlay_value(key.clone(), b"checkpoint-current".to_vec())
+        .unwrap();
+    let pinned = store.open_mvcc_snapshot().unwrap();
+    store
+        .save_audit_config_audited(
+            AuditConfig {
+                retention_days: 365,
+                legal_hold: true,
+            },
+            None,
+            "audit.config.set",
+            Some("legal_hold=true"),
+        )
+        .unwrap();
+
+    let plan = store
+        .mutable_overlay_checkpoint_plan_with_durable_floor(100, Some(0))
+        .unwrap();
+    assert_eq!(plan.active_snapshot_count, 1);
+    assert_eq!(
+        plan.oldest_pinned_generation,
+        Some(pinned.overlay_generation())
+    );
+    assert_eq!(plan.pinned_generations, vec![pinned.overlay_generation()]);
+    assert_eq!(plan.compactable_current_records, 0);
+    let blockers = &plan.current_records[0].blockers;
+    assert!(blockers.contains(&MutableOverlayReclaimBlocker::PinnedSnapshot));
+    assert!(blockers.contains(&MutableOverlayReclaimBlocker::RetainedHistory));
+    assert!(blockers.contains(&MutableOverlayReclaimBlocker::AuditRetention));
+    assert!(blockers.contains(&MutableOverlayReclaimBlocker::DurableGenerationWindow));
+    assert!(blockers.contains(&MutableOverlayReclaimBlocker::StrictPromotionBoundary));
+}
+
+#[test]
+fn mutable_overlay_checkpoint_plan_keeps_tombstones_blocked() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[53; 16],
+        b"documents",
+        b"matrix",
+        b"doc",
+        b"checkpoint-tombstone",
+    ])
+    .unwrap();
+
+    store
+        .put_mutable_overlay_value(key.clone(), b"deleted-current".to_vec())
+        .unwrap();
+    store.put_mutable_overlay_tombstone(key.clone()).unwrap();
+
+    let plan = store.mutable_overlay_checkpoint_plan(100).unwrap();
+    assert_eq!(plan.tombstone_count, 1);
+    assert_eq!(plan.current_records[0].key, key);
+    assert_eq!(plan.current_records[0].kind, OverlayEntryKind::Tombstone);
+    assert!(!plan.current_records[0].compactable);
+    assert!(
+        plan.current_records[0]
+            .blockers
+            .contains(&MutableOverlayReclaimBlocker::TombstoneRetention)
+    );
+}
+
+#[test]
+fn mutable_overlay_checkpoint_writer_compacts_current_pages_and_preserves_reads() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[54; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"checkpoint-writer",
+    ])
+    .unwrap();
+    for update in 0..16u64 {
+        store
+            .put_mutable_overlay_value(
+                key.clone(),
+                format!("checkpoint-writer-{update}").into_bytes(),
+            )
+            .unwrap();
+    }
+    let before = store.mutable_overlay_checkpoint_plan(100).unwrap();
+    assert_eq!(before.current_record_count, 1);
+    assert!(before.compactable_current_records > 0);
+    assert_eq!(before.stale_record_bytes, 0);
+    let before_status = store.store_maintenance_report(100).unwrap();
+
+    let report = store.checkpoint_mutable_overlay_pages(100).unwrap();
+    let after = store.store_maintenance_report(100).unwrap();
+
+    assert_eq!(report.planned_current_records, 1);
+    assert_eq!(report.compacted_current_records, 0);
+    assert_eq!(report.rewritten_record_bytes, 0);
+    assert_eq!(report.freed_record_pages, 0);
+    assert!(after.reusable_free_bytes >= report.reusable_free_bytes);
+    assert!(
+        report.physical_page_count
+            <= before_status.status.physical_page_count + report.freed_record_pages
+    );
+    assert_eq!(
+        store
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"checkpoint-writer-15"[..])
+    );
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    assert_eq!(
+        reopened
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"checkpoint-writer-15"[..])
+    );
+}
+
+#[test]
+fn mutable_overlay_checkpoint_writer_respects_pinned_readers() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[55; 16],
+        b"tickets",
+        b"matrix",
+        b"ticket",
+        b"checkpoint-pinned",
+    ])
+    .unwrap();
+    store
+        .put_mutable_overlay_value(key.clone(), b"pinned-0".to_vec())
+        .unwrap();
+    store
+        .put_mutable_overlay_value(key.clone(), b"pinned-1".to_vec())
+        .unwrap();
+    let pinned = store.open_mvcc_snapshot().unwrap();
+
+    let blocked = store.checkpoint_mutable_overlay_pages(100).unwrap();
+
+    assert_eq!(blocked.compacted_current_records, 0);
+    assert_eq!(blocked.blocked_current_records, 1);
+    assert_eq!(
+        pinned
+            .read_composite(&key, |_, _| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"pinned-1"[..])
+    );
+    drop(pinned);
+
+    store
+        .put_mutable_overlay_value(key.clone(), b"pinned-2".to_vec())
+        .unwrap();
+    let compacted = store.checkpoint_mutable_overlay_pages(100).unwrap();
+    assert_eq!(compacted.compacted_current_records, 0);
+}
+
+#[test]
+fn mutable_overlay_checkpoint_writer_keeps_tombstones_and_reports_no_churn() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[56; 16],
+        b"documents",
+        b"matrix",
+        b"doc",
+        b"checkpoint-tombstone-writer",
+    ])
+    .unwrap();
+    store
+        .put_mutable_overlay_value(key.clone(), b"deleted-current".to_vec())
+        .unwrap();
+    store.put_mutable_overlay_tombstone(key.clone()).unwrap();
+
+    let report = store.checkpoint_mutable_overlay_pages(100).unwrap();
+
+    assert_eq!(report.compacted_current_records, 0);
+    assert_eq!(report.blocked_current_records, 1);
+    assert_eq!(
+        store
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(Some(b"base".to_vec())))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn mutable_overlay_tombstone_reclaim_rules_gate_delete_reopen_checkpoint_and_horizon() {
+    use MutableOverlayReclaimBlocker::{
+        DurableGenerationWindow, PinnedSnapshot, TombstoneRetention,
+    };
+
+    // A superseded current-record page at generation 5, superseded by generation 6, with every
+    // retention horizon already passed. This is the baseline "reopen" shape: a value supersedes the
+    // prior entry so no tombstone masks the base.
+    let base = MutableOverlayReclaimState {
+        superseded_generation: 5,
+        superseding_generation: 6,
+        latest_index_generation: 6,
+        oldest_pinned_snapshot_generation: None,
+        retained_history_generation: None,
+        audit_retention_active: false,
+        tombstone_masks_base: false,
+        durable_reclaim_floor: 6,
+        strict_promotion_generation: None,
+    };
+    assert!(base.is_eligible().unwrap());
+
+    // Delete: the superseding entry is a tombstone that must keep hiding a value reachable from the
+    // immutable base, so the page is retained under the tombstone-retention rule and nothing else.
+    let deleted = MutableOverlayReclaimState {
+        tombstone_masks_base: true,
+        ..base
+    };
+    assert_eq!(deleted.blockers().unwrap(), vec![TombstoneRetention]);
+
+    // Checkpoint: a pinned MVCC snapshot inside the superseded window holds the page even once the
+    // tombstone no longer masks the base; releasing the checkpoint clears the block.
+    let pinned = MutableOverlayReclaimState {
+        oldest_pinned_snapshot_generation: Some(5),
+        ..base
+    };
+    assert!(pinned.blockers().unwrap().contains(&PinnedSnapshot));
+    assert!(!pinned.is_eligible().unwrap());
+    let released = MutableOverlayReclaimState {
+        oldest_pinned_snapshot_generation: None,
+        ..pinned
+    };
+    assert!(released.is_eligible().unwrap());
+
+    // Retention horizon: the durable-generation floor has not reached the superseding generation, so
+    // recovery could still roll the replacement back. Advancing the floor clears the block.
+    let below_horizon = MutableOverlayReclaimState {
+        durable_reclaim_floor: 5,
+        ..base
+    };
+    assert!(
+        below_horizon
+            .blockers()
+            .unwrap()
+            .contains(&DurableGenerationWindow)
+    );
+    let at_horizon = MutableOverlayReclaimState {
+        durable_reclaim_floor: 6,
+        ..base
+    };
+    assert!(at_horizon.is_eligible().unwrap());
+}
+
+#[test]
+fn page_attribution_materializes_lazy_object_index_after_reopen() {
+    let shared = SharedMem::default();
+    {
+        let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+        for value in 0..8u8 {
+            store
+                .put(&Object::Blob(vec![value; 512]).canonical())
+                .unwrap();
+        }
+    }
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let attribution = reopened.page_class_attribution(100).unwrap();
+    let live_record_bytes = attribution
+        .classes
+        .iter()
+        .filter(|class| class.class.starts_with("record_"))
+        .map(|class| class.bytes)
+        .sum::<u64>();
+    let stale_record_bytes = attribution
+        .classes
+        .iter()
+        .filter(|class| class.class.starts_with("stale_record_"))
+        .map(|class| class.bytes)
+        .sum::<u64>();
+
+    assert!(live_record_bytes > 0);
+    assert_eq!(stale_record_bytes, 0);
+}
+
+#[test]
+fn mutable_overlay_tombstone_delete_retains_then_reopen_preserves_reads_and_reclaims() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        &[50; 16],
+        b"documents",
+        b"matrix",
+        b"doc",
+        b"delete-reopen",
+    ])
+    .unwrap();
+
+    store
+        .put_mutable_overlay_value(key.clone(), b"v0".to_vec())
+        .unwrap();
+    // Delete: the tombstone masks the immutable base through composite reads, and the buried value
+    // page is retained under the tombstone-retention rule. A composite read is not-found even though
+    // the base still exposes a value.
+    store.put_mutable_overlay_tombstone(key.clone()).unwrap();
+    assert_eq!(
+        store
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(Some(b"base".to_vec())))
+            .unwrap(),
+        None
+    );
+    let stale_after_delete = store
+        .page_class_attribution(100)
+        .unwrap()
+        .classes
+        .iter()
+        .filter(|class| class.class.starts_with("stale_record_"))
+        .map(|class| class.bytes)
+        .sum::<u64>();
+    assert!(stale_after_delete > 0);
+
+    // Checkpoint preservation: a snapshot pinned at the tombstone generation keeps observing the
+    // delete even after the key is reopened, so tombstones preserve composite reads until the
+    // checkpoint is released.
+    let pinned = store.open_mvcc_snapshot().unwrap();
+    store
+        .put_mutable_overlay_value(key.clone(), b"reopened".to_vec())
+        .unwrap();
+    assert_eq!(
+        pinned
+            .read_composite(&key, |_, _| Ok(Some(b"base".to_vec())))
+            .unwrap(),
+        None
+    );
+    assert!(pinned.release().unwrap());
+
+    // Reopen churn with no pinned checkpoint: each value supersedes a tombstone (reclaimable) and each
+    // tombstone supersedes a value (retained). The superseded tombstone pages return to the allocator,
+    // so the free map grows even though deleted-value pages stay retained.
+    for cycle in 0..24u64 {
+        store.put_mutable_overlay_tombstone(key.clone()).unwrap();
+        store
+            .put_mutable_overlay_value(key.clone(), format!("reopen-{cycle}").into_bytes())
+            .unwrap();
+    }
+
+    // tombstone_count is a cumulative hot-write-log metric, so the current view is asserted through
+    // the single live logical key and a composite read rather than that counter.
+    let reopened = store.store_maintenance_report(100).unwrap();
+    assert_eq!(reopened.overlay_health.current_record_count, 1);
+    assert!(reopened.reusable_free_bytes > 0);
+    assert_eq!(
+        store
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"reopen-23"[..])
+    );
+}
+
+#[test]
+fn document_current_records_survive_reopen_without_rewriting_collection_root() {
+    let shared = SharedMem::default();
+    let mut loom = loom_over_backing(Box::new(shared.clone()), true).unwrap();
+    let ns = loom
+        .registry_mut()
+        .create(
+            FacetKind::Document,
+            Some("docs"),
+            WorkspaceId::from_bytes([4; 16]),
+        )
+        .unwrap();
+    document::document_put_text(&mut loom, ns, "notes", "a", "one", None).unwrap();
+    let control_root = loom.store().control_root();
+    for update in 0..32u64 {
+        document::document_put_text(
+            &mut loom,
+            ns,
+            "notes",
+            "a",
+            &format!("current-{update}"),
+            None,
+        )
+        .unwrap();
+    }
+    assert_eq!(loom.store().control_root(), control_root);
+    assert_eq!(
+        document::document_get_text(&loom, ns, "notes", "a")
+            .unwrap()
+            .unwrap()
+            .text,
+        "current-31"
+    );
+    assert_eq!(
+        document::doc_list_collections(&loom, ns).unwrap(),
+        vec!["notes".to_string()]
+    );
+    save_loom(&mut loom).unwrap();
+    drop(loom);
+
+    let mut reopened = loom_over_backing(Box::new(shared), true).unwrap();
+    assert_eq!(
+        document::document_get_text(&reopened, ns, "notes", "a")
+            .unwrap()
+            .unwrap()
+            .text,
+        "current-31"
+    );
+    assert_eq!(
+        reopened
+            .store()
+            .store_maintenance_report(100)
+            .unwrap()
+            .overlay_health
+            .current_record_count,
+        2
+    );
+    reopened
+        .commit(ns, "tester", "checkpoint documents", 1)
+        .unwrap();
+    assert_eq!(
+        document::document_get_text(&reopened, ns, "notes", "a")
+            .unwrap()
+            .unwrap()
+            .text,
+        "current-31"
+    );
+}
+
+#[test]
+fn document_delete_collection_tombstones_mutable_overlay_head() {
+    let shared = SharedMem::default();
+    let mut loom = loom_over_backing(Box::new(shared.clone()), true).unwrap();
+    let ns = loom
+        .registry_mut()
+        .create(
+            FacetKind::Document,
+            Some("docs"),
+            WorkspaceId::from_bytes([5; 16]),
+        )
+        .unwrap();
+    document::document_put_text(&mut loom, ns, "notes", "a", "one", None).unwrap();
+    document::document_put_text(&mut loom, ns, "logs", "b", "two", None).unwrap();
+
+    assert!(document::doc_delete_collection(&mut loom, ns, "notes").unwrap());
+    assert_eq!(
+        document::doc_list_collections(&loom, ns).unwrap(),
+        vec!["logs".to_string()]
+    );
+    assert!(
+        document::document_get_text(&loom, ns, "notes", "a")
+            .unwrap()
+            .is_none()
+    );
+    save_loom(&mut loom).unwrap();
+    drop(loom);
+
+    let reopened = loom_over_backing(Box::new(shared), true).unwrap();
+    assert_eq!(
+        document::doc_list_collections(&reopened, ns).unwrap(),
+        vec!["logs".to_string()]
+    );
+    assert!(
+        document::document_get_text(&reopened, ns, "notes", "a")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1726,6 +3543,7 @@ fn store_policy_defaults_and_survives_reopen() {
                 .save_store_policy_audited(
                     StorePolicy {
                         fips_required: true,
+                        ..StorePolicy::default()
                     },
                     Some(principal),
                     "store.policy.set",
@@ -1740,7 +3558,8 @@ fn store_policy_defaults_and_survives_reopen() {
     assert_eq!(
         store.store_policy().unwrap(),
         StorePolicy {
-            fips_required: true
+            fips_required: true,
+            ..StorePolicy::default()
         }
     );
     let records = store.audit_records().unwrap();
@@ -1758,6 +3577,7 @@ fn local_runtime_rejects_fips_required_store_when_not_fips_capable() {
             .save_store_policy_audited(
                 StorePolicy {
                     fips_required: true,
+                    ..StorePolicy::default()
                 },
                 None,
                 "store.policy.set",
@@ -2474,6 +4294,73 @@ fn derived_artifact_rebuild_lifecycle_coalesces_and_reports_status() {
             stamp: stale_stamp,
             message: "native engine unavailable".into()
         }
+    );
+}
+
+#[test]
+fn derived_artifact_durability_defaults_to_relaxed_unless_retained() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let ns = loom_core::WorkspaceId::from_bytes([91; 16]);
+    let search = DerivedArtifactKey::new(ns, FacetKind::Search, "docs", "tantivy").unwrap();
+    let vector = vector_pq_artifact_key(ns, "emb").unwrap();
+    let dataframe =
+        dataframe_materialization_artifact_key(ns, "etl/purchases", "columnar").unwrap();
+    let columnar = columnar_arrow_artifact_key(ns, "events").unwrap();
+
+    assert_eq!(
+        store.derived_artifact_durability(&search, None).unwrap(),
+        StoreDurabilityPolicy::Relaxed
+    );
+    assert_eq!(
+        store.derived_artifact_durability(&vector, None).unwrap(),
+        StoreDurabilityPolicy::Relaxed
+    );
+    assert_eq!(
+        store.derived_artifact_durability(&dataframe, None).unwrap(),
+        StoreDurabilityPolicy::Relaxed
+    );
+    assert_eq!(
+        store.derived_artifact_durability(&columnar, None).unwrap(),
+        StoreDurabilityPolicy::Relaxed
+    );
+    assert_eq!(
+        store
+            .derived_artifact_durability(&dataframe, Some(StoreDurabilityPolicy::Normal))
+            .unwrap(),
+        StoreDurabilityPolicy::Normal
+    );
+}
+
+#[test]
+fn derived_artifact_facet_policy_can_retain_artifacts() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let ns = loom_core::WorkspaceId::from_bytes([92; 16]);
+    let search = DerivedArtifactKey::new(ns, FacetKind::Search, "docs", "tantivy").unwrap();
+    let vector = vector_hnsw_artifact_key(ns, "emb").unwrap();
+    let mut policy = store.store_policy().unwrap();
+    policy
+        .set_default_durability(StoreDurabilityPolicy::Ephemeral)
+        .unwrap();
+    policy
+        .set_facet_durability(FacetKind::Search, Some(StoreDurabilityPolicy::Strict))
+        .unwrap();
+    store
+        .save_store_policy_audited(policy, None, "store.policy.set", None)
+        .unwrap();
+
+    assert_eq!(
+        store.derived_artifact_durability(&search, None).unwrap(),
+        StoreDurabilityPolicy::Strict
+    );
+    assert_eq!(
+        store.derived_artifact_durability(&vector, None).unwrap(),
+        StoreDurabilityPolicy::Relaxed
+    );
+    assert_eq!(
+        store
+            .derived_artifact_durability(&vector, Some(StoreDurabilityPolicy::Normal))
+            .unwrap(),
+        StoreDurabilityPolicy::Normal
     );
 }
 
@@ -4174,11 +6061,74 @@ fn gc_validated_segments_requires_completed_epoch_and_obeys_budget() {
             max_pages: u64::MAX,
         })
         .unwrap();
-    assert!(stats.segments_reclaimed <= 1);
+    assert_eq!(
+        stats.objects_relocated, 0,
+        "the active segment must be swept without relocating live objects"
+    );
+    assert_eq!(stats.segments_reclaimed, 0);
     assert!(stats.objects_dropped > 0);
     assert!(stats.pages_freed > 0);
     for (i, digest) in digests.iter().enumerate() {
         assert_eq!(store.has(digest).unwrap(), i % 10 == 0);
+    }
+    let stale_record_bytes = store
+        .page_class_attribution(0)
+        .unwrap()
+        .classes
+        .iter()
+        .filter(|class| class.class.starts_with("stale_record_"))
+        .map(|class| class.bytes)
+        .sum::<u64>();
+    assert_eq!(
+        stale_record_bytes, 0,
+        "validated segment GC must return every dropped or relocated record page to the free map"
+    );
+}
+
+#[test]
+fn repeated_validated_segment_gc_does_not_leave_untracked_record_pages() {
+    let tp = TempPath::new("gc-repeated-no-stale-records");
+    let mut store = FileStore::open(tp.path()).unwrap();
+    let mut retained = BTreeSet::new();
+
+    for cycle in 0..4u32 {
+        for object in 0..300u32 {
+            let digest = store
+                .put(&blob(
+                    format!("cycle-{cycle}-object-{object:04}").as_bytes(),
+                ))
+                .unwrap();
+            if object % 50 == 0 {
+                retained.insert(digest);
+            }
+        }
+        let state = loom_core::ReachabilityMarkState {
+            pinned: BTreeSet::new(),
+            marked: retained.clone(),
+            queue: std::collections::VecDeque::new(),
+            stream_roots: std::collections::VecDeque::new(),
+            completed: true,
+        };
+        let epoch = store
+            .begin_reachability_mark_epoch(None, BTreeSet::new(), state)
+            .unwrap();
+        store.complete_reachability_mark_epoch(&epoch).unwrap();
+        store
+            .gc_validated_segments(GcSegmentBudget::unlimited())
+            .unwrap();
+
+        let stale_record_bytes = store
+            .page_class_attribution(0)
+            .unwrap()
+            .classes
+            .iter()
+            .filter(|class| class.class.starts_with("stale_record_"))
+            .map(|class| class.bytes)
+            .sum::<u64>();
+        assert_eq!(
+            stale_record_bytes, 0,
+            "GC cycle {cycle} left record pages outside both the object index and free map"
+        );
     }
 }
 
@@ -4270,6 +6220,68 @@ fn tail_compaction_relocates_live_tail_object_and_shrinks() {
     assert_eq!(
         reopened.get(&live).unwrap().unwrap(),
         vec![0xC7; 300 * 1024]
+    );
+}
+
+#[test]
+fn tail_compaction_relocates_every_object_on_a_selected_slab_page() {
+    let tp = TempPath::new("tail-compact-shared-slab");
+    let mut store = FileStore::open(tp.path()).unwrap();
+    {
+        let mut inner = store.inner.lock().unwrap();
+        let free_pages = 64;
+        inner.free.push(FreePageRun {
+            start: 0,
+            len: free_pages,
+            freed_gen: 1,
+        });
+        inner.page_count = free_pages;
+        inner.maintenance.physical_page_count = free_pages;
+        inner.maintenance.reusable_free_pages = free_pages;
+        inner.maintenance.candidate_dead_pages = free_pages;
+        let mut file = store.file.lock().unwrap();
+        file.grow(DATA_START + inner.page_count * PAGE_SIZE)
+            .unwrap();
+    }
+    let first_bytes = b"first shared slab object";
+    let second_bytes = b"second shared slab object";
+    let first = Digest::hash(store.digest_algo, first_bytes);
+    let second = Digest::hash(store.digest_algo, second_bytes);
+    store
+        .group_commit(&[
+            (first, first_bytes.as_slice(), store.default_codec),
+            (second, second_bytes.as_slice(), store.default_codec),
+        ])
+        .unwrap();
+    {
+        let mut inner = store.inner.lock().unwrap();
+        inner.generation = REUSE_SAFE_WINDOW + 10;
+        for run in &mut inner.free {
+            run.freed_gen = 1;
+        }
+    }
+
+    let stats = store.compact_tail_once(16, 1, 32).unwrap();
+    assert!(stats.attempted);
+    assert_eq!(stats.relocated_objects, 2);
+    assert_eq!(
+        store.get(&first).unwrap().unwrap(),
+        b"first shared slab object"
+    );
+    assert_eq!(
+        store.get(&second).unwrap().unwrap(),
+        b"second shared slab object"
+    );
+    drop(store);
+
+    let reopened = FileStore::open(tp.path()).unwrap();
+    assert_eq!(
+        reopened.get(&first).unwrap().unwrap(),
+        b"first shared slab object"
+    );
+    assert_eq!(
+        reopened.get(&second).unwrap().unwrap(),
+        b"second shared slab object"
     );
 }
 
@@ -4750,21 +6762,17 @@ fn freemap_survives_a_reuse_heavy_workload() {
     // Enough distinct puts to drive the B-tree multi-level and well past the reuse window, so later
     // commits genuinely reuse aged superseded-node extents. The allocator unit tests above prove
     // the reuse mechanism; this proves the store stays correct when its on-disk B-tree nodes partly
-    // live in reused holes - after a reopen rebuilds the index from disk, every object must still
-    // resolve, and the logical end must never have moved backward.
+    // live in reused holes and online tail trimming moves the logical end in either direction.
     let n = 400usize;
     let tp = TempPath::new("freemap-workload");
     let end = {
         let store = FileStore::open(tp.path()).unwrap();
-        let mut prev_end = store.logical_end();
         for i in 0..n {
             store.put(&blob(format!("obj-{i:08}").as_bytes())).unwrap();
-            let now = store.logical_end();
-            assert!(now >= prev_end, "logical end moved backward"); // reuse fills holes only
-            prev_end = now;
+            assert!(store.logical_end() >= DATA_START);
         }
         assert_eq!(store.len(), n);
-        prev_end
+        store.logical_end()
     };
     let reopened = FileStore::open(tp.path()).unwrap();
     assert_eq!(reopened.logical_end(), end); // recovered state matches what was committed
@@ -5029,5 +7037,1547 @@ fn cas_facade_honors_sha256_profile() {
         cas_list(&loom, ns).unwrap(),
         vec![addr],
         "list enumerates the SHA-256-addressed blob"
+    );
+}
+
+#[test]
+fn store_durability_policy_parse_and_validation_accept_contract_modes() {
+    assert_eq!(
+        parse_store_durability_policy("strict").unwrap(),
+        StoreDurabilityPolicy::Strict
+    );
+    assert_eq!(
+        parse_store_durability_policy("normal").unwrap(),
+        StoreDurabilityPolicy::Normal
+    );
+    assert_eq!(
+        parse_store_durability_policy("relaxed").unwrap(),
+        StoreDurabilityPolicy::Relaxed
+    );
+    assert_eq!(
+        parse_store_durability_policy("ephemeral").unwrap(),
+        StoreDurabilityPolicy::Ephemeral
+    );
+    for policy in StoreDurabilityPolicy::ALL {
+        validate_store_durability_policy(policy).unwrap();
+    }
+}
+
+#[test]
+fn store_durability_policy_parse_rejects_unsupported_modes() {
+    let error = parse_store_durability_policy("unsafe").unwrap_err();
+
+    assert_eq!(error.code, Code::InvalidArgument);
+}
+
+#[test]
+fn store_policy_durability_defaults_and_facet_overrides_survive_reopen() {
+    let tp = TempPath::new("store-durability-policy");
+    {
+        let store = FileStore::open(tp.path()).unwrap();
+        let mut policy = store.store_policy().unwrap();
+        policy
+            .set_default_durability(StoreDurabilityPolicy::Relaxed)
+            .unwrap();
+        policy
+            .set_facet_durability(FacetKind::Ledger, Some(StoreDurabilityPolicy::Strict))
+            .unwrap();
+        policy
+            .set_facet_durability(FacetKind::Search, Some(StoreDurabilityPolicy::Ephemeral))
+            .unwrap();
+        store
+            .save_store_policy_audited(policy, None, "store.policy.set", None)
+            .unwrap();
+    }
+
+    let store = FileStore::open(tp.path()).unwrap();
+    let policy = store.store_policy().unwrap();
+
+    assert_eq!(
+        policy.effective_durability(FacetKind::Document),
+        StoreDurabilityPolicy::Relaxed
+    );
+    assert_eq!(
+        policy.effective_durability(FacetKind::Ledger),
+        StoreDurabilityPolicy::Strict
+    );
+    assert_eq!(
+        policy.effective_durability(FacetKind::Search),
+        StoreDurabilityPolicy::Ephemeral
+    );
+}
+
+#[test]
+fn store_policy_rejects_malformed_durability_configuration() {
+    let tp = TempPath::new("store-durability-policy-invalid");
+    let store = FileStore::open(tp.path()).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(STORE_POLICY_MAGIC);
+    bytes.push(2);
+    bytes.push(0);
+    bytes.push(9);
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    store.control_set(STORE_POLICY_KEY, bytes).unwrap();
+
+    let error = store.store_policy().unwrap_err();
+
+    assert_eq!(error.code, Code::CorruptObject);
+}
+
+fn reclaim_state_without_blockers() -> MutableOverlayReclaimState {
+    MutableOverlayReclaimState {
+        superseded_generation: 10,
+        superseding_generation: 12,
+        latest_index_generation: 12,
+        oldest_pinned_snapshot_generation: None,
+        retained_history_generation: None,
+        audit_retention_active: false,
+        tombstone_masks_base: false,
+        durable_reclaim_floor: 12,
+        strict_promotion_generation: None,
+    }
+}
+
+#[test]
+fn mutable_overlay_reclaim_eligibility_allows_unpinned_superseded_current_record() {
+    let state = reclaim_state_without_blockers();
+
+    assert_eq!(state.blockers().unwrap(), Vec::new());
+    assert!(state.is_eligible().unwrap());
+}
+
+#[test]
+fn mutable_overlay_reclaim_eligibility_blocks_visible_current_and_retained_views() {
+    let state = MutableOverlayReclaimState {
+        latest_index_generation: 10,
+        oldest_pinned_snapshot_generation: Some(11),
+        retained_history_generation: Some(10),
+        strict_promotion_generation: Some(10),
+        ..reclaim_state_without_blockers()
+    };
+
+    assert_eq!(
+        state.blockers().unwrap(),
+        vec![
+            MutableOverlayReclaimBlocker::CurrentIndexVisible,
+            MutableOverlayReclaimBlocker::PinnedSnapshot,
+            MutableOverlayReclaimBlocker::RetainedHistory,
+            MutableOverlayReclaimBlocker::StrictPromotionBoundary,
+        ]
+    );
+    assert!(!state.is_eligible().unwrap());
+}
+
+#[test]
+fn mutable_overlay_reclaim_eligibility_blocks_policy_and_durability_windows() {
+    let state = MutableOverlayReclaimState {
+        audit_retention_active: true,
+        tombstone_masks_base: true,
+        durable_reclaim_floor: 11,
+        ..reclaim_state_without_blockers()
+    };
+
+    assert_eq!(
+        state.blockers().unwrap(),
+        vec![
+            MutableOverlayReclaimBlocker::AuditRetention,
+            MutableOverlayReclaimBlocker::TombstoneRetention,
+            MutableOverlayReclaimBlocker::DurableGenerationWindow,
+        ]
+    );
+    assert!(!state.is_eligible().unwrap());
+}
+
+#[test]
+fn mutable_overlay_reclaim_eligibility_rejects_invalid_generation_order() {
+    let state = MutableOverlayReclaimState {
+        superseding_generation: 10,
+        ..reclaim_state_without_blockers()
+    };
+    let error = state.blockers().unwrap_err();
+
+    assert_eq!(error.code, Code::InvalidArgument);
+}
+
+fn durability_test_key(name: &str) -> OverlayKey {
+    OverlayKey::from_segments([
+        b"workspace",
+        &[9; 16],
+        b"documents",
+        b"durability",
+        b"current",
+        name.as_bytes(),
+    ])
+    .unwrap()
+}
+
+fn durability_facet_test_key(facet: &[u8], name: &str) -> OverlayKey {
+    OverlayKey::from_segments([
+        b"workspace",
+        &[10; 16],
+        facet,
+        b"durability",
+        b"current",
+        name.as_bytes(),
+    ])
+    .unwrap()
+}
+
+fn workflow_transaction_test(
+    _name: &str,
+    writes: Vec<FacetWrite>,
+    idempotency: Option<&[u8]>,
+) -> WorkflowTransaction {
+    WorkflowTransaction {
+        workspace: WorkspaceId::from_bytes([11; 16]),
+        actor: WorkspaceId::from_bytes([12; 16]),
+        expected_generation: None,
+        writes,
+        durability: OverlayDurabilityPolicy::Normal,
+        boundary: AtomicityBoundary::Single,
+        idempotency: idempotency.map(loom_core::IdempotencyKey::opaque),
+        owner_state: loom_core::WorkflowOwnerState::default(),
+    }
+}
+
+fn workflow_put(
+    facet: FacetKind,
+    key: OverlayKey,
+    payload: &[u8],
+    expected: Option<loom_core::OverlayOwnerToken>,
+) -> FacetWrite {
+    FacetWrite {
+        facet,
+        target: key,
+        op: FacetWriteOp::Put {
+            payload: payload.to_vec(),
+        },
+        secondary_indexes: Vec::new(),
+        expected: expected.map(CompareToken),
+        durability: None,
+        audit: None,
+        side_effects: FacetSideEffects::default(),
+    }
+}
+
+fn workflow_put_with_side_effect(key: OverlayKey, payload: &[u8], operation: &str) -> FacetWrite {
+    FacetWrite {
+        audit: Some(AuditIntent {
+            operation: operation.to_string(),
+        }),
+        side_effects: FacetSideEffects {
+            intents: vec![FacetSideEffect::OperationLog {
+                operation_id: operation.to_string(),
+            }],
+        },
+        ..workflow_put(FacetKind::Document, key, payload, None)
+    }
+}
+
+fn workflow_put_with_secondary_index(
+    key: OverlayKey,
+    payload: &[u8],
+    index: OverlayKey,
+    index_payload: &[u8],
+) -> FacetWrite {
+    FacetWrite {
+        secondary_indexes: vec![SecondaryIndexWrite {
+            index,
+            op: SecondaryIndexWriteOp::Put {
+                payload: index_payload.to_vec(),
+            },
+        }],
+        ..workflow_put(FacetKind::Document, key, payload, None)
+    }
+}
+
+#[test]
+fn workflow_transaction_commits_all_writes_in_one_boundary_and_replays_idempotency() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let document_key = durability_facet_test_key(b"documents", "workflow-document");
+    let search_key = durability_facet_test_key(b"search", "workflow-search");
+    let txn = workflow_transaction_test(
+        "workflow",
+        vec![
+            workflow_put(
+                FacetKind::Document,
+                document_key.clone(),
+                b"document-current",
+                None,
+            ),
+            workflow_put(
+                FacetKind::Search,
+                search_key.clone(),
+                b"search-current",
+                None,
+            ),
+        ],
+        Some(b"workflow-retry"),
+    );
+
+    let receipt = store.commit_workflow_transaction(txn.clone()).unwrap();
+    let replay = store.commit_workflow_transaction(txn).unwrap();
+
+    assert!(!receipt.replayed);
+    assert!(replay.replayed);
+    assert_eq!(receipt.writes.len(), 2);
+    assert_eq!(replay.writes[0].owner_token, receipt.writes[0].owner_token);
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let snapshot = reopened.mutable_overlay_snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .read_composite(&document_key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"document-current"[..])
+    );
+    assert_eq!(
+        snapshot
+            .read_composite(&search_key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"search-current"[..])
+    );
+}
+
+#[test]
+fn workflow_transaction_commits_overlay_control_objects_and_reference_together() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let overlay_key = durability_facet_test_key(b"documents", "cross-storage");
+    let canonical = loom_core::Object::Blob(b"owner-state".to_vec()).canonical();
+    let object = Digest::hash(Algo::Blake3, &canonical);
+    let mut txn = workflow_transaction_test(
+        "cross-storage",
+        vec![workflow_put(
+            FacetKind::Document,
+            overlay_key.clone(),
+            b"overlay-state",
+            None,
+        )],
+        Some(b"cross-storage"),
+    );
+    txn.owner_state = loom_core::WorkflowOwnerState {
+        objects: vec![(object, canonical.clone())],
+        reference: loom_core::WorkflowReferenceUpdate::Set(Some(object)),
+        controls: vec![loom_core::WorkflowControlWrite::Put {
+            key: b"owner/current".to_vec(),
+            payload: b"control-state".to_vec(),
+        }],
+        audits: vec![loom_core::WorkflowAuditWrite {
+            principal: None,
+            action: "owner.commit".to_string(),
+            target: Some("owner/current".to_string()),
+        }],
+    };
+
+    store.commit_workflow_transaction(txn).unwrap();
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    assert_eq!(reopened.reference_root(), Some(object));
+    assert_eq!(
+        reopened.control_get(b"owner/current").unwrap().as_deref(),
+        Some(&b"control-state"[..])
+    );
+    assert_eq!(
+        reopened.get(&object).unwrap().as_deref(),
+        Some(canonical.as_slice())
+    );
+    let audit = reopened.audit_records().unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, "owner.commit");
+    assert_eq!(
+        reopened
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&overlay_key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"overlay-state"[..])
+    );
+}
+
+#[test]
+fn workflow_transaction_appends_retained_history_atomically_and_survives_reopen() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let overlay_key = durability_facet_test_key(b"documents", "retained-history-owner");
+    let history_key = b"pages/workspace/operation-log".to_vec();
+    let mut first = workflow_transaction_test(
+        "retained-history-first",
+        vec![workflow_put(
+            FacetKind::Document,
+            overlay_key.clone(),
+            b"current-1",
+            None,
+        )],
+        None,
+    );
+    first.owner_state.controls = vec![loom_core::WorkflowControlWrite::AppendRetained {
+        key: history_key.clone(),
+        expected_next_sequence: 1,
+        records: vec![b"operation-1".to_vec(), b"operation-2".to_vec()],
+    }];
+    store.commit_workflow_transaction(first).unwrap();
+
+    let token = store.mutable_overlay_owner_token(&overlay_key).unwrap();
+    let mut second = workflow_transaction_test(
+        "retained-history-second",
+        vec![workflow_put(
+            FacetKind::Document,
+            overlay_key.clone(),
+            b"current-2",
+            token,
+        )],
+        None,
+    );
+    second.owner_state.controls = vec![loom_core::WorkflowControlWrite::AppendRetained {
+        key: history_key.clone(),
+        expected_next_sequence: 3,
+        records: vec![b"operation-3".to_vec()],
+    }];
+    store.commit_workflow_transaction(second).unwrap();
+
+    assert_eq!(store.retained_history_head(&history_key).unwrap(), 3);
+    assert_eq!(
+        store
+            .retained_history_records(&history_key, 2, usize::MAX)
+            .unwrap(),
+        vec![b"operation-2".to_vec(), b"operation-3".to_vec()]
+    );
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    assert_eq!(reopened.retained_history_head(&history_key).unwrap(), 3);
+    assert_eq!(
+        reopened
+            .retained_history_records(&history_key, 1, usize::MAX)
+            .unwrap(),
+        vec![
+            b"operation-1".to_vec(),
+            b"operation-2".to_vec(),
+            b"operation-3".to_vec()
+        ]
+    );
+    assert_eq!(
+        reopened
+            .mutable_overlay_current_entry(&overlay_key)
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"current-2"
+    );
+}
+
+#[test]
+fn retained_history_owner_appends_point_update_the_overlay_index() {
+    let tp = TempPath::new("retained-history-point-update");
+    let store = FileStore::open(tp.path()).unwrap();
+    let overlay_key = durability_facet_test_key(b"documents", "retained-history-growth");
+    let history_key = b"pages/workspace/bounded-operation-log".to_vec();
+    let mut warm = 0;
+
+    for sequence in 1..=48u64 {
+        let token = store.mutable_overlay_owner_token(&overlay_key).unwrap();
+        let mut transaction = workflow_transaction_test(
+            &format!("retained-history-growth-{sequence}"),
+            vec![workflow_put(
+                FacetKind::Document,
+                overlay_key.clone(),
+                format!("current-{sequence}").as_bytes(),
+                token,
+            )],
+            None,
+        );
+        transaction.owner_state.controls = vec![loom_core::WorkflowControlWrite::AppendRetained {
+            key: history_key.clone(),
+            expected_next_sequence: sequence,
+            records: vec![format!("operation-{sequence}").into_bytes()],
+        }];
+        store.commit_workflow_transaction(transaction).unwrap();
+        if sequence == 24 {
+            warm = store.maintenance_status().unwrap().physical_bytes;
+        }
+    }
+
+    let measured = store.maintenance_status().unwrap().physical_bytes;
+    assert_eq!(store.retained_history_head(&history_key).unwrap(), 48);
+    assert!(
+        measured.saturating_sub(warm) <= 256 * 1024,
+        "24 retained owner appends grew {} bytes after warmup",
+        measured.saturating_sub(warm)
+    );
+}
+
+#[test]
+fn mutable_overlay_current_index_survives_canonical_round_trip() {
+    let first = mutable_overlay_entry_address(&durability_facet_test_key(
+        b"documents",
+        "current-index-first",
+    ));
+    let second = mutable_overlay_entry_address(&durability_facet_test_key(
+        b"tickets",
+        "current-index-second",
+    ));
+    let mut addresses = vec![second, first];
+    addresses.sort();
+
+    let encoded = encode_mutable_overlay_current_index_record(&addresses);
+    assert_eq!(
+        decode_mutable_overlay_current_index_record(&encoded).unwrap(),
+        addresses
+    );
+
+    let mut duplicate = addresses.clone();
+    duplicate.push(*duplicate.last().unwrap());
+    let duplicate = encode_mutable_overlay_current_index_record(&duplicate);
+    assert!(decode_mutable_overlay_current_index_record(&duplicate).is_err());
+}
+
+#[test]
+fn cold_open_uses_current_index_instead_of_retained_history_scan() {
+    let tp = TempPath::new("current-index-open");
+    let history_key = b"pages/workspace/current-index-history".to_vec();
+    let current_key = durability_facet_test_key(b"documents", "current-index-live");
+    {
+        let store = FileStore::open(tp.path()).unwrap();
+        for sequence in 1..=40u64 {
+            let token = store.mutable_overlay_owner_token(&current_key).unwrap();
+            let mut transaction = workflow_transaction_test(
+                &format!("current-index-open-{sequence}"),
+                vec![workflow_put(
+                    FacetKind::Document,
+                    current_key.clone(),
+                    format!("current-{sequence}").as_bytes(),
+                    token,
+                )],
+                None,
+            );
+            transaction.owner_state.controls =
+                vec![loom_core::WorkflowControlWrite::AppendRetained {
+                    key: history_key.clone(),
+                    expected_next_sequence: sequence,
+                    records: vec![format!("operation-{sequence}").into_bytes()],
+                }];
+            store.commit_workflow_transaction(transaction).unwrap();
+        }
+    }
+
+    let reopened = FileStore::open(tp.path()).unwrap();
+    let stats = reopened.io_stats().unwrap();
+    assert!(stats.open_mutable_used_current_index);
+    assert_eq!(stats.open_mutable_current_records_loaded, 1);
+    assert_eq!(stats.open_mutable_control_records_skipped, 0);
+    assert_eq!(reopened.retained_history_head(&history_key).unwrap(), 40);
+    assert_eq!(
+        reopened
+            .retained_history_records(&history_key, 40, 1)
+            .unwrap(),
+        vec![b"operation-40".to_vec()]
+    );
+    assert_eq!(
+        reopened
+            .mutable_overlay_current_entry(&current_key)
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"current-40"
+    );
+}
+
+#[test]
+fn replacing_one_packed_overlay_record_preserves_its_slab_neighbors() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let first_key = durability_facet_test_key(b"documents", "packed-first");
+    let second_key = durability_facet_test_key(b"documents", "packed-second");
+
+    store
+        .put_mutable_overlay_values(vec![
+            (first_key.clone(), b"first-v1".to_vec()),
+            (second_key.clone(), b"second-v1".to_vec()),
+        ])
+        .unwrap();
+    store
+        .put_mutable_overlay_value(first_key.clone(), b"first-v2".to_vec())
+        .unwrap();
+
+    assert_eq!(
+        store
+            .mutable_overlay_current_entry(&first_key)
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"first-v2"
+    );
+    assert_eq!(
+        store
+            .mutable_overlay_current_entry(&second_key)
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"second-v1"
+    );
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    assert_eq!(
+        reopened
+            .mutable_overlay_current_entry(&first_key)
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"first-v2"
+    );
+    assert_eq!(
+        reopened
+            .mutable_overlay_current_entry(&second_key)
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"second-v1"
+    );
+}
+
+#[test]
+fn workflow_transaction_rejects_stale_retained_history_sequence_without_partial_publish() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let baseline_key = durability_facet_test_key(b"documents", "retained-history-baseline");
+    let history_key = b"pages/workspace/operation-log".to_vec();
+    let mut baseline = workflow_transaction_test(
+        "retained-history-baseline",
+        vec![workflow_put(
+            FacetKind::Document,
+            baseline_key.clone(),
+            b"baseline",
+            None,
+        )],
+        None,
+    );
+    baseline.owner_state.controls = vec![loom_core::WorkflowControlWrite::AppendRetained {
+        key: history_key.clone(),
+        expected_next_sequence: 1,
+        records: vec![b"operation-1".to_vec()],
+    }];
+    store.commit_workflow_transaction(baseline).unwrap();
+
+    let rejected_key = durability_facet_test_key(b"documents", "retained-history-rejected");
+    let mut rejected = workflow_transaction_test(
+        "retained-history-rejected",
+        vec![workflow_put(
+            FacetKind::Document,
+            rejected_key.clone(),
+            b"must-not-publish",
+            None,
+        )],
+        None,
+    );
+    rejected.owner_state.controls = vec![loom_core::WorkflowControlWrite::AppendRetained {
+        key: history_key.clone(),
+        expected_next_sequence: 1,
+        records: vec![b"duplicate".to_vec()],
+    }];
+
+    let error = store.commit_workflow_transaction(rejected).unwrap_err();
+    assert_eq!(error.code, Code::Conflict);
+    assert_eq!(store.retained_history_head(&history_key).unwrap(), 1);
+    assert_eq!(
+        store
+            .retained_history_records(&history_key, 1, usize::MAX)
+            .unwrap(),
+        vec![b"operation-1".to_vec()]
+    );
+    assert!(
+        store
+            .mutable_overlay_current_entry(&rejected_key)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn rejected_workflow_owner_state_leaves_prior_state_after_reopen() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let baseline_key = durability_facet_test_key(b"documents", "baseline");
+    store
+        .commit_workflow_transaction(workflow_transaction_test(
+            "baseline",
+            vec![workflow_put(
+                FacetKind::Document,
+                baseline_key.clone(),
+                b"baseline",
+                None,
+            )],
+            Some(b"baseline"),
+        ))
+        .unwrap();
+    let baseline_generation = store.generation();
+    let rejected_key = durability_facet_test_key(b"documents", "rejected");
+    let mut txn = workflow_transaction_test(
+        "rejected-owner-state",
+        vec![workflow_put(
+            FacetKind::Document,
+            rejected_key.clone(),
+            b"rejected",
+            None,
+        )],
+        Some(b"rejected-owner-state"),
+    );
+    txn.owner_state = loom_core::WorkflowOwnerState {
+        objects: vec![(Digest::blake3(b"wrong"), b"owner-state".to_vec())],
+        reference: loom_core::WorkflowReferenceUpdate::Set(Some(Digest::blake3(b"root"))),
+        controls: vec![loom_core::WorkflowControlWrite::Put {
+            key: b"owner/rejected".to_vec(),
+            payload: b"rejected".to_vec(),
+        }],
+        audits: Vec::new(),
+    };
+
+    let error = store.commit_workflow_transaction(txn).unwrap_err();
+    assert_eq!(error.code, Code::IntegrityFailure);
+    assert_eq!(store.generation(), baseline_generation);
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    assert_eq!(reopened.generation(), baseline_generation);
+    assert_eq!(reopened.reference_root(), None);
+    assert_eq!(reopened.control_get(b"owner/rejected").unwrap(), None);
+    let snapshot = reopened.mutable_overlay_snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .read_composite(&baseline_key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"baseline"[..])
+    );
+    assert_eq!(
+        snapshot
+            .read_composite(&rejected_key, |_| Ok(None))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn normal_workflow_transactions_batch_under_contention_and_replay_after_reopen() {
+    let backing = FsyncGateMem::default();
+    let reopened_backing = backing.clone();
+    let gate = Arc::clone(&backing.gate);
+    let store = Arc::new(FileStore::with_backing(Box::new(backing), true).unwrap());
+    gate.enable();
+    let barrier = Arc::new(Barrier::new(9));
+    let mut threads = Vec::new();
+    for worker in 0..8u8 {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            let key =
+                durability_facet_test_key(b"documents", &format!("workflow-normal-group-{worker}"));
+            let idempotency = format!("workflow-normal-group-{worker}");
+            let txn = workflow_transaction_test(
+                "workflow-normal-group",
+                vec![workflow_put(
+                    FacetKind::Document,
+                    key.clone(),
+                    &[worker],
+                    None,
+                )],
+                Some(idempotency.as_bytes()),
+            );
+            barrier.wait();
+            let receipt = store.commit_workflow_transaction(txn.clone()).unwrap();
+            (key, txn, receipt)
+        }));
+    }
+    barrier.wait();
+    gate.wait_until_first_blocked();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    gate.release();
+    let committed = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    let committed_generation = store.generation();
+    assert!(committed_generation < 8);
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(reopened_backing), true).unwrap();
+    assert_eq!(reopened.generation(), committed_generation);
+    for (key, txn, receipt) in committed {
+        assert_eq!(
+            reopened
+                .mutable_overlay_snapshot()
+                .unwrap()
+                .read_composite(&key, |_| Ok(None))
+                .unwrap(),
+            Some(match &txn.writes[0].op {
+                FacetWriteOp::Put { payload } => payload.clone(),
+                FacetWriteOp::Delete => Vec::new(),
+            })
+        );
+        let replay = reopened.commit_workflow_transaction(txn).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.generation, receipt.generation);
+    }
+}
+
+#[test]
+fn workflow_transaction_commits_secondary_index_with_current_record_and_reopens() {
+    let shared = SharedMem::default();
+    let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+    let document_key = durability_facet_test_key(b"documents", "workflow-index-document");
+    let index_key = durability_facet_test_key(b"tickets", "workflow-index-by-status-open");
+    let txn = workflow_transaction_test(
+        "workflow-index",
+        vec![workflow_put_with_secondary_index(
+            document_key.clone(),
+            b"document-current",
+            index_key.clone(),
+            document_key.as_bytes(),
+        )],
+        Some(b"workflow-index-retry"),
+    );
+
+    store.commit_workflow_transaction(txn).unwrap();
+    assert_eq!(
+        store
+            .mutable_overlay_secondary_index_value(&index_key)
+            .unwrap()
+            .as_deref(),
+        Some(document_key.as_bytes())
+    );
+    drop(store);
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+    let snapshot = reopened.mutable_overlay_snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .read_composite(&document_key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"document-current"[..])
+    );
+    assert_eq!(
+        reopened
+            .mutable_overlay_secondary_index_value(&index_key)
+            .unwrap()
+            .as_deref(),
+        Some(document_key.as_bytes())
+    );
+}
+
+#[test]
+fn document_write_commits_declared_index_and_current_record_before_reopen() {
+    let tp = TempPath::new("document-index-workflow");
+    let store = FileStore::open(tp.path()).unwrap();
+    let mut loom = Loom::new(store);
+    let workspace = loom
+        .registry_mut()
+        .create(FacetKind::Document, None, WorkspaceId::from_bytes([91; 16]))
+        .unwrap();
+    document::doc_put(
+        &mut loom,
+        workspace,
+        "people",
+        "ann",
+        br#"{"city":"Paris"}"#.to_vec(),
+    )
+    .unwrap();
+    document::doc_create_index(
+        &mut loom,
+        workspace,
+        "people",
+        document::DocumentIndexDef::new(
+            "by_city",
+            document::DocumentFieldPath::dotted("city").unwrap(),
+            false,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    document::doc_put(
+        &mut loom,
+        workspace,
+        "people",
+        "ann",
+        br#"{"city":"Rome"}"#.to_vec(),
+    )
+    .unwrap();
+    drop(loom);
+
+    let reopened = open_loom_unlocked(tp.path(), None).unwrap();
+    assert_eq!(
+        document::doc_get(&reopened, workspace, "people", "ann")
+            .unwrap()
+            .as_deref(),
+        Some(br#"{"city":"Rome"}"#.as_slice())
+    );
+    assert_eq!(
+        document::doc_find(
+            &reopened,
+            workspace,
+            "people",
+            "by_city",
+            &loom_core::tabular::Value::Text("Rome".to_string()),
+        )
+        .unwrap(),
+        vec!["ann".to_string()]
+    );
+    assert!(
+        document::doc_find(
+            &reopened,
+            workspace,
+            "people",
+            "by_city",
+            &loom_core::tabular::Value::Text("Paris".to_string()),
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[test]
+fn workflow_transaction_aborts_all_writes_on_stale_compare_token() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let first_key = durability_facet_test_key(b"documents", "workflow-conflict-first");
+    let second_key = durability_facet_test_key(b"documents", "workflow-conflict-second");
+    let stale = store
+        .put_mutable_overlay_value(second_key.clone(), b"original".to_vec())
+        .unwrap();
+    store
+        .put_mutable_overlay_value(second_key.clone(), b"newer".to_vec())
+        .unwrap();
+    let error = store
+        .commit_workflow_transaction(workflow_transaction_test(
+            "workflow-conflict",
+            vec![
+                workflow_put(FacetKind::Document, first_key.clone(), b"first", None),
+                workflow_put(FacetKind::Document, second_key, b"second", Some(stale)),
+            ],
+            None,
+        ))
+        .unwrap_err();
+
+    assert_eq!(error.code, Code::Conflict);
+    assert_eq!(
+        store
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&first_key, |_| Ok(None))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn workflow_planning_snapshot_binds_reads_tokens_and_generation() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let key = durability_facet_test_key(b"documents", "planning-coherence");
+    store
+        .put_mutable_overlay_value(key.clone(), b"first".to_vec())
+        .unwrap();
+    let snapshot = WorkflowPlanningSnapshot::open(&store, Some("planning-coherence")).unwrap();
+    let planned_generation = snapshot.expected_generation();
+    let planned_token = snapshot.owner_token(&key).unwrap().unwrap();
+
+    store
+        .put_mutable_overlay_value(key.clone(), b"concurrent".to_vec())
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .read_composite(&key, |_, _| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"first"[..])
+    );
+    assert_eq!(
+        snapshot.owner_token(&key).unwrap(),
+        Some(planned_token.clone())
+    );
+    assert_eq!(snapshot.expected_generation(), planned_generation);
+
+    let mut stale = workflow_transaction_test(
+        "planning-coherence",
+        vec![workflow_put(
+            FacetKind::Document,
+            key.clone(),
+            b"stale",
+            Some(planned_token),
+        )],
+        None,
+    );
+    stale.expected_generation = Some(planned_generation);
+    let error = store.commit_workflow_transaction(stale).unwrap_err();
+
+    assert_eq!(error.code, Code::Conflict);
+    assert_eq!(
+        store
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"concurrent"[..])
+    );
+}
+
+#[test]
+fn concurrent_workflow_plans_publish_only_one_generation() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let first_key = durability_facet_test_key(b"documents", "planning-first");
+    let second_key = durability_facet_test_key(b"documents", "planning-second");
+    let first_snapshot = WorkflowPlanningSnapshot::open(&store, Some("planning-first")).unwrap();
+    let second_snapshot = WorkflowPlanningSnapshot::open(&store, Some("planning-second")).unwrap();
+    assert_eq!(
+        first_snapshot.expected_generation(),
+        second_snapshot.expected_generation()
+    );
+
+    let mut first = workflow_transaction_test(
+        "planning-first",
+        vec![workflow_put(
+            FacetKind::Document,
+            first_key.clone(),
+            b"first",
+            None,
+        )],
+        None,
+    );
+    first.expected_generation = Some(first_snapshot.expected_generation());
+    store.commit_workflow_transaction(first).unwrap();
+
+    let mut second = workflow_transaction_test(
+        "planning-second",
+        vec![workflow_put(
+            FacetKind::Document,
+            second_key.clone(),
+            b"second",
+            None,
+        )],
+        None,
+    );
+    second.expected_generation = Some(second_snapshot.expected_generation());
+    let error = store.commit_workflow_transaction(second).unwrap_err();
+
+    assert_eq!(error.code, Code::Conflict);
+    let current = store.mutable_overlay_snapshot().unwrap();
+    assert_eq!(
+        current
+            .read_composite(&first_key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"first"[..])
+    );
+    assert_eq!(
+        current.read_composite(&second_key, |_| Ok(None)).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn workflow_transaction_does_not_write_secondary_index_when_current_compare_fails() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let first_key = durability_facet_test_key(b"documents", "workflow-index-conflict-first");
+    let second_key = durability_facet_test_key(b"documents", "workflow-index-conflict-second");
+    let index_key = durability_facet_test_key(b"tickets", "workflow-index-conflict-status");
+    let stale = store
+        .put_mutable_overlay_value(second_key.clone(), b"original".to_vec())
+        .unwrap();
+    store
+        .put_mutable_overlay_value(second_key.clone(), b"newer".to_vec())
+        .unwrap();
+    let error = store
+        .commit_workflow_transaction(workflow_transaction_test(
+            "workflow-index-conflict",
+            vec![
+                workflow_put_with_secondary_index(
+                    first_key.clone(),
+                    b"first",
+                    index_key.clone(),
+                    b"first-index",
+                ),
+                workflow_put(FacetKind::Document, second_key, b"second", Some(stale)),
+            ],
+            None,
+        ))
+        .unwrap_err();
+
+    assert_eq!(error.code, Code::Conflict);
+    assert_eq!(
+        store
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&first_key, |_| Ok(None))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .mutable_overlay_secondary_index_value(&index_key)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn workflow_transaction_rejects_unimplemented_separate_boundary() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let key = durability_facet_test_key(b"documents", "workflow-separate");
+    let mut txn = workflow_transaction_test(
+        "workflow-separate",
+        vec![workflow_put(FacetKind::Document, key, b"value", None)],
+        None,
+    );
+    txn.boundary = AtomicityBoundary::Separate;
+    let error = store.commit_workflow_transaction(txn).unwrap_err();
+
+    assert_eq!(error.code, Code::Unsupported);
+}
+
+#[test]
+fn workflow_transaction_rejects_idempotent_ephemeral_boundary() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let key = durability_facet_test_key(b"search", "workflow-ephemeral-idempotent");
+    let mut txn = workflow_transaction_test(
+        "workflow-ephemeral-idempotent",
+        vec![workflow_put(FacetKind::Search, key, b"value", None)],
+        Some(b"ephemeral-workflow-retry"),
+    );
+    txn.durability = OverlayDurabilityPolicy::Ephemeral;
+    let error = store.commit_workflow_transaction(txn).unwrap_err();
+
+    assert_eq!(error.code, Code::InvalidArgument);
+}
+
+#[test]
+fn workflow_transaction_idempotency_digest_includes_side_effect_intents() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let key = durability_facet_test_key(b"documents", "workflow-side-effects");
+    let first = workflow_transaction_test(
+        "workflow-side-effects",
+        vec![workflow_put_with_side_effect(
+            key.clone(),
+            b"value",
+            "operation-a",
+        )],
+        Some(b"side-effect-retry"),
+    );
+    let second = workflow_transaction_test(
+        "workflow-side-effects",
+        vec![workflow_put_with_side_effect(key, b"value", "operation-b")],
+        Some(b"side-effect-retry"),
+    );
+
+    store.commit_workflow_transaction(first).unwrap();
+    let error = store.commit_workflow_transaction(second).unwrap_err();
+
+    assert_eq!(error.code, Code::Conflict);
+}
+
+#[test]
+fn workflow_transaction_idempotency_digest_includes_secondary_indexes() {
+    let store = FileStore::with_backing(Box::new(SharedMem::default()), true).unwrap();
+    let key = durability_facet_test_key(b"documents", "workflow-index-idempotency");
+    let index_key = durability_facet_test_key(b"tickets", "workflow-index-idempotency-status");
+    let first = workflow_transaction_test(
+        "workflow-index-idempotency",
+        vec![workflow_put_with_secondary_index(
+            key.clone(),
+            b"value",
+            index_key.clone(),
+            b"open",
+        )],
+        Some(b"index-retry"),
+    );
+    let second = workflow_transaction_test(
+        "workflow-index-idempotency",
+        vec![workflow_put_with_secondary_index(
+            key, b"value", index_key, b"closed",
+        )],
+        Some(b"index-retry"),
+    );
+
+    store.commit_workflow_transaction(first).unwrap();
+    let error = store.commit_workflow_transaction(second).unwrap_err();
+
+    assert_eq!(error.code, Code::Conflict);
+}
+
+#[test]
+fn workflow_transaction_facet_policy_can_strengthen_ephemeral_transaction_default() {
+    let shared = SharedMem::default();
+    let key = durability_facet_test_key(b"documents", "workflow-policy-document");
+    {
+        let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+        let mut policy = store.store_policy().unwrap();
+        policy
+            .set_default_durability(StoreDurabilityPolicy::Ephemeral)
+            .unwrap();
+        policy
+            .set_facet_durability(FacetKind::Document, Some(StoreDurabilityPolicy::Normal))
+            .unwrap();
+        store
+            .save_store_policy_audited(policy, None, "store.policy.set", None)
+            .unwrap();
+        let mut txn = workflow_transaction_test(
+            "workflow-policy-document",
+            vec![workflow_put(
+                FacetKind::Document,
+                key.clone(),
+                b"document-current",
+                None,
+            )],
+            None,
+        );
+        txn.durability = StoreDurabilityPolicy::Ephemeral;
+
+        store.commit_workflow_transaction(txn).unwrap();
+    }
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+
+    assert_eq!(
+        reopened
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"document-current"[..])
+    );
+}
+
+#[test]
+fn workflow_transaction_ephemeral_policy_acknowledges_without_persisting() {
+    let shared = SharedMem::default();
+    let key = durability_facet_test_key(b"search", "workflow-policy-search");
+    {
+        let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+        let mut policy = store.store_policy().unwrap();
+        policy
+            .set_default_durability(StoreDurabilityPolicy::Ephemeral)
+            .unwrap();
+        store
+            .save_store_policy_audited(policy, None, "store.policy.set", None)
+            .unwrap();
+        let mut txn = workflow_transaction_test(
+            "workflow-policy-search",
+            vec![workflow_put(
+                FacetKind::Search,
+                key.clone(),
+                b"search-current",
+                None,
+            )],
+            None,
+        );
+        txn.durability = StoreDurabilityPolicy::Ephemeral;
+
+        store.commit_workflow_transaction(txn).unwrap();
+        assert_eq!(
+            store
+                .mutable_overlay_snapshot()
+                .unwrap()
+                .read_composite(&key, |_| Ok(None))
+                .unwrap()
+                .as_deref(),
+            Some(&b"search-current"[..])
+        );
+    }
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+
+    assert_eq!(
+        reopened
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn workflow_transaction_default_can_strengthen_ephemeral_facet_policy() {
+    let shared = SharedMem::default();
+    let key = durability_facet_test_key(b"search", "workflow-policy-ephemeral-mixed");
+    {
+        let store = FileStore::with_backing(Box::new(shared.clone()), true).unwrap();
+        let mut policy = store.store_policy().unwrap();
+        policy
+            .set_facet_durability(FacetKind::Search, Some(StoreDurabilityPolicy::Ephemeral))
+            .unwrap();
+        store
+            .save_store_policy_audited(policy, None, "store.policy.set", None)
+            .unwrap();
+        let txn = workflow_transaction_test(
+            "workflow-policy-ephemeral-mixed",
+            vec![workflow_put(
+                FacetKind::Search,
+                key.clone(),
+                b"search-current",
+                None,
+            )],
+            None,
+        );
+
+        store.commit_workflow_transaction(txn).unwrap();
+    }
+
+    let reopened = FileStore::with_backing(Box::new(shared), true).unwrap();
+
+    assert_eq!(
+        reopened
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"search-current"[..])
+    );
+}
+
+fn write_current_record_with_default_durability(
+    durability: StoreDurabilityPolicy,
+    name: &str,
+) -> (Option<Vec<u8>>, StorePolicy) {
+    let tp = TempPath::new(name);
+    let key = durability_test_key(name);
+    {
+        let store = FileStore::open(tp.path()).unwrap();
+        let mut policy = store.store_policy().unwrap();
+        policy.set_default_durability(durability).unwrap();
+        store
+            .save_store_policy_audited(policy, None, "store.policy.set", None)
+            .unwrap();
+        store
+            .put_mutable_overlay_value(key.clone(), format!("{name}-acknowledged").into_bytes())
+            .unwrap();
+    }
+    let reopened = FileStore::open(tp.path()).unwrap();
+    let policy = reopened.store_policy().unwrap();
+    let read = reopened
+        .mutable_overlay_snapshot()
+        .unwrap()
+        .read_composite(&key, |_| Ok(None))
+        .unwrap();
+
+    (read, policy)
+}
+
+#[test]
+fn facet_durability_override_takes_precedence_over_ephemeral_store_default() {
+    let tp = TempPath::new("facet-durability-precedence-normal");
+    let key = durability_facet_test_key(b"documents", "document-normal-override");
+    {
+        let store = FileStore::open(tp.path()).unwrap();
+        let mut policy = store.store_policy().unwrap();
+        policy
+            .set_default_durability(StoreDurabilityPolicy::Ephemeral)
+            .unwrap();
+        policy
+            .set_facet_durability(FacetKind::Document, Some(StoreDurabilityPolicy::Normal))
+            .unwrap();
+        store
+            .save_store_policy_audited(policy, None, "store.policy.set", None)
+            .unwrap();
+        store
+            .put_mutable_overlay_value(key.clone(), b"document-current".to_vec())
+            .unwrap();
+    }
+
+    let reopened = FileStore::open(tp.path()).unwrap();
+
+    assert_eq!(
+        reopened
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"document-current"[..])
+    );
+}
+
+#[test]
+fn facet_durability_override_can_make_one_hot_facet_ephemeral() {
+    let tp = TempPath::new("facet-durability-precedence-ephemeral");
+    let document_key = durability_facet_test_key(b"documents", "document-default-normal");
+    let search_key = durability_facet_test_key(b"search", "search-ephemeral-override");
+    {
+        let store = FileStore::open(tp.path()).unwrap();
+        let mut policy = store.store_policy().unwrap();
+        policy
+            .set_default_durability(StoreDurabilityPolicy::Normal)
+            .unwrap();
+        policy
+            .set_facet_durability(FacetKind::Search, Some(StoreDurabilityPolicy::Ephemeral))
+            .unwrap();
+        store
+            .save_store_policy_audited(policy, None, "store.policy.set", None)
+            .unwrap();
+        store
+            .put_mutable_overlay_value(document_key.clone(), b"document-current".to_vec())
+            .unwrap();
+        store
+            .put_mutable_overlay_value(search_key.clone(), b"search-current".to_vec())
+            .unwrap();
+    }
+
+    let reopened = FileStore::open(tp.path()).unwrap();
+    let snapshot = reopened.mutable_overlay_snapshot().unwrap();
+
+    assert_eq!(
+        snapshot
+            .read_composite(&document_key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"document-current"[..])
+    );
+    assert_eq!(
+        snapshot.read_composite(&search_key, |_| Ok(None)).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn strict_durability_acknowledged_current_record_survives_reopen() {
+    let (read, policy) =
+        write_current_record_with_default_durability(StoreDurabilityPolicy::Strict, "strict");
+
+    assert_eq!(policy.default_durability, StoreDurabilityPolicy::Strict);
+    assert_eq!(read.as_deref(), Some(&b"strict-acknowledged"[..]));
+}
+
+#[test]
+fn normal_durability_contract_fixture_uses_configured_policy() {
+    let (read, policy) =
+        write_current_record_with_default_durability(StoreDurabilityPolicy::Normal, "normal");
+
+    assert_eq!(policy.default_durability, StoreDurabilityPolicy::Normal);
+    assert_eq!(read.as_deref(), Some(&b"normal-acknowledged"[..]));
+}
+
+#[test]
+fn relaxed_durability_contract_fixture_uses_configured_policy() {
+    let (read, policy) =
+        write_current_record_with_default_durability(StoreDurabilityPolicy::Relaxed, "relaxed");
+
+    assert_eq!(policy.default_durability, StoreDurabilityPolicy::Relaxed);
+    assert_eq!(read.as_deref(), Some(&b"relaxed-acknowledged"[..]));
+}
+
+#[test]
+fn ephemeral_durability_acknowledged_current_record_does_not_survive_reopen() {
+    let (read, policy) =
+        write_current_record_with_default_durability(StoreDurabilityPolicy::Ephemeral, "ephemeral");
+
+    assert_eq!(policy.default_durability, StoreDurabilityPolicy::Ephemeral);
+    assert_eq!(read, None);
+}
+
+#[test]
+fn ephemeral_durability_idempotent_current_record_does_not_survive_reopen() {
+    let tp = TempPath::new("ephemeral-idempotent");
+    let key = durability_test_key("ephemeral-idempotent");
+    {
+        let store = FileStore::open(tp.path()).unwrap();
+        let mut policy = store.store_policy().unwrap();
+        policy
+            .set_default_durability(StoreDurabilityPolicy::Ephemeral)
+            .unwrap();
+        store
+            .save_store_policy_audited(policy, None, "store.policy.set", None)
+            .unwrap();
+        store
+            .put_mutable_overlay_value_idempotent(
+                key.clone(),
+                b"ephemeral-idempotent-acknowledged".to_vec(),
+                "ephemeral-idempotent",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .mutable_overlay_snapshot()
+                .unwrap()
+                .read_composite(&key, |_| Ok(None))
+                .unwrap()
+                .as_deref(),
+            Some(&b"ephemeral-idempotent-acknowledged"[..])
+        );
+    }
+    let reopened = FileStore::open(tp.path()).unwrap();
+    let read = reopened
+        .mutable_overlay_snapshot()
+        .unwrap()
+        .read_composite(&key, |_| Ok(None))
+        .unwrap();
+
+    assert_eq!(read, None);
+    assert_eq!(
+        reopened.mutable_overlay_durable_owner_token(&key).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn ephemeral_durability_tombstone_does_not_replace_durable_current_record_on_reopen() {
+    let tp = TempPath::new("ephemeral-tombstone");
+    let key = durability_test_key("ephemeral-tombstone");
+    let original_token = {
+        let store = FileStore::open(tp.path()).unwrap();
+        store
+            .put_mutable_overlay_value(key.clone(), b"durable-before-ephemeral".to_vec())
+            .unwrap()
+    };
+    {
+        let store = FileStore::open(tp.path()).unwrap();
+        let mut policy = store.store_policy().unwrap();
+        policy
+            .set_default_durability(StoreDurabilityPolicy::Ephemeral)
+            .unwrap();
+        store
+            .save_store_policy_audited(policy, None, "store.policy.set", None)
+            .unwrap();
+        store.put_mutable_overlay_tombstone(key.clone()).unwrap();
+
+        assert_eq!(
+            store
+                .mutable_overlay_snapshot()
+                .unwrap()
+                .read_composite(&key, |_| Ok(None))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .mutable_overlay_durable_owner_token(&key)
+                .unwrap()
+                .as_ref()
+                .map(|token| token.as_bytes()),
+            Some(original_token.as_bytes())
+        );
+    }
+    let reopened = FileStore::open(tp.path()).unwrap();
+    let read = reopened
+        .mutable_overlay_snapshot()
+        .unwrap()
+        .read_composite(&key, |_| Ok(None))
+        .unwrap();
+
+    assert_eq!(read.as_deref(), Some(&b"durable-before-ephemeral"[..]));
+    assert_eq!(
+        reopened
+            .mutable_overlay_durable_owner_token(&key)
+            .unwrap()
+            .as_ref()
+            .map(|token| token.as_bytes()),
+        Some(original_token.as_bytes())
     );
 }

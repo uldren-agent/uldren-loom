@@ -1,7 +1,9 @@
 //! Licensed under BUSL-1.1 (see the workspace `LICENSE`). (c) Uldren Technologies LLC.
 
 use super::*;
-use loom_core::document::{document_put_binary_with_entity_tag, document_put_text_with_entity_tag};
+use loom_core::document::{
+    doc_delete_collection, document_put_binary_with_entity_tag, document_put_text_with_entity_tag,
+};
 
 // ---------------------------------------------------------------------------------------------------
 // Document (Document facet) - text and binary document operations over string-id collections.
@@ -112,6 +114,20 @@ fn doc_delete_ns(h: &LoomSession, workspace: &str, collection: &str, id: &str) -
     let mut loom = open_h_write(h)?;
     let ns = resolve_workspace_arg(&loom, workspace)?;
     let present = doc_delete(&mut loom, ns, collection, id)?;
+    if present {
+        save_loom(&mut loom)?;
+    }
+    Ok(present)
+}
+
+fn doc_delete_collection_ns(
+    h: &LoomSession,
+    workspace: &str,
+    collection: &str,
+) -> LoomResult<bool> {
+    let mut loom = open_h_write(h)?;
+    let ns = resolve_workspace_arg(&loom, workspace)?;
+    let present = doc_delete_collection(&mut loom, ns, collection)?;
     if present {
         save_loom(&mut loom)?;
     }
@@ -577,6 +593,34 @@ pub unsafe extern "C" fn loom_doc_delete(
     let collection = arg_str!(collection, "loom_doc_delete");
     let id = arg_str!(id, "loom_doc_delete");
     match doc_delete_ns(h, workspace, collection, id) {
+        Ok(found) => {
+            if !out_found.is_null() {
+                // SAFETY: `out_found` writable per docs.
+                unsafe { *out_found = i32::from(found) };
+            }
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Remove collection `collection` and its structured roots; writes presence (`1`/`0`) to
+/// `*out_found` and returns `0`.
+///
+/// # Safety
+/// `handle` must be from [`loom_open`]; `workspace`/`collection` valid C strings; `out_found` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn loom_doc_delete_collection(
+    handle: *mut LoomSession,
+    workspace: *const c_char,
+    collection: *const c_char,
+    out_found: *mut i32,
+) -> i32 {
+    clear_error();
+    let h = handle_ref!(handle, "loom_doc_delete_collection");
+    let workspace = arg_str!(workspace, "loom_doc_delete_collection");
+    let collection = arg_str!(collection, "loom_doc_delete_collection");
+    match doc_delete_collection_ns(h, workspace, collection) {
         Ok(found) => {
             if !out_found.is_null() {
                 // SAFETY: `out_found` writable per docs.

@@ -3,7 +3,7 @@ use loom_core::{AclRight, Code, Loom, LoomError};
 use loom_store::FileStore;
 use loom_substrate::changes::{OperationChangeBatch, OperationChangeCursor, OperationChangeRecord};
 use loom_substrate::chat::{ChannelOperationLog, ChatOperationRecord};
-use loom_substrate::pages::{PageOperationLog, page_profile_operation_log_key};
+use loom_substrate::pages::PageOperationLog;
 use loom_tickets::{TicketOperationLog, TicketProfileReader};
 
 use crate::chat::chat_queue_stream_name;
@@ -117,10 +117,7 @@ fn profile_operation_changes(
 }
 
 fn page_log(store: &FileStore, workspace_id: &str) -> loom_core::Result<PageOperationLog> {
-    match store.control_get(&page_profile_operation_log_key(workspace_id)?)? {
-        Some(bytes) => PageOperationLog::decode(&bytes),
-        None => PageOperationLog::new(workspace_id, Vec::new()),
-    }
+    loom_pages::page_operation_log(store, workspace_id)
 }
 
 fn chat_log(

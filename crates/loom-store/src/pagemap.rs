@@ -137,7 +137,7 @@ impl PageAllocator {
     /// reusable immediately if extended within this transaction, and otherwise joins the free-page map
     /// on commit, tagged with this generation.
     pub(crate) fn free(&mut self, start: PageId, n: u64) {
-        self.txn_freed.insert(start.0, n);
+        insert_txn_run(&mut self.txn_freed, start.0, n);
     }
 
     /// Total pages the array spans: every page handed out so far lies below this.
@@ -164,8 +164,51 @@ impl PageAllocator {
                 freed_gen: self.txn_gen,
             });
         }
-        v
+        coalesce_free_runs(v)
     }
+}
+
+fn insert_txn_run(runs: &mut BTreeMap<u64, u64>, start: u64, len: u64) {
+    let mut merged_start = start;
+    let mut merged_end = start + len;
+    if let Some((&prev_start, &prev_len)) = runs.range(..=start).next_back() {
+        let prev_end = prev_start + prev_len;
+        if prev_end >= start {
+            merged_start = prev_start;
+            merged_end = merged_end.max(prev_end);
+            runs.remove(&prev_start);
+        }
+    }
+    while let Some((&next_start, &next_len)) = runs.range(merged_start..).next() {
+        if next_start > merged_end {
+            break;
+        }
+        merged_end = merged_end.max(next_start + next_len);
+        runs.remove(&next_start);
+    }
+    runs.insert(merged_start, merged_end - merged_start);
+}
+
+fn coalesce_free_runs(mut runs: Vec<FreePageRun>) -> Vec<FreePageRun> {
+    runs.sort_by_key(|r| r.start);
+    let mut out: Vec<FreePageRun> = Vec::with_capacity(runs.len());
+    for run in runs {
+        let Some(prev) = out.last_mut() else {
+            out.push(run);
+            continue;
+        };
+        let prev_end = prev.start + prev.len;
+        if run.start < prev_end {
+            let end = prev_end.max(run.start + run.len);
+            prev.len = end - prev.start;
+            prev.freed_gen = prev.freed_gen.max(run.freed_gen);
+        } else if run.start == prev_end && run.freed_gen == prev.freed_gen {
+            prev.len += run.len;
+        } else {
+            out.push(run);
+        }
+    }
+    out
 }
 
 /// Bytes a free-page-map blob with `count` runs occupies: `magic(1) count(4) count*{start,len,
@@ -284,12 +327,33 @@ pub(crate) fn read_map(
         }
         prev_end = end;
     }
-    Ok(runs)
+    Ok(coalesce_free_runs(runs))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_reservation_allows_one_run_split_during_allocation() {
+        let mut free = Vec::new();
+        for index in 0..169 {
+            free.push(run(index * 3, 1, 0));
+        }
+        free.push(run(1_000, 1, 0));
+        let mut alloc = PageAllocator::new_with_current_free_reusable(2_000, 2, free);
+        alloc.free(PageId(999), 1);
+        alloc.free(PageId(1_001), 1);
+
+        let pending = alloc.snapshot_free().len();
+        assert_eq!(pending, 172);
+        let reserved = map_pages(pending + 1);
+        assert_eq!(reserved, 2);
+        alloc.alloc(reserved);
+        let runs = alloc.snapshot_free();
+
+        assert!(map_pages(runs.len()) <= reserved);
+    }
     use std::fs::OpenOptions;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -365,6 +429,17 @@ mod tests {
         let mut snap = a.snapshot_free();
         snap.sort_by_key(|r| r.start);
         assert_eq!(snap, vec![run(3, 1, 2), run(12, 4, 7)]);
+    }
+
+    #[test]
+    fn adjacent_free_runs_preserve_distinct_reuse_generations() {
+        let mut a = PageAllocator::new(40, 100, vec![run(3, 2, 1)]);
+        a.free(PageId(5), 2);
+        let snapshot = a.snapshot_free();
+
+        assert_eq!(snapshot, vec![run(3, 2, 1), run(5, 2, 100)]);
+        assert_eq!(a.alloc(2), PageId(3));
+        assert_eq!(a.alloc(2), PageId(40));
     }
 
     #[test]

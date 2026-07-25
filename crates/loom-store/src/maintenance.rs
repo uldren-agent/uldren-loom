@@ -197,6 +197,10 @@ pub(crate) fn read_maintenance(
     MaintenanceState::decode(&buf)
 }
 
+pub(crate) fn looks_like_maintenance_page(buf: &[u8]) -> bool {
+    MaintenanceState::decode(buf).is_ok()
+}
+
 fn push_segment(segments: &mut Vec<u64>, segment: u64, overflow: &mut bool) {
     match segments.binary_search(&segment) {
         Ok(_) => {}

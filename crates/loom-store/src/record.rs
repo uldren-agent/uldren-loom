@@ -12,6 +12,7 @@ use crate::{crc32c, get_uvarint, put_uvarint};
 
 pub(crate) const SLAB_MAGIC: u8 = 0xB5;
 pub(crate) const LARGE_MAGIC: u8 = 0xB6;
+pub(crate) const CHUNKED_BLOB_MAGIC: u8 = 0xB7;
 
 /// Objects with a framed record this size or smaller pack into a shared slab page; larger ones get
 /// their own page run.
@@ -22,10 +23,12 @@ const SLOT_ENTRY: usize = 4; // off(2) + len(2)
 const CRC: usize = 4;
 const PAGE: usize = PAGE_SIZE as usize;
 const LARGE_HEADER: usize = 9; // magic(1) + blob_len(8)
+const CHUNKED_HEADER: usize = 21; // magic(1) + next_page(8) + total_len(8) + chunk_len(4)
+const CHUNKED_END: u64 = u64::MAX;
 
 /// A record's location: the segment, the page index within that segment, and the intra-page slot
 /// (always 0 for a large page run). Stored in the index as three uvarints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RecordLoc {
     pub(crate) segment_id: u64,
     pub(crate) page_index: u64,
@@ -189,6 +192,50 @@ pub(crate) fn decode_large(buf: &[u8]) -> Option<&[u8]> {
     Some(&buf[LARGE_HEADER..end])
 }
 
+pub(crate) fn chunked_blob_payload_capacity() -> usize {
+    PAGE - CHUNKED_HEADER - CRC
+}
+
+pub(crate) fn encode_chunked_blob_page(
+    chunk: &[u8],
+    next_page: Option<u64>,
+    total_len: u64,
+) -> Option<[u8; PAGE]> {
+    if chunk.len() > chunked_blob_payload_capacity() {
+        return None;
+    }
+    let mut page = [0u8; PAGE];
+    page[0] = CHUNKED_BLOB_MAGIC;
+    page[1..9].copy_from_slice(&next_page.unwrap_or(CHUNKED_END).to_le_bytes());
+    page[9..17].copy_from_slice(&total_len.to_le_bytes());
+    page[17..21].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+    page[CHUNKED_HEADER..CHUNKED_HEADER + chunk.len()].copy_from_slice(chunk);
+    let crc = crc32c(&page[..PAGE - CRC]);
+    page[PAGE - CRC..].copy_from_slice(&crc.to_le_bytes());
+    Some(page)
+}
+
+pub(crate) fn decode_chunked_blob_page(page: &[u8]) -> Option<(Option<u64>, u64, &[u8])> {
+    if page.len() < PAGE || page[0] != CHUNKED_BLOB_MAGIC {
+        return None;
+    }
+    let stored = u32::from_le_bytes(page[PAGE - CRC..PAGE].try_into().ok()?);
+    if crc32c(&page[..PAGE - CRC]) != stored {
+        return None;
+    }
+    let next = u64::from_le_bytes(page[1..9].try_into().ok()?);
+    let total_len = u64::from_le_bytes(page[9..17].try_into().ok()?);
+    let chunk_len = u32::from_le_bytes(page[17..21].try_into().ok()?) as usize;
+    if chunk_len > chunked_blob_payload_capacity() {
+        return None;
+    }
+    Some((
+        (next != CHUNKED_END).then_some(next),
+        total_len,
+        &page[CHUNKED_HEADER..CHUNKED_HEADER + chunk_len],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +315,19 @@ mod tests {
         let mut buf = encode_large(&blob);
         buf[20] ^= 0xFF;
         assert!(decode_large(&buf).is_none());
+    }
+
+    #[test]
+    fn chunked_blob_page_round_trips_and_rejects_crc_corruption() {
+        let payload = vec![0x5a; chunked_blob_payload_capacity()];
+        let mut page = encode_chunked_blob_page(&payload, Some(42), payload.len() as u64).unwrap();
+        let (next, total, decoded) = decode_chunked_blob_page(&page).unwrap();
+        assert_eq!(next, Some(42));
+        assert_eq!(total, payload.len() as u64);
+        assert_eq!(decoded, payload);
+
+        page[CHUNKED_HEADER] ^= 1;
+        assert!(decode_chunked_blob_page(&page).is_none());
     }
 
     #[test]

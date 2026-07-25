@@ -1,5 +1,5 @@
 use loom_core::error::{Code, LoomError, Result};
-use loom_core::workspace::WorkspaceId;
+use loom_core::workspace::{FacetKind, WorkspaceId};
 use loom_core::{
     AclDomain, AclEffect, AclGrant, AclResource, AclResourceScope, AclRight, AclScope,
     AclScopeKind, AclSubject, Digest, Loom, cas_get, cas_put,
@@ -19,7 +19,7 @@ use loom_substrate::drive::{
 };
 use loom_substrate::versioning::{
     BodyRef, ProfileRevisionUpdate, ProfileTransaction, ProfileTransactionState,
-    REVISION_INDEX_DIR, RevisionIndex, revision_index_path,
+    load_current_revision_index, persist_current_revision_index_with_owner_state,
 };
 use loom_substrate::{ActorKind, OperationEnvelope, OperationEnvelopeInput};
 use serde::Serialize;
@@ -556,23 +556,10 @@ pub fn grant_share(
     let acl_grant = drive_share_acl_grant(request.workspace_id, &grant);
     shares.grants.push(grant);
     shares = DriveShareIndex::new(request.workspace_id, shares.grants)?;
-    save_shares(loom, &shares)?;
-    let acl_snapshot = {
-        let acl = loom.acl_store_mut();
-        acl.grant(acl_grant)?;
-        acl.clone()
-    };
-    loom.store().save_acl_store_audited(
-        &acl_snapshot,
-        Some(actor),
-        "drive.share_acl.grant",
-        Some(&format!(
-            "drive:{};share:{}",
-            request.workspace_id, request.grant_id
-        )),
-    )?;
+    let mut acl_snapshot = loom.acl_store().clone();
+    acl_snapshot.grant(acl_grant)?;
     let snapshot = load_snapshot_or_empty(loom, request.workspace_id)?;
-    record_operation(
+    let operation = record_operation_with_owner_state(
         loom,
         workspace,
         &snapshot,
@@ -580,7 +567,27 @@ pub fn grant_share(
         Some(&format!("share:{}", request.grant_id)),
         profile_root(loom, &snapshot)?,
         request.grant_id.as_bytes(),
-    )
+        loom_core::WorkflowOwnerState {
+            controls: vec![
+                loom_core::WorkflowControlWrite::Put {
+                    key: drive_share_index_key(request.workspace_id)?,
+                    payload: shares.encode()?,
+                },
+                loom.store().acl_store_control_write(&acl_snapshot),
+            ],
+            audits: vec![loom_core::WorkflowAuditWrite {
+                principal: Some(actor),
+                action: "drive.share_acl.grant".to_string(),
+                target: Some(format!(
+                    "drive:{};share:{}",
+                    request.workspace_id, request.grant_id
+                )),
+            }],
+            ..Default::default()
+        },
+    )?;
+    loom.set_acl_store(acl_snapshot);
+    Ok(operation)
 }
 
 pub fn revoke_share(
@@ -598,23 +605,28 @@ pub fn revoke_share(
         .ok_or_else(|| LoomError::not_found("drive share grant not found"))?;
     let grant = shares.grants.remove(idx);
     shares = DriveShareIndex::new(workspace_id, shares.grants)?;
-    save_shares(loom, &shares)?;
     let acl_grant = drive_share_acl_grant(workspace_id, &grant);
-    let acl_snapshot = {
-        let acl = loom.acl_store_mut();
-        let removed = acl.revoke_one(&acl_grant);
-        removed.then(|| acl.clone())
-    };
-    if let Some(snapshot) = acl_snapshot {
-        loom.store().save_acl_store_audited(
-            &snapshot,
-            loom.effective_principal()?,
-            "drive.share_acl.revoke",
-            Some(&format!("drive:{workspace_id};share:{grant_id}")),
-        )?;
-    }
+    let mut acl_snapshot = loom.acl_store().clone();
+    let acl_changed = acl_snapshot.revoke_one(&acl_grant);
     let snapshot = load_snapshot_or_empty(loom, workspace_id)?;
-    record_operation(
+    let mut owner_state = loom_core::WorkflowOwnerState {
+        controls: vec![loom_core::WorkflowControlWrite::Put {
+            key: drive_share_index_key(workspace_id)?,
+            payload: shares.encode()?,
+        }],
+        ..Default::default()
+    };
+    if acl_changed {
+        owner_state
+            .controls
+            .push(loom.store().acl_store_control_write(&acl_snapshot));
+        owner_state.audits.push(loom_core::WorkflowAuditWrite {
+            principal: loom.effective_principal()?,
+            action: "drive.share_acl.revoke".to_string(),
+            target: Some(format!("drive:{workspace_id};share:{grant_id}")),
+        });
+    }
+    let operation = record_operation_with_owner_state(
         loom,
         workspace,
         &snapshot,
@@ -622,7 +634,12 @@ pub fn revoke_share(
         Some(&format!("share:{grant_id}")),
         profile_root(loom, &snapshot)?,
         grant_id.as_bytes(),
-    )
+        owner_state,
+    )?;
+    if acl_changed {
+        loom.set_acl_store(acl_snapshot);
+    }
+    Ok(operation)
 }
 
 pub fn apply_share_expiry(
@@ -653,25 +670,30 @@ pub fn apply_share_expiry(
             .map(|grant| grant.grant_id.clone())
             .collect::<Vec<_>>();
         let shares = DriveShareIndex::new(workspace_id, retained.clone())?;
-        save_shares(loom, &shares)?;
-        let acl_snapshot = {
-            let acl = loom.acl_store_mut();
-            let mut removed = false;
-            for grant in &expired {
-                removed |= acl.revoke_one(&drive_share_acl_grant(workspace_id, grant));
-            }
-            removed.then(|| acl.clone())
-        };
-        if let Some(snapshot) = acl_snapshot {
-            loom.store().save_acl_store_audited(
-                &snapshot,
-                loom.effective_principal()?,
-                "drive.share_acl.expire",
-                Some(&format!("drive:{workspace_id};shares:expired")),
-            )?;
+        let mut acl_snapshot = loom.acl_store().clone();
+        let mut acl_changed = false;
+        for grant in &expired {
+            acl_changed |= acl_snapshot.revoke_one(&drive_share_acl_grant(workspace_id, grant));
         }
         let snapshot = load_snapshot_or_empty(loom, workspace_id)?;
-        Some(record_operation(
+        let mut owner_state = loom_core::WorkflowOwnerState {
+            controls: vec![loom_core::WorkflowControlWrite::Put {
+                key: drive_share_index_key(workspace_id)?,
+                payload: shares.encode()?,
+            }],
+            ..Default::default()
+        };
+        if acl_changed {
+            owner_state
+                .controls
+                .push(loom.store().acl_store_control_write(&acl_snapshot));
+            owner_state.audits.push(loom_core::WorkflowAuditWrite {
+                principal: loom.effective_principal()?,
+                action: "drive.share_acl.expire".to_string(),
+                target: Some(format!("drive:{workspace_id};shares:expired")),
+            });
+        }
+        let operation = record_operation_with_owner_state(
             loom,
             workspace,
             &snapshot,
@@ -679,7 +701,12 @@ pub fn apply_share_expiry(
             Some("share:expired"),
             profile_root(loom, &snapshot)?,
             expired_grant_ids.join("\n").as_bytes(),
-        )?)
+            owner_state,
+        )?;
+        if acl_changed {
+            loom.set_acl_store(acl_snapshot);
+        }
+        Some(operation)
     };
     let expired_grant_ids = expired.into_iter().map(|grant| grant.grant_id).collect();
     Ok(HostedDriveShareExpiryApply {
@@ -733,9 +760,8 @@ pub fn pin_retention(
     }
     retention.pins.push(pin);
     retention = DriveRetentionIndex::new(request.workspace_id, retention.pins)?;
-    save_retention(loom, &retention)?;
     let snapshot = load_snapshot_or_empty(loom, request.workspace_id)?;
-    record_operation(
+    record_operation_with_controls(
         loom,
         workspace,
         &snapshot,
@@ -743,6 +769,10 @@ pub fn pin_retention(
         Some(&format!("retention:{}", request.pin_id)),
         profile_root(loom, &snapshot)?,
         request.pin_id.as_bytes(),
+        vec![loom_core::WorkflowControlWrite::Put {
+            key: drive_retention_index_key(request.workspace_id)?,
+            payload: retention.encode()?,
+        }],
     )
 }
 
@@ -761,9 +791,8 @@ pub fn unpin_retention(
         .ok_or_else(|| LoomError::not_found("drive retention pin not found"))?;
     retention.pins.remove(idx);
     retention = DriveRetentionIndex::new(workspace_id, retention.pins)?;
-    save_retention(loom, &retention)?;
     let snapshot = load_snapshot_or_empty(loom, workspace_id)?;
-    record_operation(
+    record_operation_with_controls(
         loom,
         workspace,
         &snapshot,
@@ -771,6 +800,10 @@ pub fn unpin_retention(
         Some(&format!("retention:{pin_id}")),
         profile_root(loom, &snapshot)?,
         pin_id.as_bytes(),
+        vec![loom_core::WorkflowControlWrite::Put {
+            key: drive_retention_index_key(workspace_id)?,
+            payload: retention.encode()?,
+        }],
     )
 }
 
@@ -798,9 +831,8 @@ pub fn apply_retention(
         None
     } else {
         let retention = DriveRetentionIndex::new(workspace_id, retained.clone())?;
-        save_retention(loom, &retention)?;
         let snapshot = load_snapshot_or_empty(loom, workspace_id)?;
-        Some(record_operation(
+        Some(record_operation_with_controls(
             loom,
             workspace,
             &snapshot,
@@ -808,6 +840,10 @@ pub fn apply_retention(
             Some("retention:expired"),
             profile_root(loom, &snapshot)?,
             expired_pin_ids.join("\n").as_bytes(),
+            vec![loom_core::WorkflowControlWrite::Put {
+                key: drive_retention_index_key(workspace_id)?,
+                payload: retention.encode()?,
+            }],
         )?)
     };
     Ok(HostedDriveRetentionApply {
@@ -851,7 +887,6 @@ pub fn create_folder(
         .push(DriveFolderChildren::new(folder_id, Vec::new())?);
     snapshot.folders =
         DriveFolderIndex::new(snapshot.workspace_id.clone(), snapshot.folders.folders)?;
-    save_snapshot(loom, &snapshot)?;
     record_operation(
         loom,
         workspace,
@@ -860,6 +895,36 @@ pub fn create_folder(
         Some(folder_id),
         base_root,
         b"folder.created",
+    )
+}
+
+pub fn record_lease_operation(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    operation_kind: &str,
+    target_kind: &str,
+    target_id: &str,
+) -> Result<HostedDriveWrite> {
+    authorize_drive_target(
+        loom,
+        workspace,
+        workspace_id,
+        target_kind,
+        target_id,
+        AclRight::Write,
+    )?;
+    let snapshot = load_snapshot_or_empty(loom, workspace_id)?;
+    let root = profile_root(loom, &snapshot)?;
+    let target_entity_id = format!("{target_kind}:{target_id}");
+    record_operation(
+        loom,
+        workspace,
+        &snapshot,
+        operation_kind,
+        Some(&target_entity_id),
+        root,
+        operation_kind.as_bytes(),
     )
 }
 
@@ -987,6 +1052,7 @@ pub fn commit_upload(
     snapshot.versions.versions.push(file_version.clone());
     snapshot.versions =
         DriveFileVersionIndex::new(snapshot.workspace_id.clone(), snapshot.versions.versions)?;
+    let mut conflict_control = None;
     if session.target_kind == DriveUploadTargetKind::NewFile {
         let parent = ensure_folder_mut(&mut snapshot, &session.parent_folder_id)?;
         if let Some(existing) = parent.entry_by_name(&session.name)?.cloned() {
@@ -1008,7 +1074,10 @@ pub fn commit_upload(
                 session.expected_root,
                 DriveConflictResolution::Open,
             )?)?;
-            save_conflicts(loom, &conflicts)?;
+            conflict_control = Some(loom_core::WorkflowControlWrite::Put {
+                key: drive_conflict_index_key(workspace_id)?,
+                payload: conflicts.encode()?,
+            });
             conflict_id = Some(id);
         } else {
             parent.entries.push(DriveFolderEntry::new(
@@ -1020,12 +1089,11 @@ pub fn commit_upload(
         snapshot.folders =
             DriveFolderIndex::new(snapshot.workspace_id.clone(), snapshot.folders.folders)?;
     }
-    save_snapshot(loom, &snapshot)?;
     let operation_kind = match session.target_kind {
         DriveUploadTargetKind::NewFile => "file.upload_committed",
         DriveUploadTargetKind::ReplaceFile => "file.content_replaced",
     };
-    let mut summary = record_operation(
+    let (mut summary, operation_log) = prepare_operation(
         loom,
         workspace,
         &snapshot,
@@ -1034,12 +1102,39 @@ pub fn commit_upload(
         base_root,
         b"upload.committed",
     )?;
+    let operation_record = operation_log
+        .records
+        .last()
+        .cloned()
+        .ok_or_else(|| LoomError::corrupt("drive operation log lost committed upload"))?;
+    let mut controls = vec![
+        loom_core::WorkflowControlWrite::Put {
+            key: drive_profile_key(&snapshot.workspace_id)?,
+            payload: snapshot.encode()?,
+        },
+        loom_core::WorkflowControlWrite::Put {
+            key: drive_operation_log_key(&snapshot.workspace_id)?,
+            payload: operation_log.encode()?,
+        },
+        loom_core::WorkflowControlWrite::Delete {
+            key: drive_upload_session_key(workspace_id, upload_id)?,
+        },
+    ];
+    controls.extend(conflict_control);
+    let owner_state = loom_core::WorkflowOwnerState {
+        objects: Vec::new(),
+        reference: loom_core::WorkflowReferenceUpdate::Keep,
+        controls,
+        audits: Vec::new(),
+    };
     update_file_revision_index(
         loom,
         workspace,
         workspace_id,
         &file_version,
+        &operation_record,
         summary.profile_root.as_str(),
+        owner_state,
     )?;
     summary.conflict_id = conflict_id;
     Ok(summary)
@@ -1109,9 +1204,7 @@ pub fn resolve_conflict(
     }
     snapshot.folders =
         DriveFolderIndex::new(snapshot.workspace_id.clone(), snapshot.folders.folders)?;
-    save_snapshot(loom, &snapshot)?;
-    save_conflicts(loom, &conflicts)?;
-    record_operation(
+    record_operation_with_controls(
         loom,
         workspace,
         &snapshot,
@@ -1119,6 +1212,10 @@ pub fn resolve_conflict(
         Some(conflict_id),
         base_root,
         b"conflict.resolved",
+        vec![loom_core::WorkflowControlWrite::Put {
+            key: drive_conflict_index_key(workspace_id)?,
+            payload: conflicts.encode()?,
+        }],
     )
 }
 
@@ -1150,7 +1247,6 @@ pub fn rename_node(
     *entry = DriveFolderEntry::new(new_name, node_id, entry.kind)?;
     snapshot.folders =
         DriveFolderIndex::new(snapshot.workspace_id.clone(), snapshot.folders.folders)?;
-    save_snapshot(loom, &snapshot)?;
     record_operation(
         loom,
         workspace,
@@ -1203,7 +1299,6 @@ pub fn move_node(
         .push(entry);
     snapshot.folders =
         DriveFolderIndex::new(snapshot.workspace_id.clone(), snapshot.folders.folders)?;
-    save_snapshot(loom, &snapshot)?;
     record_operation(
         loom,
         workspace,
@@ -1267,7 +1362,6 @@ pub fn delete_node(
     folder.entries.remove(idx);
     snapshot.folders =
         DriveFolderIndex::new(snapshot.workspace_id.clone(), snapshot.folders.folders)?;
-    save_snapshot(loom, &snapshot)?;
     record_operation(
         loom,
         workspace,
@@ -1310,13 +1404,6 @@ fn empty_snapshot(workspace_id: &str) -> Result<DriveProfileSnapshot> {
             vec![DriveFolderChildren::new("root", Vec::new())?],
         )?,
         DriveFileVersionIndex::new(workspace_id, Vec::new())?,
-    )
-}
-
-fn save_snapshot(loom: &Loom<FileStore>, snapshot: &DriveProfileSnapshot) -> Result<()> {
-    loom.store().control_set(
-        &drive_profile_key(&snapshot.workspace_id)?,
-        snapshot.encode()?,
     )
 }
 
@@ -1657,17 +1744,6 @@ fn load_operation_log(loom: &Loom<FileStore>, workspace_id: &str) -> Result<Driv
     }
 }
 
-fn append_operation(
-    loom: &Loom<FileStore>,
-    workspace_id: &str,
-    record: DriveOperationRecord,
-) -> Result<()> {
-    let mut log = load_operation_log(loom, workspace_id)?;
-    log.append(record)?;
-    loom.store()
-        .control_set(&drive_operation_log_key(workspace_id)?, log.encode()?)
-}
-
 fn load_conflicts(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveConflictIndex> {
     match loom
         .store()
@@ -1695,13 +1771,6 @@ fn load_shares(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveShareI
     }
 }
 
-fn save_shares(loom: &Loom<FileStore>, shares: &DriveShareIndex) -> Result<()> {
-    loom.store().control_set(
-        &drive_share_index_key(&shares.workspace_id)?,
-        shares.encode()?,
-    )
-}
-
 fn load_retention(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveRetentionIndex> {
     match loom
         .store()
@@ -1712,15 +1781,8 @@ fn load_retention(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveRet
     }
 }
 
-fn save_retention(loom: &Loom<FileStore>, retention: &DriveRetentionIndex) -> Result<()> {
-    loom.store().control_set(
-        &drive_retention_index_key(&retention.workspace_id)?,
-        retention.encode()?,
-    )
-}
-
 fn record_operation(
-    loom: &Loom<FileStore>,
+    loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
     snapshot: &DriveProfileSnapshot,
     operation_kind: &str,
@@ -1728,7 +1790,149 @@ fn record_operation(
     base_root: Digest,
     payload: &[u8],
 ) -> Result<HostedDriveWrite> {
-    let log = load_operation_log(loom, &snapshot.workspace_id)?;
+    record_operation_with_controls(
+        loom,
+        workspace,
+        snapshot,
+        operation_kind,
+        target_entity_id,
+        base_root,
+        payload,
+        Vec::new(),
+    )
+}
+
+fn record_operation_with_controls(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    snapshot: &DriveProfileSnapshot,
+    operation_kind: &str,
+    target_entity_id: Option<&str>,
+    base_root: Digest,
+    payload: &[u8],
+    controls: Vec<loom_core::WorkflowControlWrite>,
+) -> Result<HostedDriveWrite> {
+    record_operation_with_owner_state(
+        loom,
+        workspace,
+        snapshot,
+        operation_kind,
+        target_entity_id,
+        base_root,
+        payload,
+        loom_core::WorkflowOwnerState {
+            controls,
+            ..Default::default()
+        },
+    )
+}
+
+fn record_operation_with_owner_state(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    snapshot: &DriveProfileSnapshot,
+    operation_kind: &str,
+    target_entity_id: Option<&str>,
+    base_root: Digest,
+    payload: &[u8],
+    mut owner_state: loom_core::WorkflowOwnerState,
+) -> Result<HostedDriveWrite> {
+    let (summary, log) = prepare_operation(
+        loom,
+        workspace,
+        snapshot,
+        operation_kind,
+        target_entity_id,
+        base_root,
+        payload,
+    )?;
+    let record = log
+        .records
+        .last()
+        .ok_or_else(|| LoomError::corrupt("prepared drive operation log is empty"))?;
+    owner_state
+        .controls
+        .push(loom_core::WorkflowControlWrite::Put {
+            key: drive_profile_key(&snapshot.workspace_id)?,
+            payload: snapshot.encode()?,
+        });
+    owner_state
+        .controls
+        .push(loom_core::WorkflowControlWrite::Put {
+            key: drive_operation_log_key(&snapshot.workspace_id)?,
+            payload: log.encode()?,
+        });
+    let index = next_metadata_revision_index(
+        loom,
+        workspace,
+        &snapshot.workspace_id,
+        target_entity_id,
+        record,
+    )?;
+    let (reference_root, objects) = loom.save_state_objects()?;
+    persist_current_revision_index_with_owner_state(
+        loom,
+        workspace,
+        &snapshot.workspace_id,
+        FacetKind::Files,
+        &index,
+        {
+            owner_state.objects.extend(objects);
+            owner_state.reference = loom_core::WorkflowReferenceUpdate::Set(Some(reference_root));
+            owner_state
+        },
+    )?;
+    Ok(summary)
+}
+
+fn next_metadata_revision_index(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    target_entity_id: Option<&str>,
+    record: &DriveOperationRecord,
+) -> Result<loom_substrate::versioning::RevisionIndex> {
+    let index = load_current_revision_index(loom, workspace, workspace_id)?;
+    let Some(target_entity_id) = target_entity_id else {
+        return Ok(index);
+    };
+    let envelope = OperationEnvelope::decode(&record.envelope)?;
+    let entity_id = format!("drive:metadata:{target_entity_id}");
+    let expected_latest_revision = index
+        .latest(&entity_id)
+        .map(|entry| entry.revision)
+        .unwrap_or(0);
+    let mut state = ProfileTransactionState::new(record.root_after, index);
+    state.apply(ProfileTransaction::new(
+        workspace_id,
+        None,
+        record.root_after,
+        vec![ProfileRevisionUpdate::new(
+            entity_id,
+            record.operation_id.clone(),
+            BodyRef::new(
+                Digest::hash(loom.store().digest_algo(), &record.envelope),
+                record.envelope.len() as u64,
+                "application/vnd.uldren.loom.drive.operation+cbor",
+            )?,
+            envelope.timestamp_ms,
+            format!("drive:metadata:{target_entity_id}:{}", record.sequence),
+            Some(expected_latest_revision),
+        )?],
+    )?)?;
+    Ok(state.into_revision_index())
+}
+
+fn prepare_operation(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    snapshot: &DriveProfileSnapshot,
+    operation_kind: &str,
+    target_entity_id: Option<&str>,
+    base_root: Digest,
+    payload: &[u8],
+) -> Result<(HostedDriveWrite, DriveOperationLog)> {
+    let mut log = load_operation_log(loom, &snapshot.workspace_id)?;
     let sequence = log.next_sequence();
     let operation_id = format!("{}:{sequence}", snapshot.workspace_id);
     let root_after = profile_root(loom, snapshot)?;
@@ -1763,16 +1967,19 @@ fn record_operation(
         root_after,
         envelope.encode()?,
     )?;
-    append_operation(loom, &snapshot.workspace_id, record)?;
-    Ok(HostedDriveWrite {
-        workspace_id: snapshot.workspace_id.clone(),
-        operation_id,
-        operation_kind: operation_kind.to_string(),
-        sequence,
-        profile_root: root_after.to_string(),
-        target_entity_id: target_entity_id.map(str::to_string),
-        conflict_id: None,
-    })
+    log.append(record)?;
+    Ok((
+        HostedDriveWrite {
+            workspace_id: snapshot.workspace_id.clone(),
+            operation_id,
+            operation_kind: operation_kind.to_string(),
+            sequence,
+            profile_root: root_after.to_string(),
+            target_entity_id: target_entity_id.map(str::to_string),
+            conflict_id: None,
+        },
+        log,
+    ))
 }
 
 fn upload_content_ref(
@@ -1880,19 +2087,17 @@ fn update_file_revision_index(
     workspace: WorkspaceId,
     workspace_id: &str,
     file_version: &DriveFileVersion,
+    operation_record: &DriveOperationRecord,
     root_after: &str,
+    owner_state: loom_core::WorkflowOwnerState,
 ) -> Result<()> {
-    let index_path = revision_index_path(workspace_id)?;
-    let index = match loom.read_file_reserved(workspace, &index_path) {
-        Ok(bytes) => RevisionIndex::decode(&bytes)?,
-        Err(err) if err.code == Code::NotFound => RevisionIndex::new(),
-        Err(err) => return Err(err),
-    };
+    let index = load_current_revision_index(loom, workspace, workspace_id)?;
     let (digest, size) = content_digest_and_size(&file_version.content);
     let root = Digest::parse(root_after)?;
     let mut state = ProfileTransactionState::new(root, index);
-    let update = ProfileRevisionUpdate::new(
-        format!("drive:file:{}", file_version.file_id),
+    let file_entity_id = format!("drive:file:{}", file_version.file_id);
+    let file_update = ProfileRevisionUpdate::new(
+        file_entity_id,
         file_version.operation_id.clone(),
         BodyRef::new(
             digest,
@@ -1903,15 +2108,42 @@ fn update_file_revision_index(
         format!("drive:{}:{}", file_version.file_id, file_version.version),
         Some(file_version.version.saturating_sub(1)),
     )?;
+    let metadata_entity_id = format!("drive:metadata:{}", file_version.file_id);
+    let expected_metadata_revision = state
+        .revision_index()
+        .latest(&metadata_entity_id)
+        .map(|entry| entry.revision)
+        .unwrap_or(0);
+    let envelope = OperationEnvelope::decode(&operation_record.envelope)?;
+    let metadata_update = ProfileRevisionUpdate::new(
+        metadata_entity_id,
+        operation_record.operation_id.clone(),
+        BodyRef::new(
+            Digest::hash(loom.store().digest_algo(), &operation_record.envelope),
+            operation_record.envelope.len() as u64,
+            "application/vnd.uldren.loom.drive.operation+cbor",
+        )?,
+        envelope.timestamp_ms,
+        format!(
+            "drive:metadata:{}:{}",
+            file_version.file_id, operation_record.sequence
+        ),
+        Some(expected_metadata_revision),
+    )?;
     state.apply(ProfileTransaction::new(
         workspace_id,
         None,
         root,
-        vec![update],
+        vec![file_update, metadata_update],
     )?)?;
-    let index = state.into_revision_index();
-    loom.create_directory_reserved(workspace, REVISION_INDEX_DIR, true)?;
-    loom.write_file_reserved(workspace, &index_path, &index.encode()?, 0o100644)
+    persist_current_revision_index_with_owner_state(
+        loom,
+        workspace,
+        workspace_id,
+        FacetKind::Files,
+        &state.into_revision_index(),
+        owner_state,
+    )
 }
 
 fn latest_versions(index: &DriveFileVersionIndex) -> Vec<&DriveFileVersion> {
@@ -2216,6 +2448,61 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, Code::InvalidArgument);
 
+        let index = load_current_revision_index(&loom, workspace(), workspace_id).unwrap();
+        assert_eq!(index.latest("drive:file:file-one").unwrap().revision, 1);
+        drop(loom);
+        let reopened = Loom::new(FileStore::open(&path).unwrap());
+        let index = load_current_revision_index(&reopened, workspace(), workspace_id).unwrap();
+        assert_eq!(index.latest("drive:file:file-one").unwrap().revision, 1);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn share_grant_owner_state_survives_reopen() {
+        let (path, mut loom) = open_test_loom("share-owner-state");
+        let workspace_id = "drive";
+        let principal = WorkspaceId::v4_from_bytes([9; 16]);
+        let operation = grant_share(
+            &mut loom,
+            workspace(),
+            HostedDriveGrantShare {
+                workspace_id,
+                grant_id: "grant-one",
+                target_kind: "folder",
+                target_id: "root",
+                principal: &principal.to_string(),
+                role: "editor",
+                granted_at_ms: 100,
+                expires_at_ms: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(operation.operation_kind, "share.granted");
+        drop(loom);
+
+        let reopened = Loom::new(FileStore::open(&path).unwrap());
+        let shares = load_shares(&reopened, workspace_id).unwrap();
+        assert_eq!(shares.grants.len(), 1);
+        assert_eq!(shares.grants[0].grant_id, "grant-one");
+        let acl = reopened.store().acl_store().unwrap().unwrap();
+        assert_eq!(acl.grants().len(), 1);
+        assert_eq!(acl.grants()[0].subject, AclSubject::Principal(principal));
+        let log = load_operation_log(&reopened, workspace_id).unwrap();
+        assert_eq!(log.records.len(), 1);
+        assert_eq!(log.records[0].operation_kind, "share.granted");
+        let index = load_current_revision_index(&reopened, workspace(), workspace_id).unwrap();
+        assert_eq!(
+            index
+                .latest("drive:metadata:share:grant-one")
+                .unwrap()
+                .revision,
+            1
+        );
+        let audits = reopened.store().audit_records().unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "drive.share_acl.grant");
+        drop(reopened);
         let _ = std::fs::remove_file(path);
     }
 

@@ -18,11 +18,221 @@ const WORK_SECTION_NAME: &str = "02-work";
 const INDEX_SECTION_NAME: &str = "07-index";
 
 impl<S: ObjectStore> Loom<S> {
+    pub(super) fn load_bounded_engine_base(
+        &self,
+        root: Digest,
+        scope: &EnginePlanningScope,
+    ) -> Result<BoundedEngineBase> {
+        let Object::Tree(sections) = load_object_from(&self.store, root)? else {
+            return Err(LoomError::corrupt(
+                "bounded engine-state base root is not a section Tree",
+            ));
+        };
+        validate_state_section_entries(&sections)?;
+
+        let Object::Blob(registry_bytes) = load_object_from(&self.store, sections[0].target)?
+        else {
+            return Err(LoomError::corrupt(
+                "bounded engine-state registry section is not a Blob",
+            ));
+        };
+        let registry = parse_registry_section(&registry_bytes)?.selected(scope.workspace)?;
+
+        let Object::Tree(workspaces) = load_object_from(&self.store, sections[2].target)? else {
+            return Err(LoomError::corrupt(
+                "bounded engine-state work section is not a Tree",
+            ));
+        };
+        let workspace_name = scope.workspace.to_string();
+        let mut work = WorkTree::new();
+        if let Some(workspace_entry) = workspaces.iter().find(|entry| entry.name == workspace_name)
+        {
+            if workspace_entry.kind != EntryKind::Tree {
+                return Err(LoomError::corrupt(
+                    "bounded engine-state workspace work entry is not a Tree",
+                ));
+            }
+            let Object::Tree(paths) = load_object_from(&self.store, workspace_entry.target)? else {
+                return Err(LoomError::corrupt(
+                    "bounded engine-state workspace work target is not a Tree",
+                ));
+            };
+            for entry in paths {
+                let path_bytes = hex::decode(&entry.name)
+                    .map_err(|_| LoomError::corrupt("bounded work path name is not hex"))?;
+                let path = String::from_utf8(path_bytes)
+                    .map_err(|_| LoomError::corrupt("bounded work path is not UTF-8"))?;
+                if scope.matches_read(&path) {
+                    work.insert(
+                        path,
+                        staged_slot_from_tree_entry(&entry, self.store.digest_algo())?,
+                    );
+                }
+            }
+        }
+
+        let wanted_content = work
+            .values()
+            .filter_map(|entry| match entry {
+                StagedEntry::File(file) => Some(file.content_addr),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let Object::Tree(content_entries) = load_object_from(&self.store, sections[1].target)?
+        else {
+            return Err(LoomError::corrupt(
+                "bounded engine-state content section is not a Tree",
+            ));
+        };
+        let mut content = BTreeMap::new();
+        for entry in content_entries {
+            if entry.kind != EntryKind::Tree {
+                return Err(LoomError::corrupt(
+                    "bounded engine-state content entry kind",
+                ));
+            }
+            let content_addr = Digest::parse(&entry.name)?;
+            if wanted_content.contains(&content_addr) {
+                content.insert(content_addr, entry.target);
+            }
+        }
+        if content.len() != wanted_content.len() {
+            return Err(LoomError::corrupt(
+                "bounded engine-state content mapping is incomplete",
+            ));
+        }
+
+        let Object::Blob(directory_bytes) = load_object_from(&self.store, sections[3].target)?
+        else {
+            return Err(LoomError::corrupt(
+                "bounded engine-state directory section is not a Blob",
+            ));
+        };
+        let directories = decode_directory_section(&directory_bytes)?
+            .remove(&scope.workspace)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|directory| scope.permits_read_directory(directory))
+            .collect();
+
+        Ok(BoundedEngineBase {
+            registry,
+            work,
+            directories,
+            content,
+        })
+    }
+
+    pub fn prepare_engine_state_delta_reference(
+        &self,
+        delta: &EngineStateDelta,
+        base_root: Digest,
+        planned_objects: Vec<(Digest, Vec<u8>)>,
+    ) -> Result<SavedStateObjects> {
+        self.state_instrumentation
+            .bounded_section_rewrites
+            .fetch_add(delta.rewritten_sections().len() as u64, Ordering::Relaxed);
+        delta.prepare_reference_update(&self.store, base_root, planned_objects)
+    }
+
+    pub fn prepare_current_facet_state_reference(
+        &mut self,
+        workspace: WorkspaceId,
+        base_root: Digest,
+    ) -> Result<SavedStateObjects> {
+        self.ensure_full_state_loaded()?;
+        let scope =
+            EnginePlanningScope::new(workspace, [EnginePathSelector::Prefix(".loom".to_string())])?;
+        let base = match self.load_bounded_engine_base(base_root, &scope) {
+            Ok(base) => base,
+            Err(error) if error.code == Code::NotFound => return self.save_state_objects(),
+            Err(error) => return Err(error),
+        };
+        let current_work = self.work.get(&workspace).cloned().unwrap_or_default();
+        let current_directories = self.dirs.get(&workspace).cloned().unwrap_or_default();
+
+        let mut work = BTreeMap::new();
+        for path in base
+            .work
+            .keys()
+            .chain(current_work.keys())
+            .filter(|path| scope.matches(path))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+        {
+            if base.work.get(&path) != current_work.get(&path) {
+                work.insert(path.clone(), current_work.get(&path).copied());
+            }
+        }
+
+        let mut directories = BTreeMap::new();
+        for directory in base
+            .directories
+            .iter()
+            .chain(current_directories.iter())
+            .filter(|directory| scope.permits_directory(directory))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+        {
+            if base.directories.contains(&directory) != current_directories.contains(&directory) {
+                directories.insert(directory.clone(), current_directories.contains(&directory));
+            }
+        }
+
+        let Object::Tree(sections) = load_object_from(&self.store, base_root)? else {
+            return Err(LoomError::corrupt(
+                "bounded engine-state base root is not a section Tree",
+            ));
+        };
+        validate_state_section_entries(&sections)?;
+        let Object::Tree(entries) = load_object_from(&self.store, sections[1].target)? else {
+            return Err(LoomError::corrupt(
+                "bounded engine-state content section is not a Tree",
+            ));
+        };
+        let base_content = entries
+            .into_iter()
+            .map(|entry| Ok((Digest::parse(&entry.name)?, entry.target)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let content = self
+            .content
+            .iter()
+            .filter(|(address, object)| base_content.get(address) != Some(object))
+            .map(|(address, object)| (*address, *object))
+            .collect();
+        let delta = EngineStateDelta {
+            workspace,
+            work,
+            directories,
+            content,
+        };
+        self.state_instrumentation
+            .bounded_plans
+            .fetch_add(1, Ordering::Relaxed);
+        if delta.work.is_empty() && delta.directories.is_empty() && delta.content.is_empty() {
+            return Ok((base_root, Vec::new()));
+        }
+        self.prepare_engine_state_delta_reference(&delta, base_root, Vec::new())
+    }
+
+    pub fn fork_state_into<T: ObjectStore>(&self, store: T) -> Result<Loom<T>> {
+        let mut fork = Loom::new(store);
+        fork.import_state(&self.export_state())?;
+        fork.identity = self.identity.clone();
+        fork.acl = self.acl.clone();
+        fork.predicate_evaluator = self.predicate_evaluator.clone();
+        fork.session = self.session.clone();
+        Ok(fork)
+    }
+
     /// Serialize the engine's **recoverable** state to canonical bytes: the workspace
     /// registry (branches, tags, HEAD), the content-address -> Blob-object map, and the
     /// per-workspace **working trees + directories** (the durable staging index, so uncommitted edits
     /// survive a restart). [`Loom::import_state`] restores all of it verbatim.
     pub fn export_state(&self) -> Vec<u8> {
+        self.state_instrumentation
+            .full_exports
+            .fetch_add(1, Ordering::Relaxed);
         let reg = self.registry.encode();
         let mut out = Vec::new();
         put_uvarint(&mut out, reg.len() as u64);
@@ -186,6 +396,9 @@ impl<S: ObjectStore> Loom<S> {
     /// this preserves uncommitted staged changes. Objects the working trees reference must be present
     /// (they are kept live by [`Loom::live_object_set`]).
     pub fn import_state(&mut self, bytes: &[u8]) -> Result<()> {
+        self.state_instrumentation
+            .full_imports
+            .fetch_add(1, Ordering::Relaxed);
         // Persisted digests carry only their 32 bytes; tag them with the store's identity profile
         // so a FIPS (sha256) store reconstructs sha256-tagged addresses, which
         // matters because the store verifies a `get` under the digest's own algorithm.
@@ -441,6 +654,7 @@ impl<S: ObjectStore> Loom<S> {
         self.next_inode = next_inode;
         self.next_handle = next_handle;
         self.protected_refs = protected_refs;
+        self.mutable_overlay = crate::MutableOverlay::new();
         self.lazy_state_sections = None;
         self.ephemeral_kv.clear();
         Ok(())
@@ -450,17 +664,29 @@ impl<S: ObjectStore> Loom<S> {
     /// returning the **engine-state root** a persistence backend records as its mutable root.
     /// [`Loom::load_state`] reverses it.
     pub fn save_state(&mut self) -> Result<Digest> {
+        let (root, objects) = self.save_state_objects()?;
+        for (_, canonical) in objects {
+            self.store.put(&canonical)?;
+        }
+        Ok(root)
+    }
+
+    pub fn save_state_objects(&mut self) -> Result<SavedStateObjects> {
         self.ensure_full_state_loaded()?;
         let bytes = self.export_state();
         let mut entries = Vec::new();
+        let mut objects = Vec::new();
         for (name, section) in split_state_sections(&bytes)? {
             let target = if name == CONTENT_SECTION_NAME {
-                self.put_object(&content_section_tree(&section, self.store.digest_algo())?)?
+                self.stage_state_object(
+                    content_section_tree(&section, self.store.digest_algo())?,
+                    &mut objects,
+                )
             } else if name == WORK_SECTION_NAME || name == INDEX_SECTION_NAME {
                 let object = self.staged_map_section_tree(&section)?;
-                self.put_object(&object)?
+                self.stage_state_object(object, &mut objects)
             } else {
-                self.put_object(&Object::Blob(section))?
+                self.stage_state_object(Object::Blob(section), &mut objects)
             };
             entries.push(TreeEntry {
                 name: name.to_string(),
@@ -469,7 +695,15 @@ impl<S: ObjectStore> Loom<S> {
                 mode: 0o100644,
             });
         }
-        self.put_object(&Object::tree(entries)?)
+        let root = self.stage_state_object(Object::tree(entries)?, &mut objects);
+        Ok((root, objects))
+    }
+
+    fn stage_state_object(&self, object: Object, objects: &mut Vec<(Digest, Vec<u8>)>) -> Digest {
+        let canonical = object.canonical();
+        let digest = Digest::hash(self.store.digest_algo(), &canonical);
+        objects.push((digest, canonical));
+        digest
     }
 
     /// Load engine state from a section Tree root.
@@ -626,6 +860,192 @@ impl<S: ObjectStore> Loom<S> {
         }
         Ok(out)
     }
+}
+
+impl EngineStateDelta {
+    pub fn prepare_reference_update<S: ObjectStore>(
+        &self,
+        store: &S,
+        base_root: Digest,
+        planned_objects: Vec<(Digest, Vec<u8>)>,
+    ) -> Result<SavedStateObjects> {
+        let planning_store = crate::provider::PlanningObjectStore::new(store);
+        for (expected, bytes) in planned_objects {
+            let actual = planning_store.put(&bytes)?;
+            if actual != expected {
+                return Err(LoomError::integrity_failure(
+                    "planned engine object digest mismatch",
+                ));
+            }
+        }
+        let Object::Tree(mut sections) = load_object_from(&planning_store, base_root)? else {
+            return Err(LoomError::corrupt(
+                "bounded engine-state base root is not a section Tree",
+            ));
+        };
+        validate_state_section_entries(&sections)?;
+        if !self.content.is_empty() {
+            let section = sections
+                .iter_mut()
+                .find(|entry| entry.name == CONTENT_SECTION_NAME)
+                .expect("validated content section");
+            let Object::Tree(mut entries) = load_object_from(&planning_store, section.target)?
+            else {
+                return Err(LoomError::corrupt(
+                    "bounded engine-state content section is not a Tree",
+                ));
+            };
+            for (content, object) in &self.content {
+                upsert_tree_entry(
+                    &mut entries,
+                    TreeEntry {
+                        name: content.to_string(),
+                        kind: EntryKind::Tree,
+                        target: *object,
+                        mode: 0o100644,
+                    },
+                );
+            }
+            section.target = put_object_into(&planning_store, Object::tree(entries)?)?;
+        }
+        if !self.work.is_empty() {
+            let section = sections
+                .iter_mut()
+                .find(|entry| entry.name == WORK_SECTION_NAME)
+                .expect("validated work section");
+            let Object::Tree(mut workspaces) = load_object_from(&planning_store, section.target)?
+            else {
+                return Err(LoomError::corrupt(
+                    "bounded engine-state work section is not a Tree",
+                ));
+            };
+            let workspace_name = self.workspace.to_string();
+            let mut paths = match workspaces.iter().find(|entry| entry.name == workspace_name) {
+                Some(entry) => match load_object_from(&planning_store, entry.target)? {
+                    Object::Tree(entries) => entries,
+                    _ => {
+                        return Err(LoomError::corrupt(
+                            "bounded engine-state workspace work target is not a Tree",
+                        ));
+                    }
+                },
+                None => Vec::new(),
+            };
+            for (path, staged) in &self.work {
+                let name = hex::encode(path.as_bytes());
+                match staged {
+                    Some(staged) => {
+                        let mut entry = tree_entry_from_staged_slot(*staged);
+                        entry.name = name;
+                        upsert_tree_entry(&mut paths, entry);
+                    }
+                    None => paths.retain(|entry| entry.name != name),
+                }
+            }
+            let workspace_target = put_object_into(&planning_store, Object::tree(paths)?)?;
+            upsert_tree_entry(
+                &mut workspaces,
+                TreeEntry {
+                    name: workspace_name,
+                    kind: EntryKind::Tree,
+                    target: workspace_target,
+                    mode: 0o100644,
+                },
+            );
+            section.target = put_object_into(&planning_store, Object::tree(workspaces)?)?;
+        }
+        if !self.directories.is_empty() {
+            let section = sections
+                .iter_mut()
+                .find(|entry| entry.name == STATE_SECTION_NAMES[3])
+                .expect("validated directory section");
+            let Object::Blob(bytes) = load_object_from(&planning_store, section.target)? else {
+                return Err(LoomError::corrupt(
+                    "bounded engine-state directory section is not a Blob",
+                ));
+            };
+            let mut directories = decode_directory_section(&bytes)?;
+            let workspace_dirs = directories.entry(self.workspace).or_default();
+            for (directory, present) in &self.directories {
+                if *present {
+                    workspace_dirs.insert(directory.clone());
+                } else {
+                    workspace_dirs.remove(directory);
+                }
+            }
+            section.target = put_object_into(
+                &planning_store,
+                Object::Blob(encode_directory_section(&directories)),
+            )?;
+        }
+        let root = put_object_into(&planning_store, Object::tree(sections)?)?;
+        Ok((root, planning_store.objects()?))
+    }
+
+    pub fn rewritten_sections(&self) -> Vec<&'static str> {
+        let mut sections = Vec::new();
+        if !self.content.is_empty() {
+            sections.push(CONTENT_SECTION_NAME);
+        }
+        if !self.work.is_empty() {
+            sections.push(WORK_SECTION_NAME);
+        }
+        if !self.directories.is_empty() {
+            sections.push(STATE_SECTION_NAMES[3]);
+        }
+        sections
+    }
+}
+
+fn load_object_from<S: ObjectStore>(store: &S, digest: Digest) -> Result<Object> {
+    let bytes = store
+        .get(&digest)?
+        .ok_or_else(|| LoomError::not_found(format!("object {digest}")))?;
+    Object::decode(&bytes)
+}
+
+fn put_object_into<S: ObjectStore>(store: &S, object: Object) -> Result<Digest> {
+    store.put(&object.canonical())
+}
+
+fn upsert_tree_entry(entries: &mut Vec<TreeEntry>, replacement: TreeEntry) {
+    entries.retain(|entry| entry.name != replacement.name);
+    entries.push(replacement);
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+fn decode_directory_section(bytes: &[u8]) -> Result<BTreeMap<WorkspaceId, BTreeSet<String>>> {
+    let mut cursor = StateCur { buf: bytes, pos: 0 };
+    let count = cursor.uvarint()?;
+    let mut directories = BTreeMap::new();
+    for _ in 0..count {
+        let workspace = WorkspaceId::from_bytes(cursor.take16()?);
+        let directory_count = cursor.uvarint()?;
+        let mut workspace_dirs = BTreeSet::new();
+        for _ in 0..directory_count {
+            workspace_dirs.insert(cursor.lp_str()?);
+        }
+        directories.insert(workspace, workspace_dirs);
+    }
+    if cursor.pos != bytes.len() {
+        return Err(LoomError::corrupt(
+            "bounded engine-state directory section trailing bytes",
+        ));
+    }
+    Ok(directories)
+}
+
+fn encode_directory_section(directories: &BTreeMap<WorkspaceId, BTreeSet<String>>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    put_uvarint(&mut bytes, directories.len() as u64);
+    for (workspace, workspace_dirs) in directories {
+        bytes.extend_from_slice(workspace.as_bytes());
+        put_uvarint(&mut bytes, workspace_dirs.len() as u64);
+        for directory in workspace_dirs {
+            put_lp(&mut bytes, directory.as_bytes());
+        }
+    }
+    bytes
 }
 
 fn tree_entry_from_staged_slot(staged: StagedEntry) -> TreeEntry {

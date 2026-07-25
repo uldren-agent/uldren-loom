@@ -590,6 +590,28 @@ impl HostedKernel {
         out
     }
 
+    pub fn write_current_state<T>(
+        &self,
+        auth: &HostedAuth,
+        f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>,
+    ) -> Result<T> {
+        let out = {
+            let _guard = self
+                .write_lock
+                .lock()
+                .map_err(|_| LoomError::new(Code::Internal, "hosted kernel write lock poisoned"))?;
+            self.open_write_loom(auth).and_then(|mut loom| {
+                let out = f(&mut loom)?;
+                drop(loom);
+                Ok(out)
+            })
+        };
+        if let Err(err) = &out {
+            self.audit_security_failure(auth, err);
+        }
+        out
+    }
+
     pub fn audit_append(
         &self,
         principal: Option<WorkspaceId>,

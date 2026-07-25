@@ -94,6 +94,7 @@ pass; thereafter each document is self-contained and cross-references the others
 | 0067c | Remote Loom Client Parity Report | Informative (companion to 0067)  | Authoritative, generated per-method map of every current `idl/loom.idl` method (41 interfaces / 353 methods) to its client-parity status; backs section 12 of 0067 and is kept in sync by `uldren-loom-remote-codegen`. |
 | 0068 | Multimodal Vector Sources    | Draft target (`multimodal-vector-sources`) | Non-text source pipelines for PDFs, images, audio, video, and multimodal bundles before they become ordinary vectors in 0017; owns source unit identity, extraction profiles, provenance, modality metadata, and multimodal embedding provider contracts. |
 | 0070 | Release Maturity             | Informative                       | Alpha, Beta, Release Candidate, and Stable definitions, promotion gates, evidence requirements, and SemVer pre-release progression. |
+| 0071 | Mutable Overlay Substrate    | Draft target (`mutable-overlay`)  | Shared Loom-native sparse current-state overlay over immutable CAS/Merkle history, with bounded hot writes, composite reads, checkpoint promotion, write-lock contention requirements, and safe operational-store migration. |
 
 Exploratory landscape notes (`EXECUTION-LOGIC-LANDSCAPE.md`, `EVENTS-TRIGGERS-LANDSCAPE.md`,
 `PRINCIPALS-AND-ACCESS-CONTROL-LANDSCAPE.md`, `AI-CAPABILITIES-LANDSCAPE.md`) are research inputs that

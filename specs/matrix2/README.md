@@ -39,7 +39,7 @@ model. Matrix2 uses generic worker sessions that pull task packets from the matr
 | Packet | A ready-to-run scoped task file under `prompts/`. |
 | Agent queue | A generic worker session. It does not permanently own a lane. |
 | Pull rule | Pick the highest-ROI ready packet that matches the worker's context, lift budget, and dependency state. |
-| Result handoff | The worker updates the packet's results section. A review session can then evaluate the packet output. |
+| Result handoff | The worker records closeout evidence in typed ticket comments and first-class ticket fields on the active ticket. A review session then evaluates the ticket. |
 | Source dependency | The full `specs/_FACET_PRIMITIVES.md` file is in scope for every packet. Targeted sections narrow reading order, not dependency scope. |
 
 ## Owner Question Routing
@@ -60,13 +60,13 @@ When an agent needs owner input, it must:
 The arbiter verifies the decision record, creates any transitional graph relation while automatic
 projection is unfinished, records the owner answer, and updates the Lane or board before the worker
 resumes. If no ticket write surface is available, the agent must not ask only in chat; it must record
-the missing ticket update surface as a blocker in its result.
+the missing ticket update surface as a blocker on the active ticket.
 
 ## MCP Text and Ticket Operation Friction
 
 Matrix coordination documents are agent-readable UTF-8 text or JSON unless a task explicitly needs
-opaque bytes. Workers should therefore prefer text document tools for prompts, boards, decisions,
-and results when those tools are available:
+opaque bytes. Workers should therefore prefer text document tools for prompts, boards, and decisions
+when those tools are available (closeout evidence is recorded on the ticket, not in a document):
 
 | Operation | Preferred path | Fallback path |
 | --- | --- | --- |
@@ -75,12 +75,13 @@ and results when those tools are available:
 | Write opaque content | `document_put_binary` | None; do not force binary content through text tools. |
 
 When a client only exposes integer byte arrays, the worker should generate the byte array from a
-local UTF-8 string instead of hand-writing long arrays. The result must state that a binary fallback
-was used so the arbiter can distinguish tooling friction from task substance.
+local UTF-8 string instead of hand-writing long arrays. The worker must record on the active ticket
+that a binary fallback was used so the arbiter can distinguish tooling friction from task substance.
 
-Ticket operations are separate from document writes. A worker must not infer that writing a result
-document updates ticket state. If the active ticket update surface is unavailable, the worker records
-the missing ticket operation as a blocker in the result and stops at any boundary that requires a
+Closeout evidence is ticket-sourced: progress, blockers, questions, review requests, closeout
+evidence, and source anchors go in typed ticket comments and first-class ticket fields, never in a
+separate result document. If the active ticket update surface is unavailable, the worker records the
+missing ticket operation as a blocker on the active ticket and stops at any boundary that requires a
 ticket state transition.
 
 ## Selection Rule
@@ -102,7 +103,7 @@ packet, even if both live near each other in the matrix.
 
 ## Completion Rule
 
-A packet is complete only when its results section records:
+A packet is complete only when the active ticket records (in typed comments and first-class fields):
 
 | Required result | Why it matters |
 | --- | --- |

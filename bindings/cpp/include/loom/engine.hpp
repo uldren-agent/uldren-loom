@@ -1706,6 +1706,13 @@ public:
         return found != 0;
     }
 
+    /// Remove collection `collection` and its structured roots; returns whether it was present.
+    bool doc_delete_collection(const std::string &ns, const std::string &collection) {
+        std::int32_t found = 0;
+        detail::check(::loom_doc_delete_collection(handle_, ns.c_str(), collection.c_str(), &found));
+        return found != 0;
+    }
+
     /// List collection `collection` as its canonical binary representation.
     std::vector<std::uint8_t> doc_list_binary(const std::string &ns,
                                               const std::string &collection) {

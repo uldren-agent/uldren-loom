@@ -793,6 +793,7 @@ fn substrate_refs_indexes_published_block_refs() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .0;
     let space_root = string_value(&space, "/value/profile_root", "space root")?;
+    let page_profile_id = string_value(&space, "/value/workspace_id", "page workspace id")?;
     let target = server
         .pages_create(Parameters(PPagesCreate {
             workspace: "repo".to_string(),
@@ -816,17 +817,16 @@ fn substrate_refs_indexes_published_block_refs() -> Result<(), String> {
         .map_err(strerr)?,
     ]);
     let target_update = server
-        .pages_update(Parameters(PPagesUpdate {
-            workspace: "repo".to_string(),
-            page_id: "target".to_string(),
-            body_text: String::from_utf8(target_body.encode().map_err(strerr)?)
-                .map_err(|e| e.to_string())?,
-            expected_root: Some(target_root),
-        }))
-        .map_err(|e| e.to_string())?
-        .0;
-    let target_update_root =
-        string_value(&target_update, "/value/profile_root", "target update root")?;
+        .mcp
+        .write_pages_update(
+            "repo",
+            &page_profile_id,
+            "target",
+            target_body.encode().map_err(strerr)?,
+            Some(&target_root),
+        )
+        .map_err(strerr)?;
+    let target_update_root = target_update.profile_root;
     let target_publish = server
         .pages_publish(Parameters(PPagesPublish {
             workspace: "repo".to_string(),
@@ -868,16 +868,16 @@ fn substrate_refs_indexes_published_block_refs() -> Result<(), String> {
         .map_err(strerr)?,
     ]);
     let update = server
-        .pages_update(Parameters(PPagesUpdate {
-            workspace: "repo".to_string(),
-            page_id: "source".to_string(),
-            body_text: String::from_utf8(body.encode().map_err(strerr)?)
-                .map_err(|e| e.to_string())?,
-            expected_root: Some(page_root),
-        }))
-        .map_err(|e| e.to_string())?
-        .0;
-    let update_root = string_value(&update, "/value/profile_root", "update root")?;
+        .mcp
+        .write_pages_update(
+            "repo",
+            &page_profile_id,
+            "source",
+            body.encode().map_err(strerr)?,
+            Some(&page_root),
+        )
+        .map_err(strerr)?;
+    let update_root = update.profile_root;
     server
         .pages_publish(Parameters(PPagesPublish {
             workspace: "repo".to_string(),

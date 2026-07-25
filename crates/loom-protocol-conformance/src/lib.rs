@@ -44,7 +44,7 @@ use loom_substrate::meetings::{
     MeetingRecordInput, MeetingsProfileSnapshot, MeetingsProfileSnapshotParts, RedactionRecord,
     RedactionState, SourceRecord, SourceRecordInput, SpanKind, SpanRecord, meetings_profile_key,
 };
-use loom_substrate::versioning::{RevisionIndex, revision_index_path};
+use loom_substrate::versioning::load_current_revision_index;
 use tokio_stream::StreamExt;
 use tonic::Request as GrpcRequest;
 use tower::ServiceExt;
@@ -5206,11 +5206,9 @@ fn expect_revision_history(
     expected_media_type: &str,
 ) -> Result<(), String> {
     let auth = HostedAuth::passphrase(nid(1), "root-pass", "hosted-profile-history");
-    let path = revision_index_path(scope_id).map_err(strerr)?;
     let index = kernel
         .read(&auth, |loom| {
-            loom.read_file_reserved(workspace, &path)
-                .and_then(|bytes| RevisionIndex::decode(&bytes))
+            load_current_revision_index(loom, workspace, scope_id)
         })
         .map_err(|error| error.message)?;
     let history = index.history(entity_id);

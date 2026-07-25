@@ -142,35 +142,6 @@ fn service_ns_selector(workspace: &str) -> WsSelector {
     }
 }
 
-fn sync_ticket_references(
-    loom: &mut loom_core::Loom<loom_store::FileStore>,
-    workspace: WorkspaceId,
-    ticket: &loom_tickets::TicketSummary,
-) -> Result<(), LoomError> {
-    loom_tickets::update_ticket_field_references(
-        loom,
-        workspace,
-        &ticket.workspace_id,
-        &ticket.ticket_id,
-        &ticket.fields,
-    )?;
-    if let Some(operation_id) = ticket.operation_id.as_deref() {
-        loom_tickets::enqueue_ticket_reference_candidates(
-            loom,
-            workspace,
-            loom_tickets::TicketReferenceCandidateRequest {
-                workspace_id: &ticket.workspace_id,
-                ticket_id: &ticket.ticket_id,
-                operation_id,
-                source_root: CoreDigest::parse(&ticket.profile_root)?,
-                fields: &ticket.fields,
-                now_ms: now_ms(),
-            },
-        )?;
-    }
-    Ok(())
-}
-
 fn parse_ticket_lifecycle_action(
     value: Option<&str>,
 ) -> Result<Option<loom_tickets::TicketLifecycleAction>, LoomError> {
@@ -1157,6 +1128,16 @@ impl Document for LocalLoomClient {
         id: String,
     ) -> impl ::core::future::Future<Output = Result<bool, LoomError>> + Send {
         let out = self.document_delete(&handle, &workspace, &collection, &id);
+        async move { out }
+    }
+
+    fn delete_collection(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        collection: String,
+    ) -> impl ::core::future::Future<Output = Result<bool, LoomError>> + Send {
+        let out = self.document_delete_collection(&handle, &workspace, &collection);
         async move { out }
     }
 
@@ -2188,23 +2169,37 @@ impl Lanes for LocalLoomClient {
 
     async fn get_view_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _lane_id: String,
-        _detailed: bool,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        lane_id: String,
+        detailed: bool,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Lanes.get_view_json"))
+        let view = self.lanes_get_view(&handle, &workspace, &ticket_workspace_id, &lane_id)?;
+        match (view, detailed) {
+            (Some(view), true) => json_string(&view),
+            (Some(view), false) => json_string(&view.compact()),
+            (None, _) => Ok("null".to_string()),
+        }
     }
 
     async fn list_views_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _detailed: bool,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        detailed: bool,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Lanes.list_views_json"))
+        let views = self.lanes_list_views(&handle, &workspace, &ticket_workspace_id)?;
+        if detailed {
+            json_string(&views)
+        } else {
+            let compact = views
+                .iter()
+                .map(loom_lanes::LaneView::compact)
+                .collect::<Vec<_>>();
+            json_string(&compact)
+        }
     }
 
     fn update(
@@ -5336,7 +5331,6 @@ impl Tickets for LocalLoomClient {
                     relation_removes: &relation_removes,
                 },
             )?;
-            sync_ticket_references(loom, ns, &ticket)?;
             let result =
                 ticket_mutation_json(ticket, "ticket.updated", expected_root.as_deref(), changes)?;
             save_loom(loom)?;
@@ -5405,7 +5399,6 @@ impl Tickets for LocalLoomClient {
                     expected_root: expected_root.as_deref(),
                 },
             )?;
-            sync_ticket_references(loom, ns, &ticket)?;
             let result = ticket_mutation_json(
                 ticket,
                 "ticket.comment_added",
@@ -5450,7 +5443,6 @@ impl Tickets for LocalLoomClient {
                     expected_root: expected_root.as_deref(),
                 },
             )?;
-            sync_ticket_references(loom, ns, &ticket)?;
             let result = ticket_mutation_json(
                 ticket,
                 "ticket.comment_updated",
@@ -5483,7 +5475,6 @@ impl Tickets for LocalLoomClient {
                     expected_root: expected_root.as_deref(),
                 },
             )?;
-            sync_ticket_references(loom, ns, &ticket)?;
             let result = ticket_mutation_json(
                 ticket,
                 "ticket.comment_deleted",
@@ -5772,7 +5763,6 @@ impl Pages for LocalLoomClient {
                 now_ms(),
                 expected_root.as_deref(),
             )?;
-            save_loom(loom)?;
             json_string(&summary)
         })
     }
@@ -6332,6 +6322,8 @@ impl Chat for LocalLoomClient {
     }
 }
 
+impl LoomClient for LocalLoomClient {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6542,6 +6534,193 @@ mod tests {
     }
 
     #[test]
+    fn lanes_view_json_matches_shared_projection_for_ticket_summaries() {
+        let (client, session, workspace, dir) = seed_client("lanes-view-json");
+        let workspace_id = workspace.to_string();
+        let (ready, blocked) = client
+            .with_session(&session, |loom| {
+                loom_tickets::create_project(
+                    loom,
+                    workspace,
+                    &workspace_id,
+                    "matrix",
+                    "MX",
+                    "Matrix",
+                    None,
+                )?;
+                let ready = loom_tickets::create_ticket(
+                    loom,
+                    workspace,
+                    loom_tickets::TicketCreateRequest {
+                        workspace_id: &workspace_id,
+                        project_id: "matrix",
+                        ticket_type: "task",
+                        external_source: None,
+                        external_id: None,
+                        fields: &serde_json::json!({
+                            "title": "Ready task",
+                            "status": "ready",
+                            "priority": "P1"
+                        }),
+                        policy_labels: &[],
+                        expected_root: None,
+                    },
+                )?;
+                let blocked = loom_tickets::create_ticket(
+                    loom,
+                    workspace,
+                    loom_tickets::TicketCreateRequest {
+                        workspace_id: &workspace_id,
+                        project_id: "matrix",
+                        ticket_type: "bug",
+                        external_source: None,
+                        external_id: None,
+                        fields: &serde_json::json!({
+                            "title": "Blocked bug",
+                            "status": "blocked",
+                            "priority": "P0"
+                        }),
+                        policy_labels: &[],
+                        expected_root: Some(&ready.profile_root),
+                    },
+                )?;
+                save_loom(loom)?;
+                Ok((ready, blocked))
+            })
+            .expect("seed tickets");
+
+        client
+            .lanes_create(
+                &session,
+                "repo",
+                loom_lanes::Lane {
+                    lane_id: "view-lane".to_string(),
+                    lane_key: "review-workflow".to_string(),
+                    title: "View lane".to_string(),
+                    description: "Lane view projection regression.".to_string(),
+                    lane_kind: loom_lanes::LaneKind::Assignment.as_str().to_string(),
+                    owner_principal: None,
+                    lane_status: "ready".to_string(),
+                    lane_tickets: vec![
+                        loom_lanes::LaneTicket {
+                            ticket_id: ready.primary_key.clone(),
+                            order_key: "F".to_string(),
+                        },
+                        loom_lanes::LaneTicket {
+                            ticket_id: blocked.primary_key.clone(),
+                            order_key: "V".to_string(),
+                        },
+                        loom_lanes::LaneTicket {
+                            ticket_id: "MX-999".to_string(),
+                            order_key: "l".to_string(),
+                        },
+                    ],
+                    active_ticket_id: Some(ready.primary_key.clone()),
+                    status_report: "ready".to_string(),
+                    reviewer_feedback: String::new(),
+                    updated_at: 1,
+                    updated_by: "agent-1".to_string(),
+                },
+            )
+            .expect("seed lane");
+
+        let direct_view = client
+            .lanes_get_view(&session, "repo", &workspace_id, "view-lane")
+            .expect("direct view")
+            .expect("lane exists");
+        let shared_view = client
+            .with_session(&session, |loom| {
+                let lane =
+                    loom_lanes::get_lane(loom, workspace, "view-lane")?.expect("lane exists");
+                Ok(crate::local::build_lane_view(
+                    loom,
+                    workspace,
+                    &workspace_id,
+                    &lane,
+                ))
+            })
+            .expect("shared view");
+        assert_eq!(direct_view, shared_view);
+        assert_eq!(direct_view.status_counts.ready, 1);
+        assert_eq!(direct_view.status_counts.blocked, 1);
+        assert_eq!(direct_view.status_counts.missing, 1);
+        assert_eq!(direct_view.status_counts.total, 3);
+        assert_eq!(direct_view.lane_tickets[0].status.as_deref(), Some("ready"));
+        assert_eq!(
+            direct_view.lane_tickets[0].title.as_deref(),
+            Some("Ready task")
+        );
+        assert_eq!(direct_view.lane_tickets[0].priority.as_deref(), Some("P1"));
+        assert_eq!(
+            direct_view.lane_tickets[1].status.as_deref(),
+            Some("blocked")
+        );
+        assert_eq!(
+            direct_view.lane_tickets[1].title.as_deref(),
+            Some("Blocked bug")
+        );
+        assert_eq!(
+            direct_view.lane_tickets[2].status.as_deref(),
+            Some("missing")
+        );
+
+        let direct_json = serde_json::to_value(&direct_view).expect("direct json");
+        let detail = block(<LocalLoomClient as Lanes>::get_view_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "view-lane".to_string(),
+            true,
+        ))
+        .expect("service detailed view");
+        let detail: serde_json::Value = serde_json::from_str(&detail).expect("detail json");
+        assert_eq!(detail, direct_json);
+
+        let compact = block(<LocalLoomClient as Lanes>::get_view_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "view-lane".to_string(),
+            false,
+        ))
+        .expect("service compact view");
+        let compact: serde_json::Value = serde_json::from_str(&compact).expect("compact json");
+        assert_eq!(
+            compact,
+            serde_json::to_value(direct_view.compact()).expect("direct compact json")
+        );
+
+        let detail_list = block(<LocalLoomClient as Lanes>::list_views_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            true,
+        ))
+        .expect("service detailed list");
+        let detail_list: serde_json::Value =
+            serde_json::from_str(&detail_list).expect("detail list json");
+        assert_eq!(detail_list, serde_json::json!([direct_json]));
+
+        let compact_list = block(<LocalLoomClient as Lanes>::list_views_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id,
+            false,
+        ))
+        .expect("service compact list");
+        let compact_list: serde_json::Value =
+            serde_json::from_str(&compact_list).expect("compact list json");
+        assert_eq!(compact_list, serde_json::json!([compact]));
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn tickets_update_json_composes_fields_status_comments_and_relations_locally() {
         let (client, session, workspace, dir) = seed_client("tickets-update-json");
         let workspace_id = workspace.to_string();
@@ -6737,6 +6916,3 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
-
-// `LocalLoomClient` satisfies every generated interface trait, so it is a complete `LoomClient`.
-impl LoomClient for LocalLoomClient {}

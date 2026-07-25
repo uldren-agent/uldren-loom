@@ -2302,16 +2302,16 @@ pub(crate) enum TicketsCmd {
         /// Replace required acceptance evidence keys with the provided list.
         #[arg(long)]
         replace_required_acceptance_evidence_keys: bool,
-        /// Project owner contract summary.
+        /// Project owner contract summary. Accepts `@path` to load from a file (`@@` escapes a literal @).
         #[arg(long)]
         owner_contract_summary: Option<String>,
-        /// Project owner contract details markdown.
+        /// Project owner contract details markdown. Accepts `@path` to load from a file (`@@` escapes a literal @).
         #[arg(long)]
         owner_contract_details: Option<String>,
-        /// Project worker contract summary.
+        /// Project worker contract summary. Accepts `@path` to load from a file (`@@` escapes a literal @).
         #[arg(long)]
         worker_contract_summary: Option<String>,
-        /// Project worker contract details markdown.
+        /// Project worker contract details markdown. Accepts `@path` to load from a file (`@@` escapes a literal @).
         #[arg(long)]
         worker_contract_details: Option<String>,
         /// Expected profile root for optimistic concurrency.
@@ -2896,6 +2896,10 @@ pub(crate) enum TicketsCmd {
         /// Include complete ticket metadata in text output.
         #[arg(long)]
         detailed: bool,
+        /// Print the lean compact projection: omit description and full comment bodies, keep
+        /// comment_count and dependency ids. Ignored when `--detailed` is set.
+        #[arg(long)]
+        compact: bool,
         /// Output format: text or json.
         #[arg(long, default_value = "text")]
         format: String,
@@ -2944,7 +2948,7 @@ pub(crate) enum LanesCmd {
         /// Concise human display label for the lane.
         #[arg(long, default_value = "")]
         title: String,
-        /// Durable statement of the lane's intention and goal.
+        /// Durable statement of the lane's intention and goal. Accepts `@path` to load from a file (`@@` escapes @).
         #[arg(long, default_value = "")]
         description: String,
         /// Initial Lane status.
@@ -2953,10 +2957,10 @@ pub(crate) enum LanesCmd {
         /// Initial active ticket id.
         #[arg(long)]
         active_ticket_id: Option<String>,
-        /// Initial status report.
+        /// Initial status report. Accepts `@path` to load from a file (`@@` escapes @).
         #[arg(long, default_value = "")]
         status_report: String,
-        /// Initial reviewer feedback.
+        /// Initial reviewer feedback. Accepts `@path` to load from a file (`@@` escapes @).
         #[arg(long, default_value = "")]
         reviewer_feedback: String,
         /// Updated timestamp in milliseconds. Defaults to current time.
@@ -3011,18 +3015,51 @@ pub(crate) enum LanesCmd {
         /// New title. Omit to leave unchanged; pass an empty string to clear it.
         #[arg(long)]
         title: Option<String>,
-        /// New description. Omit to leave unchanged; pass an empty string to clear it.
+        /// New description. Omit to leave unchanged; pass an empty string to clear it. Accepts `@path` to load from a file (`@@` escapes @).
         #[arg(long)]
         description: Option<String>,
         /// New stored Lane status.
         #[arg(long)]
         lane_status: Option<String>,
-        /// New status report. Omit to leave unchanged; pass an empty string to clear it.
+        /// New status report. Omit to leave unchanged; pass an empty string to clear it. Accepts `@path` to load from a file (`@@` escapes @).
         #[arg(long)]
         status_report: Option<String>,
-        /// New reviewer feedback. Omit to leave unchanged; pass an empty string to clear it.
+        /// New reviewer feedback. Omit to leave unchanged; pass an empty string to clear it. Accepts `@path` to load from a file (`@@` escapes @).
         #[arg(long)]
         reviewer_feedback: Option<String>,
+        /// Actor principal override. Omit to derive from the authenticated principal.
+        #[arg(long)]
+        updated_by: Option<String>,
+        /// Output format: text or json.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Record a closeout on the durable ticket and the lane together: write a typed ticket comment
+    /// and a short lane status_report summary in one operation.
+    Closeout {
+        /// Path to the `.loom` file.
+        store: String,
+        /// Workspace UUID or name.
+        workspace: String,
+        /// Lane document id.
+        lane_id: String,
+        /// Ticket workspace id.
+        ticket_workspace_id: String,
+        /// Ticket id the closeout comment is recorded on.
+        ticket_id: String,
+        /// Typed ticket comment type, e.g. review_request, blocker, closeout_evidence.
+        #[arg(long)]
+        comment_type: String,
+        /// Ticket comment body (the durable record). Accepts `@path` to load from a file (`@@` escapes @).
+        #[arg(long)]
+        comment_body: String,
+        /// Optional structured evidence as JSON keyed by evidence key to values, e.g.
+        /// {"checks_run":["cargo test"],"source_anchors":["crates/..."]}.
+        #[arg(long)]
+        evidence: Option<String>,
+        /// Short lane status_report summary written alongside the ticket comment. Accepts `@path` to load from a file (`@@` escapes @).
+        #[arg(long)]
+        status_report: String,
         /// Actor principal override. Omit to derive from the authenticated principal.
         #[arg(long)]
         updated_by: Option<String>,
@@ -3103,6 +3140,26 @@ pub(crate) enum LanesCmd {
         /// Actor principal for the update.
         #[arg(long)]
         updated_by: String,
+        /// Output format: text or json.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Remove terminal (accepted/rejected/closed) tickets from assignment Lane membership without
+    /// deleting tickets or losing history. Dry-run by default; pass --apply to mutate.
+    Cleanup {
+        /// Path to the `.loom` file.
+        store: String,
+        /// Workspace UUID or name.
+        workspace: String,
+        /// Lane document id to clean. Omit to clean every assignment Lane in the workspace.
+        #[arg(long)]
+        lane: Option<String>,
+        /// Apply the cleanup (mutate membership). Omit for a non-mutating dry run.
+        #[arg(long)]
+        apply: bool,
+        /// Actor principal override. Omit to derive from the authenticated principal.
+        #[arg(long)]
+        updated_by: Option<String>,
         /// Output format: text or json.
         #[arg(long, default_value = "text")]
         format: String,
@@ -3861,6 +3918,15 @@ pub(crate) enum DocumentCmd {
         collection: String,
         /// Document id.
         id: String,
+    },
+    /// Delete a document collection and its structured roots.
+    DeleteCollection {
+        /// Path to the `.loom` file.
+        store: String,
+        /// Workspace UUID or name.
+        workspace: String,
+        /// Document collection name.
+        collection: String,
     },
     /// Fetch a UTF-8 document.
     GetText {
@@ -4687,6 +4753,15 @@ pub(crate) enum StoreCmd {
         /// Set whether this store requires FIPS-capable runtimes for hosted serving.
         #[arg(long)]
         fips_required: Option<bool>,
+        /// Set the store default durability policy: strict, normal, relaxed, or ephemeral.
+        #[arg(long)]
+        default_durability: Option<String>,
+        /// Set a facet durability override as `<facet>=<policy>`. Repeatable.
+        #[arg(long = "facet-durability")]
+        facet_durability: Vec<String>,
+        /// Clear a facet durability override. Repeatable.
+        #[arg(long = "clear-facet-durability")]
+        clear_facet_durability: Vec<String>,
     },
     /// Store a file or stdin as a Blob and print its content address.
     Put {
@@ -4715,12 +4790,67 @@ pub(crate) enum StoreCmd {
         /// Path to the `.loom` file.
         store: String,
     },
+    /// Attribute live store bytes by bounded path samples and root classes.
+    Attribution {
+        /// Path to the `.loom` file.
+        store: String,
+        /// Workspace UUID or name used for path-family attribution.
+        workspace: String,
+        /// Maximum live paths to sample for byte totals.
+        #[arg(long, default_value_t = 10000)]
+        max_objects: usize,
+        /// Maximum examples to retain per class.
+        #[arg(long, default_value_t = 8)]
+        examples: usize,
+        /// Output format: text or json.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Preflight a candidate store before replacing an active Matrix store.
     PreflightReplacement {
         /// Candidate `.loom` file.
         store: String,
         /// Coordination workspace UUID or name to verify.
         workspace: String,
+        /// Active source store to compare against the candidate freshness watermark.
+        #[arg(long)]
+        live_store: Option<String>,
+        /// Store copy JSON report containing the candidate freshness watermark.
+        #[arg(long)]
+        candidate_report: Option<String>,
+        /// Owner approval text for replacing a candidate that would discard newer live mutations.
+        #[arg(long)]
+        force_owner_approval: Option<String>,
+        /// Backup store that preserves the advanced live state when forcing a stale replacement.
+        #[arg(long)]
+        backup_store: Option<String>,
+        /// Output format: text or json.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Activate a preflighted candidate store at the active store path.
+    Replace {
+        /// Active `.loom` file to replace.
+        active_store: String,
+        /// Candidate `.loom` file that has passed replacement preflight.
+        candidate_store: String,
+        /// Coordination workspace UUID or name to verify before and after replacement.
+        workspace: String,
+        /// Store copy JSON report containing the candidate freshness watermark.
+        #[arg(long)]
+        candidate_report: String,
+        /// Backup path where the current active store is copied before replacement.
+        #[arg(long)]
+        backup_store: String,
+        /// Write the machine-readable JSON preflight and execution report to this file.
+        #[arg(long = "report-file")]
+        report_file: Option<String>,
+        /// Owner approval text for replacing a candidate that would discard newer live mutations.
+        #[arg(long)]
+        force_owner_approval: Option<String>,
+        /// Verify the plan without copying or replacing store files.
+        #[arg(long)]
+        dry_run: bool,
         /// Output format: text or json.
         #[arg(long, default_value = "text")]
         format: String,

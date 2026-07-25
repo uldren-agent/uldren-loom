@@ -232,6 +232,33 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeDocDelete(
   return found != 0 ? JNI_TRUE : JNI_FALSE;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeDocDeleteCollection(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring ns, jstring collection,
+    jbyteArray passphrase, jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openAuthenticatedStoreKeyed(env, p, passphrase, kek, authPrincipal, authPassphrase, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return JNI_FALSE;
+  }
+  const char *n = env->GetStringUTFChars(ns, nullptr);
+  const char *m = env->GetStringUTFChars(collection, nullptr);
+  int32_t found = 0;
+  st = loom_doc_delete_collection(h, n, m, &found);
+  env->ReleaseStringUTFChars(ns, n);
+  env->ReleaseStringUTFChars(collection, m);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return JNI_FALSE;
+  }
+  return found != 0 ? JNI_TRUE : JNI_FALSE;
+}
+
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_ai_uldren_loom_rn_UldrenLoomNative_nativeDocListBinary(
     JNIEnv *env, jobject thiz, jstring loomPath, jstring ns, jstring collection, jbyteArray passphrase,

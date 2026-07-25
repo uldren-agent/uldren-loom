@@ -34,6 +34,7 @@ pub mod log;
 pub mod logs;
 pub mod mail;
 pub mod metrics;
+pub mod mutable_overlay;
 pub mod object;
 pub mod optional_runtime;
 pub mod prolly;
@@ -49,6 +50,7 @@ pub mod vcs;
 pub mod vector;
 pub mod vindex;
 pub mod watch;
+pub mod workflow_transaction;
 pub mod workspace;
 
 // Calendar facet. Functions are reached via `calendar::` to avoid name clashes with the
@@ -68,7 +70,7 @@ pub use capability::{
     CapabilityProof, CapabilityRegistry, CapabilityRegistryDimension, CapabilitySet,
     CapabilityVisibility,
 };
-pub use loom_types::Fence;
+pub use loom_types::{Fence, IdempotencyKey};
 // Contacts facet. Functions via `contacts::` to avoid clashes (`EntryChange`/`ChangeKind` also
 // exist on calendar); the record types are re-exported here.
 pub use contacts::{
@@ -113,17 +115,18 @@ pub use document::{
     DocumentPolicyConfig, DocumentPredicate, DocumentProjection, DocumentPutResult, DocumentQuery,
     DocumentQueryItem, DocumentQueryResult, DocumentRecord, DocumentRecordState, DocumentText,
     DocumentTombstoneRecord, doc_create_index, doc_create_index_declaration, doc_delete,
-    doc_drop_index, doc_extract_index_value, doc_find, doc_index_statuses, doc_list_collections,
-    doc_list_index_declarations, doc_list_indexes, doc_query, doc_rebuild_index,
-    document_content_tag, document_delete_with_request, document_entity_tag,
-    document_entity_tag_string, document_entity_tag_string_from_digest, document_field_path_string,
-    document_get_binary, document_get_text, document_ids_json,
-    document_index_declaration_from_json, document_index_declaration_json,
-    document_index_declarations_json, document_index_statuses_json, document_index_value_from_json,
-    document_indexes_json, document_list_binary, document_put_binary,
-    document_put_binary_with_entity_tag, document_put_binary_with_request, document_put_text,
-    document_put_text_with_entity_tag, document_query_from_json, document_query_result_json,
-    document_set_retention_policy, get_collection, parse_document_entity_tag, put_collection,
+    doc_delete_collection, doc_drop_index, doc_extract_index_value, doc_find, doc_index_statuses,
+    doc_list_collections, doc_list_index_declarations, doc_list_indexes, doc_query,
+    doc_rebuild_index, document_content_tag, document_delete_with_request,
+    document_engine_planning_paths, document_entity_tag, document_entity_tag_string,
+    document_entity_tag_string_from_digest, document_field_path_string, document_get_binary,
+    document_get_text, document_ids_json, document_index_declaration_from_json,
+    document_index_declaration_json, document_index_declarations_json,
+    document_index_statuses_json, document_index_value_from_json, document_indexes_json,
+    document_list_binary, document_put_binary, document_put_binary_with_entity_tag,
+    document_put_binary_with_request, document_put_text, document_put_text_with_entity_tag,
+    document_query_from_json, document_query_result_json, document_set_retention_policy,
+    get_collection, parse_document_entity_tag, put_collection,
 };
 pub use error::{Code, LoomError, Result};
 pub use fs::{DirEntry, FileKind, Stat};
@@ -227,6 +230,12 @@ pub use metrics::{
     metrics_materialize_rollups, metrics_plan_query, metrics_put_descriptor,
     metrics_put_observation, metrics_query_observations, metrics_rebuild_rollups,
 };
+pub use mutable_overlay::{
+    MutableOverlay, MutableOverlayEntrySnapshot, MutableOverlayHealth, OverlayCheckpoint,
+    OverlayDurabilityPolicy, OverlayEntryKind, OverlayGeneration, OverlayKey, OverlayOwnerScope,
+    OverlayOwnerToken, OverlayPromotionEntry, OverlayPromotionSelection, OverlayReadSnapshot,
+    OverlayReadSnapshotIdentity, OverlaySnapshot, OverlaySnapshotPin,
+};
 pub use object::{
     ChunkRef, Commit, EntryKind, Object, ObjectType, Tag, TreeEntry, content_address,
 };
@@ -237,8 +246,8 @@ pub use optional_runtime::{
     optional_runtime_capability, set_ipfs_gateway_cache_config, set_optional_runtime_config,
     set_tor_onion_service_config,
 };
-pub use provider::ObjectStore;
 pub use provider::{CompressionHint, memory::MemoryStore};
+pub use provider::{ObjectStore, PlanningObjectStore};
 pub use runtime::{RuntimeProfile, runtime_profile, runtime_profile_with_tls};
 pub use search::{
     AnalyzerMapping, Document, FieldMapping, FieldType, FieldValue, Mapping, Query, QueryRequest,
@@ -272,9 +281,11 @@ pub use triggers::{
     trigger_remove,
 };
 pub use vcs::{
-    Change, ChangeKind, ConflictResolution, FileStat, LiveRootClassDiagnostics,
+    BoundedEnginePlanner, Change, ChangeKind, ConflictResolution, EnginePathSelector,
+    EnginePlanningScope, EngineStateDelta, EngineStateIoCounts, FileStat, LiveRootClassDiagnostics,
     LiveRootDiagnostics, LiveRootExample, Loom, MergeOutcome, OpenMode, ProtectedRefPolicy,
-    ReachabilityMarkState, ReachabilityMarkStep, ReplayOutcome, Status,
+    ReachabilityMarkState, ReachabilityMarkStep, ReplayOutcome, Status, VcsNamespaceCollision,
+    VcsNamespacePreflight,
 };
 pub use vector::{
     Hit, MetaFilter, Metric, VectorEntry, VectorSet, get_vector_set, put_vector_set,
@@ -292,6 +303,13 @@ pub use watch::{
     ChangeEvent, DomainChange, UnsupportedDomainDetail, WatchBatch, WatchCursor, WatchDomainDetail,
     WatchDomainSupport, WatchPathChange, WatchSelector, change_event_from_cbor,
     watch_batch_from_cbor, watch_batch_to_cbor, watch_domain_support, watch_domain_supports,
+};
+pub use workflow_transaction::{
+    AtomicityBoundary, AuditIntent, BoundedMutationPlan, CommitReceipt, CompareToken,
+    FacetSideEffect, FacetSideEffects, FacetWrite, FacetWriteBuilder, FacetWriteOp,
+    SecondaryIndexWrite, SecondaryIndexWriteOp, WorkflowAuditWrite, WorkflowCommitter,
+    WorkflowControlWrite, WorkflowOwnerState, WorkflowPlanningSnapshot, WorkflowReferenceUpdate,
+    WorkflowTransaction, WorkflowTransactionErrorKind, WriteOutcome, strictest_durability,
 };
 pub use workspace::{AclDomain, FacetKind, Registry, WorkspaceId, WorkspaceInfo, WsSelector};
 

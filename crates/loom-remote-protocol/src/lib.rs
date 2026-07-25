@@ -304,7 +304,7 @@ mod registry_tests {
     fn registry_covers_the_full_idl_surface() {
         assert_eq!(
             METHODS.len(),
-            463,
+            464,
             "generated registry must list every IDL method"
         );
         let interfaces: BTreeSet<&str> = METHODS.iter().map(|m| m.interface).collect();

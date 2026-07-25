@@ -38,8 +38,10 @@ impl<S: ObjectStore> Loom<S> {
         self.authorize_ref(ns, &head_ref, AclRight::Write)?;
         self.authorize_ref(ns, &head_ref, AclRight::Advance)?;
         let parent = self.registry.branch_tip(ns, &head)?;
+        crate::document::materialize_document_current_overlays_for_commit(self, ns)?;
         let files = self.work.get(&ns).cloned().unwrap_or_default();
         let dirs = self.dirs.get(&ns).cloned().unwrap_or_default();
+        self.validate_vcs_namespace_preflight(&files, &dirs)?;
         let root = self.build_subtree(&files, &dirs, "")?;
         let parents = parent.map_or_else(Vec::new, |p| vec![p]);
         let commit = Object::Commit(Commit {
@@ -157,13 +159,16 @@ impl<S: ObjectStore> Loom<S> {
         message: &str,
         timestamp_ms: u64,
     ) -> Result<Digest> {
+        self.ensure_full_state_loaded()?;
         let head = self.registry.head_branch(ns)?;
         let head_ref = format!("branch/{head}");
         self.authorize_ref(ns, &head_ref, AclRight::Write)?;
         self.authorize_ref(ns, &head_ref, AclRight::Advance)?;
         let parent = self.registry.branch_tip(ns, &head)?;
+        crate::document::materialize_document_current_overlays_for_commit(self, ns)?;
         let files = self.index.get(&ns).cloned().unwrap_or_default();
         let dirs = self.dirs.get(&ns).cloned().unwrap_or_default();
+        self.validate_vcs_namespace_preflight(&files, &dirs)?;
         let root = self.build_subtree(&files, &dirs, "")?;
         let parents = parent.map_or_else(Vec::new, |p| vec![p]);
         let commit = Object::Commit(Commit {
@@ -181,6 +186,34 @@ impl<S: ObjectStore> Loom<S> {
             Some(prev) => self.registry.update_branch(ns, &head, Some(prev), digest)?,
         }
         Ok(digest)
+    }
+
+    pub fn vcs_namespace_preflight(&self, ns: WorkspaceId) -> Result<VcsNamespacePreflight> {
+        self.ensure_full_state_available()?;
+        self.authorize(ns, FacetKind::Vcs, AclRight::Read)?;
+        let files = self.work.get(&ns).cloned().unwrap_or_default();
+        let dirs = self.dirs.get(&ns).cloned().unwrap_or_default();
+        Ok(namespace_preflight(&files, &dirs))
+    }
+
+    pub fn vcs_staged_namespace_preflight(&self, ns: WorkspaceId) -> Result<VcsNamespacePreflight> {
+        self.ensure_full_state_available()?;
+        self.authorize(ns, FacetKind::Vcs, AclRight::Read)?;
+        let files = self.index.get(&ns).cloned().unwrap_or_default();
+        let dirs = self.dirs.get(&ns).cloned().unwrap_or_default();
+        Ok(namespace_preflight(&files, &dirs))
+    }
+
+    pub(crate) fn validate_vcs_namespace_preflight(
+        &self,
+        files: &WorkTree,
+        dirs: &BTreeSet<String>,
+    ) -> Result<()> {
+        let report = namespace_preflight(files, dirs);
+        if report.is_clean() {
+            return Ok(());
+        }
+        Err(LoomError::invalid(namespace_preflight_message(&report)))
     }
 
     /// Materialize `commit`'s tree into `ns`'s working tree (replacing it), resetting the staging index
@@ -449,4 +482,80 @@ impl<S: ObjectStore> Loom<S> {
     }
 
     // ---- history replay (cherry-pick / revert / rebase) -----------------------------------------
+}
+
+fn namespace_preflight(files: &WorkTree, dirs: &BTreeSet<String>) -> VcsNamespacePreflight {
+    let mut conflicts = BTreeMap::<(String, String), VcsNamespaceCollision>::new();
+    for path in files.keys() {
+        for ancestor in path_ancestors(path) {
+            if files.contains_key(&ancestor) {
+                insert_namespace_collision(&mut conflicts, ancestor, path.clone());
+            }
+        }
+        if dirs.contains(path) {
+            insert_namespace_collision(&mut conflicts, path.clone(), format!("{path}/"));
+        }
+    }
+    for dir in dirs {
+        if files.contains_key(dir) {
+            insert_namespace_collision(&mut conflicts, dir.clone(), format!("{dir}/"));
+        }
+        for ancestor in path_ancestors(dir) {
+            if files.contains_key(&ancestor) {
+                insert_namespace_collision(&mut conflicts, ancestor, dir.clone());
+            }
+        }
+    }
+    VcsNamespacePreflight {
+        conflicts: conflicts.into_values().collect(),
+    }
+}
+
+fn path_ancestors(path: &str) -> Vec<String> {
+    let mut ancestors = Vec::new();
+    let mut cursor = path;
+    while let Some((parent, _)) = cursor.rsplit_once('/') {
+        if parent.is_empty() {
+            break;
+        }
+        ancestors.push(parent.to_string());
+        cursor = parent;
+    }
+    ancestors
+}
+
+fn insert_namespace_collision(
+    conflicts: &mut BTreeMap<(String, String), VcsNamespaceCollision>,
+    leaf_path: String,
+    child_path: String,
+) {
+    let key = (leaf_path.clone(), child_path.clone());
+    conflicts.entry(key).or_insert_with(|| {
+        let path = leaf_path.clone();
+        VcsNamespaceCollision {
+            path: path.clone(),
+            leaf_path,
+            child_path,
+            repair_options: vec![
+                format!("remove or unstage the leaf path {path:?} before committing"),
+                format!("rename or move descendants under {path:?} before committing"),
+                format!(
+                    "if {path:?} is intended to be a directory, restore it as a directory and keep only descendant paths"
+                ),
+            ],
+        }
+    });
+}
+
+fn namespace_preflight_message(report: &VcsNamespacePreflight) -> String {
+    let mut message = String::from("vcs namespace collision preflight failed");
+    for conflict in &report.conflicts {
+        message.push_str(&format!(
+            ": {:?} is both a leaf path and a parent of {:?}",
+            conflict.leaf_path, conflict.child_path
+        ));
+        message.push_str("; repair options: ");
+        message.push_str(&conflict.repair_options.join("; "));
+    }
+    message
 }

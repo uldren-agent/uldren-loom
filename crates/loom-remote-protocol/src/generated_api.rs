@@ -1618,6 +1618,13 @@ pub trait Document {
         collection: String,
         id: String,
     ) -> impl ::core::future::Future<Output = Result<bool, LoomError>> + Send;
+    /// Generated binding for `Document.delete_collection`.
+    fn delete_collection(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        collection: String,
+    ) -> impl ::core::future::Future<Output = Result<bool, LoomError>> + Send;
     /// Generated binding for `Document.delete_indexed`.
     fn delete_indexed(
         &self,

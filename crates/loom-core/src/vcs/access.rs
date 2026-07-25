@@ -23,10 +23,13 @@ impl<S: ObjectStore> Loom<S> {
             next_handle: 1,
             ephemeral_kv: BTreeMap::new(),
             protected_refs: BTreeMap::new(),
+            mutable_overlay: crate::MutableOverlay::new(),
             identity: None,
             acl: AclStore::new(),
             predicate_evaluator: None,
             session: None,
+            state_instrumentation: Arc::new(EngineStateInstrumentation::default()),
+            bounded_planner: false,
         }
     }
 
@@ -49,6 +52,111 @@ impl<S: ObjectStore> Loom<S> {
     /// mutable root (the reference-store pointer) after [`Loom::save_state`].
     pub fn store_mut(&mut self) -> &mut S {
         &mut self.store
+    }
+
+    pub fn mutable_overlay(&self) -> &crate::MutableOverlay {
+        &self.mutable_overlay
+    }
+
+    pub fn mutable_overlay_snapshot(&self) -> crate::OverlaySnapshot {
+        self.mutable_overlay.snapshot()
+    }
+
+    pub fn open_mutable_overlay_read_snapshot(
+        &self,
+        owner: Option<&str>,
+    ) -> crate::Result<crate::OverlayReadSnapshot> {
+        self.store
+            .open_mutable_overlay_read_snapshot(self.mutable_overlay_snapshot(), owner)
+    }
+
+    pub fn mutable_overlay_checkpoint(&self) -> crate::OverlayCheckpoint {
+        self.mutable_overlay.checkpoint()
+    }
+
+    pub fn mutable_overlay_checkpoint_with_inherited_keys(
+        &self,
+    ) -> crate::Result<crate::OverlayCheckpoint> {
+        self.mutable_overlay.checkpoint_with_inherited_keys()
+    }
+
+    pub fn mutable_overlay_mut(&mut self) -> &mut crate::MutableOverlay {
+        &mut self.mutable_overlay
+    }
+
+    pub fn engine_state_io_counts(&self) -> EngineStateIoCounts {
+        self.state_instrumentation.snapshot()
+    }
+
+    pub fn is_bounded_planner(&self) -> bool {
+        self.bounded_planner
+    }
+
+    pub fn bounded_engine_planner<'a>(
+        &'a self,
+        scope: EnginePlanningScope,
+        base_root: Digest,
+        overlay: crate::MutableOverlay,
+    ) -> Result<BoundedEnginePlanner<'a, S>> {
+        self.ensure_full_state_available()?;
+        let workspace = scope.workspace;
+        let base = self.load_bounded_engine_base(base_root, &scope)?;
+        let mut engine = Loom::new(crate::provider::PlanningObjectStore::new(&self.store));
+        engine.registry = base.registry;
+        engine.identity = self.identity.clone();
+        engine.acl = self.acl.clone();
+        engine.predicate_evaluator = self.predicate_evaluator.clone();
+        engine.session = self.session.clone();
+        engine.mutable_overlay = overlay;
+        engine.bounded_planner = true;
+        if let Some(compression) = self.compression.get(&workspace) {
+            engine.compression.insert(workspace, *compression);
+        }
+        let baseline_work = base.work;
+        engine.work.insert(workspace, baseline_work.clone());
+        let baseline_dirs = base.directories;
+        engine.dirs.insert(workspace, baseline_dirs.clone());
+        let baseline_content = base.content;
+        engine.content = baseline_content.clone();
+        self.state_instrumentation
+            .bounded_plans
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(BoundedEnginePlanner {
+            engine,
+            scope,
+            baseline_work,
+            baseline_dirs,
+            baseline_content,
+        })
+    }
+
+    pub fn apply_engine_state_delta(&mut self, delta: EngineStateDelta) -> Result<()> {
+        self.ensure_full_state_loaded()?;
+        let changed_path_count = delta.work.len() as u64;
+        let work = self.work.entry(delta.workspace).or_default();
+        for (path, entry) in delta.work {
+            match entry {
+                Some(entry) => {
+                    work.insert(path, entry);
+                }
+                None => {
+                    work.remove(&path);
+                }
+            }
+        }
+        let directories = self.dirs.entry(delta.workspace).or_default();
+        for (directory, present) in delta.directories {
+            if present {
+                directories.insert(directory);
+            } else {
+                directories.remove(&directory);
+            }
+        }
+        self.content.extend(delta.content);
+        self.state_instrumentation
+            .bounded_paths_applied
+            .fetch_add(changed_path_count, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Consume the engine and return its underlying object store. Used to hand an opened (e.g.

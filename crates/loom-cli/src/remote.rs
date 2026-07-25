@@ -764,7 +764,11 @@ impl StoreClient {
         match self {
             StoreClient::Local { locator } => {
                 let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Document)?;
+                let existing = resolve_ns(&loom, workspace).ok();
+                let ns = match existing {
+                    Some(ns) => ns,
+                    None => ensure_facet_workspace(&mut loom, workspace, FacetKind::Document)?,
+                };
                 let result = loom_core::document::document_put_text_with_entity_tag(
                     &mut loom,
                     ns,
@@ -774,7 +778,9 @@ impl StoreClient {
                     expected_entity_tag,
                 )
                 .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
+                if existing.is_none() {
+                    save_loom(&mut loom).map_err(|e| e.to_string())?;
+                }
                 Ok(result)
             }
             #[cfg(feature = "remote-client")]
@@ -826,7 +832,11 @@ impl StoreClient {
         match self {
             StoreClient::Local { locator } => {
                 let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Document)?;
+                let existing = resolve_ns(&loom, workspace).ok();
+                let ns = match existing {
+                    Some(ns) => ns,
+                    None => ensure_facet_workspace(&mut loom, workspace, FacetKind::Document)?,
+                };
                 let result = loom_core::document::document_put_binary_with_entity_tag(
                     &mut loom,
                     ns,
@@ -836,7 +846,9 @@ impl StoreClient {
                     expected_entity_tag,
                 )
                 .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
+                if existing.is_none() {
+                    save_loom(&mut loom).map_err(|e| e.to_string())?;
+                }
                 Ok(result)
             }
             #[cfg(feature = "remote-client")]
@@ -895,6 +907,34 @@ impl StoreClient {
                 workspace.to_string(),
                 collection.to_string(),
                 id.to_string(),
+            )),
+        }
+    }
+
+    /// Delete document `collection` and its structured roots; returns whether present.
+    pub(crate) fn doc_delete_collection(
+        &self,
+        keys: &KeyOpts,
+        workspace: &str,
+        collection: &str,
+    ) -> Result<bool, String> {
+        match self {
+            StoreClient::Local { locator } => {
+                let mut loom = cli_open_loom(locator, keys)?;
+                let ns = resolve_ns(&loom, workspace)?;
+                let present = loom_core::document::doc_delete_collection(&mut loom, ns, collection)
+                    .map_err(|e| e.to_string())?;
+                if present {
+                    save_loom(&mut loom).map_err(|e| e.to_string())?;
+                }
+                Ok(present)
+            }
+            #[cfg(feature = "remote-client")]
+            StoreClient::Remote(remote) => remote.block(Document::delete_collection(
+                &remote.client,
+                remote.handle.clone(),
+                workspace.to_string(),
+                collection.to_string(),
             )),
         }
     }
@@ -2937,6 +2977,7 @@ impl StoreClient {
                 Ok(store_policy_json(
                     loom_store::StorePolicy {
                         fips_required: r.fips_required,
+                        ..loom_store::StorePolicy::default()
                     },
                     r.audit_seq,
                 ))
@@ -2960,6 +3001,7 @@ impl StoreClient {
                 Ok(store_policy_json(
                     loom_store::StorePolicy {
                         fips_required: r.fips_required,
+                        ..loom_store::StorePolicy::default()
                     },
                     r.audit_seq,
                 ))
@@ -6579,6 +6621,24 @@ impl uldren_loom_mcp::RemoteMcpBackend for McpRemoteBackend {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.runtime.handle().spawn(async move {
             let _ = tx.send(Document::delete_indexed(client.as_ref(), handle, ws, coll, id).await);
+        });
+        rx.recv().map_err(|_| remote_backend_channel_closed())?
+    }
+
+    fn document_delete_collection(
+        &self,
+        workspace: &str,
+        collection: &str,
+    ) -> std::result::Result<bool, loom_types::LoomError> {
+        let client = self.client.clone();
+        let handle = self.handle.clone();
+        let workspace = workspace.to_string();
+        let collection = collection.to_string();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.runtime.handle().spawn(async move {
+            let _ = tx.send(
+                Document::delete_collection(client.as_ref(), handle, workspace, collection).await,
+            );
         });
         rx.recv().map_err(|_| remote_backend_channel_closed())?
     }

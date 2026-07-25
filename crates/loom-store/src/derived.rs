@@ -692,6 +692,16 @@ struct RebuildRecord {
 }
 
 impl FileStore {
+    pub fn derived_artifact_durability(
+        &self,
+        key: &DerivedArtifactKey,
+        owner_policy: Option<StoreDurabilityPolicy>,
+    ) -> Result<StoreDurabilityPolicy> {
+        Ok(self
+            .store_policy()?
+            .effective_derived_artifact_durability(key.facet, owner_policy))
+    }
+
     pub fn put_derived_artifact(
         &self,
         key: &DerivedArtifactKey,

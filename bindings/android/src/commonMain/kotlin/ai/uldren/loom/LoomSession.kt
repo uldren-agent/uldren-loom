@@ -434,6 +434,9 @@ class DocumentOps(private val s: LoomSession) {
     fun delete(workspace: String, collection: String, id: String): Boolean =
         Loom.docDelete(s.path, workspace, collection, id, s.passphrase, s.kek, s.authPrincipal, s.authPassphrase)
 
+    fun deleteCollection(workspace: String, collection: String): Boolean =
+        Loom.docDeleteCollection(s.path, workspace, collection, s.passphrase, s.kek, s.authPrincipal, s.authPassphrase)
+
     fun listBinary(workspace: String, collection: String): ByteArray =
         Loom.docListBinary(s.path, workspace, collection, s.passphrase, s.kek, s.authPrincipal, s.authPassphrase)
 

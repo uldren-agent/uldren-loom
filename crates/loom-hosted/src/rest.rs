@@ -455,7 +455,7 @@ impl RestAdapter<'_> {
         let changes = ticket_field_value_changes(fields);
         rest_result(
             200,
-            self.kernel.write(auth, |loom| {
+            self.kernel.write_current_state(auth, |loom| {
                 crate::tickets::update_fields(
                     loom,
                     workspace,
@@ -480,7 +480,7 @@ impl RestAdapter<'_> {
         rest_result(
             200,
             self.kernel
-                .write(auth, |loom| crate::tickets::update(loom, workspace, input)),
+                .write_current_state(auth, |loom| crate::tickets::update(loom, workspace, input)),
         )
         .map(|response| ticket_response(response, "ticket.updated", root_before, changes))
     }
@@ -753,7 +753,7 @@ impl RestAdapter<'_> {
         rest_result(
             200,
             self.kernel
-                .write(auth, |loom| crate::lanes::update(loom, workspace, input)),
+                .write_current_state(auth, |loom| crate::lanes::update(loom, workspace, input)),
         )
         .map(|response| public_lane_receipt_response(response, "lane.updated", changes))
     }
@@ -2738,7 +2738,7 @@ mod tests {
     use loom_core::{Code, WorkspaceId};
     use loom_interchange::{ExportReport, ImportReport};
     use loom_store::FileStore;
-    use loom_substrate::versioning::{RevisionIndex, revision_index_path};
+    use loom_substrate::versioning::{RevisionIndex, load_current_revision_index};
 
     use super::*;
     use crate::test_support::{
@@ -2752,11 +2752,9 @@ mod tests {
         workspace: WorkspaceId,
         scope_id: &str,
     ) -> RevisionIndex {
-        let path = revision_index_path(scope_id).unwrap();
         kernel
             .read(auth, |loom| {
-                loom.read_file_reserved(workspace, &path)
-                    .and_then(|bytes| RevisionIndex::decode(&bytes))
+                load_current_revision_index(loom, workspace, scope_id)
             })
             .unwrap()
     }

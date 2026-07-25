@@ -398,6 +398,14 @@ impl HostedKernel {
         self.inner.write(auth, f)
     }
 
+    pub fn write_current_state<T>(
+        &self,
+        auth: &HostedAuth,
+        f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>,
+    ) -> Result<T> {
+        self.inner.write_current_state(auth, f)
+    }
+
     pub fn audit_append(
         &self,
         principal: Option<WorkspaceId>,

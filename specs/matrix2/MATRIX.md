@@ -15,7 +15,7 @@ facet-section references are reading-order hints, not dependency boundaries.
 | Prefer ROI over serial order | Do not finish a lane serially when another lane has a higher-value ready packet. |
 | Respect source scope | Work only in the packet's allowed files unless the packet explicitly asks for an owner decision to expand scope. |
 | Read the primitive file as a whole | Each packet must treat the full `_FACET_PRIMITIVES.md` file as the design dependency, then use targeted sections for depth. |
-| Write results into the packet | The executing session updates the `Results` section in the prompt file. |
+| Record results on the ticket | The executing session records progress, closeout evidence, files changed, source anchors, checks run, and blockers in typed ticket comments and first-class ticket fields on the active ticket, not in a separate result document. |
 | Preserve decision visibility | If owner input is needed, route the question through the active ticket and decision resource before chat notification. |
 
 ## Lane Definitions

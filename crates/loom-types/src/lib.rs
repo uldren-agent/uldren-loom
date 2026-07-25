@@ -8,6 +8,7 @@ pub mod inference;
 pub mod order_key;
 pub mod receipt;
 pub mod tabular;
+pub mod ticket_status;
 pub mod vcs;
 pub mod workspace;
 
@@ -28,6 +29,10 @@ pub use receipt::{MutationChange, MutationEnvelope, MutationReceipt};
 pub use tabular::{
     CmpOp, ColumnType, Row, Value, cell_from, cell_value, encode_cell, encode_cells,
     encode_key_value, encode_pk_values, key_bytes,
+};
+pub use ticket_status::{
+    LANE_TICKET_STATUS_COUNT_FIELDS, NORMALIZED_TICKET_STATUSES, TicketStatusClass,
+    classify_ticket_status,
 };
 pub use vcs::ChangeKind;
 pub use workspace::{AclDomain, FacetKind, WorkspaceId};

@@ -89,6 +89,18 @@ pub(crate) struct PStoreMaintenanceRun {
     #[serde(default)]
     pub(crate) max_pages: Option<u64>,
 }
+
+#[derive(Default, Deserialize, JsonSchema)]
+pub(crate) struct PStorePolicySet {
+    #[serde(default)]
+    pub(crate) fips_required: Option<bool>,
+    #[serde(default)]
+    pub(crate) default_durability: Option<String>,
+    #[serde(default)]
+    pub(crate) facet_durability_overrides: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) clear_facet_durability_overrides: Vec<String>,
+}
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct PNs {
     pub(crate) workspace: String,
@@ -1067,6 +1079,10 @@ pub(crate) struct PTicketsGet {
     pub(crate) projection: Option<String>,
     #[serde(default)]
     pub(crate) detailed: bool,
+    /// Return the lean compact projection (omits description and full comment bodies; keeps
+    /// comment_count, dependency ids, and the latest_update summary). Ignored when `detailed` is set.
+    #[serde(default)]
+    pub(crate) compact: bool,
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct PTicketsList {
@@ -1182,6 +1198,26 @@ pub(crate) struct PLanesUpdate {
     pub(crate) updated_by: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
+pub(crate) struct PLanesCloseout {
+    pub(crate) workspace: String,
+    pub(crate) ticket_workspace_id: String,
+    pub(crate) ticket_id: String,
+    /// Typed ticket comment type, e.g. review_request, blocker, closeout_evidence.
+    pub(crate) comment_type: String,
+    pub(crate) comment_body: String,
+    /// Optional structured evidence recorded on the ticket comment, keyed by evidence key to values
+    /// (e.g. {"checks_run": ["..."], "source_anchors": ["..."]}).
+    #[serde(default)]
+    pub(crate) evidence: Option<BTreeMap<String, Vec<String>>>,
+    pub(crate) lane_id: String,
+    /// Short lane status_report summary written alongside the ticket comment.
+    pub(crate) status_report: String,
+    #[serde(default)]
+    pub(crate) updated_by: Option<String>,
+    #[serde(default)]
+    pub(crate) expected_root: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
 pub(crate) struct PLanesTicketAdd {
     pub(crate) workspace: String,
     pub(crate) lane_id: String,
@@ -1216,6 +1252,19 @@ pub(crate) struct PLanesDelete {
     pub(crate) workspace: String,
     pub(crate) lane_id: String,
     pub(crate) updated_by: String,
+}
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct PLanesCleanup {
+    pub(crate) workspace: String,
+    /// Lane document id to clean. Omit to clean every assignment Lane in the workspace.
+    #[serde(default)]
+    pub(crate) lane_id: Option<String>,
+    /// Apply the cleanup (mutate membership). Defaults to false: a non-mutating dry run.
+    #[serde(default)]
+    pub(crate) apply: bool,
+    /// Actor principal override. Omit to derive from the authenticated principal.
+    #[serde(default)]
+    pub(crate) updated_by: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct PSpacesCreate {

@@ -12,6 +12,7 @@ description = "Source-backed Lane coordination model for Uldren Loom."
 [dependencies]
 loom-codec.workspace = true
 loom-core.workspace = true
+loom-tickets.workspace = true
 loom-store.workspace = true
 loom-types.workspace = true
 serde.workspace = true

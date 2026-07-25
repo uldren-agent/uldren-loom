@@ -666,6 +666,16 @@ internal object LoomNative {
         authPassphrase: ByteArray?,
     ): Boolean
 
+    external fun nativeDocDeleteCollection(
+        path: String,
+        workspace: String,
+        collection: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): Boolean
+
 
     external fun nativeDocListBinary(
         path: String,

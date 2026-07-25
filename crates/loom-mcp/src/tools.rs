@@ -108,6 +108,8 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
         Some("capabilities"),
     ),
     read("store_blob_digest", "store", "Store", Some("blob_digest")),
+    read("store_policy_get", "store", "StoreAdmin", None),
+    write("store_policy_set", "store", "StoreAdmin", None),
     read("store_maintenance_status", "store", "StoreAdmin", None),
     write("store_maintenance_policy_set", "store", "StoreAdmin", None),
     write("store_maintenance_run", "store", "StoreAdmin", None),
@@ -505,6 +507,7 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
     read("lanes_get", "lanes", "Lanes", Some("get")),
     read("lanes_list", "lanes", "Lanes", Some("list")),
     write("lanes_update", "lanes", "Lanes", Some("update")),
+    write("lanes_closeout", "lanes", "Store", None),
     write("lanes_ticket_add", "lanes", "Lanes", Some("ticket_add")),
     write(
         "lanes_ticket_remove",
@@ -519,6 +522,7 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
         Some("ticket_transfer"),
     ),
     write("lanes_delete", "lanes", "Lanes", Some("delete")),
+    write("lanes_cleanup", "lanes", "Store", None),
     // spaces and pages
     write("spaces_create", "spaces", "Store", None),
     read("spaces_get", "spaces", "Store", None),
@@ -691,6 +695,12 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
     read("document_query", "document", "Document", Some("query_json")),
     write("document_replace_text", "document", "Document", None),
     write("document_delete", "document", "Document", Some("delete")),
+    write(
+        "document_delete_collection",
+        "document",
+        "Document",
+        Some("delete_collection"),
+    ),
     read(
         "document_list_binary",
         "document",

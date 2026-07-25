@@ -88,6 +88,20 @@ Test placement rules:
 - If a test must stay in `src` to reach private helpers, keep it unit-sized. It must not bind sockets,
   launch daemons, download models, require devices or emulators, or perform production-cost crypto.
 
+Test sizing rules:
+
+- Default tests in the `just ci` path use small bounded loops that finish in milliseconds. Cap
+  repeated write, insert, or placement loops at a low iteration count (aim for 50 or fewer) and keep
+  each test well under a second so `just ci` stays fast.
+- Real persistence at volume, socket binding, daemon or server startup, mounted filesystems, model
+  downloads, device use, production-cost crypto, and stress or soak loops do not run in `just ci`. Put
+  them in an `#[ignore]`-gated diagnostic, an integration test under `crates/<crate>/tests/` wired to a
+  `test-*` recipe, or a dedicated `just` target.
+- Justify the iteration count of any repeated write-loop test in a nearby comment, and never leave a
+  multi-minute loop in the default path. Name stress, soak, and diagnostic tests with a `stress_`,
+  `soak_`, or `diagnostic_` prefix and mark them `#[ignore = "diagnostic: <reason>; run via just
+  <recipe>"]`.
+
 ## 4. Cross-compilation of the Rust workspace (`uldren-loom-core`, `uldren-loom-cli`, `uldren-loom-ffi`)
 
 Run these from the repository root; they cross-compile the core engine, the `loom` CLI, and the

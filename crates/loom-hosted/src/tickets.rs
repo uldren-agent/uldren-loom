@@ -1,6 +1,6 @@
+use loom_core::Loom;
 use loom_core::error::Result;
 use loom_core::workspace::WorkspaceId;
-use loom_core::{Digest, Loom};
 use loom_store::FileStore;
 use loom_tickets::{
     TicketComment, TicketCommentDeleteRequest, TicketCommentRequest, TicketCommentUpdateRequest,
@@ -116,13 +116,6 @@ pub struct HostedTicketCreate<'a> {
     pub expected_root: Option<&'a str>,
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 pub fn create(
     loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
@@ -130,7 +123,7 @@ pub fn create(
 ) -> Result<TicketSummary> {
     let projection = parse_ticket_projection(input.projection)?;
     let fields = normalize_ticket_fields_for_projection(input.fields, projection)?;
-    let ticket = loom_tickets::create_ticket(
+    loom_tickets::create_ticket(
         loom,
         workspace,
         TicketCreateRequest {
@@ -143,9 +136,7 @@ pub fn create(
             policy_labels: input.policy_labels,
             expected_root: input.expected_root,
         },
-    )?;
-    update_ticket_references(loom, workspace, &ticket)?;
-    Ok(ticket)
+    )
 }
 
 pub fn update_fields(
@@ -156,7 +147,7 @@ pub fn update_fields(
     fields: &Value,
     expected_root: Option<&str>,
 ) -> Result<TicketSummary> {
-    let ticket = loom_tickets::update_ticket_fields(
+    loom_tickets::update_ticket_fields(
         loom,
         workspace,
         TicketUpdateFieldsRequest {
@@ -165,9 +156,7 @@ pub fn update_fields(
             fields,
             expected_root,
         },
-    )?;
-    update_ticket_references(loom, workspace, &ticket)?;
-    Ok(ticket)
+    )
 }
 
 pub struct HostedTicketUpdate<'a> {
@@ -200,7 +189,7 @@ pub fn update(
         .transpose()?;
     let delete_fields =
         normalize_ticket_delete_fields_for_projection(input.delete_fields, projection);
-    let ticket = loom_tickets::update_ticket(
+    loom_tickets::update_ticket(
         loom,
         workspace,
         TicketUpdateRequest {
@@ -219,9 +208,7 @@ pub fn update(
             relation_sets: input.relation_sets,
             relation_removes: input.relation_removes,
         },
-    )?;
-    update_ticket_references(loom, workspace, &ticket)?;
-    Ok(ticket)
+    )
 }
 
 pub struct HostedTicketDelete<'a> {
@@ -235,7 +222,7 @@ pub fn delete(
     workspace: WorkspaceId,
     input: HostedTicketDelete<'_>,
 ) -> Result<TicketSummary> {
-    let ticket = loom_tickets::delete_ticket(
+    loom_tickets::delete_ticket(
         loom,
         workspace,
         TicketDeleteRequest {
@@ -243,9 +230,7 @@ pub fn delete(
             ticket_id: input.ticket_id,
             expected_root: input.expected_root,
         },
-    )?;
-    update_ticket_references(loom, workspace, &ticket)?;
-    Ok(ticket)
+    )
 }
 
 pub fn comments(
@@ -272,7 +257,7 @@ pub fn comment_add(
     workspace: WorkspaceId,
     input: HostedTicketCommentAdd<'_>,
 ) -> Result<TicketSummary> {
-    let ticket = loom_tickets::add_ticket_comment(
+    loom_tickets::add_ticket_comment(
         loom,
         workspace,
         TicketCommentRequest {
@@ -284,9 +269,7 @@ pub fn comment_add(
             evidence: input.evidence,
             expected_root: input.expected_root,
         },
-    )?;
-    update_ticket_references(loom, workspace, &ticket)?;
-    Ok(ticket)
+    )
 }
 
 pub struct HostedTicketCommentUpdate<'a> {
@@ -304,7 +287,7 @@ pub fn comment_update(
     workspace: WorkspaceId,
     input: HostedTicketCommentUpdate<'_>,
 ) -> Result<TicketSummary> {
-    let ticket = loom_tickets::update_ticket_comment(
+    loom_tickets::update_ticket_comment(
         loom,
         workspace,
         TicketCommentUpdateRequest {
@@ -316,9 +299,7 @@ pub fn comment_update(
             evidence: input.evidence,
             expected_root: input.expected_root,
         },
-    )?;
-    update_ticket_references(loom, workspace, &ticket)?;
-    Ok(ticket)
+    )
 }
 
 pub struct HostedTicketCommentDelete<'a> {
@@ -333,7 +314,7 @@ pub fn comment_delete(
     workspace: WorkspaceId,
     input: HostedTicketCommentDelete<'_>,
 ) -> Result<TicketSummary> {
-    let ticket = loom_tickets::delete_ticket_comment(
+    loom_tickets::delete_ticket_comment(
         loom,
         workspace,
         TicketCommentDeleteRequest {
@@ -342,9 +323,7 @@ pub fn comment_delete(
             comment_id: input.comment_id,
             expected_root: input.expected_root,
         },
-    )?;
-    update_ticket_references(loom, workspace, &ticket)?;
-    Ok(ticket)
+    )
 }
 
 pub struct HostedTicketRelationWrite<'a> {
@@ -397,35 +376,6 @@ pub fn relation_remove(
             expected_root: input.expected_root,
         },
     )
-}
-
-fn update_ticket_references(
-    loom: &mut Loom<FileStore>,
-    workspace: WorkspaceId,
-    ticket: &TicketSummary,
-) -> Result<()> {
-    loom_tickets::update_ticket_field_references(
-        loom,
-        workspace,
-        &ticket.workspace_id,
-        &ticket.ticket_id,
-        &ticket.fields,
-    )?;
-    if let Some(operation_id) = ticket.operation_id.as_deref() {
-        loom_tickets::enqueue_ticket_reference_candidates(
-            loom,
-            workspace,
-            loom_tickets::TicketReferenceCandidateRequest {
-                workspace_id: &ticket.workspace_id,
-                ticket_id: &ticket.ticket_id,
-                operation_id,
-                source_root: Digest::parse(&ticket.profile_root)?,
-                fields: &ticket.fields,
-                now_ms: now_ms(),
-            },
-        )?;
-    }
-    Ok(())
 }
 
 pub fn get(
