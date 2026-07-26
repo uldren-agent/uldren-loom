@@ -456,23 +456,41 @@ impl<S: ObjectStore> Loom<S> {
         root: Digest,
         have: &BTreeSet<Digest>,
     ) -> Result<BTreeSet<Digest>> {
+        self.stream_reachable_until(root, have, None)
+    }
+
+    pub(crate) fn stream_reachable_until(
+        &self,
+        root: Digest,
+        have: &BTreeSet<Digest>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<BTreeSet<Digest>> {
         let mut out = BTreeSet::new();
         if have.contains(&root) {
             return Ok(out);
         }
+        check_stream_deadline(deadline)?;
         out.insert(root);
         let Object::Tree(entries) = self.get_object(&root)? else {
             return Err(LoomError::corrupt("stream root is not a Tree"));
         };
         for e in entries {
+            check_stream_deadline(deadline)?;
             match e.name.as_str() {
-                "meta" => self.collect_content_objects(e.target, have, &mut out)?,
+                "meta" => self.collect_content_objects_until(e.target, have, &mut out, deadline)?,
                 "entries" => {
-                    let reach = crate::prolly::reachable_with_leaves(&self.store, &e.target, have)?;
+                    let reach = crate::prolly::reachable_with_leaves_until(
+                        &self.store,
+                        &e.target,
+                        have,
+                        deadline,
+                    )?;
                     for node in reach.nodes {
+                        check_stream_deadline(deadline)?;
                         out.insert(node);
                     }
                     for value in reach.leaf_values {
+                        check_stream_deadline(deadline)?;
                         let mut f = crate::cbor::Fields::new(crate::cbor::decode_array(&value)?);
                         if f.uint()? != STREAM_ENTRY_VERSION {
                             return Err(LoomError::corrupt(
@@ -482,13 +500,19 @@ impl<S: ObjectStore> Loom<S> {
                         let payload_addr = f.digest()?;
                         let _len = f.uint()?;
                         f.end()?;
-                        self.collect_content_objects(payload_addr, have, &mut out)?;
+                        self.collect_content_objects_until(payload_addr, have, &mut out, deadline)?;
                     }
                 }
                 "consumers" => {
-                    for node in
-                        crate::prolly::reachable_with_leaves(&self.store, &e.target, have)?.nodes
+                    for node in crate::prolly::reachable_with_leaves_until(
+                        &self.store,
+                        &e.target,
+                        have,
+                        deadline,
+                    )?
+                    .nodes
                     {
+                        check_stream_deadline(deadline)?;
                         out.insert(node);
                     }
                 }
@@ -500,12 +524,14 @@ impl<S: ObjectStore> Loom<S> {
 
     /// Resolve a content address to its stored object (blob or chunk list) and fold the object, plus any
     /// chunk blobs, into `out`, pruned by `have`.
-    fn collect_content_objects(
+    fn collect_content_objects_until(
         &self,
         addr: Digest,
         have: &BTreeSet<Digest>,
         out: &mut BTreeSet<Digest>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<()> {
+        check_stream_deadline(deadline)?;
         let obj = self
             .content
             .get(&addr)
@@ -516,6 +542,7 @@ impl<S: ObjectStore> Loom<S> {
         }
         if let Object::ChunkList { entries, .. } = self.get_object(&obj)? {
             for c in entries {
+                check_stream_deadline(deadline)?;
                 if !have.contains(&c.target) {
                     out.insert(c.target);
                 }
@@ -523,4 +550,14 @@ impl<S: ObjectStore> Loom<S> {
         }
         Ok(())
     }
+}
+
+fn check_stream_deadline(deadline: Option<std::time::Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(LoomError::new(
+            crate::error::Code::ResourceExhausted,
+            "maintenance work budget exhausted",
+        ));
+    }
+    Ok(())
 }

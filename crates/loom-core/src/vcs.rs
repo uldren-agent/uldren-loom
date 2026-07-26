@@ -882,7 +882,7 @@ mod state;
 mod streams;
 mod timeseries;
 
-pub use objects::{ReachabilityMarkState, ReachabilityMarkStep};
+pub use objects::{ReachabilityMarkState, ReachabilityMarkStep, ReachabilityProllyCursor};
 
 // ---- engine-state codec helpers (for export_state/import_state) ---------------------------------
 

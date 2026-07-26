@@ -284,8 +284,8 @@ pub use vcs::{
     BoundedEnginePlanner, Change, ChangeKind, ConflictResolution, EnginePathSelector,
     EnginePlanningScope, EngineStateDelta, EngineStateIoCounts, FileStat, LiveRootClassDiagnostics,
     LiveRootDiagnostics, LiveRootExample, Loom, MergeOutcome, OpenMode, ProtectedRefPolicy,
-    ReachabilityMarkState, ReachabilityMarkStep, ReplayOutcome, Status, VcsNamespaceCollision,
-    VcsNamespacePreflight,
+    ReachabilityMarkState, ReachabilityMarkStep, ReachabilityProllyCursor, ReplayOutcome, Status,
+    VcsNamespaceCollision, VcsNamespacePreflight,
 };
 pub use vector::{
     Hit, MetaFilter, Metric, VectorEntry, VectorSet, get_vector_set, put_vector_set,

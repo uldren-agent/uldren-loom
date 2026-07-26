@@ -15,6 +15,227 @@ struct GcReclaimEvidence {
 }
 
 type GcInterleave<'a> = Option<&'a mut dyn FnMut(&FileStore) -> Result<()>>;
+type GcDeadline = Option<std::time::Instant>;
+type IndexScanEntry = ([u8; 32], RecordLoc);
+type IndexScanState = (pagebtree::ScanCursor, Vec<IndexScanEntry>);
+type FullCompactionSnapshot = (Vec<[u8; 32]>, Option<Vec<u8>>, Option<PageId>, u64);
+const INDEX_SCAN_STATE_MAGIC: &[u8; 8] = b"LIDXCUR1";
+
+fn check_gc_deadline(deadline: GcDeadline) -> Result<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(LoomError::new(
+            Code::ResourceExhausted,
+            "maintenance work budget exhausted",
+        ));
+    }
+    Ok(())
+}
+
+fn lock_until<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    deadline: GcDeadline,
+) -> Result<std::sync::MutexGuard<'a, T>> {
+    match deadline {
+        None => mutex.lock().map_err(|_| poisoned()),
+        Some(deadline) => loop {
+            match mutex.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(poisoned()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    check_gc_deadline(Some(deadline))?;
+                    std::thread::yield_now();
+                }
+            }
+        },
+    }
+}
+
+fn put_optional_digest_bytes(out: &mut Vec<u8>, digest: Option<Digest>) {
+    match digest {
+        Some(digest) => {
+            out.push(1);
+            out.extend_from_slice(digest.bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn put_optional_page_bytes(out: &mut Vec<u8>, page: Option<PageId>) {
+    match page {
+        Some(page) => {
+            out.push(1);
+            out.extend_from_slice(&page.0.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn encode_index_scan_state(
+    evidence_key: [u8; 32],
+    cursor: &pagebtree::ScanCursor,
+    entries: &[([u8; 32], RecordLoc)],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(INDEX_SCAN_STATE_MAGIC);
+    out.extend_from_slice(&evidence_key);
+    out.extend_from_slice(&(cursor.stack.len() as u32).to_le_bytes());
+    for op in &cursor.stack {
+        match op {
+            pagebtree::ScanOp::Visit { page, depth } => {
+                out.push(0);
+                out.extend_from_slice(&page.0.to_le_bytes());
+                out.extend_from_slice(&(*depth as u32).to_le_bytes());
+            }
+            pagebtree::ScanOp::Emit((key, loc)) => {
+                out.push(1);
+                out.extend_from_slice(key);
+                loc.encode(&mut out);
+            }
+        }
+    }
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (key, loc) in entries {
+        out.extend_from_slice(key);
+        loc.encode(&mut out);
+    }
+    out
+}
+
+fn decode_index_scan_state(bytes: &[u8], evidence_key: [u8; 32]) -> Result<Option<IndexScanState>> {
+    let mut pos = 0usize;
+    if take(bytes, &mut pos, INDEX_SCAN_STATE_MAGIC.len())? != INDEX_SCAN_STATE_MAGIC {
+        return Ok(None);
+    }
+    if take(bytes, &mut pos, 32)? != evidence_key {
+        return Ok(None);
+    }
+    let stack_len = take_u32(bytes, &mut pos)? as usize;
+    let mut stack = Vec::with_capacity(stack_len);
+    for _ in 0..stack_len {
+        let tag = take(bytes, &mut pos, 1)?[0];
+        match tag {
+            0 => {
+                let page = PageId(take_u64(bytes, &mut pos)?);
+                let depth = take_u32(bytes, &mut pos)? as usize;
+                stack.push(pagebtree::ScanOp::Visit { page, depth });
+            }
+            1 => {
+                let key = take_array_32(bytes, &mut pos)?;
+                let loc = RecordLoc::decode(bytes, &mut pos)
+                    .ok_or_else(|| corrupt("maintenance index cursor locator"))?;
+                stack.push(pagebtree::ScanOp::Emit((key, loc)));
+            }
+            _ => return Err(corrupt("maintenance index cursor operation")),
+        }
+    }
+    let entry_len = take_u32(bytes, &mut pos)? as usize;
+    let mut entries = Vec::with_capacity(entry_len);
+    for _ in 0..entry_len {
+        let key = take_array_32(bytes, &mut pos)?;
+        let loc = RecordLoc::decode(bytes, &mut pos)
+            .ok_or_else(|| corrupt("maintenance index cursor entry locator"))?;
+        entries.push((key, loc));
+    }
+    if pos != bytes.len() {
+        return Err(corrupt("maintenance index cursor trailing bytes"));
+    }
+    Ok(Some((pagebtree::ScanCursor { stack }, entries)))
+}
+
+fn take<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| corrupt("maintenance index cursor offset overflow"))?;
+    let out = bytes
+        .get(*pos..end)
+        .ok_or_else(|| corrupt("maintenance index cursor truncated"))?;
+    *pos = end;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loom_core::{Algo, ObjectStore};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_store(tag: &str) -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "loom-store-{tag}-{}-{seq}.loom",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn index_scan_state_round_trips_and_invalidates_by_evidence() {
+        let key = [7u8; 32];
+        let cursor = pagebtree::ScanCursor {
+            stack: vec![
+                pagebtree::ScanOp::Visit {
+                    page: PageId(42),
+                    depth: 2,
+                },
+                pagebtree::ScanOp::Emit(([9u8; 32], RecordLoc::from_global(11, 3))),
+            ],
+        };
+        let entries = vec![([3u8; 32], RecordLoc::from_global(5, 1))];
+        let encoded = encode_index_scan_state(key, &cursor, &entries);
+
+        let decoded = decode_index_scan_state(&encoded, key).unwrap().unwrap();
+        assert_eq!(decoded.0, cursor);
+        assert_eq!(decoded.1, entries);
+        assert!(
+            decode_index_scan_state(&encoded, [8u8; 32])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn index_snapshot_resumes_after_deadline_preserved_cursor() {
+        let path = temp_store("index-cursor-resume");
+        let store = FileStore::create_with_profile(&path, Algo::Blake3).unwrap();
+        for i in 0..256u64 {
+            store.put(&i.to_le_bytes()).unwrap();
+        }
+        let evidence = {
+            let mut inner = store.inner.lock().unwrap();
+            let control_map = store.control_map_locked(&mut inner).unwrap();
+            store
+                .gc_reclaim_evidence_locked(&inner, &control_map)
+                .unwrap()
+        };
+
+        let error = store
+            .index_snapshot_from_evidence(&evidence, None, Some(std::time::Instant::now()))
+            .unwrap_err();
+        assert_eq!(error.code, Code::ResourceExhausted);
+        assert!(store.maintenance_index_scan.lock().unwrap().is_some());
+
+        let snapshot = store
+            .index_snapshot_from_evidence(&evidence, None, None)
+            .unwrap();
+        assert!(snapshot.len() >= 256);
+        assert!(store.maintenance_index_scan.lock().unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn take_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap()))
+}
+
+fn take_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
+    Ok(u64::from_le_bytes(take(bytes, pos, 8)?.try_into().unwrap()))
+}
+
+fn take_array_32(bytes: &[u8], pos: &mut usize) -> Result<[u8; 32]> {
+    Ok(take(bytes, pos, 32)?.try_into().unwrap())
+}
 
 impl FileStore {
     #[cfg(not(target_arch = "wasm32"))]
@@ -77,18 +298,35 @@ impl FileStore {
     /// regardless. Freed pages return to the free-page map for reuse, so a later write reuses them
     /// rather than growing the file; reclaiming file size by truncation is a separate step.
     pub fn gc_segments(&mut self, live: &BTreeSet<[u8; 32]>) -> Result<GcStats> {
-        self.gc_segments_inner(live, None, GcSegmentBudget::unlimited(), true, None, None)
+        self.gc_segments_inner(
+            live,
+            None,
+            GcSegmentBudget::unlimited(),
+            true,
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn gc_validated_segments(&mut self, budget: GcSegmentBudget) -> Result<GcStats> {
-        self.gc_validated_segments_impl(budget, true, None, None)
+        self.gc_validated_segments_impl(budget, true, None, None, None)
     }
 
     pub fn gc_validated_segments_without_tail_trim(
         &mut self,
         budget: GcSegmentBudget,
     ) -> Result<GcStats> {
-        self.gc_validated_segments_impl(budget, false, None, None)
+        self.gc_validated_segments_impl(budget, false, None, None, None)
+    }
+
+    pub fn gc_validated_segments_until(
+        &mut self,
+        budget: GcSegmentBudget,
+        trim_tail: bool,
+        deadline: std::time::Instant,
+    ) -> Result<GcStats> {
+        self.gc_validated_segments_impl(budget, trim_tail, None, None, Some(deadline))
     }
 
     #[cfg(test)]
@@ -97,7 +335,7 @@ impl FileStore {
         budget: GcSegmentBudget,
         mut interleave: impl FnMut(&FileStore) -> Result<()>,
     ) -> Result<GcStats> {
-        self.gc_validated_segments_impl(budget, true, Some(&mut interleave), None)
+        self.gc_validated_segments_impl(budget, true, Some(&mut interleave), None, None)
     }
 
     #[cfg(test)]
@@ -106,7 +344,7 @@ impl FileStore {
         budget: GcSegmentBudget,
         mut interleave: impl FnMut(&FileStore) -> Result<()>,
     ) -> Result<GcStats> {
-        self.gc_validated_segments_impl(budget, true, None, Some(&mut interleave))
+        self.gc_validated_segments_impl(budget, true, None, Some(&mut interleave), None)
     }
 
     fn gc_validated_segments_impl(
@@ -115,7 +353,9 @@ impl FileStore {
         trim_tail: bool,
         pre_reclaim_interleave: GcInterleave<'_>,
         read_phase_interleave: GcInterleave<'_>,
+        deadline: GcDeadline,
     ) -> Result<GcStats> {
+        check_gc_deadline(deadline)?;
         let epoch = self
             .active_reachability_mark_epoch()?
             .ok_or_else(|| LoomError::not_found("reachability mark epoch not found"))?;
@@ -155,6 +395,7 @@ impl FileStore {
             trim_tail,
             Some(&epoch),
             read_phase_interleave,
+            deadline,
         )
     }
 
@@ -166,10 +407,12 @@ impl FileStore {
         trim_tail: bool,
         validated_epoch: Option<&ReachabilityMarkEpoch>,
         read_phase_interleave: GcInterleave<'_>,
+        deadline: GcDeadline,
     ) -> Result<GcStats> {
+        check_gc_deadline(deadline)?;
         let codec = self.default_codec; // re-frame relocated records per the current default
         let (evidence, keep_reference, keep_control, keep_derived) = {
-            let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+            let mut inner = lock_until(&self.inner, deadline)?;
             let control_map = self.control_map_locked(&mut inner)?;
             let evidence = self.gc_reclaim_evidence_locked(&inner, &control_map)?;
             if let Some(epoch) = validated_epoch
@@ -188,7 +431,8 @@ impl FileStore {
                 self.derived_payload_digests_from_control_map(&control_map)?,
             )
         };
-        let index_snapshot = self.index_snapshot_from_evidence(&evidence, read_phase_interleave)?;
+        let index_snapshot =
+            self.index_snapshot_from_evidence(&evidence, read_phase_interleave, deadline)?;
         let alive = |digest: &[u8; 32]| {
             live.contains(digest)
                 || keep_reference.as_ref() == Some(digest)
@@ -199,8 +443,9 @@ impl FileStore {
         // run or a fragmented page chain, while multiple small objects may share one slab page.
         let mut page_live: BTreeMap<u64, bool> = BTreeMap::new();
         let mut record_pages = BTreeMap::<[u8; 32], Vec<u64>>::new();
-        let mut file = self.file.lock().map_err(|_| poisoned())?;
+        let mut file = lock_until(&self.file, deadline)?;
         for (digest, loc) in &index_snapshot {
+            check_gc_deadline(deadline)?;
             let pages =
                 crate::record_io::blob_pages(&mut **file, loc.global_page(), evidence.page_count)?;
             for page in &pages {
@@ -240,6 +485,7 @@ impl FileStore {
         let mut dropped: Vec<[u8; 32]> = Vec::new();
         let mut pages_to_free: BTreeSet<u64> = BTreeSet::new();
         for (digest, loc) in &index_snapshot {
+            check_gc_deadline(deadline)?;
             let pages = &record_pages[digest];
             let touches_chosen = pages
                 .iter()
@@ -271,9 +517,11 @@ impl FileStore {
             return Ok(GcStats::default());
         }
 
+        check_gc_deadline(deadline)?;
+
         // Phase B: one transaction - relocate survivors to fresh pages, point-update their index
         // entries, delete the dropped keys, and free the reclaimed segments' pages.
-        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        let mut inner = lock_until(&self.inner, deadline)?;
         let control_map = self.control_map_locked(&mut inner)?;
         let current_evidence = self.gc_reclaim_evidence_locked(&inner, &control_map)?;
         if current_evidence != evidence {
@@ -300,7 +548,7 @@ impl FileStore {
         self.materialize_index_locked(&mut inner)?;
         let before_page_count = evidence.page_count;
         let (roots, index_root, placements, pages_freed) = {
-            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            let mut file = lock_until(&self.file, deadline)?;
             let mut alloc = PageAllocator::new(inner.page_count, new_gen, inner.free.clone());
             let borrowed: Vec<(Digest, &[u8], Codec)> = survivors
                 .iter()
@@ -458,7 +706,17 @@ impl FileStore {
         max_objects: u64,
         max_bytes: u64,
     ) -> Result<TailCompactionStats> {
-        self.compact_tail_once_impl(max_pages, max_objects, max_bytes, None)
+        self.compact_tail_once_impl(max_pages, max_objects, max_bytes, None, None)
+    }
+
+    pub fn compact_tail_once_until(
+        &mut self,
+        max_pages: u64,
+        max_objects: u64,
+        max_bytes: u64,
+        deadline: std::time::Instant,
+    ) -> Result<TailCompactionStats> {
+        self.compact_tail_once_impl(max_pages, max_objects, max_bytes, None, Some(deadline))
     }
 
     #[cfg(test)]
@@ -469,7 +727,13 @@ impl FileStore {
         max_bytes: u64,
         mut interleave: impl FnMut(&FileStore) -> Result<()>,
     ) -> Result<TailCompactionStats> {
-        self.compact_tail_once_impl(max_pages, max_objects, max_bytes, Some(&mut interleave))
+        self.compact_tail_once_impl(
+            max_pages,
+            max_objects,
+            max_bytes,
+            Some(&mut interleave),
+            None,
+        )
     }
 
     fn compact_tail_once_impl(
@@ -478,7 +742,9 @@ impl FileStore {
         max_objects: u64,
         max_bytes: u64,
         pre_commit_interleave: GcInterleave<'_>,
+        deadline: GcDeadline,
     ) -> Result<TailCompactionStats> {
+        check_gc_deadline(deadline)?;
         if max_pages == 0 || max_objects == 0 || max_bytes == 0 {
             return Err(LoomError::new(
                 Code::InvalidArgument,
@@ -487,7 +753,7 @@ impl FileStore {
         }
         let codec = self.default_codec;
         let evidence = {
-            let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+            let mut inner = lock_until(&self.inner, deadline)?;
             let control_map = self.control_map_locked(&mut inner)?;
             self.gc_reclaim_evidence_locked(&inner, &control_map)?
         };
@@ -503,11 +769,13 @@ impl FileStore {
             });
         }
         let scan_start = tail_end.saturating_sub(max_pages);
-        let index_snapshot = self.index_snapshot_from_evidence(&evidence, None)?;
+        let index_snapshot = self.index_snapshot_from_evidence(&evidence, None, deadline)?;
+        check_gc_deadline(deadline)?;
         let mut physical = Vec::with_capacity(index_snapshot.len());
         {
-            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            let mut file = lock_until(&self.file, deadline)?;
             for (key, loc) in index_snapshot {
+                check_gc_deadline(deadline)?;
                 let pages = crate::record_io::blob_pages(
                     &mut **file,
                     loc.global_page(),
@@ -524,6 +792,7 @@ impl FileStore {
             std::cmp::Reverse(pages.iter().copied().max().unwrap_or(0))
         });
         for (key, loc, pages) in physical {
+            check_gc_deadline(deadline)?;
             if !pages
                 .iter()
                 .any(|page| *page >= scan_start && *page < tail_end)
@@ -562,11 +831,13 @@ impl FileStore {
             });
         }
 
+        check_gc_deadline(deadline)?;
+
         if let Some(interleave) = pre_commit_interleave {
             interleave(self)?;
         }
 
-        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        let mut inner = lock_until(&self.inner, deadline)?;
         let control_map = self.control_map_locked(&mut inner)?;
         let current_evidence = self.gc_reclaim_evidence_locked(&inner, &control_map)?;
         if current_evidence != evidence {
@@ -593,7 +864,7 @@ impl FileStore {
         let keep_reference = inner.reference_root.map(|d| *d.bytes());
         let keep_control = inner.control_root.map(|d| *d.bytes());
         let (roots, index_root, placements, relocated_pages) = {
-            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            let mut file = lock_until(&self.file, deadline)?;
             let mut alloc = PageAllocator::new_reusing_before(
                 inner.page_count,
                 new_gen,
@@ -701,24 +972,89 @@ impl FileStore {
         &self,
         evidence: &GcReclaimEvidence,
         mut read_phase_interleave: GcInterleave<'_>,
+        deadline: GcDeadline,
     ) -> Result<Vec<([u8; 32], RecordLoc)>> {
         let Some(root) = evidence.index_root else {
             return Ok(Vec::new());
         };
+        let evidence_key = self.index_scan_evidence_key(evidence);
         let mut interleaved = false;
-        pagebtree::load_all_with_page_reader(root, evidence.page_count, |page| {
-            let mut buf = [0u8; PAGE_SIZE as usize];
-            {
-                let mut file = self.file.lock().map_err(|_| poisoned())?;
-                read_exact_at(&mut **file, page.offset(DATA_START), &mut buf)
-                    .map_err(|_| corrupt("truncated btree node page"))?;
+        let (mut cursor, mut out) = self
+            .load_index_scan_state(evidence_key)?
+            .unwrap_or_else(|| (pagebtree::ScanCursor::new(root), Vec::new()));
+        while !cursor.completed() {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                self.save_index_scan_state(evidence_key, &cursor, &out)?;
+                check_gc_deadline(deadline)?;
             }
+            let step = pagebtree::scan_step_with_page_reader(
+                &mut cursor,
+                evidence.page_count,
+                64,
+                deadline,
+                |page| {
+                    check_gc_deadline(deadline)?;
+                    let mut buf = [0u8; PAGE_SIZE as usize];
+                    {
+                        let mut file = lock_until(&self.file, deadline)?;
+                        read_exact_at(&mut **file, page.offset(DATA_START), &mut buf)
+                            .map_err(|_| corrupt("truncated btree node page"))?;
+                    }
+                    Ok(buf)
+                },
+            )?;
+            out.extend(step.entries);
             if !interleaved && let Some(interleave) = read_phase_interleave.as_mut() {
                 interleaved = true;
                 interleave(self)?;
             }
-            Ok(buf)
-        })
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                self.save_index_scan_state(evidence_key, &cursor, &out)?;
+                check_gc_deadline(deadline)?;
+            }
+        }
+        self.clear_index_scan_state()?;
+        Ok(out)
+    }
+
+    fn index_scan_evidence_key(&self, evidence: &GcReclaimEvidence) -> [u8; 32] {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&evidence.generation.to_le_bytes());
+        bytes.extend_from_slice(&evidence.page_count.to_le_bytes());
+        put_optional_digest_bytes(&mut bytes, evidence.reference_root);
+        put_optional_digest_bytes(&mut bytes, evidence.control_root);
+        put_optional_page_bytes(&mut bytes, evidence.index_root);
+        put_optional_page_bytes(&mut bytes, evidence.overlay_root);
+        put_optional_digest_bytes(&mut bytes, evidence.control_fingerprint);
+        bytes.extend_from_slice(&(evidence.derived_roots.len() as u32).to_le_bytes());
+        for root in &evidence.derived_roots {
+            bytes.extend_from_slice(root.bytes());
+        }
+        *Digest::hash(self.digest_algo, &bytes).bytes()
+    }
+
+    fn load_index_scan_state(&self, evidence_key: [u8; 32]) -> Result<Option<IndexScanState>> {
+        let guard = self.maintenance_index_scan.lock().map_err(|_| poisoned())?;
+        let Some(bytes) = guard.as_deref() else {
+            return Ok(None);
+        };
+        decode_index_scan_state(bytes, evidence_key)
+    }
+
+    fn save_index_scan_state(
+        &self,
+        evidence_key: [u8; 32],
+        cursor: &pagebtree::ScanCursor,
+        entries: &[([u8; 32], RecordLoc)],
+    ) -> Result<()> {
+        *self.maintenance_index_scan.lock().map_err(|_| poisoned())? =
+            Some(encode_index_scan_state(evidence_key, cursor, entries));
+        Ok(())
+    }
+
+    fn clear_index_scan_state(&self) -> Result<()> {
+        *self.maintenance_index_scan.lock().map_err(|_| poisoned())? = None;
+        Ok(())
     }
 
     fn gc_reclaim_evidence_locked(
@@ -893,15 +1229,26 @@ impl FileStore {
             // last, once the roots are known.
             write_at(&mut out, 0, &vec![0u8; DATA_START as usize]).map_err(io_err)?;
 
-            let (keys, enc_meta): (Vec<[u8; 32]>, Option<Vec<u8>>) = {
+            let (keys, enc_meta, source_overlay_root, source_page_count): FullCompactionSnapshot = {
                 let mut i = self.inner.lock().map_err(|_| poisoned())?;
                 self.materialize_index_locked(&mut i)?;
-                (i.index.keys().copied().collect(), i.encryption_meta.clone())
+                (
+                    i.index.keys().copied().collect(),
+                    i.encryption_meta.clone(),
+                    i.overlay_root,
+                    i.page_count,
+                )
             };
-            let overlay_records = {
+            let (current_records, mut control_records) = {
                 let overlay = self.mutable_overlay.lock().map_err(|_| poisoned())?;
                 let generation = overlay.generation().as_u64();
-                let entries = overlay.export_entries()?;
+                let entries = overlay
+                    .export_entries()?
+                    .into_iter()
+                    .map(|entry| (entry.key.clone(), entry))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_values()
+                    .collect::<Vec<_>>();
                 let mut records = Vec::new();
                 if generation > 0 || !entries.is_empty() {
                     records.push((
@@ -915,7 +1262,40 @@ impl FileStore {
                         encode_mutable_overlay_entry(entry),
                     )
                 }));
-                records
+                let (current_records, control_records) = split_mutable_overlay_records(&records);
+                let mut control_records = control_records
+                    .into_iter()
+                    .map(|(address, value)| (address, value.to_vec()))
+                    .collect::<Vec<_>>();
+                if let Some(root) = source_overlay_root {
+                    let mut file = self.file.lock().map_err(|_| poisoned())?;
+                    for (address, loc) in
+                        pagebtree::load_all(&mut **file, DATA_START, root, source_page_count)?
+                    {
+                        if address == mutable_overlay_meta_address()
+                            || address == mutable_overlay_current_root_address()
+                        {
+                            continue;
+                        }
+                        let value = read_blob_from_loc(&mut **file, loc)?;
+                        if is_mutable_overlay_current_entry_record(&value) {
+                            return Err(corrupt(
+                                "mutable overlay control root contains current entry; controlled migration required",
+                            ));
+                        }
+                        if !is_mutable_overlay_control_record_family(&value) {
+                            return Err(corrupt("unknown mutable overlay control record family"));
+                        }
+                        control_records.push((address, value));
+                    }
+                }
+                control_records.sort_by_key(|record| record.0);
+                control_records.dedup_by_key(|record| record.0);
+                let current_records = current_records
+                    .into_iter()
+                    .map(|(address, value)| (address, value.to_vec()))
+                    .collect::<Vec<_>>();
+                (current_records, control_records)
             };
             // Read each retained object back through `get` (digest-verified) and collect it for packing.
             let mut retained: Vec<(Digest, Vec<u8>, Codec)> = Vec::with_capacity(keys.len());
@@ -960,11 +1340,20 @@ impl FileStore {
             };
             entries.sort_unstable_by_key(|e| e.0); // build_packed needs ascending, unique keys
             let index_root = pagebtree::build_packed(&mut out, DATA_START, &mut alloc, &entries)?;
-            let overlay_borrowed = overlay_records
+            let current_borrowed = current_records
                 .iter()
                 .map(|(key, value)| (*key, value.as_slice()))
                 .collect::<Vec<_>>();
-            let mut overlay_entries = write_blob_pages(&mut out, &mut alloc, &overlay_borrowed)?;
+            let mut current_entries = write_blob_pages(&mut out, &mut alloc, &current_borrowed)?;
+            current_entries.sort_unstable_by_key(|e| e.0);
+            let current_root =
+                pagebtree::build_packed(&mut out, DATA_START, &mut alloc, &current_entries)?;
+            control_records.push(mutable_overlay_current_root_record(current_root));
+            let control_borrowed = control_records
+                .iter()
+                .map(|(key, value)| (*key, value.as_slice()))
+                .collect::<Vec<_>>();
+            let mut overlay_entries = write_blob_pages(&mut out, &mut alloc, &control_borrowed)?;
             overlay_entries.sort_unstable_by_key(|e| e.0);
             let overlay_root =
                 pagebtree::build_packed(&mut out, DATA_START, &mut alloc, &overlay_entries)?;

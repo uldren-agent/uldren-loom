@@ -2365,7 +2365,7 @@ mod tests {
                 HostedLaneTicketUpdate {
                     lane_id: "tickets-schema",
                     ticket_id: "MX-103",
-                    placement: loom_lanes::LaneTicketPlacement::Append,
+                    placement: loom_lanes::LaneTicketPlacement::Last,
                     updated_by: "agent:3",
                 },
             )

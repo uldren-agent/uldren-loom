@@ -6,7 +6,7 @@
 //!
 //! Licensed under BUSL-1.1.
 
-use crate::local::{DocumentReplaceTextArgs, LaneUpdateInput, LocalLoomClient};
+use crate::local::{DocumentReplaceTextArgs, LaneCloseoutInput, LaneUpdateInput, LocalLoomClient};
 use loom_codec::Value;
 use loom_core::digest::Digest as CoreDigest;
 use loom_core::identity::IdentityPublicKeySpec;
@@ -128,6 +128,22 @@ fn ticket_mutation_json(
     json_string(&MutationEnvelope::new(ticket, receipt))
 }
 
+fn relation_mutation_json(
+    relation: loom_tickets::TicketRelationSummary,
+    operation: &str,
+    root_before: Option<&str>,
+    changes: Vec<MutationChange>,
+) -> Result<String, LoomError> {
+    let receipt = MutationReceipt::new(operation, "ticket_relation", relation.relation_id.clone())
+        .operation_id(Some(relation.operation_id.clone()))
+        .roots(
+            root_before.map(str::to_string),
+            Some(relation.profile_root.clone()),
+        )
+        .changes(changes);
+    json_string(&MutationEnvelope::new(relation, receipt))
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -157,6 +173,8 @@ struct ServiceTicketUpdateComment {
     #[serde(default)]
     comment_type: Option<String>,
     body: String,
+    #[serde(default)]
+    evidence: Option<JsonValue>,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +190,236 @@ struct ServiceTicketUpdateRelationRemove {
     relation_id: String,
 }
 
+#[derive(Default, Deserialize)]
+struct ServiceTicketListRequest {
+    #[serde(default)]
+    projection: Option<String>,
+    #[serde(default)]
+    statuses: Vec<String>,
+    #[serde(default)]
+    assignees: Vec<String>,
+    #[serde(default)]
+    priorities: Vec<String>,
+    #[serde(default)]
+    ticket_types: Vec<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    policy_labels: Vec<String>,
+    #[serde(default)]
+    lane: Option<String>,
+    #[serde(default)]
+    board: Option<String>,
+    #[serde(default)]
+    ready: bool,
+    #[serde(default)]
+    include_completed: bool,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+struct ServiceTicketProjectSettingsPatch {
+    default_projection: Option<loom_tickets::TicketProjectionProfile>,
+    enable_projections: Vec<loom_tickets::TicketProjectionProfile>,
+    disable_projections: Vec<loom_tickets::TicketProjectionProfile>,
+    actor_enforcement: Option<loom_tickets::TicketLifecycleAuthorizationPolicy>,
+    project_owner_principal: Option<String>,
+    clear_project_owner_principal: bool,
+    acceptance_authorities: Option<Vec<String>>,
+    acceptance_evidence_enforcement: Option<bool>,
+    required_acceptance_evidence_keys: Option<Vec<loom_tickets::TicketAcceptanceEvidenceKey>>,
+    owner_contract_summary: Option<String>,
+    owner_contract_details: Option<String>,
+    worker_contract_summary: Option<String>,
+    worker_contract_details: Option<String>,
+    expected_root: Option<String>,
+}
+
+fn parse_ticket_list_request(value: Option<&str>) -> Result<ServiceTicketListRequest, LoomError> {
+    value
+        .map(|raw| {
+            serde_json::from_str(raw).map_err(|err| {
+                LoomError::new(Code::InvalidArgument, format!("ticket list request: {err}"))
+            })
+        })
+        .transpose()
+        .map(|request| request.unwrap_or_default())
+}
+
+fn ticket_patch_array(bytes: &[u8]) -> Result<Vec<Value>, LoomError> {
+    match loom_codec::decode(bytes).map_err(|err| {
+        LoomError::new(
+            Code::InvalidArgument,
+            format!("project settings patch: {err}"),
+        )
+    })? {
+        Value::Array(items) => Ok(items),
+        _ => Err(LoomError::new(
+            Code::InvalidArgument,
+            "project settings patch must be an array",
+        )),
+    }
+}
+
+fn patch_optional_text(value: &Value, field: &str) -> Result<Option<String>, LoomError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => Ok(Some(text.clone())),
+        _ => Err(LoomError::new(
+            Code::InvalidArgument,
+            format!("project settings patch {field} must be text or null"),
+        )),
+    }
+}
+
+fn patch_required_bool(value: &Value, field: &str) -> Result<bool, LoomError> {
+    match value {
+        Value::Bool(value) => Ok(*value),
+        _ => Err(LoomError::new(
+            Code::InvalidArgument,
+            format!("project settings patch {field} must be bool"),
+        )),
+    }
+}
+
+fn patch_optional_bool(value: &Value, field: &str) -> Result<Option<bool>, LoomError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Bool(value) => Ok(Some(*value)),
+        _ => Err(LoomError::new(
+            Code::InvalidArgument,
+            format!("project settings patch {field} must be bool or null"),
+        )),
+    }
+}
+
+fn patch_text_list(value: &Value, field: &str) -> Result<Vec<String>, LoomError> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Text(text) => Ok(text.clone()),
+                _ => Err(LoomError::new(
+                    Code::InvalidArgument,
+                    format!("project settings patch {field} items must be text"),
+                )),
+            })
+            .collect(),
+        _ => Err(LoomError::new(
+            Code::InvalidArgument,
+            format!("project settings patch {field} must be an array"),
+        )),
+    }
+}
+
+fn patch_optional_text_list(value: &Value, field: &str) -> Result<Option<Vec<String>>, LoomError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Array(_) => patch_text_list(value, field).map(Some),
+        _ => Err(LoomError::new(
+            Code::InvalidArgument,
+            format!("project settings patch {field} must be an array or null"),
+        )),
+    }
+}
+
+fn parse_project_settings_patch(
+    bytes: &[u8],
+) -> Result<ServiceTicketProjectSettingsPatch, LoomError> {
+    let items = ticket_patch_array(bytes)?;
+    let [
+        default_projection,
+        enable_projections,
+        disable_projections,
+        actor_enforcement,
+        project_owner_principal,
+        clear_project_owner_principal,
+        acceptance_authorities,
+        acceptance_evidence_enforcement,
+        required_acceptance_evidence_keys,
+        owner_contract_summary,
+        owner_contract_details,
+        worker_contract_summary,
+        worker_contract_details,
+        expected_root,
+    ] = items.as_slice()
+    else {
+        return Err(LoomError::new(
+            Code::InvalidArgument,
+            "project settings patch must have 14 fields",
+        ));
+    };
+    let default_projection = patch_optional_text(default_projection, "default_projection")?
+        .as_deref()
+        .map(loom_tickets::TicketProjectionProfile::parse)
+        .transpose()?;
+    let enable_projections = patch_text_list(enable_projections, "enable_projections")?
+        .iter()
+        .map(|profile| loom_tickets::TicketProjectionProfile::parse(profile))
+        .collect::<Result<Vec<_>, _>>()?;
+    let disable_projections = patch_text_list(disable_projections, "disable_projections")?
+        .iter()
+        .map(|profile| loom_tickets::TicketProjectionProfile::parse(profile))
+        .collect::<Result<Vec<_>, _>>()?;
+    let actor_enforcement = patch_optional_text(actor_enforcement, "actor_enforcement")?
+        .as_deref()
+        .map(loom_tickets::TicketLifecycleAuthorizationPolicy::parse)
+        .transpose()?;
+    let required_acceptance_evidence_keys = match patch_optional_text_list(
+        required_acceptance_evidence_keys,
+        "required_acceptance_evidence_keys",
+    )? {
+        Some(keys) => Some(
+            keys.iter()
+                .map(|key| loom_tickets::TicketAcceptanceEvidenceKey::parse(key))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        None => None,
+    };
+    Ok(ServiceTicketProjectSettingsPatch {
+        default_projection,
+        enable_projections,
+        disable_projections,
+        actor_enforcement,
+        project_owner_principal: patch_optional_text(
+            project_owner_principal,
+            "project_owner_principal",
+        )?,
+        clear_project_owner_principal: patch_required_bool(
+            clear_project_owner_principal,
+            "clear_project_owner_principal",
+        )?,
+        acceptance_authorities: patch_optional_text_list(
+            acceptance_authorities,
+            "acceptance_authorities",
+        )?,
+        acceptance_evidence_enforcement: patch_optional_bool(
+            acceptance_evidence_enforcement,
+            "acceptance_evidence_enforcement",
+        )?,
+        required_acceptance_evidence_keys,
+        owner_contract_summary: patch_optional_text(
+            owner_contract_summary,
+            "owner_contract_summary",
+        )?,
+        owner_contract_details: patch_optional_text(
+            owner_contract_details,
+            "owner_contract_details",
+        )?,
+        worker_contract_summary: patch_optional_text(
+            worker_contract_summary,
+            "worker_contract_summary",
+        )?,
+        worker_contract_details: patch_optional_text(
+            worker_contract_details,
+            "worker_contract_details",
+        )?,
+        expected_root: patch_optional_text(expected_root, "expected_root")?,
+    })
+}
+
 fn parse_service_workspace_id(value: &str, field: &str) -> Result<WorkspaceId, LoomError> {
     WorkspaceId::parse(value)
         .map_err(|err| LoomError::new(Code::InvalidArgument, format!("{field}: {}", err.message)))
@@ -180,6 +428,133 @@ fn parse_service_workspace_id(value: &str, field: &str) -> Result<WorkspaceId, L
 fn parse_string_list_json(value: &str, field: &str) -> Result<Vec<String>, LoomError> {
     serde_json::from_str(value)
         .map_err(|err| LoomError::new(Code::InvalidArgument, format!("{field}: {err}")))
+}
+
+fn parse_json_value(value: &str, field: &str) -> Result<JsonValue, LoomError> {
+    serde_json::from_str(value)
+        .map_err(|err| LoomError::new(Code::InvalidArgument, format!("{field}: {err}")))
+}
+
+fn parse_ticket_comment_evidence_json(
+    value: &str,
+) -> Result<loom_tickets::TicketCommentEvidence, LoomError> {
+    let value = parse_json_value(value, "ticket comment evidence json")?;
+    loom_tickets::TicketCommentEvidence::from_json(&value)
+}
+
+fn parse_ticket_comment_evidence_update_json(
+    value: &str,
+) -> Result<Option<loom_tickets::TicketCommentEvidence>, LoomError> {
+    let value = parse_json_value(value, "ticket comment evidence json")?;
+    if value.is_null() {
+        Ok(None)
+    } else {
+        loom_tickets::TicketCommentEvidence::from_json(&value).map(Some)
+    }
+}
+
+#[derive(Deserialize)]
+struct ServiceBoardColumn {
+    column_id: String,
+    name: String,
+    mapped_statuses: Vec<String>,
+    wip_limit: Option<u32>,
+    hidden: bool,
+    rank: u64,
+}
+
+#[derive(Deserialize)]
+struct ServiceBoardCreateRequest {
+    board_id: String,
+    board_key: String,
+    name: String,
+    description: String,
+    project_id: String,
+    mode: String,
+    columns: Vec<ServiceBoardColumn>,
+    card_display_fields: Vec<String>,
+    updated_by: String,
+    expected_root: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ServiceBoardUpdateRequest {
+    board_key: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    board_status: Option<String>,
+    card_display_fields: Option<Vec<String>>,
+    updated_by: String,
+    expected_root: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ServiceBoardColumnConfigureRequest {
+    mode: Option<String>,
+    columns: Vec<ServiceBoardColumn>,
+    updated_by: String,
+    expected_root: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ServiceBoardCardMoveRequest {
+    ticket_id: String,
+    column_id: String,
+    rank_token: String,
+    swimlane_id: Option<String>,
+    updated_by: String,
+    expected_root: Option<String>,
+}
+
+fn parse_board_columns_json(
+    columns: Vec<ServiceBoardColumn>,
+) -> Result<Vec<loom_tickets::BoardColumn>, LoomError> {
+    columns
+        .into_iter()
+        .map(|column| {
+            loom_tickets::BoardColumn::with_display(
+                column.column_id,
+                column.name,
+                column.mapped_statuses.into_iter().collect(),
+                column.wip_limit,
+                column.hidden,
+                column.rank,
+            )
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct ServiceStructureDecomposeItem {
+    node_id: String,
+    project_id: String,
+    ticket_type: Option<String>,
+    fields: Option<JsonValue>,
+    #[serde(default)]
+    policy_labels: Vec<String>,
+}
+
+fn parse_ticket_projection_arg(
+    value: Option<&str>,
+) -> Result<Option<loom_tickets::TicketProjectionProfile>, LoomError> {
+    loom_tickets::parse_ticket_projection(value)
+}
+
+fn parse_ticket_field_cardinality_arg(
+    value: &str,
+) -> Result<loom_tickets::TicketFieldCardinality, LoomError> {
+    match value {
+        "single" => Ok(loom_tickets::TicketFieldCardinality::Single),
+        "optional" => Ok(loom_tickets::TicketFieldCardinality::Optional),
+        "list" => Ok(loom_tickets::TicketFieldCardinality::List {
+            min_items: 0,
+            max_items: None,
+        }),
+        _ => Err(LoomError::new(
+            Code::InvalidArgument,
+            "ticket field cardinality must be single, optional, or list",
+        )),
+    }
 }
 
 fn make_result_view(id: u64) -> ResultView {
@@ -2238,10 +2613,25 @@ impl Lanes for LocalLoomClient {
         workspace: String,
         lane_id: String,
         ticket_id: String,
+        placement: Option<String>,
+        anchor: Option<String>,
         updated_by: String,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
-        let out = self
-            .lanes_ticket_add(&handle, &workspace, &lane_id, &ticket_id, &updated_by)
+        let placement = loom_lanes::LaneTicketPlacement::parse(
+            placement.as_deref().unwrap_or("LAST"),
+            anchor.as_deref(),
+        );
+        let out = placement
+            .and_then(|placement| {
+                self.lanes_ticket_add(
+                    &handle,
+                    &workspace,
+                    &lane_id,
+                    &ticket_id,
+                    placement,
+                    &updated_by,
+                )
+            })
             .and_then(|lane| lane.encode());
         async move { out }
     }
@@ -2293,6 +2683,58 @@ impl Lanes for LocalLoomClient {
             .lanes_delete(&handle, &workspace, &lane_id, &updated_by)
             .and_then(|lane| lane.encode());
         async move { out }
+    }
+
+    fn closeout(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        lane_id: String,
+        ticket_workspace_id: String,
+        ticket_id: String,
+        comment_type: String,
+        comment_body: String,
+        evidence_json: Option<String>,
+        status_report: String,
+        updated_by: String,
+        expected_root: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = (|| {
+            let evidence = evidence_json
+                .as_deref()
+                .map(parse_ticket_comment_evidence_json)
+                .transpose()?;
+            self.lanes_closeout(
+                &handle,
+                &workspace,
+                LaneCloseoutInput {
+                    lane_id: &lane_id,
+                    ticket_workspace_id: &ticket_workspace_id,
+                    ticket_id: &ticket_id,
+                    comment_type: &comment_type,
+                    comment_body: &comment_body,
+                    evidence,
+                    status_report: &status_report,
+                    updated_by: &updated_by,
+                    expected_root: expected_root.as_deref(),
+                },
+            )
+        })()
+        .and_then(|lane| lane.encode());
+        async move { out }
+    }
+
+    async fn cleanup_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        lane_id: Option<String>,
+        apply: bool,
+        updated_by: String,
+    ) -> Result<String, LoomError> {
+        let reports =
+            self.lanes_cleanup(&handle, &workspace, lane_id.as_deref(), apply, &updated_by)?;
+        json_string(&reports)
     }
 }
 
@@ -5120,71 +5562,169 @@ impl Drive for LocalLoomClient {
 impl Tickets for LocalLoomClient {
     async fn tickets_project_create_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _project_id: String,
-        _key_prefix: String,
-        _name: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        project_id: String,
+        key_prefix: String,
+        name: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Tickets.tickets_project_create_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let project = loom_tickets::create_project(
+                loom,
+                ns,
+                &ticket_workspace_id,
+                &project_id,
+                &key_prefix,
+                &name,
+                expected_root.as_deref(),
+            )?;
+            let result = json_string(&project)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn tickets_project_rekey_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _project_id: String,
-        _key_prefix: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        project_id: String,
+        key_prefix: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Tickets.tickets_project_rekey_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let project = loom_tickets::rekey_project(
+                loom,
+                ns,
+                &ticket_workspace_id,
+                &project_id,
+                &key_prefix,
+                expected_root.as_deref(),
+            )?;
+            let result = json_string(&project)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
+    }
+
+    async fn tickets_projects_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+    ) -> Result<String, LoomError> {
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let projects = loom_tickets::list_projects(loom, ns, &ticket_workspace_id)?;
+            let summaries = projects
+                .iter()
+                .map(|project| {
+                    loom_tickets::get_project_with_contract_details(
+                        loom,
+                        ns,
+                        &ticket_workspace_id,
+                        &project.project_id,
+                        false,
+                    )?
+                    .ok_or_else(|| LoomError::not_found("ticket project not found"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            json_string(&summaries)
+        })
     }
 
     async fn tickets_project_settings_get_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _project_id: String,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        project_id: String,
+        include_contracts: bool,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Tickets.tickets_project_settings_get_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let project = loom_tickets::get_project_with_contract_details(
+                loom,
+                ns,
+                &ticket_workspace_id,
+                &project_id,
+                include_contracts,
+            )?
+            .ok_or_else(|| LoomError::not_found("ticket project not found"))?;
+            json_string(&project)
+        })
     }
 
     async fn tickets_fields_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _project_id: Option<String>,
-        _projection: Option<String>,
-        _operation: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        project_id: Option<String>,
+        projection: Option<String>,
+        operation: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.tickets_fields_json"))
+        let projection = parse_ticket_projection_arg(projection.as_deref())?;
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let catalog = match project_id.as_deref() {
+                Some(project_id) => loom_tickets::ticket_field_catalog_for_project(
+                    loom,
+                    ns,
+                    &ticket_workspace_id,
+                    project_id,
+                    projection,
+                    operation.as_deref(),
+                )?,
+                None => loom_tickets::ticket_field_catalog(projection, operation.as_deref())?,
+            };
+            json_string(&catalog)
+        })
     }
 
     async fn tickets_create_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _project_id: String,
-        _ticket_type: String,
-        _external_source: Option<String>,
-        _external_id: Option<String>,
-        _fields_json: String,
-        _policy_labels_json: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        project_id: String,
+        ticket_type: String,
+        external_source: Option<String>,
+        external_id: Option<String>,
+        fields_json: String,
+        policy_labels_json: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.tickets_create_json"))
+        let fields = parse_json_value(&fields_json, "ticket fields json")?;
+        let policy_labels =
+            parse_string_list_json(&policy_labels_json, "ticket policy labels json")?;
+        let changes = ticket_field_value_changes(&fields);
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let ticket = loom_tickets::create_ticket(
+                loom,
+                ns,
+                loom_tickets::TicketCreateRequest {
+                    workspace_id: &ticket_workspace_id,
+                    project_id: &project_id,
+                    ticket_type: &ticket_type,
+                    external_source: external_source.as_deref(),
+                    external_id: external_id.as_deref(),
+                    fields: &fields,
+                    policy_labels: &policy_labels,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result =
+                ticket_mutation_json(ticket, "ticket.created", expected_root.as_deref(), changes)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn tickets_update_json(
@@ -5203,6 +5743,7 @@ impl Tickets for LocalLoomClient {
         comment_id: Option<String>,
         comment_type: Option<String>,
         comment_body: Option<String>,
+        comment_evidence_json: Option<String>,
         expected_root: Option<String>,
         comments_json: Option<String>,
         relation_sets_json: Option<String>,
@@ -5228,6 +5769,10 @@ impl Tickets for LocalLoomClient {
             parse_string_list_json(&delete_fields_json, "ticket delete fields json")?;
         let action_applied = action.is_some();
         let action = parse_ticket_lifecycle_action(action.as_deref())?;
+        let comment_evidence = comment_evidence_json
+            .as_deref()
+            .map(parse_ticket_comment_evidence_json)
+            .transpose()?;
         let comments_input = parse_optional_json_list::<ServiceTicketUpdateComment>(
             comments_json.as_deref(),
             "ticket comments json",
@@ -5281,17 +5826,24 @@ impl Tickets for LocalLoomClient {
                     comment_id: comment_id.as_deref(),
                     comment_type: comment_type.as_deref(),
                     body,
-                    evidence: None,
+                    evidence: comment_evidence,
                 });
         let comments = comments_input
             .iter()
-            .map(|comment| loom_tickets::TicketUpdateCommentRequest {
-                comment_id: comment.comment_id.as_deref(),
-                comment_type: comment.comment_type.as_deref(),
-                body: &comment.body,
-                evidence: None,
+            .map(|comment| {
+                comment
+                    .evidence
+                    .as_ref()
+                    .map(loom_tickets::TicketCommentEvidence::from_json)
+                    .transpose()
+                    .map(|evidence| loom_tickets::TicketUpdateCommentRequest {
+                        comment_id: comment.comment_id.as_deref(),
+                        comment_type: comment.comment_type.as_deref(),
+                        body: &comment.body,
+                        evidence,
+                    })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let relation_sets = relation_sets_input
             .iter()
             .zip(relation_kinds.iter())
@@ -5340,13 +5892,32 @@ impl Tickets for LocalLoomClient {
 
     async fn tickets_delete_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _ticket_id: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        ticket_id: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.tickets_delete_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let ticket = loom_tickets::delete_ticket(
+                loom,
+                ns,
+                loom_tickets::TicketDeleteRequest {
+                    workspace_id: &ticket_workspace_id,
+                    ticket_id: &ticket_id,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = ticket_mutation_json(
+                ticket,
+                "ticket.deleted",
+                expected_root.as_deref(),
+                vec![MutationChange::ResourceDeleted],
+            )?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn tickets_comments_json(
@@ -5373,8 +5944,13 @@ impl Tickets for LocalLoomClient {
         comment_id: Option<String>,
         comment_type: Option<String>,
         body: String,
+        evidence_json: Option<String>,
         expected_root: Option<String>,
     ) -> Result<String, LoomError> {
+        let evidence = evidence_json
+            .as_deref()
+            .map(parse_ticket_comment_evidence_json)
+            .transpose()?;
         let mut changes = vec![MutationChange::field_set(
             "comment_type",
             comment_type
@@ -5395,7 +5971,7 @@ impl Tickets for LocalLoomClient {
                     comment_id: comment_id.as_deref(),
                     comment_type: comment_type.as_deref(),
                     body: &body,
-                    evidence: None,
+                    evidence,
                     expected_root: expected_root.as_deref(),
                 },
             )?;
@@ -5419,8 +5995,13 @@ impl Tickets for LocalLoomClient {
         comment_id: String,
         comment_type: Option<String>,
         body: Option<String>,
+        evidence_json: Option<String>,
         expected_root: Option<String>,
     ) -> Result<String, LoomError> {
+        let evidence = evidence_json
+            .as_deref()
+            .map(parse_ticket_comment_evidence_update_json)
+            .transpose()?;
         let mut changes = vec![MutationChange::field_set("comment_id", &comment_id)];
         if let Some(comment_type) = comment_type.as_deref() {
             changes.push(MutationChange::field_set("comment_type", comment_type));
@@ -5439,7 +6020,7 @@ impl Tickets for LocalLoomClient {
                     comment_id: &comment_id,
                     comment_type: comment_type.as_deref(),
                     body: body.as_deref(),
-                    evidence: None,
+                    evidence,
                     expected_root: expected_root.as_deref(),
                 },
             )?;
@@ -5491,256 +6072,617 @@ impl Tickets for LocalLoomClient {
 
     async fn tickets_relation_set_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _ticket_id: String,
-        _relation_id: Option<String>,
-        _kind: String,
-        _target_id: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        ticket_id: String,
+        relation_id: Option<String>,
+        kind: String,
+        target_id: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Tickets.tickets_relation_set_json",
-        ))
+        let kind = loom_tickets::TicketRelationKind::parse(&kind)?;
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let relation = loom_tickets::add_ticket_relation(
+                loom,
+                ns,
+                loom_tickets::TicketRelationRequest {
+                    workspace_id: &ticket_workspace_id,
+                    ticket_id: &ticket_id,
+                    relation_id: relation_id.as_deref(),
+                    kind,
+                    target_id: &target_id,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = relation_mutation_json(
+                relation.clone(),
+                "ticket.relation_set",
+                expected_root.as_deref(),
+                vec![MutationChange::relation_set(
+                    relation.relation_id,
+                    relation.kind,
+                    relation.target_id,
+                )],
+            )?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn tickets_relation_remove_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _ticket_id: String,
-        _relation_id: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        ticket_id: String,
+        relation_id: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Tickets.tickets_relation_remove_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let relation = loom_tickets::remove_ticket_relation(
+                loom,
+                ns,
+                loom_tickets::TicketRelationRemoveRequest {
+                    workspace_id: &ticket_workspace_id,
+                    ticket_id: &ticket_id,
+                    relation_id: &relation_id,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = relation_mutation_json(
+                relation.clone(),
+                "ticket.relation_removed",
+                expected_root.as_deref(),
+                vec![MutationChange::relation_removed(
+                    relation.relation_id,
+                    relation.kind,
+                    relation.target_id,
+                )],
+            )?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn tickets_relation_list_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _ticket_id: String,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        ticket_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Tickets.tickets_relation_list_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let relations =
+                loom_tickets::list_ticket_relations(loom, ns, &ticket_workspace_id, &ticket_id)?;
+            json_string(&relations)
+        })
     }
 
     async fn tickets_get_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _ticket_id: String,
-        _projection: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        ticket_id: String,
+        projection: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.tickets_get_json"))
+        let projection = parse_ticket_projection_arg(projection.as_deref())?;
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let ticket = loom_tickets::get_ticket_with_projection(
+                loom,
+                ns,
+                &ticket_workspace_id,
+                &ticket_id,
+                projection,
+            )?;
+            json_string(&ticket)
+        })
     }
 
     async fn tickets_list_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _projection: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        request: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.tickets_list_json"))
+        let request = parse_ticket_list_request(request.as_deref())?;
+        let projection = parse_ticket_projection_arg(request.projection.as_deref())?;
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let lane_member_ids = match request.lane.as_deref() {
+                Some(lane_id) => {
+                    let lane = loom_lanes::get_lane(loom, ns, lane_id)?.ok_or_else(|| {
+                        LoomError::not_found(format!("lane {lane_id:?} not found"))
+                    })?;
+                    Some(
+                        lane.lane_tickets
+                            .iter()
+                            .map(|ticket| ticket.ticket_id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                None => None,
+            };
+            let query = loom_tickets::TicketListQuery {
+                projection,
+                statuses: request.statuses,
+                assignees: request.assignees,
+                priorities: request.priorities,
+                ticket_types: request.ticket_types,
+                labels: request.labels,
+                policy_labels: request.policy_labels,
+                ready_only: request.ready,
+                include_completed: request.include_completed,
+                lane_member_ids,
+                board_id: request.board,
+                cursor: request.cursor,
+                limit: request.limit,
+            };
+            let page = loom_tickets::list_tickets_page(loom, ns, &ticket_workspace_id, &query)?;
+            json_string(&page)
+        })
     }
 
     async fn tickets_history_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _ticket_id: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        ticket_id: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.tickets_history_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let history =
+                loom_tickets::history(loom, ns, &ticket_workspace_id, ticket_id.as_deref())?;
+            json_string(&history)
+        })
     }
 
     async fn boards_create_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _request_json: String,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        request_json: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.boards_create_json"))
+        let request: ServiceBoardCreateRequest =
+            serde_json::from_str(&request_json).map_err(|err| {
+                LoomError::new(
+                    Code::InvalidArgument,
+                    format!("board create request json: {err}"),
+                )
+            })?;
+        let columns = parse_board_columns_json(request.columns)?;
+        let mode = loom_tickets::BoardMode::parse(&request.mode)?;
+        let scope = if mode == loom_tickets::BoardMode::Manual {
+            loom_tickets::BoardScope::ManualSet
+        } else {
+            loom_tickets::BoardScope::project(request.project_id.clone())
+        };
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let board = loom_tickets::create_board(
+                loom,
+                ns,
+                loom_tickets::BoardCreateRequest {
+                    workspace_id: &ticket_workspace_id,
+                    board_id: &request.board_id,
+                    board_key: &request.board_key,
+                    name: &request.name,
+                    description: &request.description,
+                    project_id: &request.project_id,
+                    scope,
+                    mode,
+                    columns: &columns,
+                    swimlanes: &[],
+                    card_display_fields: &request.card_display_fields,
+                    owner_principal: None,
+                    coordinator_principal: None,
+                    updated_by: &request.updated_by,
+                    expected_root: request.expected_root.as_deref(),
+                },
+            )?;
+            save_loom(loom)?;
+            json_string(&board)
+        })
     }
 
     async fn boards_get_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _board_id: String,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        board_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.boards_get_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let board = loom_tickets::get_board(loom, ns, &ticket_workspace_id, &board_id)?
+                .ok_or_else(|| LoomError::not_found("board not found"))?;
+            json_string(&board)
+        })
     }
 
     async fn boards_list_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _include_deleted: bool,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        include_deleted: bool,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.boards_list_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let boards =
+                loom_tickets::list_boards(loom, ns, &ticket_workspace_id, include_deleted)?;
+            json_string(&boards)
+        })
     }
 
     async fn boards_update_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _board_id: String,
-        _request_json: String,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        board_id: String,
+        request_json: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.boards_update_json"))
+        let request: ServiceBoardUpdateRequest =
+            serde_json::from_str(&request_json).map_err(|err| {
+                LoomError::new(
+                    Code::InvalidArgument,
+                    format!("board update request json: {err}"),
+                )
+            })?;
+        let board_status = request
+            .board_status
+            .as_deref()
+            .map(loom_tickets::BoardStatus::parse)
+            .transpose()?;
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let board = loom_tickets::update_board(
+                loom,
+                ns,
+                loom_tickets::BoardUpdateRequest {
+                    workspace_id: &ticket_workspace_id,
+                    board_id: &board_id,
+                    board_key: request.board_key.as_deref(),
+                    name: request.name.as_deref(),
+                    description: request.description.as_deref(),
+                    scope: None,
+                    owner_principal: None,
+                    coordinator_principal: None,
+                    card_display_fields: request.card_display_fields.as_deref(),
+                    board_status,
+                    updated_by: &request.updated_by,
+                    expected_root: request.expected_root.as_deref(),
+                },
+            )?;
+            save_loom(loom)?;
+            json_string(&board)
+        })
     }
 
     async fn boards_delete_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _board_id: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        board_id: String,
+        updated_by: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.boards_delete_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let board = loom_tickets::update_board(
+                loom,
+                ns,
+                loom_tickets::BoardUpdateRequest {
+                    workspace_id: &ticket_workspace_id,
+                    board_id: &board_id,
+                    board_key: None,
+                    name: None,
+                    description: None,
+                    scope: None,
+                    owner_principal: None,
+                    coordinator_principal: None,
+                    card_display_fields: None,
+                    board_status: Some(loom_tickets::BoardStatus::Deleted),
+                    updated_by: &updated_by,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            save_loom(loom)?;
+            json_string(&board)
+        })
     }
 
     async fn boards_configure_columns_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _board_id: String,
-        _request_json: String,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        board_id: String,
+        request_json: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Tickets.boards_configure_columns_json",
-        ))
+        let request: ServiceBoardColumnConfigureRequest = serde_json::from_str(&request_json)
+            .map_err(|err| {
+                LoomError::new(
+                    Code::InvalidArgument,
+                    format!("board column configure request json: {err}"),
+                )
+            })?;
+        let columns = parse_board_columns_json(request.columns)?;
+        let mode = request
+            .mode
+            .as_deref()
+            .map(loom_tickets::BoardMode::parse)
+            .transpose()?;
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let board = loom_tickets::configure_board_columns(
+                loom,
+                ns,
+                loom_tickets::BoardColumnConfigureRequest {
+                    workspace_id: &ticket_workspace_id,
+                    board_id: &board_id,
+                    mode,
+                    columns: &columns,
+                    swimlanes: &[],
+                    updated_by: &request.updated_by,
+                    expected_root: request.expected_root.as_deref(),
+                },
+            )?;
+            save_loom(loom)?;
+            json_string(&board)
+        })
     }
 
     async fn boards_move_card_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _board_id: String,
-        _request_json: String,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        board_id: String,
+        request_json: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.boards_move_card_json"))
+        let request: ServiceBoardCardMoveRequest =
+            serde_json::from_str(&request_json).map_err(|err| {
+                LoomError::new(
+                    Code::InvalidArgument,
+                    format!("board move request json: {err}"),
+                )
+            })?;
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let board = loom_tickets::move_board_card(
+                loom,
+                ns,
+                loom_tickets::BoardCardMoveRequest {
+                    workspace_id: &ticket_workspace_id,
+                    board_id: &board_id,
+                    ticket_id: &request.ticket_id,
+                    column_id: &request.column_id,
+                    rank_token: &request.rank_token,
+                    swimlane_id: request.swimlane_id.as_deref(),
+                    updated_by: &request.updated_by,
+                    expected_root: request.expected_root.as_deref(),
+                },
+            )?;
+            save_loom(loom)?;
+            json_string(&board)
+        })
     }
 
     async fn tickets_project_settings_set_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _project_id: String,
-        _default_projection: Option<String>,
-        _enable_projections_json: String,
-        _disable_projections_json: String,
-        _actor_enforcement: Option<String>,
-        _project_owner_principal: Option<String>,
-        _clear_project_owner_principal: bool,
-        _acceptance_authorities_json: Option<String>,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        project_id: String,
+        patch: Vec<u8>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Tickets.tickets_project_settings_set_json",
-        ))
+        let patch = parse_project_settings_patch(&patch)?;
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let project = loom_tickets::set_project_settings(
+                loom,
+                ns,
+                loom_tickets::TicketProjectSettingsRequest {
+                    workspace_id: &ticket_workspace_id,
+                    project_id: &project_id,
+                    default_projection: patch.default_projection,
+                    enable_projections: &patch.enable_projections,
+                    disable_projections: &patch.disable_projections,
+                    actor_enforcement: patch.actor_enforcement,
+                    project_owner_principal: patch.project_owner_principal.as_deref(),
+                    clear_project_owner_principal: patch.clear_project_owner_principal,
+                    acceptance_authorities: patch.acceptance_authorities.as_deref(),
+                    acceptance_evidence_enforcement: patch.acceptance_evidence_enforcement,
+                    required_acceptance_evidence_keys: patch
+                        .required_acceptance_evidence_keys
+                        .as_deref(),
+                    owner_contract_summary: patch.owner_contract_summary.as_deref(),
+                    owner_contract_details: patch.owner_contract_details.as_deref(),
+                    worker_contract_summary: patch.worker_contract_summary.as_deref(),
+                    worker_contract_details: patch.worker_contract_details.as_deref(),
+                    expected_root: patch.expected_root.as_deref(),
+                },
+            )?;
+            let result = json_string(&project)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn tickets_field_put_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _project_id: String,
-        _field_id: String,
-        _key: String,
-        _name: String,
-        _description: Option<String>,
-        _field_type: String,
-        _option_set: Option<String>,
-        _max_length: u32,
-        _has_max_length: bool,
-        _required: bool,
-        _searchable: bool,
-        _orderable: bool,
-        _cardinality: String,
-        _applicable_type_ids_json: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        project_id: String,
+        field_id: String,
+        key: String,
+        name: String,
+        description: Option<String>,
+        field_type: String,
+        option_set: Option<String>,
+        max_length: u32,
+        has_max_length: bool,
+        required: bool,
+        searchable: bool,
+        orderable: bool,
+        cardinality: String,
+        applicable_type_ids_json: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Tickets.tickets_field_put_json"))
+        let cardinality = parse_ticket_field_cardinality_arg(&cardinality)?;
+        let applicable_type_ids =
+            parse_string_list_json(&applicable_type_ids_json, "applicable_type_ids_json")?;
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let catalog = loom_tickets::put_ticket_field_definition(
+                loom,
+                ns,
+                loom_tickets::TicketFieldDefinitionWriteRequest {
+                    workspace_id: &ticket_workspace_id,
+                    project_id: &project_id,
+                    field_id: &field_id,
+                    key: &key,
+                    name: &name,
+                    description: description.as_deref(),
+                    field_type: &field_type,
+                    option_set: option_set.as_deref(),
+                    max_length: has_max_length.then_some(max_length),
+                    required,
+                    searchable,
+                    orderable,
+                    cardinality,
+                    applicable_type_ids: &applicable_type_ids,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = json_string(&catalog)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn tickets_field_retire_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _ticket_workspace_id: String,
-        _project_id: String,
-        _field_id: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+        project_id: String,
+        field_id: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Tickets.tickets_field_retire_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let catalog = loom_tickets::retire_ticket_field_definition(
+                loom,
+                ns,
+                loom_tickets::TicketFieldDefinitionRetireRequest {
+                    workspace_id: &ticket_workspace_id,
+                    project_id: &project_id,
+                    field_id: &field_id,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = json_string(&catalog)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 }
 
 impl Pages for LocalLoomClient {
     async fn spaces_create_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _space_id: String,
-        _title: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        space_id: String,
+        title: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.spaces_create_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let summary = loom_pages::create_space(
+                loom,
+                ns,
+                &page_workspace_id,
+                &space_id,
+                &title,
+                expected_root.as_deref(),
+            )?;
+            let result = json_string(&summary)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn spaces_list_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.spaces_list_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let spaces = loom_pages::list_spaces(loom, ns, &page_workspace_id)?;
+            json_string(&spaces)
+        })
     }
 
     async fn spaces_get_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _space_id: String,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        space_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.spaces_get_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let space = loom_pages::get_space(loom, ns, &page_workspace_id, &space_id)?;
+            json_string(&space)
+        })
     }
 
     async fn pages_create_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _page_id: String,
-        _space_id: String,
-        _parent_page_id: Option<String>,
-        _title: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        page_id: String,
+        space_id: String,
+        parent_page_id: Option<String>,
+        title: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.pages_create_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let summary = loom_pages::create_page(
+                loom,
+                ns,
+                loom_pages::PageCreateRequest {
+                    workspace_id: &page_workspace_id,
+                    page_id: &page_id,
+                    space_id: &space_id,
+                    parent_page_id: parent_page_id.as_deref(),
+                    title: &title,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = json_string(&summary)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn pages_update_json(
@@ -5763,175 +6705,341 @@ impl Pages for LocalLoomClient {
                 now_ms(),
                 expected_root.as_deref(),
             )?;
-            json_string(&summary)
+            let result = json_string(&summary)?;
+            save_loom(loom)?;
+            Ok(result)
         })
     }
 
     async fn pages_publish_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _page_id: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        page_id: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.pages_publish_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let publish = loom_pages::publish_page(
+                loom,
+                ns,
+                &page_workspace_id,
+                &page_id,
+                now_ms(),
+                expected_root.as_deref(),
+            )?;
+            let result = json_string(&publish)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn pages_get_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _page_id: String,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        page_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.pages_get_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let page = loom_pages::get_page(loom, ns, &page_workspace_id, &page_id)?;
+            json_string(&page)
+        })
     }
 
     async fn pages_list_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.pages_list_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let pages = loom_pages::list_pages(loom, ns, &page_workspace_id)?;
+            json_string(&pages)
+        })
     }
 
     async fn pages_history_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _page_id: String,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        page_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.pages_history_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let history = loom_pages::page_history(loom, ns, &page_workspace_id, &page_id)?;
+            json_string(&history)
+        })
     }
 
     async fn structures_create_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _structure_id: String,
-        _space_id: String,
-        _kind: String,
-        _title: String,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        structure_id: String,
+        space_id: String,
+        kind: String,
+        title: String,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.structures_create_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let render = loom_pages::create_structure(
+                loom,
+                ns,
+                loom_pages::StructureCreateRequest {
+                    workspace_id: &page_workspace_id,
+                    structure_id: &structure_id,
+                    space_id: &space_id,
+                    kind: &kind,
+                    title: &title,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = json_string(&render)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn structures_add_node_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _structure_id: String,
-        _node_id: String,
-        _kind: String,
-        _label: String,
-        _body_digest: Option<String>,
-        _entity_ref: Option<String>,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        structure_id: String,
+        node_id: String,
+        kind: String,
+        label: String,
+        body_digest: Option<String>,
+        entity_ref: Option<String>,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.structures_add_node_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let node = loom_pages::add_structure_node(
+                loom,
+                ns,
+                loom_pages::StructureNodeRequest {
+                    workspace_id: &page_workspace_id,
+                    structure_id: &structure_id,
+                    node_id: &node_id,
+                    kind: &kind,
+                    label: &label,
+                    body_digest: body_digest.as_deref(),
+                    entity_ref,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = json_string(&node)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn structures_update_node_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _structure_id: String,
-        _node_id: String,
-        _kind: String,
-        _label: String,
-        _body_digest: Option<String>,
-        _entity_ref: Option<String>,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        structure_id: String,
+        node_id: String,
+        kind: String,
+        label: String,
+        body_digest: Option<String>,
+        entity_ref: Option<String>,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Pages.structures_update_node_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let node = loom_pages::update_structure_node(
+                loom,
+                ns,
+                loom_pages::StructureNodeRequest {
+                    workspace_id: &page_workspace_id,
+                    structure_id: &structure_id,
+                    node_id: &node_id,
+                    kind: &kind,
+                    label: &label,
+                    body_digest: body_digest.as_deref(),
+                    entity_ref,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = json_string(&node)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn structures_bind_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _structure_id: String,
-        _node_id: String,
-        _entity_ref: Option<String>,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        structure_id: String,
+        node_id: String,
+        entity_ref: Option<String>,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.structures_bind_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let node = loom_pages::bind_structure_node(
+                loom,
+                ns,
+                loom_pages::StructureBindRequest {
+                    workspace_id: &page_workspace_id,
+                    structure_id: &structure_id,
+                    node_id: &node_id,
+                    entity_ref,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = json_string(&node)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn structures_move_node_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _structure_id: String,
-        _node_id: String,
-        _parent_node_id: Option<String>,
-        _label: Option<String>,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        structure_id: String,
+        node_id: String,
+        parent_node_id: Option<String>,
+        label: Option<String>,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Pages.structures_move_node_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let moved = loom_pages::move_structure_node(
+                loom,
+                ns,
+                loom_pages::StructureMoveRequest {
+                    workspace_id: &page_workspace_id,
+                    structure_id: &structure_id,
+                    node_id: &node_id,
+                    parent_node_id: parent_node_id.as_deref(),
+                    label: label.as_deref(),
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = json_string(&moved)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn structures_link_node_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _structure_id: String,
-        _edge_id: String,
-        _src_node_id: String,
-        _dst_node_id: String,
-        _label: String,
-        _target_ref: Option<String>,
-        _expected_root: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        structure_id: String,
+        edge_id: String,
+        src_node_id: String,
+        dst_node_id: String,
+        label: String,
+        target_ref: Option<String>,
+        expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Pages.structures_link_node_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let edge = loom_pages::link_structure_node(
+                loom,
+                ns,
+                loom_pages::StructureLinkRequest {
+                    workspace_id: &page_workspace_id,
+                    structure_id: &structure_id,
+                    edge_id: &edge_id,
+                    src_node_id: &src_node_id,
+                    dst_node_id: &dst_node_id,
+                    label: &label,
+                    target_ref,
+                    expected_root: expected_root.as_deref(),
+                },
+            )?;
+            let result = json_string(&edge)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn structures_decompose_to_tickets_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _structure_id: String,
-        _items_json: String,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        structure_id: String,
+        items_json: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Pages.structures_decompose_to_tickets_json",
-        ))
+        let items: Vec<ServiceStructureDecomposeItem> =
+            serde_json::from_str(&items_json).map_err(|err| {
+                LoomError::new(
+                    Code::InvalidArgument,
+                    format!("structure decompose items json: {err}"),
+                )
+            })?;
+        let request_items = items
+            .iter()
+            .map(|item| loom_pages::StructureDecomposeItem {
+                node_id: item.node_id.as_str(),
+                project_id: item.project_id.as_str(),
+                ticket_type: item.ticket_type.as_deref(),
+                fields: item.fields.as_ref(),
+                policy_labels: &item.policy_labels,
+            })
+            .collect::<Vec<_>>();
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let summary = loom_pages::decompose_to_tickets(
+                loom,
+                ns,
+                loom_pages::StructureDecomposeRequest {
+                    workspace_id: &page_workspace_id,
+                    structure_id: &structure_id,
+                    items: &request_items,
+                },
+            )?;
+            let result = json_string(&summary)?;
+            save_loom(loom)?;
+            Ok(result)
+        })
     }
 
     async fn structures_get_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
-        _structure_id: String,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
+        structure_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.structures_get_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let render = loom_pages::get_structure(loom, ns, &page_workspace_id, &structure_id)?
+                .ok_or_else(|| LoomError::not_found("structure not found"))?;
+            json_string(&render)
+        })
     }
 
     async fn structures_list_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _page_workspace_id: String,
+        handle: LoomSession,
+        workspace: String,
+        page_workspace_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Pages.structures_list_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let structures = loom_pages::list_structures(loom, ns, &page_workspace_id)?;
+            json_string(&structures)
+        })
     }
 }
 
@@ -6370,6 +7478,56 @@ mod tests {
         (client, session, workspace, dir)
     }
 
+    fn settings_patch_cbor(
+        default_projection: Option<&str>,
+        actor_enforcement: Option<&str>,
+        acceptance_authorities: Option<Vec<&str>>,
+        acceptance_evidence_enforcement: Option<bool>,
+        required_acceptance_evidence_keys: Option<Vec<&str>>,
+        owner_contract_summary: Option<&str>,
+        owner_contract_details: Option<&str>,
+        worker_contract_summary: Option<&str>,
+        worker_contract_details: Option<&str>,
+        expected_root: Option<&str>,
+    ) -> Vec<u8> {
+        let opt_text = |value: Option<&str>| {
+            value
+                .map(|value| Value::Text(value.to_string()))
+                .unwrap_or(Value::Null)
+        };
+        let opt_text_list = |values: Option<Vec<&str>>| {
+            values
+                .map(|values| {
+                    Value::Array(
+                        values
+                            .into_iter()
+                            .map(|value| Value::Text(value.to_string()))
+                            .collect(),
+                    )
+                })
+                .unwrap_or(Value::Null)
+        };
+        loom_codec::encode(&Value::Array(vec![
+            opt_text(default_projection),
+            Value::Array(Vec::new()),
+            Value::Array(Vec::new()),
+            opt_text(actor_enforcement),
+            Value::Null,
+            Value::Bool(false),
+            opt_text_list(acceptance_authorities),
+            acceptance_evidence_enforcement
+                .map(Value::Bool)
+                .unwrap_or(Value::Null),
+            opt_text_list(required_acceptance_evidence_keys),
+            opt_text(owner_contract_summary),
+            opt_text(owner_contract_details),
+            opt_text(worker_contract_summary),
+            opt_text(worker_contract_details),
+            opt_text(expected_root),
+        ]))
+        .expect("settings patch cbor")
+    }
+
     #[test]
     fn pages_update_json_uses_string_body_text() {
         let (client, session, workspace, dir) = seed_client("pages-json");
@@ -6421,6 +7579,699 @@ mod tests {
     }
 
     #[test]
+    fn pages_create_get_and_list_json_roundtrip_locally() {
+        let (client, session, _workspace, dir) = seed_client("pages-create-json");
+        let space = block(<LocalLoomClient as Pages>::spaces_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "eng".to_string(),
+            "Eng".to_string(),
+            None,
+        ))
+        .expect("create space");
+        let space: serde_json::Value = serde_json::from_str(&space).expect("space json");
+        let space_root = space["profile_root"].as_str().expect("space root");
+
+        let page = block(<LocalLoomClient as Pages>::pages_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "page-1".to_string(),
+            "eng".to_string(),
+            None,
+            "Roadmap".to_string(),
+            Some(space_root.to_string()),
+        ))
+        .expect("create page");
+        let page: serde_json::Value = serde_json::from_str(&page).expect("page json");
+        assert_eq!(page["page_id"], "page-1");
+        assert_eq!(page["title"], "Roadmap");
+
+        let get = block(<LocalLoomClient as Pages>::pages_get_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "page-1".to_string(),
+        ))
+        .expect("get page");
+        let get: serde_json::Value = serde_json::from_str(&get).expect("get json");
+        assert_eq!(get["page_id"], "page-1");
+
+        let list = block(<LocalLoomClient as Pages>::pages_list_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+        ))
+        .expect("list pages");
+        let list: serde_json::Value = serde_json::from_str(&list).expect("list json");
+        assert_eq!(list.as_array().expect("pages").len(), 1);
+
+        let stale = block(<LocalLoomClient as Pages>::pages_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "page-2".to_string(),
+            "eng".to_string(),
+            None,
+            "Stale".to_string(),
+            Some(space_root.to_string()),
+        ))
+        .expect_err("stale page root rejected");
+        assert_eq!(stale.code, Code::Conflict);
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pages_publish_history_and_structures_json_roundtrip_locally() {
+        let (client, session, workspace, dir) = seed_client("pages-structures-json");
+        let workspace_id = workspace.to_string();
+        let space = block(<LocalLoomClient as Pages>::spaces_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "eng".to_string(),
+            "Eng".to_string(),
+            None,
+        ))
+        .expect("create space");
+        let space: serde_json::Value = serde_json::from_str(&space).expect("space json");
+        let page = block(<LocalLoomClient as Pages>::pages_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "page-1".to_string(),
+            "eng".to_string(),
+            None,
+            "Roadmap".to_string(),
+            space["profile_root"].as_str().map(str::to_string),
+        ))
+        .expect("create page");
+        let page: serde_json::Value = serde_json::from_str(&page).expect("page json");
+        let update = block(<LocalLoomClient as Pages>::pages_update_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "page-1".to_string(),
+            "Plan".to_string(),
+            page["profile_root"].as_str().map(str::to_string),
+        ))
+        .expect("update page");
+        let update: serde_json::Value = serde_json::from_str(&update).expect("update json");
+        let publish = block(<LocalLoomClient as Pages>::pages_publish_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "page-1".to_string(),
+            update["profile_root"].as_str().map(str::to_string),
+        ))
+        .expect("publish page");
+        let publish: serde_json::Value = serde_json::from_str(&publish).expect("publish json");
+        assert_eq!(publish["page_id"], "page-1");
+        assert_eq!(publish["outcome"], "published");
+
+        let history = block(<LocalLoomClient as Pages>::pages_history_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "page-1".to_string(),
+        ))
+        .expect("page history");
+        let history: serde_json::Value = serde_json::from_str(&history).expect("history json");
+        assert!(!history.as_array().expect("history").is_empty());
+
+        let structure = block(<LocalLoomClient as Pages>::structures_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "roadmap".to_string(),
+            "eng".to_string(),
+            "outline".to_string(),
+            "Roadmap".to_string(),
+            None,
+        ))
+        .expect("create structure");
+        let structure: serde_json::Value =
+            serde_json::from_str(&structure).expect("structure json");
+        assert_eq!(structure["structure"]["structure_id"], "roadmap");
+
+        let root = block(<LocalLoomClient as Pages>::structures_add_node_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "roadmap".to_string(),
+            "root".to_string(),
+            "section".to_string(),
+            "Root".to_string(),
+            None,
+            None,
+            None,
+        ))
+        .expect("add root node");
+        let root: serde_json::Value = serde_json::from_str(&root).expect("root node json");
+        assert_eq!(root["node_id"], "root");
+
+        let child = block(<LocalLoomClient as Pages>::structures_add_node_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "roadmap".to_string(),
+            "child".to_string(),
+            "section".to_string(),
+            "Child".to_string(),
+            None,
+            None,
+            None,
+        ))
+        .expect("add child node");
+        let child: serde_json::Value = serde_json::from_str(&child).expect("child node json");
+        assert_eq!(child["node_id"], "child");
+
+        let updated = block(<LocalLoomClient as Pages>::structures_update_node_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "roadmap".to_string(),
+            "child".to_string(),
+            "milestone".to_string(),
+            "Milestone".to_string(),
+            None,
+            Some("page:page-1".to_string()),
+            None,
+        ))
+        .expect("update child node");
+        let updated: serde_json::Value = serde_json::from_str(&updated).expect("updated node json");
+        assert_eq!(updated["kind"], "milestone");
+
+        let moved = block(<LocalLoomClient as Pages>::structures_move_node_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "roadmap".to_string(),
+            "child".to_string(),
+            Some("root".to_string()),
+            None,
+            None,
+        ))
+        .expect("move child node");
+        let moved: serde_json::Value = serde_json::from_str(&moved).expect("moved node json");
+        assert_eq!(moved["parent_node_id"], "root");
+
+        let edge = block(<LocalLoomClient as Pages>::structures_link_node_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "roadmap".to_string(),
+            "edge-1".to_string(),
+            "root".to_string(),
+            "child".to_string(),
+            "relates".to_string(),
+            None,
+            None,
+        ))
+        .expect("link nodes");
+        let edge: serde_json::Value = serde_json::from_str(&edge).expect("edge json");
+        assert_eq!(edge["edge_id"], "edge-1");
+
+        let render = block(<LocalLoomClient as Pages>::structures_get_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "roadmap".to_string(),
+        ))
+        .expect("get structure");
+        let render: serde_json::Value = serde_json::from_str(&render).expect("render json");
+        assert_eq!(render["nodes"].as_array().expect("nodes").len(), 2);
+
+        let structures = block(<LocalLoomClient as Pages>::structures_list_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+        ))
+        .expect("list structures");
+        let structures: serde_json::Value =
+            serde_json::from_str(&structures).expect("structures json");
+        assert_eq!(structures.as_array().expect("structures").len(), 1);
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tickets_create_get_and_list_json_roundtrip_locally() {
+        let (client, session, workspace, dir) = seed_client("tickets-create-json");
+        let workspace_id = workspace.to_string();
+        let project = block(<LocalLoomClient as Tickets>::tickets_project_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "MX".to_string(),
+            "Matrix".to_string(),
+            None,
+        ))
+        .expect("create project");
+        let project: serde_json::Value = serde_json::from_str(&project).expect("project json");
+        assert_eq!(project["project_id"], "matrix");
+
+        let settings = block(
+            <LocalLoomClient as Tickets>::tickets_project_settings_set_json(
+                &client,
+                session.clone(),
+                "repo".to_string(),
+                workspace_id.clone(),
+                "matrix".to_string(),
+                settings_patch_cbor(
+                    Some("jira"),
+                    Some("write_access"),
+                    Some(Vec::new()),
+                    Some(true),
+                    Some(vec!["checks_run", "source_anchors"]),
+                    Some("Owner accepts completed work."),
+                    Some("Owner details."),
+                    Some("Worker delivers evidence."),
+                    Some("Worker details."),
+                    project["profile_root"].as_str(),
+                ),
+            ),
+        )
+        .expect("set project settings");
+        let settings: serde_json::Value = serde_json::from_str(&settings).expect("settings json");
+        assert_eq!(settings["default_projection"], "jira");
+        assert_eq!(settings["acceptance_evidence_enforcement"], true);
+        assert_eq!(
+            settings["required_acceptance_evidence_keys"],
+            serde_json::json!(["source_anchors", "checks_run"])
+        );
+        assert_eq!(
+            settings["contracts"]["owner"]["details"],
+            serde_json::Value::Null
+        );
+        let settings_with_contracts = block(
+            <LocalLoomClient as Tickets>::tickets_project_settings_get_json(
+                &client,
+                session.clone(),
+                "repo".to_string(),
+                workspace_id.clone(),
+                "matrix".to_string(),
+                true,
+            ),
+        )
+        .expect("get settings with contracts");
+        let settings_with_contracts: serde_json::Value =
+            serde_json::from_str(&settings_with_contracts).expect("settings detail json");
+        assert_eq!(
+            settings_with_contracts["contracts"]["owner"]["details"],
+            "Owner details."
+        );
+        assert_eq!(
+            settings_with_contracts["contracts"]["worker"]["details"],
+            "Worker details."
+        );
+
+        let field_catalog = block(<LocalLoomClient as Tickets>::tickets_field_put_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "risk".to_string(),
+            "risk".to_string(),
+            "Risk".to_string(),
+            Some("Risk note".to_string()),
+            "string".to_string(),
+            None,
+            140,
+            true,
+            false,
+            true,
+            false,
+            "optional".to_string(),
+            serde_json::json!(["task"]).to_string(),
+            None,
+        ))
+        .expect("put field");
+        let field_catalog: serde_json::Value =
+            serde_json::from_str(&field_catalog).expect("field catalog json");
+        assert!(
+            field_catalog["fields"]
+                .as_array()
+                .expect("fields")
+                .iter()
+                .any(|field| field["native_field"] == "risk")
+        );
+
+        let retired_catalog = block(<LocalLoomClient as Tickets>::tickets_field_retire_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "risk".to_string(),
+            None,
+        ))
+        .expect("retire field");
+        let retired_catalog: serde_json::Value =
+            serde_json::from_str(&retired_catalog).expect("retired catalog json");
+        assert!(
+            retired_catalog["fields"]
+                .as_array()
+                .expect("retired fields")
+                .iter()
+                .all(|field| field["native_field"] != "risk")
+        );
+
+        let created = block(<LocalLoomClient as Tickets>::tickets_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "task".to_string(),
+            None,
+            None,
+            serde_json::json!({"status": "ready", "title": "Build it"}).to_string(),
+            "[]".to_string(),
+            None,
+        ))
+        .expect("create ticket");
+        let created: serde_json::Value = serde_json::from_str(&created).expect("create json");
+        assert_eq!(created["receipt"]["operation"], "ticket.created");
+        assert_eq!(created["resource"]["primary_key"], "MX-1");
+        assert_eq!(created["resource"]["fields"]["title"], "Build it");
+
+        let get = block(<LocalLoomClient as Tickets>::tickets_get_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "MX-1".to_string(),
+            None,
+        ))
+        .expect("get ticket");
+        let get: serde_json::Value = serde_json::from_str(&get).expect("get json");
+        assert_eq!(get["primary_key"], "MX-1");
+
+        let second = block(<LocalLoomClient as Tickets>::tickets_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "task".to_string(),
+            None,
+            None,
+            serde_json::json!({"status": "ready", "title": "Ship it"}).to_string(),
+            "[]".to_string(),
+            Some(
+                created["resource"]["profile_root"]
+                    .as_str()
+                    .expect("ticket root")
+                    .to_string(),
+            ),
+        ))
+        .expect("create second ticket");
+        let second: serde_json::Value = serde_json::from_str(&second).expect("second json");
+        assert_eq!(second["resource"]["primary_key"], "MX-2");
+
+        let list = block(<LocalLoomClient as Tickets>::tickets_list_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            None,
+        ))
+        .expect("list tickets");
+        let list: serde_json::Value = serde_json::from_str(&list).expect("list json");
+        assert_eq!(list["items"].as_array().expect("tickets").len(), 2);
+        assert_eq!(list["total"], 2);
+
+        client
+            .with_session(&session, |loom| {
+                let lane = loom_lanes::Lane::new(loom_lanes::LaneInput {
+                    lane_id: "agent-1",
+                    lane_key: "agent-1",
+                    title: "Agent 1",
+                    description: "Agent 1 active lane",
+                    lane_kind: loom_lanes::LaneKind::Assignment,
+                    owner_principal: None,
+                    lane_status: loom_lanes::LaneStatus::Working,
+                    lane_tickets: &[loom_lanes::LaneTicket {
+                        ticket_id: "MX-1".to_string(),
+                        order_key: "M".to_string(),
+                    }],
+                    active_ticket_id: Some("MX-1"),
+                    status_report: "working",
+                    reviewer_feedback: "",
+                    updated_at: 1,
+                    updated_by: "agent-1",
+                })?;
+                loom_lanes::create_lane(loom, workspace, lane)?;
+                save_loom(loom)?;
+                Ok(())
+            })
+            .expect("create lane");
+
+        let lane_list = block(<LocalLoomClient as Tickets>::tickets_list_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            Some(serde_json::json!({"lane": "agent-1"}).to_string()),
+        ))
+        .expect("list lane tickets");
+        let lane_list: serde_json::Value =
+            serde_json::from_str(&lane_list).expect("lane list json");
+        assert_eq!(
+            lane_list["items"].as_array().expect("lane tickets").len(),
+            1
+        );
+        assert_eq!(lane_list["items"][0]["primary_key"], "MX-1");
+        assert_eq!(lane_list["total"], 1);
+
+        let stale = block(<LocalLoomClient as Tickets>::tickets_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id,
+            "matrix".to_string(),
+            "task".to_string(),
+            None,
+            None,
+            serde_json::json!({"status": "ready"}).to_string(),
+            "[]".to_string(),
+            Some(
+                project["profile_root"]
+                    .as_str()
+                    .expect("project root")
+                    .to_string(),
+            ),
+        ))
+        .expect_err("stale ticket root rejected");
+        assert_eq!(stale.code, Code::Conflict);
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ticket_and_page_json_methods_preserve_acl_denials_locally() {
+        let (client, session, workspace, dir) = seed_client("ticket-page-json-auth");
+        let workspace_id = workspace.to_string();
+        let root = WorkspaceId::v4_from_bytes([31; 16]);
+        let user = WorkspaceId::v4_from_bytes([32; 16]);
+        let (project_root, page_root) = client
+            .with_session(&session, |loom| {
+                let project = loom_tickets::create_project(
+                    loom,
+                    workspace,
+                    &workspace_id,
+                    "matrix",
+                    "MX",
+                    "Matrix",
+                    None,
+                )?;
+                loom_tickets::create_ticket(
+                    loom,
+                    workspace,
+                    loom_tickets::TicketCreateRequest {
+                        workspace_id: &workspace_id,
+                        project_id: "matrix",
+                        ticket_type: "task",
+                        external_source: None,
+                        external_id: None,
+                        fields: &serde_json::json!({"status": "ready", "title": "Seed"}),
+                        policy_labels: &[],
+                        expected_root: Some(&project.profile_root),
+                    },
+                )?;
+                let space = loom_pages::create_space(loom, workspace, "pages", "eng", "Eng", None)?;
+                let page = loom_pages::create_page(
+                    loom,
+                    workspace,
+                    loom_pages::PageCreateRequest {
+                        workspace_id: "pages",
+                        page_id: "page-1",
+                        space_id: "eng",
+                        parent_page_id: None,
+                        title: "Seed page",
+                        expected_root: Some(&space.profile_root),
+                    },
+                )?;
+                let mut identity = loom_core::IdentityStore::new(root);
+                identity.set_passphrase(root, "root-pass", b"12345678")?;
+                identity.add_principal(user, "user", loom_core::PrincipalKind::User)?;
+                identity.set_passphrase(user, "user-pass", b"abcdefgh")?;
+                let mut acl = loom_core::acl::AclStore::new();
+                acl.allow(
+                    loom_core::acl::AclSubject::Principal(root),
+                    None,
+                    None,
+                    [loom_core::acl::AclRight::Admin],
+                )?;
+                loom.store().save_identity_store(&identity)?;
+                loom.store().save_acl_store(&acl)?;
+                loom.set_identity_store(identity);
+                loom.set_acl_store(acl);
+                save_loom(loom)?;
+                Ok((project.profile_root, page.profile_root))
+            })
+            .expect("seed auth store");
+
+        client
+            .authenticate_passphrase(&session, user, b"user-pass")
+            .expect("authenticate user");
+        let denied_ticket_write = block(<LocalLoomClient as Tickets>::tickets_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "task".to_string(),
+            None,
+            None,
+            serde_json::json!({"status": "ready", "title": "Denied"}).to_string(),
+            "[]".to_string(),
+            Some(project_root.clone()),
+        ))
+        .expect_err("ticket write denied");
+        assert_eq!(denied_ticket_write.code, Code::PermissionDenied);
+        let denied_ticket_read = block(<LocalLoomClient as Tickets>::tickets_get_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "MX-1".to_string(),
+            None,
+        ))
+        .expect_err("ticket read denied");
+        assert_eq!(denied_ticket_read.code, Code::PermissionDenied);
+        let denied_page_write = block(<LocalLoomClient as Pages>::pages_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "pages".to_string(),
+            "page-denied".to_string(),
+            "eng".to_string(),
+            None,
+            "Denied".to_string(),
+            Some(page_root.clone()),
+        ))
+        .expect_err("page write denied");
+        assert_eq!(denied_page_write.code, Code::PermissionDenied);
+        let denied_page_read = block(<LocalLoomClient as Pages>::pages_get_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "pages".to_string(),
+            "page-1".to_string(),
+        ))
+        .expect_err("page read denied");
+        assert_eq!(denied_page_read.code, Code::PermissionDenied);
+
+        client
+            .authenticate_passphrase(&session, root, b"root-pass")
+            .expect("authenticate root");
+        let tickets = block(<LocalLoomClient as Tickets>::tickets_list_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            None,
+        ))
+        .expect("authorized ticket list");
+        let tickets: serde_json::Value = serde_json::from_str(&tickets).expect("tickets json");
+        assert_eq!(tickets["items"].as_array().expect("tickets").len(), 1);
+        assert_eq!(tickets["total"], 1);
+        let pages = block(<LocalLoomClient as Pages>::pages_list_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "pages".to_string(),
+        ))
+        .expect("authorized page list");
+        let pages: serde_json::Value = serde_json::from_str(&pages).expect("pages json");
+        assert_eq!(pages.as_array().expect("pages").len(), 1);
+
+        let authorized_ticket = block(<LocalLoomClient as Tickets>::tickets_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id,
+            "matrix".to_string(),
+            "task".to_string(),
+            None,
+            None,
+            serde_json::json!({"status": "ready", "title": "Allowed"}).to_string(),
+            "[]".to_string(),
+            None,
+        ))
+        .expect("authorized ticket write");
+        let authorized_ticket: serde_json::Value =
+            serde_json::from_str(&authorized_ticket).expect("authorized ticket json");
+        assert_eq!(authorized_ticket["resource"]["primary_key"], "MX-2");
+        let authorized_page = block(<LocalLoomClient as Pages>::pages_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "pages".to_string(),
+            "page-2".to_string(),
+            "eng".to_string(),
+            None,
+            "Allowed".to_string(),
+            None,
+        ))
+        .expect("authorized page write");
+        let authorized_page: serde_json::Value =
+            serde_json::from_str(&authorized_page).expect("authorized page json");
+        assert_eq!(authorized_page["page_id"], "page-2");
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn tickets_comment_json_methods_roundtrip_locally() {
         let (client, session, workspace, dir) = seed_client("tickets-comments-json");
         let workspace_id = workspace.to_string();
@@ -6463,6 +8314,7 @@ mod tests {
             Some("c1".to_string()),
             Some("review_request".to_string()),
             "Ready for review".to_string(),
+            Some(serde_json::json!({"checks_run": ["cargo test"]}).to_string()),
             Some(ticket.profile_root.clone()),
         ))
         .expect("add comment");
@@ -6484,6 +8336,10 @@ mod tests {
         assert_eq!(comments[0]["comment_id"], "c1");
         assert_eq!(comments[0]["comment_type"], "review_request");
         assert_eq!(comments[0]["body"], "Ready for review");
+        assert_eq!(
+            comments[0]["evidence"],
+            serde_json::json!({"checks_run": ["cargo test"]})
+        );
 
         let update = block(<LocalLoomClient as Tickets>::tickets_comment_update_json(
             &client,
@@ -6494,6 +8350,7 @@ mod tests {
             "c1".to_string(),
             Some("review_feedback".to_string()),
             Some("Needs evidence".to_string()),
+            Some("null".to_string()),
             Some(add_root.to_string()),
         ))
         .expect("update comment");
@@ -6784,10 +8641,11 @@ mod tests {
             Some("single-comment".to_string()),
             Some("blocker".to_string()),
             Some("Blocked on dependency".to_string()),
+            Some(serde_json::json!({"checks_run": ["cargo test"]}).to_string()),
             Some(target.profile_root.clone()),
             Some(
                 serde_json::json!([
-                    {"comment_id": "array-comment", "comment_type": "progress", "body": "Investigated root cause"}
+                    {"comment_id": "array-comment", "comment_type": "progress", "body": "Investigated root cause", "evidence": {"source_anchors": ["crates/loom-client/src/service.rs"]}}
                 ])
                 .to_string(),
             ),
@@ -6830,6 +8688,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(update_root.to_string()),
             None,
             None,
@@ -6848,7 +8707,331 @@ mod tests {
         ))
         .expect("list comments");
         let comments: serde_json::Value = serde_json::from_str(&comments).expect("comments json");
-        assert_eq!(comments.as_array().expect("comments").len(), 2);
+        let comments = comments.as_array().expect("comments");
+        assert_eq!(comments.len(), 2);
+        let single = comments
+            .iter()
+            .find(|comment| comment["comment_id"] == "single-comment")
+            .expect("single comment");
+        assert_eq!(
+            single["evidence"],
+            serde_json::json!({"checks_run": ["cargo test"]})
+        );
+        let batch = comments
+            .iter()
+            .find(|comment| comment["comment_id"] == "array-comment")
+            .expect("array comment");
+        assert_eq!(
+            batch["evidence"],
+            serde_json::json!({"source_anchors": ["crates/loom-client/src/service.rs"]})
+        );
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn boards_json_roundtrips_locally() {
+        let (client, session, workspace, dir) = seed_client("boards-json");
+        let workspace_id = workspace.to_string();
+        block(<LocalLoomClient as Tickets>::tickets_project_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "MX".to_string(),
+            "Matrix".to_string(),
+            None,
+        ))
+        .expect("create project");
+        let ticket = block(<LocalLoomClient as Tickets>::tickets_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "task".to_string(),
+            None,
+            None,
+            serde_json::json!({"status": "ready", "title": "Route board"}).to_string(),
+            "[]".to_string(),
+            None,
+        ))
+        .expect("create ticket");
+        let ticket: serde_json::Value = serde_json::from_str(&ticket).expect("ticket json");
+        let ticket_id = ticket["resource"]["ticket_id"]
+            .as_str()
+            .expect("canonical ticket id");
+
+        let create_request = serde_json::json!({
+            "board_id": "matrix-board",
+            "board_key": "MX-BOARD",
+            "name": "Matrix Board",
+            "description": "Manual work board",
+            "project_id": "matrix",
+            "mode": "manual",
+            "columns": [
+                {
+                    "column_id": "todo",
+                    "name": "To Do",
+                    "mapped_statuses": [],
+                    "wip_limit": null,
+                    "hidden": false,
+                    "rank": 10
+                },
+                {
+                    "column_id": "doing",
+                    "name": "Doing",
+                    "mapped_statuses": [],
+                    "wip_limit": null,
+                    "hidden": false,
+                    "rank": 20
+                }
+            ],
+            "card_display_fields": ["title", "status"],
+            "updated_by": "cli-test",
+            "expected_root": null
+        });
+        let created = block(<LocalLoomClient as Tickets>::boards_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            create_request.to_string(),
+        ))
+        .expect("create board");
+        let created: serde_json::Value = serde_json::from_str(&created).expect("created board");
+        assert_eq!(created["board_id"], "matrix-board");
+        assert_eq!(created["mode"], "manual");
+
+        let list = block(<LocalLoomClient as Tickets>::boards_list_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            false,
+        ))
+        .expect("list boards");
+        let list: serde_json::Value = serde_json::from_str(&list).expect("board list");
+        assert_eq!(list.as_array().expect("boards").len(), 1);
+
+        let update_request = serde_json::json!({
+            "board_key": null,
+            "name": "Matrix Planning",
+            "description": null,
+            "board_status": null,
+            "card_display_fields": null,
+            "updated_by": "cli-test",
+            "expected_root": null
+        });
+        let updated = block(<LocalLoomClient as Tickets>::boards_update_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix-board".to_string(),
+            update_request.to_string(),
+        ))
+        .expect("update board");
+        let updated: serde_json::Value = serde_json::from_str(&updated).expect("updated board");
+        assert_eq!(updated["name"], "Matrix Planning");
+
+        let configure_request = serde_json::json!({
+            "mode": null,
+            "columns": [
+                {
+                    "column_id": "todo",
+                    "name": "To Do",
+                    "mapped_statuses": [],
+                    "wip_limit": null,
+                    "hidden": false,
+                    "rank": 10
+                },
+                {
+                    "column_id": "done",
+                    "name": "Done",
+                    "mapped_statuses": [],
+                    "wip_limit": null,
+                    "hidden": false,
+                    "rank": 30
+                }
+            ],
+            "updated_by": "cli-test",
+            "expected_root": null
+        });
+        block(<LocalLoomClient as Tickets>::boards_configure_columns_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix-board".to_string(),
+            configure_request.to_string(),
+        ))
+        .expect("configure board");
+
+        let move_request = serde_json::json!({
+            "ticket_id": ticket_id,
+            "column_id": "done",
+            "rank_token": "0001",
+            "swimlane_id": null,
+            "updated_by": "cli-test",
+            "expected_root": null
+        });
+        let moved = block(<LocalLoomClient as Tickets>::boards_move_card_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix-board".to_string(),
+            move_request.to_string(),
+        ))
+        .expect("move board card");
+        let moved: serde_json::Value = serde_json::from_str(&moved).expect("moved board");
+        assert_eq!(moved["cards"][0]["ticket_id"], ticket_id);
+        assert_eq!(moved["cards"][0]["column_id"], "done");
+
+        let deleted = block(<LocalLoomClient as Tickets>::boards_delete_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix-board".to_string(),
+            "cli-test".to_string(),
+            None,
+        ))
+        .expect("delete board");
+        let deleted: serde_json::Value = serde_json::from_str(&deleted).expect("deleted board");
+        assert_eq!(deleted["board_status"], "deleted");
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tickets_relation_history_and_delete_json_roundtrip_locally() {
+        let (client, session, workspace, dir) = seed_client("tickets-relation-json");
+        let workspace_id = workspace.to_string();
+        let (source, target) = client
+            .with_session(&session, |loom| {
+                loom_tickets::create_project(
+                    loom,
+                    workspace,
+                    &workspace_id,
+                    "matrix",
+                    "MX",
+                    "Matrix",
+                    None,
+                )?;
+                let source = loom_tickets::create_ticket(
+                    loom,
+                    workspace,
+                    loom_tickets::TicketCreateRequest {
+                        workspace_id: &workspace_id,
+                        project_id: "matrix",
+                        ticket_type: "task",
+                        external_source: None,
+                        external_id: None,
+                        fields: &serde_json::json!({"status": "planned", "title": "Source"}),
+                        policy_labels: &[],
+                        expected_root: None,
+                    },
+                )?;
+                let target = loom_tickets::create_ticket(
+                    loom,
+                    workspace,
+                    loom_tickets::TicketCreateRequest {
+                        workspace_id: &workspace_id,
+                        project_id: "matrix",
+                        ticket_type: "task",
+                        external_source: None,
+                        external_id: None,
+                        fields: &serde_json::json!({"status": "planned", "title": "Target"}),
+                        policy_labels: &[],
+                        expected_root: Some(&source.profile_root),
+                    },
+                )?;
+                save_loom(loom)?;
+                Ok((source, target))
+            })
+            .expect("seed tickets");
+
+        let set = block(<LocalLoomClient as Tickets>::tickets_relation_set_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            source.ticket_id.clone(),
+            Some("dependency".to_string()),
+            "depends_on".to_string(),
+            target.ticket_id.clone(),
+            Some(target.profile_root.clone()),
+        ))
+        .expect("set relation");
+        let set: serde_json::Value = serde_json::from_str(&set).expect("set json");
+        assert_eq!(set["receipt"]["operation"], "ticket.relation_set");
+        assert_eq!(set["resource"]["relation_id"], "dependency");
+        assert_eq!(set["resource"]["kind"], "depends_on");
+        let set_root = set["resource"]["profile_root"].as_str().expect("set root");
+
+        let relations = block(<LocalLoomClient as Tickets>::tickets_relation_list_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            source.ticket_id.clone(),
+        ))
+        .expect("list relations");
+        let relations: serde_json::Value =
+            serde_json::from_str(&relations).expect("relations json");
+        assert_eq!(relations.as_array().expect("relations").len(), 1);
+        assert_eq!(relations[0]["direction"], "outgoing");
+
+        let history = block(<LocalLoomClient as Tickets>::tickets_history_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            Some(source.ticket_id.clone()),
+        ))
+        .expect("history");
+        let history: serde_json::Value = serde_json::from_str(&history).expect("history json");
+        assert!(
+            history
+                .as_array()
+                .expect("history")
+                .iter()
+                .any(|record| record["operation_kind"] == "ticket.relation_set")
+        );
+
+        let remove = block(<LocalLoomClient as Tickets>::tickets_relation_remove_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            source.ticket_id.clone(),
+            "dependency".to_string(),
+            Some(set_root.to_string()),
+        ))
+        .expect("remove relation");
+        let remove: serde_json::Value = serde_json::from_str(&remove).expect("remove json");
+        assert_eq!(remove["receipt"]["operation"], "ticket.relation_removed");
+        let remove_root = remove["resource"]["profile_root"]
+            .as_str()
+            .expect("remove root");
+
+        let deleted = block(<LocalLoomClient as Tickets>::tickets_delete_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id,
+            source.ticket_id,
+            Some(remove_root.to_string()),
+        ))
+        .expect("delete ticket");
+        let deleted: serde_json::Value = serde_json::from_str(&deleted).expect("delete json");
+        assert_eq!(deleted["receipt"]["operation"], "ticket.deleted");
+        assert_eq!(deleted["resource"]["fields"]["resolution"], "deleted");
 
         client.close(&session);
         std::fs::remove_dir_all(&dir).ok();

@@ -5491,6 +5491,7 @@ impl crate::LoomMcp {
             .map_err(|e| LoomError::invalid(format!("app index.html must be UTF-8: {e}")))?;
         self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
+            loom.authorize(ns, FacetKind::Files, AclRight::Write)?;
             loom.create_directory_reserved(ns, &apps::app_dir(app), true)?;
             loom.write_file_reserved(ns, &apps::index_path(app), index_html, 0o100644)?;
             loom.write_file_reserved(ns, &apps::meta_path(app), meta_md, 0o100644)
@@ -5509,6 +5510,7 @@ impl crate::LoomMcp {
         let parent = apps::app_parent_dir(app, path)?;
         self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
+            loom.authorize(ns, FacetKind::Files, AclRight::Write)?;
             loom.create_directory_reserved(ns, &parent, true)?;
             loom.write_file_reserved(ns, &file_path, content, mode)
         })
@@ -5518,6 +5520,7 @@ impl crate::LoomMcp {
         let file_path = apps::app_file_path(app, path)?;
         self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
+            loom.authorize(ns, FacetKind::Files, AclRight::Write)?;
             loom.remove_file_reserved(ns, &file_path)
         })
     }
@@ -9359,7 +9362,7 @@ mod tests {
             LaneTicketUpdateRequest {
                 lane_id: "review-lane-a",
                 ticket_id: "DEMO-102",
-                placement: LaneTicketPlacement::Append,
+                placement: LaneTicketPlacement::Last,
                 updated_by: Some("user:reviewer-a"),
             },
         )
@@ -9480,7 +9483,7 @@ mod tests {
             LaneTicketUpdateRequest {
                 lane_id: "review-lane-b",
                 ticket_id: &backlog.primary_key,
-                placement: LaneTicketPlacement::Append,
+                placement: LaneTicketPlacement::Last,
                 updated_by: Some("user:reviewer-b"),
             },
         )
@@ -9490,7 +9493,7 @@ mod tests {
             LaneTicketUpdateRequest {
                 lane_id: "review-lane-b",
                 ticket_id: &planned.primary_key,
-                placement: LaneTicketPlacement::Append,
+                placement: LaneTicketPlacement::Last,
                 updated_by: Some("user:reviewer-b"),
             },
         )
@@ -10354,11 +10357,14 @@ mod tests {
                 .unwrap_or(0);
             (count, reusable, working_tree_roots)
         });
+        let base_non_working_tree_records = base.saturating_sub(base_working_tree_roots);
+        let after_non_working_tree_records = after.saturating_sub(working_tree_roots_after);
         // Repeated updates supersede prior overlay records for the same keys rather than adding new
-        // current records, so the live overlay record count stays bounded across many hot writes.
+        // non-working-tree current records, so the live overlay record count stays bounded across
+        // many hot writes while each commit keeps its own persisted working tree root.
         assert_eq!(
-            after, base,
-            "hot writes must not grow the current overlay record count"
+            after_non_working_tree_records, base_non_working_tree_records,
+            "hot writes must not grow non-working-tree current overlay records"
         );
         // Superseded overlay pages become reusable instead of permanent physical growth.
         assert!(
@@ -12014,7 +12020,7 @@ mod tests {
                 LaneTicketUpdateRequest {
                     lane_id: "review-lane-b",
                     ticket_id: "DEMO-700",
-                    placement: LaneTicketPlacement::Append,
+                    placement: LaneTicketPlacement::Last,
                     updated_by: Some("user:reviewer-b"),
                 },
             )

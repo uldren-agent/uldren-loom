@@ -232,7 +232,7 @@ fn mcp_surface_baseline_is_reproducible() {
     assert_eq!(tools.len(), 407);
     assert_eq!(
         serde_json::to_vec(&tools).expect("tools json").len(),
-        531_191
+        531_193
     );
     assert_eq!(read_only_tools.len(), 215);
     assert_eq!(
@@ -6412,10 +6412,14 @@ impl crate::RemoteMcpBackend for GateTestBackend {
         _: &str,
         lane_id: &str,
         ticket_id: &str,
+        placement: Option<&str>,
+        anchor: Option<&str>,
         updated_by: &str,
     ) -> std::result::Result<loom_lanes::Lane, LoomError> {
         let mut lane = gate_lane(lane_id);
-        loom_lanes::append_lane_ticket(&mut lane, ticket_id)?;
+        let placement =
+            loom_lanes::LaneTicketPlacement::parse(placement.unwrap_or("LAST"), anchor)?;
+        loom_lanes::place_lane_ticket(&mut lane, ticket_id, placement)?;
         lane.updated_by = updated_by.to_string();
         Ok(lane)
     }
@@ -7641,7 +7645,7 @@ impl crate::RemoteMcpBackend for GateTestBackend {
 }
 
 #[test]
-fn remote_tool_route_classifies_by_capability_and_promotion() {
+fn remote_tool_route_classifies_by_execution_target() {
     use crate::tools::{
         RemoteCapability, RemoteToolRoute, remote_tool_route, remote_tool_route_for,
     };
@@ -7651,15 +7655,11 @@ fn remote_tool_route_classifies_by_capability_and_promotion() {
         RemoteToolRoute::UnaryForward,
         "a unary IDL-backed tool forwards over remote"
     );
-    // `chat_set_presence` is a permanent host-local tool (in-process ephemeral presence), so it stays a
-    // rejected host/composite tool over remote even after the chat family is promoted.
-    match remote_tool_route("chat_set_presence") {
-        RemoteToolRoute::Reject(message) => assert!(
-            message.contains("not available against a remote Loom store"),
-            "unexpected message: {message}"
-        ),
-        other => panic!("an unpromoted host/composite tool must reject, got {other:?}"),
-    }
+    assert_eq!(
+        remote_tool_route("chat_set_presence"),
+        RemoteToolRoute::ServerExecute,
+        "composite tools execute beside the served store"
+    );
     assert_eq!(
         remote_tool_route("watch_subscribe"),
         RemoteToolRoute::UnaryForward,
@@ -7678,9 +7678,22 @@ fn remote_tool_route_classifies_by_capability_and_promotion() {
         "Lane tools are IDL-backed and forward over remote"
     );
     assert_eq!(
-        remote_tool_route_for("apps_open", true, Some(RemoteCapability::LocalOnly)),
+        remote_tool_route("apps_list"),
         RemoteToolRoute::ServerExecute,
-        "a server-promoted tool routes to server-side execution"
+        "composite catalog tools route to server-side execution"
+    );
+    match remote_tool_route_for("unknown_tool", None) {
+        RemoteToolRoute::Reject(message) => assert!(
+            message.contains("execution-boundary manifest"),
+            "unexpected message: {message}"
+        ),
+        other => panic!("unknown tools must reject, got {other:?}"),
+    }
+    assert_eq!(
+        remote_tool_route_for("stream_tool", Some(RemoteCapability::HandleStream)),
+        RemoteToolRoute::Reject(
+            "MCP tool stream_tool uses a handle/stream interface that is not supported against a remote Loom store".to_string()
+        )
     );
 }
 
@@ -7696,7 +7709,7 @@ fn remote_execute_tool_transport_roundtrips_and_rejects_precisely() {
 
     let err = GateTestBackend
         .execute_tool("chat_post_message", b"{}")
-        .expect_err("a not-promoted tool is declined");
+        .expect_err("the fixture declines unknown server-side tools");
     assert!(
         err.to_string().contains("not server-promoted"),
         "unexpected error: {err}"

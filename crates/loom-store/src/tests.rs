@@ -639,6 +639,9 @@ fn store_maintenance_policy_and_run_state_persist() {
         last_tail_compaction_truncated_pages: 1,
         last_tail_compaction_conflicts: 4,
         last_shrink_skip_reason: Some("tail_blocked_by_live_objects".to_string()),
+        last_progress_steps: 7,
+        last_yield_count: 8,
+        last_overrun_count: 9,
     };
     store
         .record_store_maintenance_run_state(run_state.clone())
@@ -2365,6 +2368,8 @@ fn complete_validated_segment_epoch(store: &FileStore) {
         marked: live_digests,
         queue: std::collections::VecDeque::new(),
         stream_roots: std::collections::VecDeque::new(),
+        content_roots: std::collections::VecDeque::new(),
+        prolly_cursors: std::collections::VecDeque::new(),
         completed: true,
     };
     let epoch = store
@@ -2601,6 +2606,8 @@ fn gc_validated_segments_ignores_maintenance_metadata_changes() {
         marked: BTreeSet::from([digest]),
         queue: std::collections::VecDeque::new(),
         stream_roots: std::collections::VecDeque::new(),
+        content_roots: std::collections::VecDeque::new(),
+        prolly_cursors: std::collections::VecDeque::new(),
         completed: true,
     };
     let epoch = store
@@ -6040,6 +6047,8 @@ fn gc_validated_segments_requires_completed_epoch_and_obeys_budget() {
         marked: live_digests,
         queue: std::collections::VecDeque::new(),
         stream_roots: std::collections::VecDeque::new(),
+        content_roots: std::collections::VecDeque::new(),
+        prolly_cursors: std::collections::VecDeque::new(),
         completed: false,
     };
     let mut epoch = store
@@ -6107,6 +6116,8 @@ fn repeated_validated_segment_gc_does_not_leave_untracked_record_pages() {
             marked: retained.clone(),
             queue: std::collections::VecDeque::new(),
             stream_roots: std::collections::VecDeque::new(),
+            content_roots: std::collections::VecDeque::new(),
+            prolly_cursors: std::collections::VecDeque::new(),
             completed: true,
         };
         let epoch = store
@@ -7514,41 +7525,36 @@ fn retained_history_owner_appends_point_update_the_overlay_index() {
 }
 
 #[test]
-fn mutable_overlay_current_index_survives_canonical_round_trip() {
-    let first = mutable_overlay_entry_address(&durability_facet_test_key(
-        b"documents",
-        "current-index-first",
-    ));
-    let second = mutable_overlay_entry_address(&durability_facet_test_key(
-        b"tickets",
-        "current-index-second",
-    ));
-    let mut addresses = vec![second, first];
-    addresses.sort();
-
-    let encoded = encode_mutable_overlay_current_index_record(&addresses);
+fn mutable_overlay_current_root_survives_canonical_round_trip() {
+    let encoded = encode_mutable_overlay_current_root_record(Some(PageId(42)));
     assert_eq!(
-        decode_mutable_overlay_current_index_record(&encoded).unwrap(),
-        addresses
+        decode_mutable_overlay_current_root_record(&encoded).unwrap(),
+        Some(PageId(42))
+    );
+    assert_eq!(
+        decode_mutable_overlay_current_root_record(&encode_mutable_overlay_current_root_record(
+            None
+        ))
+        .unwrap(),
+        None
     );
 
-    let mut duplicate = addresses.clone();
-    duplicate.push(*duplicate.last().unwrap());
-    let duplicate = encode_mutable_overlay_current_index_record(&duplicate);
-    assert!(decode_mutable_overlay_current_index_record(&duplicate).is_err());
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    assert!(decode_mutable_overlay_current_root_record(&trailing).is_err());
 }
 
 #[test]
-fn cold_open_uses_current_index_instead_of_retained_history_scan() {
-    let tp = TempPath::new("current-index-open");
-    let history_key = b"pages/workspace/current-index-history".to_vec();
-    let current_key = durability_facet_test_key(b"documents", "current-index-live");
+fn cold_open_uses_current_root_instead_of_retained_history_scan() {
+    let tp = TempPath::new("current-root-open");
+    let history_key = b"pages/workspace/current-root-history".to_vec();
+    let current_key = durability_facet_test_key(b"documents", "current-root-live");
     {
         let store = FileStore::open(tp.path()).unwrap();
         for sequence in 1..=40u64 {
             let token = store.mutable_overlay_owner_token(&current_key).unwrap();
             let mut transaction = workflow_transaction_test(
-                &format!("current-index-open-{sequence}"),
+                &format!("current-root-open-{sequence}"),
                 vec![workflow_put(
                     FacetKind::Document,
                     current_key.clone(),
@@ -7569,7 +7575,7 @@ fn cold_open_uses_current_index_instead_of_retained_history_scan() {
 
     let reopened = FileStore::open(tp.path()).unwrap();
     let stats = reopened.io_stats().unwrap();
-    assert!(stats.open_mutable_used_current_index);
+    assert!(stats.open_mutable_used_current_root);
     assert_eq!(stats.open_mutable_current_records_loaded, 1);
     assert_eq!(stats.open_mutable_control_records_skipped, 0);
     assert_eq!(reopened.retained_history_head(&history_key).unwrap(), 40);
@@ -7586,6 +7592,275 @@ fn cold_open_uses_current_index_instead_of_retained_history_scan() {
             .unwrap()
             .payload,
         b"current-40"
+    );
+}
+
+#[test]
+fn point_update_after_many_current_keys_updates_current_root_locally() {
+    let tp = TempPath::new("current-root-point-update");
+    let store = FileStore::open(tp.path()).unwrap();
+    let mut keys = Vec::new();
+    for index in 0..64 {
+        let key = durability_facet_test_key(b"documents", &format!("point-update-{index}"));
+        store
+            .put_mutable_overlay_value(key.clone(), format!("value-{index}").into_bytes())
+            .unwrap();
+        keys.push(key);
+    }
+    let warm = store.maintenance_status().unwrap().physical_bytes;
+    store
+        .put_mutable_overlay_value(keys[0].clone(), b"value-updated".to_vec())
+        .unwrap();
+    let measured = store.maintenance_status().unwrap().physical_bytes;
+
+    assert!(
+        measured.saturating_sub(warm) <= 32 * 1024,
+        "one point update after 64 current keys grew {} bytes",
+        measured.saturating_sub(warm)
+    );
+}
+
+#[test]
+fn cold_open_rejects_corrupt_current_root_pointer() {
+    let tp = TempPath::new("current-root-corrupt");
+    {
+        let store = FileStore::open(tp.path()).unwrap();
+        let key = durability_facet_test_key(b"documents", "corrupt-current-root");
+        store
+            .put_mutable_overlay_value(key, b"current".to_vec())
+            .unwrap();
+        store
+            .commit_raw_overlay_records_for_test(&[mutable_overlay_current_root_record(Some(
+                PageId(u64::MAX),
+            ))])
+            .unwrap();
+    }
+
+    let err = FileStore::open(tp.path()).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("btree node page out of range"),
+        "{message}"
+    );
+}
+
+#[test]
+fn compact_preserves_nested_current_root_and_reopens_bounded() {
+    let tp = TempPath::new("current-root-compact");
+    let key = durability_facet_test_key(b"documents", "compact-current-root");
+    {
+        let mut store = FileStore::open(tp.path()).unwrap();
+        for update in 0..8u64 {
+            store
+                .put_mutable_overlay_value(key.clone(), format!("compact-{update}").into_bytes())
+                .unwrap();
+        }
+
+        store.compact().unwrap();
+    }
+
+    let reopened = FileStore::open(tp.path()).unwrap();
+    let stats = reopened.io_stats().unwrap();
+    assert!(stats.open_mutable_used_current_root);
+    assert_eq!(stats.open_mutable_current_records_loaded, 1);
+    assert_eq!(
+        reopened
+            .mutable_overlay_snapshot()
+            .unwrap()
+            .read_composite(&key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"compact-7"[..])
+    );
+}
+
+#[test]
+fn compact_preserves_durable_overlay_control_records() {
+    let tp = TempPath::new("current-root-compact-controls");
+    let ordinary_key = durability_facet_test_key(b"documents", "compact-idempotency");
+    let tombstone_key = durability_facet_test_key(b"documents", "compact-tombstone");
+    let workflow_key = durability_facet_test_key(b"documents", "compact-workflow");
+    let index_key = durability_facet_test_key(b"tickets", "compact-workflow-index");
+    let history_key = b"pages/workspace/compact-history".to_vec();
+    let mut workflow = workflow_transaction_test(
+        "compact-workflow-idempotency",
+        vec![workflow_put_with_secondary_index(
+            workflow_key.clone(),
+            b"workflow-current",
+            index_key.clone(),
+            workflow_key.as_bytes(),
+        )],
+        Some(b"compact-workflow-idempotency"),
+    );
+    workflow.owner_state.controls = vec![loom_core::WorkflowControlWrite::AppendRetained {
+        key: history_key.clone(),
+        expected_next_sequence: 1,
+        records: vec![b"operation-1".to_vec(), b"operation-2".to_vec()],
+    }];
+    let workflow_replay = workflow.clone();
+
+    let ordinary_token;
+    {
+        let mut store = FileStore::open(tp.path()).unwrap();
+        ordinary_token = store
+            .put_mutable_overlay_value_idempotent(
+                ordinary_key.clone(),
+                b"ordinary-current".to_vec(),
+                "compact-idempotency",
+            )
+            .unwrap();
+        store
+            .put_mutable_overlay_value(tombstone_key.clone(), b"deleted".to_vec())
+            .unwrap();
+        store
+            .put_mutable_overlay_tombstone(tombstone_key.clone())
+            .unwrap();
+        store.commit_workflow_transaction(workflow).unwrap();
+
+        store.compact().unwrap();
+    }
+
+    let reopened = FileStore::open(tp.path()).unwrap();
+    assert_eq!(
+        reopened
+            .put_mutable_overlay_value_idempotent(
+                ordinary_key.clone(),
+                b"ordinary-current".to_vec(),
+                "compact-idempotency",
+            )
+            .unwrap()
+            .as_bytes(),
+        ordinary_token.as_bytes()
+    );
+    assert_eq!(
+        reopened
+            .mutable_overlay_durable_owner_token(&ordinary_key)
+            .unwrap()
+            .as_ref()
+            .map(|token| token.as_bytes()),
+        Some(ordinary_token.as_bytes())
+    );
+    assert_eq!(reopened.retained_history_head(&history_key).unwrap(), 2);
+    assert_eq!(
+        reopened
+            .retained_history_records(&history_key, 1, usize::MAX)
+            .unwrap(),
+        vec![b"operation-1".to_vec(), b"operation-2".to_vec()]
+    );
+    assert_eq!(
+        reopened
+            .mutable_overlay_secondary_index_value(&index_key)
+            .unwrap()
+            .as_deref(),
+        Some(workflow_key.as_bytes())
+    );
+    let replay = reopened
+        .commit_workflow_transaction(workflow_replay)
+        .unwrap();
+    assert_eq!(replay.writes[0].target.as_bytes(), workflow_key.as_bytes());
+    let snapshot = reopened.mutable_overlay_snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .read_composite(&tombstone_key, |_| Ok(Some(b"base".to_vec())))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        snapshot
+            .read_composite(&workflow_key, |_| Ok(None))
+            .unwrap()
+            .as_deref(),
+        Some(&b"workflow-current"[..])
+    );
+}
+
+#[test]
+fn rekey_reseal_preserves_durable_overlay_control_records() {
+    let tp = TempPath::new("current-root-reseal-controls");
+    let (meta0, session0) = loom_core::keys::EncryptionMeta::create(
+        &KeySpec::passphrase("old-pw"),
+        loom_core::keys::Suite::XChaCha20Poly1305,
+        [2u8; 16].to_vec(),
+        [0x11; 32],
+        [3u8; 24].to_vec(),
+    )
+    .unwrap();
+    let ordinary_key = durability_facet_test_key(b"documents", "reseal-idempotency");
+    let workflow_key = durability_facet_test_key(b"documents", "reseal-workflow");
+    let index_key = durability_facet_test_key(b"tickets", "reseal-workflow-index");
+    let history_key = b"pages/workspace/reseal-history".to_vec();
+    let mut workflow = workflow_transaction_test(
+        "reseal-workflow-idempotency",
+        vec![workflow_put_with_secondary_index(
+            workflow_key.clone(),
+            b"reseal-workflow-current",
+            index_key.clone(),
+            workflow_key.as_bytes(),
+        )],
+        Some(b"reseal-workflow-idempotency"),
+    );
+    workflow.owner_state.controls = vec![loom_core::WorkflowControlWrite::AppendRetained {
+        key: history_key.clone(),
+        expected_next_sequence: 1,
+        records: vec![b"reseal-operation".to_vec()],
+    }];
+    let workflow_replay = workflow.clone();
+    let ordinary_token;
+    {
+        let mut store = FileStore::create_encrypted(tp.path(), meta0.encode(), session0).unwrap();
+        ordinary_token = store
+            .put_mutable_overlay_value_idempotent(
+                ordinary_key.clone(),
+                b"reseal-current".to_vec(),
+                "reseal-idempotency",
+            )
+            .unwrap();
+        store.commit_workflow_transaction(workflow).unwrap();
+        let (meta1, session1) = loom_core::keys::EncryptionMeta::create(
+            &KeySpec::passphrase("new-pw"),
+            loom_core::keys::Suite::Aes256Gcm,
+            [4u8; 16].to_vec(),
+            [0x22; 32],
+            [5u8; 24].to_vec(),
+        )
+        .unwrap();
+        store.rekey_reseal(meta1.encode(), session1).unwrap();
+    }
+
+    let reopened = FileStore::open(tp.path()).unwrap();
+    reopened.unlock(&KeySpec::passphrase("new-pw")).unwrap();
+    assert_eq!(
+        reopened
+            .put_mutable_overlay_value_idempotent(
+                ordinary_key.clone(),
+                b"reseal-current".to_vec(),
+                "reseal-idempotency",
+            )
+            .unwrap()
+            .as_bytes(),
+        ordinary_token.as_bytes()
+    );
+    assert_eq!(
+        reopened
+            .retained_history_records(&history_key, 1, usize::MAX)
+            .unwrap(),
+        vec![b"reseal-operation".to_vec()]
+    );
+    assert_eq!(
+        reopened
+            .mutable_overlay_secondary_index_value(&index_key)
+            .unwrap()
+            .as_deref(),
+        Some(workflow_key.as_bytes())
+    );
+    assert_eq!(
+        reopened
+            .commit_workflow_transaction(workflow_replay)
+            .unwrap()
+            .writes[0]
+            .target
+            .as_bytes(),
+        workflow_key.as_bytes()
     );
 }
 

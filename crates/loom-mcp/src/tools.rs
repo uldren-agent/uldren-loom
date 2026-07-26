@@ -1,7 +1,7 @@
 //! The curated MCP tool surface.
 //!
-//! This catalog defines every tool the host exposes, the area it lives in, the IDL interface and method
-//! it projects, and whether it reads or writes. It is
+//! This catalog defines every tool the host exposes, the area it lives in, its execution target, and
+//! whether it reads or writes. It is
 //! intentionally not a 1:1 emission of the IDL. Binding-ergonomic interfaces (sessions, key
 //! administration, result decoding, stateful file handles, async plumbing) are folded into the host or
 //! returned natively and never appear here.
@@ -9,7 +9,7 @@
 //! Two test layers keep this honest:
 //!
 //! - **Drift**: the catalog and documented tool table must list exactly the same tool names.
-//! - **Coverage**: every tool's `idl_method` must be a real method on its `idl_interface`, and every
+//! - **Coverage**: every generated target must name a real method on its IDL interface, and every
 //!   method of a projected interface must be either projected as a tool or named in [`EXCLUDED`] as a
 //!   deliberate fold/drop. A new IDL method that is neither fails the test, forcing a decision.
 //!
@@ -25,21 +25,28 @@ pub enum ToolKind {
     Write,
 }
 
-/// How a tool can be served when the MCP host is backed by a remote Loom endpoint (`loom mcp` against a
-/// URL or remote alias). Derived from the tool's IDL projection, so it cannot drift from the catalog.
+include!(concat!(env!("OUT_DIR"), "/tool_surface_ids.rs"));
+
+/// The accepted execution-boundary target for one MCP tool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RemoteCapability {
-    /// Projects a unary IDL method; forwarded to the generated `LoomClient` method over the wire.
-    Unary,
-    /// Projects an IDL method on a handle/stream interface (`Sql`, `Watch`, `Dataframe`); remote-capable
-    /// through the remote handle/stream machinery.
-    HandleStream,
-    /// No single IDL method (a host-level or composite feature); not available against a remote store and
-    /// rejected with an explicit local-only error.
-    LocalOnly,
+pub enum ExecutionTarget {
+    Generated(GeneratedOperationId),
+    Composite(CompositeId),
+    OwningAdapter(AdapterId),
 }
 
-/// The `(interface, idl_method)` pairs whose exposed MCP tool genuinely needs the remote host to reject
+/// How a tool is served when the MCP host is backed by a remote Loom endpoint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RemoteCapability {
+    /// A generated IDL target using ordinary request/response execution.
+    Unary,
+    /// A generated IDL target that needs handle/stream machinery.
+    HandleStream,
+    /// MCP-level orchestration that must execute beside the served store.
+    ServerExecute,
+}
+
+/// The `(interface, method)` pairs whose exposed MCP tool genuinely needs the remote host to reject
 /// at the gate because it can only run against a local handle/stream with no per-request bridge. This is
 /// currently empty: every MCP tool with an IDL method is a unary request/response in the MCP surface and
 /// is either forwarded over remote or rejected inside its own method with a precise, current-behavior
@@ -58,40 +65,73 @@ pub struct ToolSpec {
     pub name: &'static str,
     /// The lower-case area (facet or subsystem) the tool belongs to.
     pub area: &'static str,
-    /// The IDL interface this tool projects.
-    pub idl_interface: &'static str,
-    /// The IDL method this tool projects.
-    pub idl_method: Option<&'static str>,
+    /// The accepted execution target for this tool.
+    pub target: ExecutionTarget,
     /// Whether the tool reads or writes.
     pub kind: ToolKind,
 }
 
-const fn read(
+const fn read_generated(
     name: &'static str,
     area: &'static str,
-    idl_interface: &'static str,
-    idl_method: Option<&'static str>,
+    operation: GeneratedOperationId,
 ) -> ToolSpec {
     ToolSpec {
         name,
         area,
-        idl_interface,
-        idl_method,
+        target: ExecutionTarget::Generated(operation),
         kind: ToolKind::Read,
     }
 }
 
-const fn write(
+const fn write_generated(
     name: &'static str,
     area: &'static str,
-    idl_interface: &'static str,
-    idl_method: Option<&'static str>,
+    operation: GeneratedOperationId,
 ) -> ToolSpec {
     ToolSpec {
         name,
         area,
-        idl_interface,
-        idl_method,
+        target: ExecutionTarget::Generated(operation),
+        kind: ToolKind::Write,
+    }
+}
+
+const fn read_composite(
+    name: &'static str,
+    area: &'static str,
+    composite_id: CompositeId,
+) -> ToolSpec {
+    ToolSpec {
+        name,
+        area,
+        target: ExecutionTarget::Composite(composite_id),
+        kind: ToolKind::Read,
+    }
+}
+
+const fn write_composite(
+    name: &'static str,
+    area: &'static str,
+    composite_id: CompositeId,
+) -> ToolSpec {
+    ToolSpec {
+        name,
+        area,
+        target: ExecutionTarget::Composite(composite_id),
+        kind: ToolKind::Write,
+    }
+}
+
+const fn write_owning_adapter(
+    name: &'static str,
+    area: &'static str,
+    adapter_id: AdapterId,
+) -> ToolSpec {
+    ToolSpec {
+        name,
+        area,
+        target: ExecutionTarget::OwningAdapter(adapter_id),
         kind: ToolKind::Write,
     }
 }
@@ -99,852 +139,1680 @@ const fn write(
 /// The curated tool surface. Ordered by area.
 pub const TOOL_SURFACE: &[ToolSpec] = &[
     // store
-    read("store_version", "store", "Store", Some("version")),
-    read("store_capabilities", "store", "Store", Some("capabilities")),
-    read(
+    read_generated("store_version", "store", GeneratedOperationId::StoreVersion),
+    read_generated(
+        "store_capabilities",
+        "store",
+        GeneratedOperationId::StoreCapabilities,
+    ),
+    read_generated(
         "store_capabilities_json",
         "store",
-        "Store",
-        Some("capabilities"),
+        GeneratedOperationId::StoreCapabilities,
     ),
-    read("store_blob_digest", "store", "Store", Some("blob_digest")),
-    read("store_policy_get", "store", "StoreAdmin", None),
-    write("store_policy_set", "store", "StoreAdmin", None),
-    read("store_maintenance_status", "store", "StoreAdmin", None),
-    write("store_maintenance_policy_set", "store", "StoreAdmin", None),
-    write("store_maintenance_run", "store", "StoreAdmin", None),
-    // telemetry
-    write(
+    read_generated(
+        "store_blob_digest",
+        "store",
+        GeneratedOperationId::StoreBlobDigest,
+    ),
+    read_generated(
+        "store_policy_get",
+        "store",
+        GeneratedOperationId::StoreAdminStorePolicyGet,
+    ),
+    write_generated(
+        "store_policy_set",
+        "store",
+        GeneratedOperationId::StoreAdminStorePolicySet,
+    ),
+    read_composite(
+        "store_maintenance_status",
+        "store",
+        CompositeId::StoreMaintenanceStatus,
+    ),
+    write_composite(
+        "store_maintenance_policy_set",
+        "store",
+        CompositeId::StoreMaintenancePolicySet,
+    ),
+    write_composite(
+        "store_maintenance_run",
+        "store",
+        CompositeId::StoreMaintenanceRun,
+    ),
+    // metrics
+    write_generated(
         "metrics_put_descriptor",
         "metrics",
-        "Metrics",
-        Some("put_descriptor"),
+        GeneratedOperationId::MetricsPutDescriptor,
     ),
-    read(
+    read_generated(
         "metrics_get_descriptor",
         "metrics",
-        "Metrics",
-        Some("get_descriptor"),
+        GeneratedOperationId::MetricsGetDescriptor,
     ),
-    write(
+    write_generated(
         "metrics_put_observation",
         "metrics",
-        "Metrics",
-        Some("put_observation"),
+        GeneratedOperationId::MetricsPutObservation,
     ),
-    read("metrics_query", "metrics", "Metrics", Some("query")),
-    write("logs_put_record", "logs", "Logs", Some("put_record")),
-    read("logs_get_record", "logs", "Logs", Some("get_record")),
-    read("logs_query", "logs", "Logs", Some("query")),
-    write("traces_put_span", "traces", "Traces", Some("put_span")),
-    read("traces_get_span", "traces", "Traces", Some("get_span")),
-    read(
+    read_generated(
+        "metrics_query",
+        "metrics",
+        GeneratedOperationId::MetricsQuery,
+    ),
+    // logs
+    write_generated(
+        "logs_put_record",
+        "logs",
+        GeneratedOperationId::LogsPutRecord,
+    ),
+    read_generated(
+        "logs_get_record",
+        "logs",
+        GeneratedOperationId::LogsGetRecord,
+    ),
+    read_generated("logs_query", "logs", GeneratedOperationId::LogsQuery),
+    // traces
+    write_generated(
+        "traces_put_span",
+        "traces",
+        GeneratedOperationId::TracesPutSpan,
+    ),
+    read_generated(
+        "traces_get_span",
+        "traces",
+        GeneratedOperationId::TracesGetSpan,
+    ),
+    read_generated(
         "traces_trace_spans",
         "traces",
-        "Traces",
-        Some("trace_spans"),
+        GeneratedOperationId::TracesTraceSpans,
     ),
-    read("traces_query", "traces", "Traces", Some("query")),
+    read_generated("traces_query", "traces", GeneratedOperationId::TracesQuery),
     // workspace
-    read(
+    read_generated(
         "workspace_list",
         "workspace",
-        "Workspaces",
-        Some("workspace_list"),
+        GeneratedOperationId::WorkspacesWorkspaceList,
     ),
     // vcs
-    write("vcs_commit", "vcs", "VersionControl", Some("commit")),
-    write("vcs_branch", "vcs", "VersionControl", Some("branch")),
-    write("vcs_checkout", "vcs", "VersionControl", Some("checkout")),
-    read(
+    write_generated(
+        "vcs_commit",
+        "vcs",
+        GeneratedOperationId::VersionControlCommit,
+    ),
+    write_generated(
+        "vcs_branch",
+        "vcs",
+        GeneratedOperationId::VersionControlBranch,
+    ),
+    write_generated(
+        "vcs_checkout",
+        "vcs",
+        GeneratedOperationId::VersionControlCheckout,
+    ),
+    read_generated(
         "vcs_head_branch",
         "vcs",
-        "VersionControl",
-        Some("head_branch"),
+        GeneratedOperationId::VersionControlHeadBranch,
     ),
-    read("vcs_log", "vcs", "VersionControl", Some("log")),
-    write("vcs_merge", "vcs", "VersionControl", Some("merge")),
-    read(
+    read_generated("vcs_log", "vcs", GeneratedOperationId::VersionControlLog),
+    write_generated(
+        "vcs_merge",
+        "vcs",
+        GeneratedOperationId::VersionControlMerge,
+    ),
+    read_generated(
         "vcs_merge_in_progress",
         "vcs",
-        "VersionControl",
-        Some("merge_in_progress"),
+        GeneratedOperationId::VersionControlMergeInProgress,
     ),
-    read(
+    read_generated(
         "vcs_merge_conflicts",
         "vcs",
-        "VersionControl",
-        Some("merge_conflicts"),
+        GeneratedOperationId::VersionControlMergeConflicts,
     ),
-    write(
+    write_generated(
         "vcs_merge_resolve",
         "vcs",
-        "VersionControl",
-        Some("merge_resolve"),
+        GeneratedOperationId::VersionControlMergeResolve,
     ),
-    write(
+    write_generated(
         "vcs_merge_abort",
         "vcs",
-        "VersionControl",
-        Some("merge_abort"),
+        GeneratedOperationId::VersionControlMergeAbort,
     ),
-    write(
+    write_generated(
         "vcs_merge_continue",
         "vcs",
-        "VersionControl",
-        Some("merge_continue"),
+        GeneratedOperationId::VersionControlMergeContinue,
     ),
-    read("vcs_status", "vcs", "VersionControl", Some("status")),
-    write("vcs_stage", "vcs", "VersionControl", Some("stage")),
-    write("vcs_stage_all", "vcs", "VersionControl", Some("stage_all")),
-    write("vcs_unstage", "vcs", "VersionControl", Some("unstage")),
-    write(
+    read_generated(
+        "vcs_status",
+        "vcs",
+        GeneratedOperationId::VersionControlStatus,
+    ),
+    write_generated(
+        "vcs_stage",
+        "vcs",
+        GeneratedOperationId::VersionControlStage,
+    ),
+    write_generated(
+        "vcs_stage_all",
+        "vcs",
+        GeneratedOperationId::VersionControlStageAll,
+    ),
+    write_generated(
+        "vcs_unstage",
+        "vcs",
+        GeneratedOperationId::VersionControlUnstage,
+    ),
+    write_generated(
         "vcs_commit_staged",
         "vcs",
-        "VersionControl",
-        Some("commit_staged"),
+        GeneratedOperationId::VersionControlCommitStaged,
     ),
-    write(
+    write_generated(
         "vcs_tag_create",
         "vcs",
-        "VersionControl",
-        Some("tag_create"),
+        GeneratedOperationId::VersionControlTagCreate,
     ),
-    read("vcs_tag_list", "vcs", "VersionControl", Some("tag_list")),
-    read(
+    read_generated(
+        "vcs_tag_list",
+        "vcs",
+        GeneratedOperationId::VersionControlTagList,
+    ),
+    read_generated(
         "vcs_tag_target",
         "vcs",
-        "VersionControl",
-        Some("tag_target"),
+        GeneratedOperationId::VersionControlTagTarget,
     ),
-    write(
+    write_generated(
         "vcs_tag_delete",
         "vcs",
-        "VersionControl",
-        Some("tag_delete"),
+        GeneratedOperationId::VersionControlTagDelete,
     ),
-    write(
+    write_generated(
         "vcs_tag_rename",
         "vcs",
-        "VersionControl",
-        Some("tag_rename"),
+        GeneratedOperationId::VersionControlTagRename,
     ),
-    write(
+    write_generated(
         "vcs_restore_file",
         "vcs",
-        "VersionControl",
-        Some("restore_file"),
+        GeneratedOperationId::VersionControlRestoreFile,
     ),
-    write(
+    write_generated(
         "vcs_restore_path",
         "vcs",
-        "VersionControl",
-        Some("restore_path"),
+        GeneratedOperationId::VersionControlRestorePath,
     ),
-    write(
+    write_generated(
         "vcs_cherry_pick",
         "vcs",
-        "VersionControl",
-        Some("cherry_pick"),
+        GeneratedOperationId::VersionControlCherryPick,
     ),
-    write("vcs_revert", "vcs", "VersionControl", Some("revert")),
-    write("vcs_rebase", "vcs", "VersionControl", Some("rebase")),
-    write("vcs_squash", "vcs", "VersionControl", Some("squash")),
-    read("vcs_diff", "vcs", "VersionControl", Some("diff")),
-    read("vcs_blame", "vcs", "VersionControl", Some("blame")),
+    write_generated(
+        "vcs_revert",
+        "vcs",
+        GeneratedOperationId::VersionControlRevert,
+    ),
+    write_generated(
+        "vcs_rebase",
+        "vcs",
+        GeneratedOperationId::VersionControlRebase,
+    ),
+    write_generated(
+        "vcs_squash",
+        "vcs",
+        GeneratedOperationId::VersionControlSquash,
+    ),
+    read_generated("vcs_diff", "vcs", GeneratedOperationId::VersionControlDiff),
+    read_generated(
+        "vcs_blame",
+        "vcs",
+        GeneratedOperationId::VersionControlBlame,
+    ),
     // watch
-    read("watch_subscribe", "watch", "Watch", Some("subscribe")),
-    read("watch_poll", "watch", "Watch", Some("poll")),
+    read_generated(
+        "watch_subscribe",
+        "watch",
+        GeneratedOperationId::WatchSubscribe,
+    ),
+    read_generated("watch_poll", "watch", GeneratedOperationId::WatchPoll),
     // fs
-    write("fs_write_file", "fs", "FileSystem", Some("write_file")),
-    read("fs_read_file", "fs", "FileSystem", Some("read_file")),
-    write("fs_append_file", "fs", "FileSystem", Some("append_file")),
-    write("fs_remove_file", "fs", "FileSystem", Some("remove_file")),
-    read("fs_read_at", "fs", "FileSystem", Some("read_at")),
-    read("fs_stat", "fs", "FileSystem", Some("stat")),
-    read(
+    write_generated(
+        "fs_write_file",
+        "fs",
+        GeneratedOperationId::FileSystemWriteFile,
+    ),
+    read_generated(
+        "fs_read_file",
+        "fs",
+        GeneratedOperationId::FileSystemReadFile,
+    ),
+    write_generated(
+        "fs_append_file",
+        "fs",
+        GeneratedOperationId::FileSystemAppendFile,
+    ),
+    write_generated(
+        "fs_remove_file",
+        "fs",
+        GeneratedOperationId::FileSystemRemoveFile,
+    ),
+    read_generated("fs_read_at", "fs", GeneratedOperationId::FileSystemReadAt),
+    read_generated("fs_stat", "fs", GeneratedOperationId::FileSystemStat),
+    read_generated(
         "fs_list_directory",
         "fs",
-        "FileSystem",
-        Some("list_directory"),
+        GeneratedOperationId::FileSystemListDirectory,
     ),
-    write(
+    write_generated(
         "fs_create_directory",
         "fs",
-        "FileSystem",
-        Some("create_directory"),
+        GeneratedOperationId::FileSystemCreateDirectory,
     ),
-    write(
+    write_generated(
         "fs_remove_directory",
         "fs",
-        "FileSystem",
-        Some("remove_directory"),
+        GeneratedOperationId::FileSystemRemoveDirectory,
     ),
-    write("fs_write_at", "fs", "FileSystem", Some("write_at")),
-    write("fs_truncate", "fs", "FileSystem", Some("truncate")),
-    write("fs_symlink", "fs", "FileSystem", Some("symlink")),
-    read("fs_read_link", "fs", "FileSystem", Some("read_link")),
+    write_generated("fs_write_at", "fs", GeneratedOperationId::FileSystemWriteAt),
+    write_generated(
+        "fs_truncate",
+        "fs",
+        GeneratedOperationId::FileSystemTruncate,
+    ),
+    write_generated("fs_symlink", "fs", GeneratedOperationId::FileSystemSymlink),
+    read_generated(
+        "fs_read_link",
+        "fs",
+        GeneratedOperationId::FileSystemReadLink,
+    ),
     // apps
-    read("apps_list", "apps", "FileSystem", None),
-    read("apps_show", "apps", "FileSystem", None),
-    read("apps_read_file", "apps", "FileSystem", None),
-    write("apps_create", "apps", "FileSystem", None),
-    write("apps_write_file", "apps", "FileSystem", None),
-    write("apps_remove_file", "apps", "FileSystem", None),
-    write("apps_call_tool", "apps", "FileSystem", None),
+    read_composite("apps_list", "apps", CompositeId::AppsSurfaceAppsList),
+    read_composite("apps_show", "apps", CompositeId::AppsSurfaceAppsShow),
+    read_composite(
+        "apps_read_file",
+        "apps",
+        CompositeId::AppsSurfaceAppsReadFile,
+    ),
+    write_composite("apps_create", "apps", CompositeId::AppsSurfaceAppsCreate),
+    write_composite(
+        "apps_write_file",
+        "apps",
+        CompositeId::AppsSurfaceAppsWriteFile,
+    ),
+    write_composite(
+        "apps_remove_file",
+        "apps",
+        CompositeId::AppsSurfaceAppsRemoveFile,
+    ),
+    write_composite(
+        "apps_call_tool",
+        "apps",
+        CompositeId::AppsSurfaceAppsCallTool,
+    ),
     // ask
-    write("ask_questions", "ask", "Document", None),
-    read("ask_answers", "ask", "Document", None),
-    write("ask_record", "ask", "Document", None),
+    write_composite("ask_questions", "ask", CompositeId::AskSurfaceAskQuestions),
+    read_composite("ask_answers", "ask", CompositeId::AskSurfaceAskAnswers),
+    write_composite("ask_record", "ask", CompositeId::AskSurfaceAskRecord),
     // cas
-    write("cas_put", "cas", "Cas", Some("put")),
-    read("cas_get", "cas", "Cas", Some("get")),
-    read("cas_has", "cas", "Cas", Some("has")),
-    write("cas_delete", "cas", "Cas", Some("delete")),
-    read("cas_list", "cas", "Cas", Some("list")),
+    write_generated("cas_put", "cas", GeneratedOperationId::CasPut),
+    read_generated("cas_get", "cas", GeneratedOperationId::CasGet),
+    read_generated("cas_has", "cas", GeneratedOperationId::CasHas),
+    write_generated("cas_delete", "cas", GeneratedOperationId::CasDelete),
+    read_generated("cas_list", "cas", GeneratedOperationId::CasList),
     // graph
-    write("graph_upsert_node", "graph", "Graph", Some("upsert_node")),
-    read("graph_get_node", "graph", "Graph", Some("get_node")),
-    write("graph_remove_node", "graph", "Graph", Some("remove_node")),
-    write("graph_upsert_edge", "graph", "Graph", Some("upsert_edge")),
-    read("graph_get_edge", "graph", "Graph", Some("get_edge")),
-    write("graph_remove_edge", "graph", "Graph", Some("remove_edge")),
-    read("graph_neighbors", "graph", "Graph", Some("neighbors")),
-    read("graph_out_edges", "graph", "Graph", Some("out_edges")),
-    read("graph_in_edges", "graph", "Graph", Some("in_edges")),
-    read("graph_reachable", "graph", "Graph", Some("reachable")),
-    read(
+    write_generated(
+        "graph_upsert_node",
+        "graph",
+        GeneratedOperationId::GraphUpsertNode,
+    ),
+    read_generated(
+        "graph_get_node",
+        "graph",
+        GeneratedOperationId::GraphGetNode,
+    ),
+    write_generated(
+        "graph_remove_node",
+        "graph",
+        GeneratedOperationId::GraphRemoveNode,
+    ),
+    write_generated(
+        "graph_upsert_edge",
+        "graph",
+        GeneratedOperationId::GraphUpsertEdge,
+    ),
+    read_generated(
+        "graph_get_edge",
+        "graph",
+        GeneratedOperationId::GraphGetEdge,
+    ),
+    write_generated(
+        "graph_remove_edge",
+        "graph",
+        GeneratedOperationId::GraphRemoveEdge,
+    ),
+    read_generated(
+        "graph_neighbors",
+        "graph",
+        GeneratedOperationId::GraphNeighbors,
+    ),
+    read_generated(
+        "graph_out_edges",
+        "graph",
+        GeneratedOperationId::GraphOutEdges,
+    ),
+    read_generated(
+        "graph_in_edges",
+        "graph",
+        GeneratedOperationId::GraphInEdges,
+    ),
+    read_generated(
+        "graph_reachable",
+        "graph",
+        GeneratedOperationId::GraphReachable,
+    ),
+    read_generated(
         "graph_shortest_path",
         "graph",
-        "Graph",
-        Some("shortest_path"),
+        GeneratedOperationId::GraphShortestPath,
     ),
-    read("graph_query", "graph", "Graph", Some("query")),
-    read(
+    read_generated("graph_query", "graph", GeneratedOperationId::GraphQuery),
+    read_generated(
         "graph_explain_query",
         "graph",
-        "Graph",
-        Some("explain_query"),
+        GeneratedOperationId::GraphExplainQuery,
     ),
     // vector
-    write("vector_create", "vector", "Vector", Some("create")),
-    write("vector_upsert", "vector", "Vector", Some("upsert")),
-    write(
+    write_generated(
+        "vector_create",
+        "vector",
+        GeneratedOperationId::VectorCreate,
+    ),
+    write_generated(
+        "vector_upsert",
+        "vector",
+        GeneratedOperationId::VectorUpsert,
+    ),
+    write_generated(
         "vector_upsert_source",
         "vector",
-        "Vector",
-        Some("upsert_source"),
+        GeneratedOperationId::VectorUpsertSource,
     ),
-    read("vector_get", "vector", "Vector", Some("get")),
-    read(
+    read_generated("vector_get", "vector", GeneratedOperationId::VectorGet),
+    read_generated(
         "vector_source_text",
         "vector",
-        "Vector",
-        Some("source_text"),
+        GeneratedOperationId::VectorSourceText,
     ),
-    read(
+    read_generated(
         "vector_embedding_model",
         "vector",
-        "Vector",
-        Some("embedding_model"),
+        GeneratedOperationId::VectorEmbeddingModel,
     ),
-    read("vector_ids", "vector", "Vector", Some("ids")),
-    read(
+    read_generated("vector_ids", "vector", GeneratedOperationId::VectorIds),
+    read_generated(
         "vector_metadata_index_keys",
         "vector",
-        "Vector",
-        Some("metadata_index_keys"),
+        GeneratedOperationId::VectorMetadataIndexKeys,
     ),
-    write(
+    write_generated(
         "vector_create_metadata_index",
         "vector",
-        "Vector",
-        Some("create_metadata_index"),
+        GeneratedOperationId::VectorCreateMetadataIndex,
     ),
-    write(
+    write_generated(
         "vector_drop_metadata_index",
         "vector",
-        "Vector",
-        Some("drop_metadata_index"),
+        GeneratedOperationId::VectorDropMetadataIndex,
     ),
-    write("vector_delete", "vector", "Vector", Some("delete")),
-    read("vector_search", "vector", "Vector", Some("search")),
-    read(
+    write_generated(
+        "vector_delete",
+        "vector",
+        GeneratedOperationId::VectorDelete,
+    ),
+    read_generated(
+        "vector_search",
+        "vector",
+        GeneratedOperationId::VectorSearch,
+    ),
+    read_generated(
         "vector_search_policy",
         "vector",
-        "Vector",
-        Some("search_policy"),
+        GeneratedOperationId::VectorSearchPolicy,
     ),
     // columnar
-    write("columnar_create", "columnar", "Columnar", Some("create")),
-    write("columnar_append", "columnar", "Columnar", Some("append")),
-    write("columnar_compact", "columnar", "Columnar", Some("compact")),
-    read("columnar_scan", "columnar", "Columnar", Some("scan")),
-    read("columnar_columns", "columnar", "Columnar", Some("columns")),
-    read("columnar_rows", "columnar", "Columnar", Some("rows")),
-    read("columnar_inspect", "columnar", "Columnar", Some("inspect")),
-    read(
+    write_generated(
+        "columnar_create",
+        "columnar",
+        GeneratedOperationId::ColumnarCreate,
+    ),
+    write_generated(
+        "columnar_append",
+        "columnar",
+        GeneratedOperationId::ColumnarAppend,
+    ),
+    write_generated(
+        "columnar_compact",
+        "columnar",
+        GeneratedOperationId::ColumnarCompact,
+    ),
+    read_generated(
+        "columnar_scan",
+        "columnar",
+        GeneratedOperationId::ColumnarScan,
+    ),
+    read_generated(
+        "columnar_columns",
+        "columnar",
+        GeneratedOperationId::ColumnarColumns,
+    ),
+    read_generated(
+        "columnar_rows",
+        "columnar",
+        GeneratedOperationId::ColumnarRows,
+    ),
+    read_generated(
+        "columnar_inspect",
+        "columnar",
+        GeneratedOperationId::ColumnarInspect,
+    ),
+    read_generated(
         "columnar_source_digest",
         "columnar",
-        "Columnar",
-        Some("source_digest"),
+        GeneratedOperationId::ColumnarSourceDigest,
     ),
-    read("columnar_select", "columnar", "Columnar", Some("select")),
-    read(
+    read_generated(
+        "columnar_select",
+        "columnar",
+        GeneratedOperationId::ColumnarSelect,
+    ),
+    read_generated(
         "columnar_aggregate",
         "columnar",
-        "Columnar",
-        Some("aggregate"),
+        GeneratedOperationId::ColumnarAggregate,
     ),
     // dataframe
-    write("dataframe_create", "dataframe", "Dataframe", Some("create")),
-    read(
+    write_generated(
+        "dataframe_create",
+        "dataframe",
+        GeneratedOperationId::DataframeCreate,
+    ),
+    read_generated(
         "dataframe_collect",
         "dataframe",
-        "Dataframe",
-        Some("collect"),
+        GeneratedOperationId::DataframeCollect,
     ),
-    read(
+    read_generated(
         "dataframe_preview",
         "dataframe",
-        "Dataframe",
-        Some("preview"),
+        GeneratedOperationId::DataframePreview,
     ),
-    write(
+    write_generated(
         "dataframe_materialize",
         "dataframe",
-        "Dataframe",
-        Some("materialize"),
+        GeneratedOperationId::DataframeMaterialize,
     ),
-    read(
+    read_generated(
         "dataframe_plan_digest",
         "dataframe",
-        "Dataframe",
-        Some("plan_digest"),
+        GeneratedOperationId::DataframePlanDigest,
     ),
-    read(
+    read_generated(
         "dataframe_source_digests",
         "dataframe",
-        "Dataframe",
-        Some("source_digests"),
+        GeneratedOperationId::DataframeSourceDigests,
     ),
     // fts
-    write("fts_create", "fts", "Search", Some("create")),
-    write("fts_index", "fts", "Search", Some("index")),
-    read("fts_get", "fts", "Search", Some("get")),
-    write("fts_delete", "fts", "Search", Some("delete")),
-    read("fts_ids", "fts", "Search", Some("ids")),
-    write("fts_remap", "fts", "Search", Some("remap")),
-    read("fts_query", "fts", "Search", Some("query")),
-    read("fts_source_digest", "fts", "Search", Some("source_digest")),
-    read("fts_status", "fts", "Search", Some("status")),
-    // tools
-    read("search", "search", "Search", None),
+    write_generated("fts_create", "fts", GeneratedOperationId::SearchCreate),
+    write_generated("fts_index", "fts", GeneratedOperationId::SearchIndex),
+    read_generated("fts_get", "fts", GeneratedOperationId::SearchGet),
+    write_generated("fts_delete", "fts", GeneratedOperationId::SearchDelete),
+    read_generated("fts_ids", "fts", GeneratedOperationId::SearchIds),
+    write_generated("fts_remap", "fts", GeneratedOperationId::SearchRemap),
+    read_generated("fts_query", "fts", GeneratedOperationId::SearchQuery),
+    read_generated(
+        "fts_source_digest",
+        "fts",
+        GeneratedOperationId::SearchSourceDigest,
+    ),
+    read_generated("fts_status", "fts", GeneratedOperationId::SearchStatus),
+    // search
+    read_composite("search", "search", CompositeId::GlobalSearchSearch),
     // substrate
-    read("substrate_changes", "substrate", "Search", None),
-    read("workgraph_changes", "workgraph", "Search", None),
-    read("workgraph_metrics", "workgraph", "Search", None),
-    write("workgraph_fact_put", "workgraph", "Search", None),
-    read("substrate_refs", "substrate", "Search", None),
-    write("substrate_alias_bind", "substrate", "Search", None),
-    write("substrate_alias_release", "substrate", "Search", None),
-    read("substrate_alias_resolve", "substrate", "Search", None),
-    read("substrate_alias_list", "substrate", "Search", None),
-    read("substrate_reference_status", "substrate", "Search", None),
-    write("substrate_reference_reconcile", "substrate", "Store", None),
-    read("substrate_history", "substrate", "Search", None),
-    read("substrate_revision_latest", "substrate", "Search", None),
-    read("substrate_revision_at", "substrate", "Search", None),
-    read("substrate_revision_as_of_root", "substrate", "Search", None),
-    read("substrate_checkpoint_before", "substrate", "Search", None),
-    write("substrate_transact", "substrate", "Search", None),
-    write("substrate_view_define", "substrate", "Search", None),
-    read("substrate_view_get", "substrate", "Search", None),
-    read("substrate_view_list", "substrate", "Search", None),
-    read(
+    read_composite(
+        "substrate_changes",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateChanges,
+    ),
+    // workgraph
+    read_composite(
+        "workgraph_changes",
+        "workgraph",
+        CompositeId::WorkgraphSurfaceWorkgraphChanges,
+    ),
+    read_composite(
+        "workgraph_metrics",
+        "workgraph",
+        CompositeId::WorkgraphSurfaceWorkgraphMetrics,
+    ),
+    write_composite(
+        "workgraph_fact_put",
+        "workgraph",
+        CompositeId::WorkgraphSurfaceWorkgraphFactPut,
+    ),
+    // substrate
+    read_composite(
+        "substrate_refs",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateRefs,
+    ),
+    write_composite(
+        "substrate_alias_bind",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateAliasBind,
+    ),
+    write_composite(
+        "substrate_alias_release",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateAliasRelease,
+    ),
+    read_composite(
+        "substrate_alias_resolve",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateAliasResolve,
+    ),
+    read_composite(
+        "substrate_alias_list",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateAliasList,
+    ),
+    read_composite(
+        "substrate_reference_status",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateReferenceStatus,
+    ),
+    write_composite(
+        "substrate_reference_reconcile",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateReferenceReconcile,
+    ),
+    read_composite(
+        "substrate_history",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateHistory,
+    ),
+    read_composite(
+        "substrate_revision_latest",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateRevisionLatest,
+    ),
+    read_composite(
+        "substrate_revision_at",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateRevisionAt,
+    ),
+    read_composite(
+        "substrate_revision_as_of_root",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateRevisionAsOfRoot,
+    ),
+    read_composite(
+        "substrate_checkpoint_before",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateCheckpointBefore,
+    ),
+    write_composite(
+        "substrate_transact",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateTransact,
+    ),
+    write_composite(
+        "substrate_view_define",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateViewDefine,
+    ),
+    read_composite(
+        "substrate_view_get",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateViewGet,
+    ),
+    read_composite(
+        "substrate_view_list",
+        "substrate",
+        CompositeId::SubstrateSurfaceSubstrateViewList,
+    ),
+    read_composite(
         "substrate_write_admission_policy_get",
         "substrate",
-        "Search",
-        None,
+        CompositeId::SubstrateSurfaceSubstrateWriteAdmissionPolicyGet,
     ),
-    write(
+    write_composite(
         "substrate_write_admission_policy_set",
         "substrate",
-        "Search",
-        None,
+        CompositeId::SubstrateSurfaceSubstrateWriteAdmissionPolicySet,
     ),
     // tickets
-    write("tickets_project_create", "tickets", "Store", None),
-    write("tickets_project_rekey", "tickets", "Store", None),
-    read("tickets_project_settings_get", "tickets", "Store", None),
-    write("tickets_project_settings_set", "tickets", "Store", None),
-    read("tickets_projects", "tickets", "Store", None),
-    read("tickets_relations", "tickets", "Store", None),
-    read("tickets_fields", "tickets", "Store", None),
-    write("tickets_field_put", "tickets", "Store", None),
-    write("tickets_field_retire", "tickets", "Store", None),
-    write("tickets_create", "tickets", "Store", None),
-    write("tickets_update", "tickets", "Store", None),
-    write("tickets_delete", "tickets", "Store", None),
-    read("tickets_comments", "tickets", "Store", None),
-    write("tickets_comment_add", "tickets", "Store", None),
-    write("tickets_comment_update", "tickets", "Store", None),
-    write("tickets_comment_delete", "tickets", "Store", None),
-    write("tickets_board_create", "tickets", "Store", None),
-    write("tickets_board_update", "tickets", "Store", None),
-    write("tickets_board_delete", "tickets", "Store", None),
-    write("tickets_board_configure_columns", "tickets", "Store", None),
-    write("tickets_board_move_card", "tickets", "Store", None),
-    write("tickets_relation_set", "tickets", "Store", None),
-    write("tickets_relation_remove", "tickets", "Store", None),
-    read("tickets_get", "tickets", "Store", None),
-    read("tickets_list", "tickets", "Store", None),
-    read("tickets_board_get", "tickets", "Store", None),
-    read("tickets_board_list", "tickets", "Store", None),
-    read("tickets_history", "tickets", "Store", None),
+    write_generated(
+        "tickets_project_create",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsProjectCreateJson,
+    ),
+    write_generated(
+        "tickets_project_rekey",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsProjectRekeyJson,
+    ),
+    read_generated(
+        "tickets_project_settings_get",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsProjectSettingsGetJson,
+    ),
+    write_generated(
+        "tickets_project_settings_set",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsProjectSettingsSetJson,
+    ),
+    read_composite("tickets_projects", "tickets", CompositeId::TicketsProjects),
+    read_generated(
+        "tickets_relations",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsRelationListJson,
+    ),
+    read_generated(
+        "tickets_fields",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsFieldsJson,
+    ),
+    write_generated(
+        "tickets_field_put",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsFieldPutJson,
+    ),
+    write_generated(
+        "tickets_field_retire",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsFieldRetireJson,
+    ),
+    write_generated(
+        "tickets_create",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsCreateJson,
+    ),
+    write_generated(
+        "tickets_update",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsUpdateJson,
+    ),
+    write_generated(
+        "tickets_delete",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsDeleteJson,
+    ),
+    read_generated(
+        "tickets_comments",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsCommentsJson,
+    ),
+    write_generated(
+        "tickets_comment_add",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsCommentAddJson,
+    ),
+    write_generated(
+        "tickets_comment_update",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsCommentUpdateJson,
+    ),
+    write_generated(
+        "tickets_comment_delete",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsCommentDeleteJson,
+    ),
+    write_generated(
+        "tickets_board_create",
+        "tickets",
+        GeneratedOperationId::TicketsBoardsCreateJson,
+    ),
+    write_generated(
+        "tickets_board_update",
+        "tickets",
+        GeneratedOperationId::TicketsBoardsUpdateJson,
+    ),
+    write_generated(
+        "tickets_board_delete",
+        "tickets",
+        GeneratedOperationId::TicketsBoardsDeleteJson,
+    ),
+    write_generated(
+        "tickets_board_configure_columns",
+        "tickets",
+        GeneratedOperationId::TicketsBoardsConfigureColumnsJson,
+    ),
+    write_generated(
+        "tickets_board_move_card",
+        "tickets",
+        GeneratedOperationId::TicketsBoardsMoveCardJson,
+    ),
+    write_generated(
+        "tickets_relation_set",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsRelationSetJson,
+    ),
+    write_generated(
+        "tickets_relation_remove",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsRelationRemoveJson,
+    ),
+    read_generated(
+        "tickets_get",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsGetJson,
+    ),
+    read_generated(
+        "tickets_list",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsListJson,
+    ),
+    read_generated(
+        "tickets_board_get",
+        "tickets",
+        GeneratedOperationId::TicketsBoardsGetJson,
+    ),
+    read_generated(
+        "tickets_board_list",
+        "tickets",
+        GeneratedOperationId::TicketsBoardsListJson,
+    ),
+    read_generated(
+        "tickets_history",
+        "tickets",
+        GeneratedOperationId::TicketsTicketsHistoryJson,
+    ),
     // lanes
-    write("lanes_create", "lanes", "Lanes", Some("create")),
-    read("lanes_get", "lanes", "Lanes", Some("get")),
-    read("lanes_list", "lanes", "Lanes", Some("list")),
-    write("lanes_update", "lanes", "Lanes", Some("update")),
-    write("lanes_closeout", "lanes", "Store", None),
-    write("lanes_ticket_add", "lanes", "Lanes", Some("ticket_add")),
-    write(
+    write_generated("lanes_create", "lanes", GeneratedOperationId::LanesCreate),
+    read_generated("lanes_get", "lanes", GeneratedOperationId::LanesGet),
+    read_generated("lanes_list", "lanes", GeneratedOperationId::LanesList),
+    write_generated("lanes_update", "lanes", GeneratedOperationId::LanesUpdate),
+    write_composite("lanes_closeout", "lanes", CompositeId::LanesCloseout),
+    write_generated(
+        "lanes_ticket_add",
+        "lanes",
+        GeneratedOperationId::LanesTicketAdd,
+    ),
+    write_generated(
         "lanes_ticket_remove",
         "lanes",
-        "Lanes",
-        Some("ticket_remove"),
+        GeneratedOperationId::LanesTicketRemove,
     ),
-    write(
+    write_generated(
         "lanes_ticket_transfer",
         "lanes",
-        "Lanes",
-        Some("ticket_transfer"),
+        GeneratedOperationId::LanesTicketTransfer,
     ),
-    write("lanes_delete", "lanes", "Lanes", Some("delete")),
-    write("lanes_cleanup", "lanes", "Store", None),
-    // spaces and pages
-    write("spaces_create", "spaces", "Store", None),
-    read("spaces_get", "spaces", "Store", None),
-    read("spaces_list", "spaces", "Store", None),
-    write("pages_create", "pages", "Store", None),
-    write("pages_update", "pages", "Store", None),
-    write("pages_publish", "pages", "Store", None),
-    read("pages_get", "pages", "Store", None),
-    read("pages_list", "pages", "Store", None),
-    read("pages_history", "pages", "Store", None),
+    write_generated("lanes_delete", "lanes", GeneratedOperationId::LanesDelete),
+    write_composite("lanes_cleanup", "lanes", CompositeId::LanesCleanup),
+    // spaces
+    write_generated(
+        "spaces_create",
+        "spaces",
+        GeneratedOperationId::PagesSpacesCreateJson,
+    ),
+    read_generated(
+        "spaces_get",
+        "spaces",
+        GeneratedOperationId::PagesSpacesGetJson,
+    ),
+    read_generated(
+        "spaces_list",
+        "spaces",
+        GeneratedOperationId::PagesSpacesListJson,
+    ),
+    // pages
+    write_generated(
+        "pages_create",
+        "pages",
+        GeneratedOperationId::PagesPagesCreateJson,
+    ),
+    write_generated(
+        "pages_update",
+        "pages",
+        GeneratedOperationId::PagesPagesUpdateJson,
+    ),
+    write_generated(
+        "pages_publish",
+        "pages",
+        GeneratedOperationId::PagesPagesPublishJson,
+    ),
+    read_generated(
+        "pages_get",
+        "pages",
+        GeneratedOperationId::PagesPagesGetJson,
+    ),
+    read_generated(
+        "pages_list",
+        "pages",
+        GeneratedOperationId::PagesPagesListJson,
+    ),
+    read_generated(
+        "pages_history",
+        "pages",
+        GeneratedOperationId::PagesPagesHistoryJson,
+    ),
     // lifecycles
-    write("lifecycles_define", "lifecycles", "Store", None),
-    write("lifecycles_define_standard", "lifecycles", "Store", None),
-    read("lifecycles_definitions", "lifecycles", "Store", None),
-    read("lifecycles_definition", "lifecycles", "Store", None),
-    write("lifecycles_instantiate", "lifecycles", "Store", None),
-    read("lifecycles_instances", "lifecycles", "Store", None),
-    read("lifecycles_instance", "lifecycles", "Store", None),
-    write("lifecycles_active_set", "lifecycles", "Store", None),
-    write("lifecycles_active_clear", "lifecycles", "Store", None),
-    read("lifecycles_snapshot_plan", "lifecycles", "Store", None),
-    read("lifecycles_current_surface", "lifecycles", "Store", None),
-    write("lifecycles_transition", "lifecycles", "Store", None),
-    read("lifecycles_snapshots", "lifecycles", "Store", None),
-    read("lifecycles_snapshot", "lifecycles", "Store", None),
-    read("lifecycles_snapshot_content", "lifecycles", "Store", None),
-    read("lifecycles_operation_log", "lifecycles", "Store", None),
+    write_composite(
+        "lifecycles_define",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesDefine,
+    ),
+    write_composite(
+        "lifecycles_define_standard",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesDefineStandard,
+    ),
+    read_composite(
+        "lifecycles_definitions",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesDefinitions,
+    ),
+    read_composite(
+        "lifecycles_definition",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesDefinition,
+    ),
+    write_composite(
+        "lifecycles_instantiate",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesInstantiate,
+    ),
+    read_composite(
+        "lifecycles_instances",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesInstances,
+    ),
+    read_composite(
+        "lifecycles_instance",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesInstance,
+    ),
+    write_composite(
+        "lifecycles_active_set",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesActiveSet,
+    ),
+    write_composite(
+        "lifecycles_active_clear",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesActiveClear,
+    ),
+    read_composite(
+        "lifecycles_snapshot_plan",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesSnapshotPlan,
+    ),
+    read_composite(
+        "lifecycles_current_surface",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesCurrentSurface,
+    ),
+    write_composite(
+        "lifecycles_transition",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesTransition,
+    ),
+    read_composite(
+        "lifecycles_snapshots",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesSnapshots,
+    ),
+    read_composite(
+        "lifecycles_snapshot",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesSnapshot,
+    ),
+    read_composite(
+        "lifecycles_snapshot_content",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesSnapshotContent,
+    ),
+    read_composite(
+        "lifecycles_operation_log",
+        "lifecycles",
+        CompositeId::LifecycleSurfaceLifecyclesOperationLog,
+    ),
     // chat
-    read("chat_channels", "chat", "Store", None),
-    read("chat_fetch_events", "chat", "Store", None),
-    read("chat_messages", "chat", "Store", None),
-    read("chat_cursor", "chat", "Store", None),
-    read("chat_presence", "chat", "Store", None),
-    write("chat_create_channel", "chat", "Store", None),
-    write("chat_rename_channel", "chat", "Store", None),
-    write("chat_post_message", "chat", "Store", None),
-    write("chat_edit_message", "chat", "Store", None),
-    write("chat_redact_message", "chat", "Store", None),
-    read("chat_emoji_list", "chat", "Store", None),
-    write("chat_emoji_register", "chat", "Store", None),
-    write("chat_emoji_unregister", "chat", "Store", None),
-    write("chat_add_reaction", "chat", "Store", None),
-    write("chat_remove_reaction", "chat", "Store", None),
-    write("chat_create_thread", "chat", "Store", None),
-    write("chat_create_task", "chat", "Store", None),
-    write("chat_claim_task", "chat", "Store", None),
-    write("chat_complete_task", "chat", "Store", None),
-    write("chat_invoke_agent", "chat", "Store", None),
-    write("chat_agent_reply", "chat", "Store", None),
-    write("chat_request_handoff", "chat", "Store", None),
-    write("chat_update_cursor", "chat", "Store", None),
-    write("chat_set_presence", "chat", "Store", None),
+    read_generated(
+        "chat_channels",
+        "chat",
+        GeneratedOperationId::ChatChatListChannelsJson,
+    ),
+    read_generated(
+        "chat_fetch_events",
+        "chat",
+        GeneratedOperationId::ChatChatFetchEventsJson,
+    ),
+    read_generated(
+        "chat_messages",
+        "chat",
+        GeneratedOperationId::ChatChatMessagesJson,
+    ),
+    read_generated(
+        "chat_cursor",
+        "chat",
+        GeneratedOperationId::ChatChatCursorJson,
+    ),
+    read_composite("chat_presence", "chat", CompositeId::ChatPresence),
+    write_generated(
+        "chat_create_channel",
+        "chat",
+        GeneratedOperationId::ChatChatCreateChannelJson,
+    ),
+    write_generated(
+        "chat_rename_channel",
+        "chat",
+        GeneratedOperationId::ChatChatRenameChannelJson,
+    ),
+    write_generated(
+        "chat_post_message",
+        "chat",
+        GeneratedOperationId::ChatChatPostMessageJson,
+    ),
+    write_generated(
+        "chat_edit_message",
+        "chat",
+        GeneratedOperationId::ChatChatEditMessageJson,
+    ),
+    write_generated(
+        "chat_redact_message",
+        "chat",
+        GeneratedOperationId::ChatChatRedactMessageJson,
+    ),
+    read_generated(
+        "chat_emoji_list",
+        "chat",
+        GeneratedOperationId::ChatChatEmojiListJson,
+    ),
+    write_generated(
+        "chat_emoji_register",
+        "chat",
+        GeneratedOperationId::ChatChatEmojiRegisterJson,
+    ),
+    write_generated(
+        "chat_emoji_unregister",
+        "chat",
+        GeneratedOperationId::ChatChatEmojiUnregisterJson,
+    ),
+    write_generated(
+        "chat_add_reaction",
+        "chat",
+        GeneratedOperationId::ChatChatAddReactionJson,
+    ),
+    write_generated(
+        "chat_remove_reaction",
+        "chat",
+        GeneratedOperationId::ChatChatRemoveReactionJson,
+    ),
+    write_generated(
+        "chat_create_thread",
+        "chat",
+        GeneratedOperationId::ChatChatCreateThreadJson,
+    ),
+    write_generated(
+        "chat_create_task",
+        "chat",
+        GeneratedOperationId::ChatChatCreateTaskJson,
+    ),
+    write_generated(
+        "chat_claim_task",
+        "chat",
+        GeneratedOperationId::ChatChatClaimTaskJson,
+    ),
+    write_generated(
+        "chat_complete_task",
+        "chat",
+        GeneratedOperationId::ChatChatCompleteTaskJson,
+    ),
+    write_generated(
+        "chat_invoke_agent",
+        "chat",
+        GeneratedOperationId::ChatChatInvokeAgentJson,
+    ),
+    write_generated(
+        "chat_agent_reply",
+        "chat",
+        GeneratedOperationId::ChatChatAgentReplyJson,
+    ),
+    write_generated(
+        "chat_request_handoff",
+        "chat",
+        GeneratedOperationId::ChatChatRequestHandoffJson,
+    ),
+    write_generated(
+        "chat_update_cursor",
+        "chat",
+        GeneratedOperationId::ChatChatUpdateCursorJson,
+    ),
+    write_composite("chat_set_presence", "chat", CompositeId::ChatSetPresence),
     // drive
-    read("drive_list", "drive", "Store", None),
-    read("drive_stat", "drive", "Store", None),
-    read("drive_read", "drive", "Store", None),
-    read("drive_list_versions", "drive", "Store", None),
-    read("drive_list_conflicts", "drive", "Store", None),
-    write("drive_create_folder", "drive", "Store", None),
-    write("drive_create_upload", "drive", "Store", None),
-    write("drive_upload_chunk", "drive", "Store", None),
-    write("drive_commit_upload", "drive", "Store", None),
-    write("drive_rename", "drive", "Store", None),
-    write("drive_move", "drive", "Store", None),
-    write("drive_delete", "drive", "Store", None),
-    write("drive_resolve_conflict", "drive", "Store", None),
-    read("drive_list_shares", "drive", "Store", None),
-    write("drive_grant_share", "drive", "Store", None),
-    write("drive_revoke_share", "drive", "Store", None),
-    write("drive_apply_share_expiry", "drive", "Store", None),
-    read("drive_list_retention", "drive", "Store", None),
-    write("drive_pin_retention", "drive", "Store", None),
-    write("drive_unpin_retention", "drive", "Store", None),
-    write("drive_apply_retention", "drive", "Store", None),
-    write("drive_acquire_lease", "drive", "Store", None),
-    write("drive_refresh_lease", "drive", "Store", None),
-    write("drive_release_lease", "drive", "Store", None),
-    write("drive_break_lease", "drive", "Store", None),
+    read_generated(
+        "drive_list",
+        "drive",
+        GeneratedOperationId::DriveDriveListJson,
+    ),
+    read_generated(
+        "drive_stat",
+        "drive",
+        GeneratedOperationId::DriveDriveStatJson,
+    ),
+    read_generated(
+        "drive_read",
+        "drive",
+        GeneratedOperationId::DriveDriveReadFile,
+    ),
+    read_generated(
+        "drive_list_versions",
+        "drive",
+        GeneratedOperationId::DriveDriveListVersionsJson,
+    ),
+    read_generated(
+        "drive_list_conflicts",
+        "drive",
+        GeneratedOperationId::DriveDriveListConflictsJson,
+    ),
+    write_generated(
+        "drive_create_folder",
+        "drive",
+        GeneratedOperationId::DriveDriveCreateFolderJson,
+    ),
+    write_generated(
+        "drive_create_upload",
+        "drive",
+        GeneratedOperationId::DriveDriveCreateUploadJson,
+    ),
+    write_generated(
+        "drive_upload_chunk",
+        "drive",
+        GeneratedOperationId::DriveDriveUploadChunkJson,
+    ),
+    write_generated(
+        "drive_commit_upload",
+        "drive",
+        GeneratedOperationId::DriveDriveCommitUploadJson,
+    ),
+    write_generated(
+        "drive_rename",
+        "drive",
+        GeneratedOperationId::DriveDriveRenameJson,
+    ),
+    write_generated(
+        "drive_move",
+        "drive",
+        GeneratedOperationId::DriveDriveMoveJson,
+    ),
+    write_generated(
+        "drive_delete",
+        "drive",
+        GeneratedOperationId::DriveDriveDeleteJson,
+    ),
+    write_generated(
+        "drive_resolve_conflict",
+        "drive",
+        GeneratedOperationId::DriveDriveResolveConflictJson,
+    ),
+    read_generated(
+        "drive_list_shares",
+        "drive",
+        GeneratedOperationId::DriveDriveListSharesJson,
+    ),
+    write_generated(
+        "drive_grant_share",
+        "drive",
+        GeneratedOperationId::DriveDriveGrantShareJson,
+    ),
+    write_generated(
+        "drive_revoke_share",
+        "drive",
+        GeneratedOperationId::DriveDriveRevokeShareJson,
+    ),
+    write_generated(
+        "drive_apply_share_expiry",
+        "drive",
+        GeneratedOperationId::DriveDriveApplyShareExpiryJson,
+    ),
+    read_generated(
+        "drive_list_retention",
+        "drive",
+        GeneratedOperationId::DriveDriveListRetentionJson,
+    ),
+    write_generated(
+        "drive_pin_retention",
+        "drive",
+        GeneratedOperationId::DriveDrivePinRetentionJson,
+    ),
+    write_generated(
+        "drive_unpin_retention",
+        "drive",
+        GeneratedOperationId::DriveDriveUnpinRetentionJson,
+    ),
+    write_generated(
+        "drive_apply_retention",
+        "drive",
+        GeneratedOperationId::DriveDriveApplyRetentionJson,
+    ),
+    write_composite(
+        "drive_acquire_lease",
+        "drive",
+        CompositeId::DriveAcquireLease,
+    ),
+    write_composite(
+        "drive_refresh_lease",
+        "drive",
+        CompositeId::DriveRefreshLease,
+    ),
+    write_composite(
+        "drive_release_lease",
+        "drive",
+        CompositeId::DriveReleaseLease,
+    ),
+    write_composite("drive_break_lease", "drive", CompositeId::DriveBreakLease),
     // meetings
-    read("meetings_list", "meetings", "Store", None),
-    read("meetings_get", "meetings", "Store", None),
-    read("meetings_search", "meetings", "Store", None),
-    read("meetings_projection_outputs", "meetings", "Store", None),
-    read("meetings_extraction_review", "meetings", "Store", None),
-    write("meetings_accept_annotation", "meetings", "Store", None),
-    write("meetings_reject_annotation", "meetings", "Store", None),
-    write("meetings_propose_vocabulary", "meetings", "Store", None),
-    write("meetings_accept_vocabulary", "meetings", "Store", None),
-    write("meetings_reject_vocabulary", "meetings", "Store", None),
-    write("meetings_add_entity_merge", "meetings", "Store", None),
-    write("meetings_add_promotion", "meetings", "Store", None),
-    write("meetings_promote_task_to_ticket", "meetings", "Store", None),
-    write(
+    read_composite(
+        "meetings_list",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsList,
+    ),
+    read_composite(
+        "meetings_get",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsGet,
+    ),
+    read_composite(
+        "meetings_search",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsSearch,
+    ),
+    read_composite(
+        "meetings_projection_outputs",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsProjectionOutputs,
+    ),
+    read_composite(
+        "meetings_extraction_review",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsExtractionReview,
+    ),
+    write_composite(
+        "meetings_accept_annotation",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsAcceptAnnotation,
+    ),
+    write_composite(
+        "meetings_reject_annotation",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsRejectAnnotation,
+    ),
+    write_composite(
+        "meetings_propose_vocabulary",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsProposeVocabulary,
+    ),
+    write_composite(
+        "meetings_accept_vocabulary",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsAcceptVocabulary,
+    ),
+    write_composite(
+        "meetings_reject_vocabulary",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsRejectVocabulary,
+    ),
+    write_composite(
+        "meetings_add_entity_merge",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsAddEntityMerge,
+    ),
+    write_composite(
+        "meetings_add_promotion",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsAddPromotion,
+    ),
+    write_composite(
+        "meetings_promote_task_to_ticket",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsPromoteTaskToTicket,
+    ),
+    write_composite(
         "meetings_promote_decision_to_decision_log",
         "meetings",
-        "Store",
-        None,
+        CompositeId::MeetingsSurfaceMeetingsPromoteDecisionToDecisionLog,
     ),
-    write(
+    write_composite(
         "meetings_promote_question_to_lifecycle",
         "meetings",
-        "Store",
-        None,
+        CompositeId::MeetingsSurfaceMeetingsPromoteQuestionToLifecycle,
     ),
-    write(
+    write_composite(
         "meetings_promote_artifact_to_reference_artifact",
         "meetings",
-        "Store",
-        None,
+        CompositeId::MeetingsSurfaceMeetingsPromoteArtifactToReferenceArtifact,
     ),
-    write(
+    write_composite(
         "meetings_promote_reference_to_reference_artifact",
         "meetings",
-        "Store",
-        None,
+        CompositeId::MeetingsSurfaceMeetingsPromoteReferenceToReferenceArtifact,
     ),
-    write("meetings_import_snapshot", "meetings", "Store", None),
-    write("redmine_import_snapshot", "redmine", "Store", None),
-    write("studio_reindex", "studio", "Store", None),
+    write_composite(
+        "meetings_import_snapshot",
+        "meetings",
+        CompositeId::MeetingsSurfaceMeetingsImportSnapshot,
+    ),
+    // redmine
+    write_owning_adapter(
+        "redmine_import_snapshot",
+        "redmine",
+        AdapterId::InterchangeAdapterRedmineImportSnapshot,
+    ),
+    // studio
+    write_composite(
+        "studio_reindex",
+        "studio",
+        CompositeId::StudioSurfaceStudioReindex,
+    ),
     // import
-    write("import_submit_batch", "import", "Store", None),
-    write("import_execute_batch", "import", "Store", None),
+    write_owning_adapter(
+        "import_submit_batch",
+        "import",
+        AdapterId::InterchangeAdapterImportSubmitBatch,
+    ),
+    write_owning_adapter(
+        "import_execute_batch",
+        "import",
+        AdapterId::InterchangeAdapterImportExecuteBatch,
+    ),
     // structures
-    write("structures_create", "structures", "Store", None),
-    read("structures_get", "structures", "Store", None),
-    read("structures_list", "structures", "Store", None),
-    write("structures_add_node", "structures", "Store", None),
-    write("structures_update_node", "structures", "Store", None),
-    write("structures_move_node", "structures", "Store", None),
-    write("structures_link_node", "structures", "Store", None),
-    write("structures_bind", "structures", "Store", None),
-    write(
+    write_generated(
+        "structures_create",
+        "structures",
+        GeneratedOperationId::PagesStructuresCreateJson,
+    ),
+    read_generated(
+        "structures_get",
+        "structures",
+        GeneratedOperationId::PagesStructuresGetJson,
+    ),
+    read_generated(
+        "structures_list",
+        "structures",
+        GeneratedOperationId::PagesStructuresListJson,
+    ),
+    write_generated(
+        "structures_add_node",
+        "structures",
+        GeneratedOperationId::PagesStructuresAddNodeJson,
+    ),
+    write_generated(
+        "structures_update_node",
+        "structures",
+        GeneratedOperationId::PagesStructuresUpdateNodeJson,
+    ),
+    write_generated(
+        "structures_move_node",
+        "structures",
+        GeneratedOperationId::PagesStructuresMoveNodeJson,
+    ),
+    write_generated(
+        "structures_link_node",
+        "structures",
+        GeneratedOperationId::PagesStructuresLinkNodeJson,
+    ),
+    write_generated(
+        "structures_bind",
+        "structures",
+        GeneratedOperationId::PagesStructuresBindJson,
+    ),
+    write_generated(
         "structures_decompose_to_tickets",
         "structures",
-        "Store",
-        None,
+        GeneratedOperationId::PagesStructuresDecomposeToTicketsJson,
     ),
     // kv
-    write("kv_put", "kv", "Kv", Some("put")),
-    read("kv_get", "kv", "Kv", Some("get")),
-    write("kv_delete", "kv", "Kv", Some("delete")),
-    read("kv_list", "kv", "Kv", Some("list")),
-    read("kv_range", "kv", "Kv", Some("range")),
-    read("kv_list_collections", "kv", "Kv", Some("list_collections")),
+    write_generated("kv_put", "kv", GeneratedOperationId::KvPut),
+    read_generated("kv_get", "kv", GeneratedOperationId::KvGet),
+    write_generated("kv_delete", "kv", GeneratedOperationId::KvDelete),
+    read_generated("kv_list", "kv", GeneratedOperationId::KvList),
+    read_generated("kv_range", "kv", GeneratedOperationId::KvRange),
+    read_generated(
+        "kv_list_collections",
+        "kv",
+        GeneratedOperationId::KvListCollections,
+    ),
     // document
-    write(
+    write_generated(
         "document_put_text",
         "document",
-        "Document",
-        Some("put_text"),
+        GeneratedOperationId::DocumentPutText,
     ),
-    read(
+    read_generated(
         "document_get_text",
         "document",
-        "Document",
-        Some("get_text"),
+        GeneratedOperationId::DocumentGetText,
     ),
-    write(
+    write_generated(
         "document_put_binary",
         "document",
-        "Document",
-        Some("put_binary"),
+        GeneratedOperationId::DocumentPutBinary,
     ),
-    read(
+    read_generated(
         "document_get_binary",
         "document",
-        "Document",
-        Some("get_binary"),
+        GeneratedOperationId::DocumentGetBinary,
     ),
-    read("document_query", "document", "Document", Some("query_json")),
-    write("document_replace_text", "document", "Document", None),
-    write("document_delete", "document", "Document", Some("delete")),
-    write(
+    read_generated(
+        "document_query",
+        "document",
+        GeneratedOperationId::DocumentQueryJson,
+    ),
+    write_composite(
+        "document_replace_text",
+        "document",
+        CompositeId::DocumentReplaceText,
+    ),
+    write_generated(
+        "document_delete",
+        "document",
+        GeneratedOperationId::DocumentDelete,
+    ),
+    write_generated(
         "document_delete_collection",
         "document",
-        "Document",
-        Some("delete_collection"),
+        GeneratedOperationId::DocumentDeleteCollection,
     ),
-    read(
+    read_generated(
         "document_list_binary",
         "document",
-        "Document",
-        Some("list_binary"),
+        GeneratedOperationId::DocumentListBinary,
     ),
-    read(
+    read_generated(
         "document_list_collections",
         "document",
-        "Document",
-        Some("list_collections"),
+        GeneratedOperationId::DocumentListCollections,
     ),
     // timeseries
-    write("timeseries_put", "timeseries", "TimeSeries", Some("put")),
-    read("timeseries_get", "timeseries", "TimeSeries", Some("get")),
-    read(
+    write_generated(
+        "timeseries_put",
+        "timeseries",
+        GeneratedOperationId::TimeSeriesPut,
+    ),
+    read_generated(
+        "timeseries_get",
+        "timeseries",
+        GeneratedOperationId::TimeSeriesGet,
+    ),
+    read_generated(
         "timeseries_range",
         "timeseries",
-        "TimeSeries",
-        Some("range"),
+        GeneratedOperationId::TimeSeriesRange,
     ),
-    read(
+    read_generated(
         "timeseries_latest",
         "timeseries",
-        "TimeSeries",
-        Some("latest"),
+        GeneratedOperationId::TimeSeriesLatest,
     ),
-    read(
+    read_generated(
         "timeseries_list_collections",
         "timeseries",
-        "TimeSeries",
-        Some("list_collections"),
+        GeneratedOperationId::TimeSeriesListCollections,
     ),
     // ledger
-    write("ledger_append", "ledger", "Ledger", Some("append")),
-    read("ledger_get", "ledger", "Ledger", Some("get")),
-    read("ledger_head", "ledger", "Ledger", Some("head")),
-    read("ledger_len", "ledger", "Ledger", Some("len")),
-    read("ledger_verify", "ledger", "Ledger", Some("verify")),
-    read(
+    write_generated(
+        "ledger_append",
+        "ledger",
+        GeneratedOperationId::LedgerAppend,
+    ),
+    read_generated("ledger_get", "ledger", GeneratedOperationId::LedgerGet),
+    read_generated("ledger_head", "ledger", GeneratedOperationId::LedgerHead),
+    read_generated("ledger_len", "ledger", GeneratedOperationId::LedgerLen),
+    read_generated(
+        "ledger_verify",
+        "ledger",
+        GeneratedOperationId::LedgerVerify,
+    ),
+    read_generated(
         "ledger_list_collections",
         "ledger",
-        "Ledger",
-        Some("list_collections"),
+        GeneratedOperationId::LedgerListCollections,
     ),
     // queue
-    write("queue_append", "queue", "Queue", Some("append")),
-    read("queue_get", "queue", "Queue", Some("get")),
-    read("queue_range", "queue", "Queue", Some("range")),
-    read("queue_len", "queue", "Queue", Some("len")),
-    read("queue_list_streams", "queue", "Queue", Some("list_streams")),
-    read(
+    write_generated("queue_append", "queue", GeneratedOperationId::QueueAppend),
+    read_generated("queue_get", "queue", GeneratedOperationId::QueueGet),
+    read_generated("queue_range", "queue", GeneratedOperationId::QueueRange),
+    read_generated("queue_len", "queue", GeneratedOperationId::QueueLen),
+    read_generated(
+        "queue_list_streams",
+        "queue",
+        GeneratedOperationId::QueueListStreams,
+    ),
+    read_generated(
         "queue_consumer_position",
         "queue",
-        "QueueConsumers",
-        Some("consumer_position"),
+        GeneratedOperationId::QueueConsumersConsumerPosition,
     ),
-    read(
+    read_generated(
         "queue_consumer_read",
         "queue",
-        "QueueConsumers",
-        Some("consumer_read"),
+        GeneratedOperationId::QueueConsumersConsumerRead,
     ),
-    write(
+    write_generated(
         "queue_consumer_advance",
         "queue",
-        "QueueConsumers",
-        Some("consumer_advance"),
+        GeneratedOperationId::QueueConsumersConsumerAdvance,
     ),
-    write(
+    write_generated(
         "queue_consumer_reset",
         "queue",
-        "QueueConsumers",
-        Some("consumer_reset"),
+        GeneratedOperationId::QueueConsumersConsumerReset,
     ),
     // calendar
-    write(
+    write_generated(
         "calendar_create_collection",
         "calendar",
-        "Calendar",
-        Some("create_collection"),
+        GeneratedOperationId::CalendarCreateCollection,
     ),
-    read(
+    read_generated(
         "calendar_get_collection",
         "calendar",
-        "Calendar",
-        Some("get_collection"),
+        GeneratedOperationId::CalendarGetCollection,
     ),
-    read(
+    read_generated(
         "calendar_list_collections",
         "calendar",
-        "Calendar",
-        Some("list_collections"),
+        GeneratedOperationId::CalendarListCollections,
     ),
-    write(
+    write_generated(
         "calendar_delete_collection",
         "calendar",
-        "Calendar",
-        Some("delete_collection"),
+        GeneratedOperationId::CalendarDeleteCollection,
     ),
-    write(
+    write_generated(
         "calendar_put_entry",
         "calendar",
-        "Calendar",
-        Some("put_entry"),
+        GeneratedOperationId::CalendarPutEntry,
     ),
-    write("calendar_put_ics", "calendar", "Calendar", Some("put_ics")),
-    read(
+    write_generated(
+        "calendar_put_ics",
+        "calendar",
+        GeneratedOperationId::CalendarPutIcs,
+    ),
+    read_generated(
         "calendar_get_entry",
         "calendar",
-        "Calendar",
-        Some("get_entry"),
+        GeneratedOperationId::CalendarGetEntry,
     ),
-    write(
+    write_generated(
         "calendar_delete_entry",
         "calendar",
-        "Calendar",
-        Some("delete_entry"),
+        GeneratedOperationId::CalendarDeleteEntry,
     ),
-    read(
+    read_generated(
         "calendar_list_entries",
         "calendar",
-        "Calendar",
-        Some("list_entries"),
+        GeneratedOperationId::CalendarListEntries,
     ),
-    read("calendar_range", "calendar", "Calendar", Some("range")),
-    read("calendar_search", "calendar", "Calendar", Some("search")),
-    read("calendar_to_ics", "calendar", "Calendar", Some("to_ics")),
+    read_generated(
+        "calendar_range",
+        "calendar",
+        GeneratedOperationId::CalendarRange,
+    ),
+    read_generated(
+        "calendar_search",
+        "calendar",
+        GeneratedOperationId::CalendarSearch,
+    ),
+    read_generated(
+        "calendar_to_ics",
+        "calendar",
+        GeneratedOperationId::CalendarToIcs,
+    ),
     // contacts
-    write(
+    write_generated(
         "contacts_create_book",
         "contacts",
-        "Contacts",
-        Some("create_book"),
+        GeneratedOperationId::ContactsCreateBook,
     ),
-    read(
+    read_generated(
         "contacts_get_book",
         "contacts",
-        "Contacts",
-        Some("get_book"),
+        GeneratedOperationId::ContactsGetBook,
     ),
-    read(
+    read_generated(
         "contacts_list_books",
         "contacts",
-        "Contacts",
-        Some("list_books"),
+        GeneratedOperationId::ContactsListBooks,
     ),
-    write(
+    write_generated(
         "contacts_delete_book",
         "contacts",
-        "Contacts",
-        Some("delete_book"),
+        GeneratedOperationId::ContactsDeleteBook,
     ),
-    write(
+    write_generated(
         "contacts_put_entry",
         "contacts",
-        "Contacts",
-        Some("put_entry"),
+        GeneratedOperationId::ContactsPutEntry,
     ),
-    write(
+    write_generated(
         "contacts_put_vcard",
         "contacts",
-        "Contacts",
-        Some("put_vcard"),
+        GeneratedOperationId::ContactsPutVcard,
     ),
-    read(
+    read_generated(
         "contacts_get_entry",
         "contacts",
-        "Contacts",
-        Some("get_entry"),
+        GeneratedOperationId::ContactsGetEntry,
     ),
-    write(
+    write_generated(
         "contacts_delete_entry",
         "contacts",
-        "Contacts",
-        Some("delete_entry"),
+        GeneratedOperationId::ContactsDeleteEntry,
     ),
-    read(
+    read_generated(
         "contacts_list_entries",
         "contacts",
-        "Contacts",
-        Some("list_entries"),
+        GeneratedOperationId::ContactsListEntries,
     ),
-    read("contacts_search", "contacts", "Contacts", Some("search")),
-    read(
+    read_generated(
+        "contacts_search",
+        "contacts",
+        GeneratedOperationId::ContactsSearch,
+    ),
+    read_generated(
         "contacts_to_vcard",
         "contacts",
-        "Contacts",
-        Some("to_vcard"),
+        GeneratedOperationId::ContactsToVcard,
     ),
     // mail
-    write(
+    write_generated(
         "mail_create_mailbox",
         "mail",
-        "Mail",
-        Some("create_mailbox"),
+        GeneratedOperationId::MailCreateMailbox,
     ),
-    read("mail_get_mailbox", "mail", "Mail", Some("get_mailbox")),
-    read(
+    read_generated(
+        "mail_get_mailbox",
+        "mail",
+        GeneratedOperationId::MailGetMailbox,
+    ),
+    read_generated(
         "mail_list_mailboxes",
         "mail",
-        "Mail",
-        Some("list_mailboxes"),
+        GeneratedOperationId::MailListMailboxes,
     ),
-    write(
+    write_generated(
         "mail_delete_mailbox",
         "mail",
-        "Mail",
-        Some("delete_mailbox"),
+        GeneratedOperationId::MailDeleteMailbox,
     ),
-    write(
+    write_generated(
         "mail_ingest_message",
         "mail",
-        "Mail",
-        Some("ingest_message"),
+        GeneratedOperationId::MailIngestMessage,
     ),
-    read("mail_get_message", "mail", "Mail", Some("get_message")),
-    read("mail_to_eml", "mail", "Mail", Some("to_eml")),
-    write(
+    read_generated(
+        "mail_get_message",
+        "mail",
+        GeneratedOperationId::MailGetMessage,
+    ),
+    read_generated("mail_to_eml", "mail", GeneratedOperationId::MailToEml),
+    write_generated(
         "mail_delete_message",
         "mail",
-        "Mail",
-        Some("delete_message"),
+        GeneratedOperationId::MailDeleteMessage,
     ),
-    read("mail_list_messages", "mail", "Mail", Some("list_messages")),
-    read("mail_get_flags", "mail", "Mail", Some("get_flags")),
-    write("mail_set_flags", "mail", "Mail", Some("set_flags")),
-    read("mail_search", "mail", "Mail", Some("search")),
+    read_generated(
+        "mail_list_messages",
+        "mail",
+        GeneratedOperationId::MailListMessages,
+    ),
+    read_generated("mail_get_flags", "mail", GeneratedOperationId::MailGetFlags),
+    write_generated("mail_set_flags", "mail", GeneratedOperationId::MailSetFlags),
+    read_generated("mail_search", "mail", GeneratedOperationId::MailSearch),
     // sql
-    write("sql_exec", "sql", "Sql", Some("sql_exec")),
-    read("sql_query", "sql", "Sql", Some("sql_query")),
-    write("sql_commit", "sql", "Sql", Some("sql_commit")),
-    read("sql_read_table", "sql", "Sql", Some("sql_read_table")),
-    read("sql_read_table_at", "sql", "Sql", Some("sql_read_table_at")),
-    read("sql_index_scan", "sql", "Sql", Some("sql_index_scan")),
-    read("sql_index_scan_at", "sql", "Sql", Some("sql_index_scan_at")),
-    read("sql_diff", "sql", "Sql", Some("sql_diff")),
-    read("sql_table_diff", "sql", "Sql", Some("sql_table_diff")),
-    read("sql_blame", "sql", "Sql", Some("sql_blame")),
-    read(
+    write_generated("sql_exec", "sql", GeneratedOperationId::SqlSqlExec),
+    read_generated("sql_query", "sql", GeneratedOperationId::SqlSqlQuery),
+    write_generated("sql_commit", "sql", GeneratedOperationId::SqlSqlCommit),
+    read_generated(
+        "sql_read_table",
+        "sql",
+        GeneratedOperationId::SqlSqlReadTable,
+    ),
+    read_generated(
+        "sql_read_table_at",
+        "sql",
+        GeneratedOperationId::SqlSqlReadTableAt,
+    ),
+    read_generated(
+        "sql_index_scan",
+        "sql",
+        GeneratedOperationId::SqlSqlIndexScan,
+    ),
+    read_generated(
+        "sql_index_scan_at",
+        "sql",
+        GeneratedOperationId::SqlSqlIndexScanAt,
+    ),
+    read_generated("sql_diff", "sql", GeneratedOperationId::SqlSqlDiff),
+    read_generated(
+        "sql_table_diff",
+        "sql",
+        GeneratedOperationId::SqlSqlTableDiff,
+    ),
+    read_generated("sql_blame", "sql", GeneratedOperationId::SqlSqlBlame),
+    read_generated(
         "sql_list_databases",
         "sql",
-        "Sql",
-        Some("sql_list_databases"),
+        GeneratedOperationId::SqlSqlListDatabases,
     ),
 ];
 
@@ -977,8 +1845,6 @@ pub const EXCLUDED: &[(&str, &[&str])] = &[
             // Maintenance MCP tools are local host operations over the concrete store handle. The raw
             // administrative IDL methods are not projected as remote MCP tools.
             "store_stat",
-            "store_policy_get",
-            "store_policy_set",
             "store_rekey",
         ],
     ),
@@ -1017,12 +1883,22 @@ pub const EXCLUDED: &[(&str, &[&str])] = &[
         &["upsert_edge_indexed", "remove_edge_indexed"],
     ),
     (
+        "Tickets",
+        &[
+            // The MCP surface exposes this through the composite `tickets_projects` tool.
+            "tickets_projects_json",
+        ],
+    ),
+    (
         "Lanes",
         &[
             // The view helpers are represented by `lanes_get` and `lanes_list`, which return the
             // persisted lane view shape directly.
             "get_view_json",
             "list_views_json",
+            // The generated local helpers back the composite MCP tools with ticket-aware behavior.
+            "closeout",
+            "cleanup_json",
             // The MCP surface exposes `delete` through `lanes_delete`; closed-lane validation lives
             // in the shared Lanes implementation.
         ],
@@ -1096,196 +1972,29 @@ pub fn tool(name: &str) -> Option<&'static ToolSpec> {
 }
 
 impl ToolSpec {
-    /// How this tool can be served when the host is backed by a remote Loom endpoint. A tool with no IDL
-    /// method is a host-level/composite feature and is local-only; a tool on a handle/stream interface is
-    /// remote-capable through the handle/stream machinery; anything else projects a unary IDL method and
-    /// is forwarded to the generated `LoomClient` method.
-    pub fn remote_capability(&self) -> RemoteCapability {
-        match self.idl_method {
-            None => RemoteCapability::LocalOnly,
-            Some(method) if HANDLE_STREAM_METHODS.contains(&(self.idl_interface, method)) => {
-                RemoteCapability::HandleStream
-            }
-            Some(_) => RemoteCapability::Unary,
+    pub fn idl_projection(&self) -> Option<(&'static str, &'static str)> {
+        match self.target {
+            ExecutionTarget::Generated(operation) => Some(operation.projection()),
+            ExecutionTarget::Composite(_) | ExecutionTarget::OwningAdapter(_) => None,
         }
     }
-}
 
-pub const SERVER_PROMOTED_TOOLS: &[&str] = &[
-    "apps_list",
-    "apps_show",
-    "apps_read_file",
-    "apps_create",
-    "apps_write_file",
-    "apps_remove_file",
-    "drive_list",
-    "drive_stat",
-    "drive_read",
-    "drive_list_versions",
-    "drive_list_conflicts",
-    "drive_list_shares",
-    "drive_list_retention",
-    "drive_grant_share",
-    "drive_revoke_share",
-    "drive_apply_share_expiry",
-    "drive_pin_retention",
-    "drive_unpin_retention",
-    "drive_apply_retention",
-    "drive_acquire_lease",
-    "drive_refresh_lease",
-    "drive_release_lease",
-    "drive_break_lease",
-    "drive_create_folder",
-    "drive_create_upload",
-    "drive_upload_chunk",
-    "drive_commit_upload",
-    "drive_rename",
-    "drive_move",
-    "drive_delete",
-    "drive_resolve_conflict",
-    "meetings_projection_outputs",
-    "meetings_list",
-    "meetings_get",
-    "meetings_search",
-    "meetings_extraction_review",
-    "meetings_accept_annotation",
-    "meetings_reject_annotation",
-    "meetings_propose_vocabulary",
-    "meetings_accept_vocabulary",
-    "meetings_reject_vocabulary",
-    "meetings_add_entity_merge",
-    "meetings_add_promotion",
-    "meetings_promote_task_to_ticket",
-    "meetings_promote_decision_to_decision_log",
-    "meetings_promote_question_to_lifecycle",
-    "meetings_promote_artifact_to_reference_artifact",
-    "meetings_promote_reference_to_reference_artifact",
-    "meetings_import_snapshot",
-    // `ask_answers` waits client-side and polls the served ask state between attempts.
-    "ask_questions",
-    "ask_record",
-    // chat (Kv + Document + Queue over the substrate chat profile): server-side execution via the shared
-    // `LoomMcp` chat facade. `chat_presence`/`chat_set_presence` are deliberately excluded because they operate
-    // on in-process ephemeral presence (host-runtime state, not served-store state), like `studio-status`,
-    // so they stay local.
-    "chat_fetch_events",
-    "chat_channels",
-    "chat_create_channel",
-    "chat_rename_channel",
-    "chat_messages",
-    "chat_cursor",
-    "chat_post_message",
-    "chat_edit_message",
-    "chat_redact_message",
-    "chat_emoji_list",
-    "chat_emoji_register",
-    "chat_emoji_unregister",
-    "chat_add_reaction",
-    "chat_remove_reaction",
-    "chat_create_thread",
-    "chat_create_task",
-    "chat_claim_task",
-    "chat_complete_task",
-    "chat_invoke_agent",
-    "chat_agent_reply",
-    "chat_request_handoff",
-    "chat_update_cursor",
-    // spaces / pages / structures (Studio profile-root families over Document + reference): server-side
-    // execution via the shared `LoomMcp` facade, preserving expected-root optimistic concurrency (each
-    // write threads `expected_root` and commits server-side).
-    "spaces_create",
-    "spaces_get",
-    "spaces_list",
-    "pages_create",
-    "pages_update",
-    "pages_publish",
-    "pages_get",
-    "pages_list",
-    "pages_history",
-    "structures_create",
-    "structures_get",
-    "structures_list",
-    "structures_add_node",
-    "structures_update_node",
-    "structures_move_node",
-    "structures_link_node",
-    "structures_bind",
-    "structures_decompose_to_tickets",
-    "substrate_changes",
-    "workgraph_metrics",
-    "substrate_refs",
-    "substrate_alias_bind",
-    "substrate_alias_release",
-    "substrate_alias_resolve",
-    "substrate_alias_list",
-    "substrate_reference_status",
-    "substrate_reference_reconcile",
-    "substrate_history",
-    "substrate_revision_latest",
-    "substrate_revision_at",
-    "substrate_revision_as_of_root",
-    "substrate_checkpoint_before",
-    "substrate_view_define",
-    "substrate_view_get",
-    "substrate_view_list",
-    "substrate_write_admission_policy_get",
-    "substrate_write_admission_policy_set",
-    "substrate_transact",
-    "tickets_project_create",
-    "tickets_project_rekey",
-    "tickets_project_settings_get",
-    "tickets_project_settings_set",
-    "tickets_projects",
-    "tickets_relations",
-    "tickets_fields",
-    "tickets_field_put",
-    "tickets_field_retire",
-    "tickets_create",
-    "tickets_update",
-    "tickets_delete",
-    "tickets_comments",
-    "tickets_comment_add",
-    "tickets_comment_update",
-    "tickets_comment_delete",
-    "tickets_board_create",
-    "tickets_board_update",
-    "tickets_board_delete",
-    "tickets_board_configure_columns",
-    "tickets_board_move_card",
-    "tickets_relation_set",
-    "tickets_relation_remove",
-    "tickets_relations",
-    "tickets_get",
-    "tickets_list",
-    "tickets_board_get",
-    "tickets_board_list",
-    "tickets_history",
-    // 660: deferred store-backed families promoted server-side.
-    "workgraph_changes",
-    "workgraph_fact_put",
-    "import_submit_batch",
-    "import_execute_batch",
-    "redmine_import_snapshot",
-    // lifecycles (store-backed); `lifecycles_active_set`/`lifecycles_active_clear` stay host-local
-    // (in-process active-lifecycle selection) and are NOT promoted.
-    "lifecycles_define",
-    "lifecycles_define_standard",
-    "lifecycles_definitions",
-    "lifecycles_definition",
-    "lifecycles_instantiate",
-    "lifecycles_instances",
-    "lifecycles_instance",
-    "lifecycles_snapshot_plan",
-    "lifecycles_current_surface",
-    "lifecycles_transition",
-    "lifecycles_snapshots",
-    "lifecycles_snapshot",
-    "lifecycles_snapshot_content",
-    "lifecycles_operation_log",
-];
-
-pub fn server_promoted(name: &str) -> bool {
-    SERVER_PROMOTED_TOOLS.contains(&name)
+    pub fn remote_capability(&self) -> RemoteCapability {
+        match self.target {
+            ExecutionTarget::Generated(operation)
+                if {
+                    let (idl_interface, idl_method) = operation.projection();
+                    HANDLE_STREAM_METHODS.contains(&(idl_interface, idl_method))
+                } =>
+            {
+                RemoteCapability::HandleStream
+            }
+            ExecutionTarget::Generated(_) => RemoteCapability::Unary,
+            ExecutionTarget::Composite(_) | ExecutionTarget::OwningAdapter(_) => {
+                RemoteCapability::ServerExecute
+            }
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1296,30 +2005,18 @@ pub enum RemoteToolRoute {
 }
 
 pub fn remote_tool_route(name: &str) -> RemoteToolRoute {
-    remote_tool_route_for(
-        name,
-        server_promoted(name),
-        tool(name).map(ToolSpec::remote_capability),
-    )
+    remote_tool_route_for(name, tool(name).map(ToolSpec::remote_capability))
 }
 
-/// The pure routing decision, factored out so both production (`remote_tool_route`) and tests can
-/// exercise every branch (including the promoted branch, which has no catalog entry yet).
-pub fn remote_tool_route_for(
-    name: &str,
-    promoted: bool,
-    capability: Option<RemoteCapability>,
-) -> RemoteToolRoute {
-    if promoted {
-        return RemoteToolRoute::ServerExecute;
-    }
+pub fn remote_tool_route_for(name: &str, capability: Option<RemoteCapability>) -> RemoteToolRoute {
     match capability {
-        Some(RemoteCapability::Unary) | None => RemoteToolRoute::UnaryForward,
-        Some(RemoteCapability::LocalOnly) => RemoteToolRoute::Reject(format!(
-            "MCP tool {name} is not available against a remote Loom store: it has no remote projection and runs only against a local .loom"
-        )),
+        Some(RemoteCapability::Unary) => RemoteToolRoute::UnaryForward,
+        Some(RemoteCapability::ServerExecute) => RemoteToolRoute::ServerExecute,
         Some(RemoteCapability::HandleStream) => RemoteToolRoute::Reject(format!(
             "MCP tool {name} uses a handle/stream interface that is not supported against a remote Loom store"
+        )),
+        None => RemoteToolRoute::Reject(format!(
+            "MCP tool {name} is not in the MCP execution-boundary manifest"
         )),
     }
 }
@@ -1332,49 +2029,47 @@ mod tests {
     const IDL: &str = include_str!("../../../idl/loom.idl");
     const SPEC: &str = include_str!("../../../specs/0008-wire-protocols.md");
 
-    /// The remote-capability partition of the tool surface is the source of truth for the remote-MCP
-    /// dispatch gate: unary IDL tools forward to `LoomClient`, handle/stream tools are rejected over
-    /// remote, and host/composite tools are local-only. This locks the partition counts into code so a
-    /// new tool cannot silently change remote coverage.
     #[test]
     fn remote_capability_partitions_the_surface() {
         let mut unary = 0usize;
         let mut handle_stream = 0usize;
-        let mut local_only = 0usize;
+        let mut server_execute = 0usize;
         for tool in tool_surface() {
             match tool.remote_capability() {
                 RemoteCapability::Unary => unary += 1,
                 RemoteCapability::HandleStream => handle_stream += 1,
-                RemoteCapability::LocalOnly => local_only += 1,
+                RemoteCapability::ServerExecute => server_execute += 1,
             }
         }
-        // Counts are DERIVED from TOOL_SURFACE, not hardcoded: local-only is exactly the tools without an
-        // IDL method; handle/stream is exactly the tools whose (interface, method) is in
-        // HANDLE_STREAM_METHODS; unary is the remainder. This keeps one source of truth - a new tool or a
-        // classification change moves these in lockstep.
-        let derived_local_only = tool_surface()
-            .iter()
-            .filter(|t| t.idl_method.is_none())
-            .count();
         let derived_handle_stream = tool_surface()
             .iter()
             .filter(|t| {
-                t.idl_method
-                    .is_some_and(|m| HANDLE_STREAM_METHODS.contains(&(t.idl_interface, m)))
+                t.idl_projection().is_some_and(|(interface, method)| {
+                    HANDLE_STREAM_METHODS.contains(&(interface, method))
+                })
             })
             .count();
-        let derived_unary = tool_surface().len() - derived_local_only - derived_handle_stream;
-        assert_eq!(local_only, derived_local_only, "local-only count drift");
+        let derived_server_execute = tool_surface()
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.target,
+                    ExecutionTarget::Composite(_) | ExecutionTarget::OwningAdapter(_)
+                )
+            })
+            .count();
+        let derived_unary = tool_surface().len() - derived_handle_stream - derived_server_execute;
         assert_eq!(
             handle_stream, derived_handle_stream,
             "handle/stream count drift"
         );
+        assert_eq!(
+            server_execute, derived_server_execute,
+            "server-execute count drift"
+        );
         assert_eq!(unary, derived_unary, "unary count drift");
-        assert_eq!(unary + handle_stream + local_only, tool_surface().len());
-        // No tool is gate-rejected as handle/stream: `HANDLE_STREAM_METHODS` is empty, so every IDL-backed
-        // tool classifies Unary (forwarded, or rejected precisely inside its own method). The three
-        // session/stream SQL tools are Unary: `sql_exec` is wired (per-request SqlSession in the backend),
-        // while `sql_query`/`sql_commit` forward at the gate and reject in-method for a contract reason.
+        assert_eq!(unary + handle_stream + server_execute, tool_surface().len());
+
         let hs_names: BTreeSet<&str> = tool_surface()
             .iter()
             .filter(|t| matches!(t.remote_capability(), RemoteCapability::HandleStream))
@@ -1390,18 +2085,36 @@ mod tests {
                     tool(sql_tool).unwrap().remote_capability(),
                     RemoteCapability::Unary
                 ),
-                "{sql_tool} should classify Unary (forwarded or method-rejected)"
+                "{sql_tool} should classify Unary"
             );
         }
-        // Every local-only tool genuinely lacks an IDL method; every remote-capable tool has one.
+    }
+
+    #[test]
+    fn execution_targets_use_closed_identifiers() {
+        let mut generated = BTreeSet::new();
+        let mut composite = BTreeSet::new();
+        let mut adapters = BTreeSet::new();
         for tool in tool_surface() {
-            match tool.remote_capability() {
-                RemoteCapability::LocalOnly => {
-                    assert!(tool.idl_method.is_none(), "{} misclassified", tool.name)
+            match tool.target {
+                ExecutionTarget::Generated(operation) => {
+                    generated.insert(operation);
                 }
-                _ => assert!(tool.idl_method.is_some(), "{} misclassified", tool.name),
+                ExecutionTarget::Composite(composite_id) => {
+                    composite.insert(composite_id);
+                }
+                ExecutionTarget::OwningAdapter(adapter_id) => {
+                    adapters.insert(adapter_id);
+                }
             }
         }
+        assert_eq!(generated.len(), 294);
+        assert_eq!(composite.len(), 81);
+        assert_eq!(adapters.len(), 3);
+        assert!(generated.contains(&GeneratedOperationId::StoreAdminStorePolicyGet));
+        assert!(generated.contains(&GeneratedOperationId::StoreAdminStorePolicySet));
+        assert!(composite.contains(&CompositeId::ChatSetPresence));
+        assert!(adapters.contains(&AdapterId::InterchangeAdapterImportExecuteBatch));
     }
 
     /// The IDL `enum FacetKind` must mirror `loom_core::FacetKind`, so a facet added on one side but
@@ -1547,33 +2260,36 @@ mod tests {
             .map(|(iface, methods)| (*iface, methods.iter().copied().collect()))
             .collect();
 
-        // Every tool's interface and (concrete) method must exist in the IDL.
+        // Every generated target's interface and method must exist in the IDL.
         for spec in TOOL_SURFACE {
+            let Some((interface, method)) = spec.idl_projection() else {
+                continue;
+            };
             let methods = idl
-                .get(spec.idl_interface)
+                .get(interface)
                 .unwrap_or_else(|| panic!("tool {} names unknown interface", spec.name));
-            if let Some(method) = spec.idl_method {
-                assert!(
-                    methods.contains(method),
-                    "tool {} projects {}.{}, absent from the IDL",
-                    spec.name,
-                    spec.idl_interface,
-                    method
-                );
-            }
+            assert!(
+                methods.contains(method),
+                "tool {} projects {}.{}, absent from the IDL",
+                spec.name,
+                interface,
+                method
+            );
         }
 
-        // Per projected interface: idl methods minus excluded == the projected (concrete) methods.
+        // Per generated interface: idl methods minus excluded == the projected methods.
         let mut projected_ifaces = BTreeSet::new();
         for spec in TOOL_SURFACE {
-            projected_ifaces.insert(spec.idl_interface);
+            if let Some((interface, _)) = spec.idl_projection() {
+                projected_ifaces.insert(interface);
+            }
         }
         for iface in projected_ifaces {
             let idl_methods = &idl[iface];
             let projected: BTreeSet<&str> = TOOL_SURFACE
                 .iter()
-                .filter(|t| t.idl_interface == iface)
-                .filter_map(|t| t.idl_method)
+                .filter_map(|t| t.idl_projection())
+                .filter_map(|(interface, method)| (interface == iface).then_some(method))
                 .collect();
             let empty = BTreeSet::new();
             let excl = excluded.get(iface).unwrap_or(&empty);
@@ -1600,7 +2316,10 @@ mod tests {
                 "FULLY_FOLDED names unknown interface {iface}"
             );
             assert!(
-                !TOOL_SURFACE.iter().any(|t| t.idl_interface == *iface),
+                !TOOL_SURFACE
+                    .iter()
+                    .filter_map(ToolSpec::idl_projection)
+                    .any(|(interface, _)| interface == *iface),
                 "interface {iface} is marked fully folded but has a tool"
             );
         }

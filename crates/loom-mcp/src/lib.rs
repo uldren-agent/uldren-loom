@@ -1191,9 +1191,11 @@ pub trait RemoteMcpBackend: Send + Sync {
         workspace: &str,
         lane_id: &str,
         ticket_id: &str,
+        placement: Option<&str>,
+        anchor: Option<&str>,
         updated_by: &str,
     ) -> Result<loom_lanes::Lane> {
-        let _ = (workspace, lane_id, ticket_id, updated_by);
+        let _ = (workspace, lane_id, ticket_id, placement, anchor, updated_by);
         Err(remote_local_handle_unsupported())
     }
 

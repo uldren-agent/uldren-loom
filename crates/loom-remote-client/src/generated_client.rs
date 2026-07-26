@@ -6098,6 +6098,8 @@ impl<T: Transport + Send + Sync> Lanes for RemoteLoomClient<T> {
         workspace: String,
         lane_id: String,
         ticket_id: String,
+        placement: Option<String>,
+        anchor: Option<String>,
         updated_by: String,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
@@ -6105,6 +6107,14 @@ impl<T: Transport + Send + Sync> Lanes for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
             ::loom_remote_protocol::codec::ToValue::to_value(&lane_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&ticket_id),
+            match placement {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            match anchor {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
             ::loom_remote_protocol::codec::ToValue::to_value(&updated_by),
         ];
         async move {
@@ -6192,6 +6202,49 @@ impl<T: Transport + Send + Sync> Lanes for RemoteLoomClient<T> {
             }
         }
     }
+    fn closeout(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        lane_id: String,
+        ticket_workspace_id: String,
+        ticket_id: String,
+        comment_type: String,
+        comment_body: String,
+        evidence_json: Option<String>,
+        status_report: String,
+        updated_by: String,
+        expected_root: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&lane_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&ticket_workspace_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&ticket_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&comment_type),
+            ::loom_remote_protocol::codec::ToValue::to_value(&comment_body),
+            match evidence_json {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&status_report),
+            ::loom_remote_protocol::codec::ToValue::to_value(&updated_by),
+            match expected_root {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+        ];
+        async move {
+            let value = self
+                .call("Lanes", "closeout", args, &CallOptions::default())
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
     fn get_view_json(
         &self,
         handle: LoomSession,
@@ -6230,6 +6283,31 @@ impl<T: Transport + Send + Sync> Lanes for RemoteLoomClient<T> {
         async move {
             let value = self
                 .call("Lanes", "list_views_json", args, &CallOptions::default())
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn cleanup_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        lane_id: Option<String>,
+        apply: bool,
+        updated_by: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            match lane_id {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&apply),
+            ::loom_remote_protocol::codec::ToValue::to_value(&updated_by),
+        ];
+        async move {
+            let value = self
+                .call("Lanes", "cleanup_json", args, &CallOptions::default())
                 .await?;
             crate::wire::from_wire::<String>(&value)
         }
@@ -9017,18 +9095,43 @@ impl<T: Transport + Send + Sync> Tickets for RemoteLoomClient<T> {
             crate::wire::from_wire::<String>(&value)
         }
     }
+    fn tickets_projects_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&ticket_workspace_id),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Tickets",
+                    "tickets_projects_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
     fn tickets_project_settings_get_json(
         &self,
         handle: LoomSession,
         workspace: String,
         ticket_workspace_id: String,
         project_id: String,
+        include_contracts: bool,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
             ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
             ::loom_remote_protocol::codec::ToValue::to_value(&ticket_workspace_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&project_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&include_contracts),
         ];
         async move {
             let value = self
@@ -9048,43 +9151,14 @@ impl<T: Transport + Send + Sync> Tickets for RemoteLoomClient<T> {
         workspace: String,
         ticket_workspace_id: String,
         project_id: String,
-        default_projection: Option<String>,
-        enable_projections_json: String,
-        disable_projections_json: String,
-        actor_enforcement: Option<String>,
-        project_owner_principal: Option<String>,
-        clear_project_owner_principal: bool,
-        acceptance_authorities_json: Option<String>,
-        expected_root: Option<String>,
+        patch: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
             ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
             ::loom_remote_protocol::codec::ToValue::to_value(&ticket_workspace_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&project_id),
-            match default_projection {
-                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
-                None => ::loom_codec::Value::Null,
-            },
-            ::loom_remote_protocol::codec::ToValue::to_value(&enable_projections_json),
-            ::loom_remote_protocol::codec::ToValue::to_value(&disable_projections_json),
-            match actor_enforcement {
-                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
-                None => ::loom_codec::Value::Null,
-            },
-            match project_owner_principal {
-                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
-                None => ::loom_codec::Value::Null,
-            },
-            ::loom_remote_protocol::codec::ToValue::to_value(&clear_project_owner_principal),
-            match acceptance_authorities_json {
-                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
-                None => ::loom_codec::Value::Null,
-            },
-            match expected_root {
-                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
-                None => ::loom_codec::Value::Null,
-            },
+            ::loom_codec::Value::Bytes(patch),
         ];
         async move {
             let value = self
@@ -9292,6 +9366,7 @@ impl<T: Transport + Send + Sync> Tickets for RemoteLoomClient<T> {
         comment_id: Option<String>,
         comment_type: Option<String>,
         comment_body: Option<String>,
+        comment_evidence_json: Option<String>,
         expected_root: Option<String>,
         comments_json: Option<String>,
         relation_sets_json: Option<String>,
@@ -9336,6 +9411,10 @@ impl<T: Transport + Send + Sync> Tickets for RemoteLoomClient<T> {
                 None => ::loom_codec::Value::Null,
             },
             match comment_body {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            match comment_evidence_json {
                 Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
                 None => ::loom_codec::Value::Null,
             },
@@ -9432,6 +9511,7 @@ impl<T: Transport + Send + Sync> Tickets for RemoteLoomClient<T> {
         comment_id: Option<String>,
         comment_type: Option<String>,
         body: String,
+        evidence_json: Option<String>,
         expected_root: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
@@ -9448,6 +9528,10 @@ impl<T: Transport + Send + Sync> Tickets for RemoteLoomClient<T> {
                 None => ::loom_codec::Value::Null,
             },
             ::loom_remote_protocol::codec::ToValue::to_value(&body),
+            match evidence_json {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
             match expected_root {
                 Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
                 None => ::loom_codec::Value::Null,
@@ -9474,6 +9558,7 @@ impl<T: Transport + Send + Sync> Tickets for RemoteLoomClient<T> {
         comment_id: String,
         comment_type: Option<String>,
         body: Option<String>,
+        evidence_json: Option<String>,
         expected_root: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
@@ -9487,6 +9572,10 @@ impl<T: Transport + Send + Sync> Tickets for RemoteLoomClient<T> {
                 None => ::loom_codec::Value::Null,
             },
             match body {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            match evidence_json {
                 Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
                 None => ::loom_codec::Value::Null,
             },
@@ -9758,6 +9847,7 @@ impl<T: Transport + Send + Sync> Tickets for RemoteLoomClient<T> {
         workspace: String,
         ticket_workspace_id: String,
         board_id: String,
+        updated_by: String,
         expected_root: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
@@ -9765,6 +9855,7 @@ impl<T: Transport + Send + Sync> Tickets for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
             ::loom_remote_protocol::codec::ToValue::to_value(&ticket_workspace_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&board_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&updated_by),
             match expected_root {
                 Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
                 None => ::loom_codec::Value::Null,

@@ -1368,12 +1368,16 @@ interface Lanes {
                 optional string title, optional string description, optional string lane_status,
                 optional string status_report, optional string reviewer_feedback, string updated_by);
     Lane ticket_add(LoomSession handle, string workspace, string lane_id, string ticket_id,
-                    string updated_by);
+                    optional string placement, optional string anchor, string updated_by);
     Lane ticket_remove(LoomSession handle, string workspace, string lane_id, string ticket_id,
                        string updated_by);
     Lane ticket_transfer(LoomSession handle, string workspace, string source_lane_id,
                          string target_lane_id, string ticket_id, string updated_by);
     Lane delete(LoomSession handle, string workspace, string lane_id, string updated_by);
+    Lane closeout(LoomSession handle, string workspace, string lane_id, string ticket_workspace_id,
+                  string ticket_id, string comment_type, string comment_body,
+                  optional string evidence_json, string status_report, string updated_by,
+                  optional string expected_root);
     // Compact and detailed Lane views resolved against `ticket_workspace_id`. Detailed returns the
     // full LaneView (stored status, owner, updated time, ordered ticket summaries with status,
     // priority, and title, status report, and reviewer feedback); compact returns the label, derived
@@ -1384,6 +1388,8 @@ interface Lanes {
                          string lane_id, bool detailed);
     string list_views_json(LoomSession handle, string workspace, string ticket_workspace_id,
                            bool detailed);
+    string cleanup_json(LoomSession handle, string workspace, optional string lane_id, bool apply,
+                        string updated_by);
 }
 
 // ---- pages ----
@@ -1679,6 +1685,48 @@ interface Drive {
                                       string drive_workspace_id, u64 now_ms);
 }
 
+enum TicketProjectionProfile {
+    NATIVE,
+    JIRA,
+    ASANA,
+    NOTION,
+    REDMINE,
+}
+
+enum TicketLifecycleAuthorizationPolicy {
+    WRITE_ACCESS,
+    OWNERSHIP_GOVERNED,
+    ASSIGNEE,
+    REVIEW_AUTHORITY,
+}
+
+enum TicketAcceptanceEvidenceKey {
+    SOURCE_ANCHORS,
+    CHECKS_RUN,
+    NOT_RUN_RATIONALE,
+    FILES_CHANGED,
+    FOLLOWUPS,
+    DECISION_POINTS,
+    RISK_NOTES,
+}
+
+struct TicketProjectSettingsPatch {
+    optional TicketProjectionProfile default_projection;
+    list<TicketProjectionProfile> enable_projections;
+    list<TicketProjectionProfile> disable_projections;
+    optional TicketLifecycleAuthorizationPolicy actor_enforcement;
+    optional string project_owner_principal;
+    bool clear_project_owner_principal;
+    optional list<string> acceptance_authorities;
+    optional bool acceptance_evidence_enforcement;
+    optional list<TicketAcceptanceEvidenceKey> required_acceptance_evidence_keys;
+    optional string owner_contract_summary;
+    optional string owner_contract_details;
+    optional string worker_contract_summary;
+    optional string worker_contract_details;
+    optional string expected_root;
+}
+
 interface Tickets {
     string tickets_project_create_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                        string project_id, string key_prefix, string name,
@@ -1686,18 +1734,13 @@ interface Tickets {
     string tickets_project_rekey_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                       string project_id, string key_prefix,
                                       optional string expected_root);
+    string tickets_projects_json(LoomSession handle, string workspace, string ticket_workspace_id);
     string tickets_project_settings_get_json(LoomSession handle, string workspace,
-                                             string ticket_workspace_id, string project_id);
+                                             string ticket_workspace_id, string project_id,
+                                             bool include_contracts);
     string tickets_project_settings_set_json(LoomSession handle, string workspace,
                                              string ticket_workspace_id, string project_id,
-                                             optional string default_projection,
-                                             string enable_projections_json,
-                                             string disable_projections_json,
-                                             optional string actor_enforcement,
-                                             optional string project_owner_principal,
-                                             bool clear_project_owner_principal,
-                                             optional string acceptance_authorities_json,
-                                             optional string expected_root);
+                                             TicketProjectSettingsPatch patch);
     string tickets_fields_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                optional string project_id, optional string projection,
                                optional string operation);
@@ -1723,7 +1766,8 @@ interface Tickets {
                                optional string target_status, optional string observed_source_status,
                                optional string observed_workflow_version, optional string assignee,
                                optional string comment_id, optional string comment_type,
-                               optional string comment_body, optional string expected_root,
+                               optional string comment_body, optional string comment_evidence_json,
+                               optional string expected_root,
                                optional string comments_json, optional string relation_sets_json,
                                optional string relation_removes_json);
     string tickets_delete_json(LoomSession handle, string workspace, string ticket_workspace_id,
@@ -1733,11 +1777,12 @@ interface Tickets {
     string tickets_comment_add_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                     string ticket_id, optional string comment_id,
                                     optional string comment_type, string body,
-                                    optional string expected_root);
+                                    optional string evidence_json, optional string expected_root);
     string tickets_comment_update_json(LoomSession handle, string workspace,
                                        string ticket_workspace_id, string ticket_id,
                                        string comment_id, optional string comment_type,
-                                       optional string body, optional string expected_root);
+                                       optional string body, optional string evidence_json,
+                                       optional string expected_root);
     string tickets_comment_delete_json(LoomSession handle, string workspace,
                                        string ticket_workspace_id, string ticket_id,
                                        string comment_id, optional string expected_root);
@@ -1760,7 +1805,7 @@ interface Tickets {
     string boards_update_json(LoomSession handle, string workspace, string ticket_workspace_id,
                               string board_id, string request_json);
     string boards_delete_json(LoomSession handle, string workspace, string ticket_workspace_id,
-                              string board_id, optional string expected_root);
+                              string board_id, string updated_by, optional string expected_root);
     string boards_configure_columns_json(LoomSession handle, string workspace,
                                          string ticket_workspace_id, string board_id,
                                          string request_json);

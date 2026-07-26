@@ -575,37 +575,93 @@ pub(crate) fn looks_like_node_page(buf: &[u8; PAGE]) -> bool {
     decode_node_page(buf).is_ok()
 }
 
-fn walk_with_page_reader(
-    page_count: u64,
-    read_page: &mut impl FnMut(PageId) -> Result<[u8; PAGE]>,
-    page: PageId,
-    depth: usize,
-    out: &mut Vec<([u8; 32], RecordLoc)>,
-) -> Result<()> {
-    if depth > MAX_DEPTH {
-        return Err(corrupt("btree deeper than the structural maximum"));
-    }
-    if page.0 >= page_count {
-        return Err(corrupt("btree node page out of range"));
-    }
-    let buf = read_page(page)?;
-    let node = decode_node_page(&buf)?;
-    if node.is_leaf {
-        out.extend(node.entries.iter().copied());
-    } else {
-        for i in 0..node.entries.len() {
-            walk_with_page_reader(page_count, read_page, node.children[i], depth + 1, out)?;
-            out.push(node.entries[i]);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScanCursor {
+    pub(crate) stack: Vec<ScanOp>,
+}
+
+impl ScanCursor {
+    pub(crate) fn new(root: PageId) -> Self {
+        Self {
+            stack: vec![ScanOp::Visit {
+                page: root,
+                depth: 0,
+            }],
         }
-        walk_with_page_reader(
-            page_count,
-            read_page,
-            node.children[node.entries.len()],
-            depth + 1,
-            out,
-        )?;
     }
-    Ok(())
+
+    pub(crate) fn completed(&self) -> bool {
+        self.stack.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScanOp {
+    Visit { page: PageId, depth: usize },
+    Emit(([u8; 32], RecordLoc)),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScanStep {
+    pub(crate) entries: Vec<([u8; 32], RecordLoc)>,
+    pub(crate) pages_read: usize,
+    pub(crate) completed: bool,
+}
+
+pub(crate) fn scan_step_with_page_reader(
+    cursor: &mut ScanCursor,
+    page_count: u64,
+    max_pages: usize,
+    deadline: Option<std::time::Instant>,
+    mut read_page: impl FnMut(PageId) -> Result<[u8; PAGE]>,
+) -> Result<ScanStep> {
+    let mut entries = Vec::new();
+    let mut pages_read = 0usize;
+    while let Some(op) = cursor.stack.pop() {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            cursor.stack.push(op);
+            break;
+        }
+        match op {
+            ScanOp::Emit(entry) => entries.push(entry),
+            ScanOp::Visit { page, depth } => {
+                if pages_read >= max_pages {
+                    cursor.stack.push(ScanOp::Visit { page, depth });
+                    break;
+                }
+                if depth > MAX_DEPTH {
+                    return Err(corrupt("btree deeper than the structural maximum"));
+                }
+                if page.0 >= page_count {
+                    return Err(corrupt("btree node page out of range"));
+                }
+                let node = decode_node_page(&read_page(page)?)?;
+                pages_read += 1;
+                if node.is_leaf {
+                    for entry in node.entries.into_iter().rev() {
+                        cursor.stack.push(ScanOp::Emit(entry));
+                    }
+                } else {
+                    cursor.stack.push(ScanOp::Visit {
+                        page: node.children[node.entries.len()],
+                        depth: depth + 1,
+                    });
+                    for i in (0..node.entries.len()).rev() {
+                        cursor.stack.push(ScanOp::Emit(node.entries[i]));
+                        cursor.stack.push(ScanOp::Visit {
+                            page: node.children[i],
+                            depth: depth + 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(ScanStep {
+        entries,
+        pages_read,
+        completed: cursor.completed(),
+    })
 }
 
 /// CoW-insert `(key, value)` into the tree rooted at `root` (None = empty), allocating new node pages
@@ -763,16 +819,6 @@ pub(crate) fn collect_pages(
     Ok(out)
 }
 
-pub(crate) fn load_all_with_page_reader(
-    root: PageId,
-    page_count: u64,
-    mut read_page: impl FnMut(PageId) -> Result<[u8; PAGE]>,
-) -> Result<Vec<([u8; 32], RecordLoc)>> {
-    let mut out = Vec::new();
-    walk_with_page_reader(page_count, &mut read_page, root, 0, &mut out)?;
-    Ok(out)
-}
-
 /// Bulk-build a balanced B-tree from `entries` (sorted ascending and unique), writing each node
 /// exactly once via `cur`, and return the new root page (None if empty). Used by compaction, where
 /// per-key [`insert`] would reproduce the copy-on-write churn it is reclaiming. Compaction is
@@ -917,6 +963,39 @@ mod tests {
             get(&mut s.1, HEADER, root, &[0xFF; 32], cur.page_count()).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn scan_cursor_reaches_every_entry_across_bounded_steps() {
+        let mut s = Scratch::new();
+        let mut root: Option<PageId> = None;
+        let mut cur = PageAllocator::new(0, 0, Vec::new());
+        let mut expect = BTreeMap::new();
+        for i in 0..512u64 {
+            let k = key(i);
+            let v = loc(i);
+            let bound = cur.page_count();
+            root = Some(insert(&mut s.1, HEADER, &mut cur, root, &k, v, bound).unwrap());
+            expect.insert(k, v);
+        }
+        let mut cursor = ScanCursor::new(root.unwrap());
+        let mut out = Vec::new();
+        let mut steps = 0usize;
+        while !cursor.completed() {
+            let page_count = cur.page_count();
+            let step = scan_step_with_page_reader(&mut cursor, page_count, 1, None, |page| {
+                let mut buf = [0u8; PAGE];
+                read_exact_at(&mut s.1, page.offset(HEADER), &mut buf).map_err(io_err)?;
+                Ok(buf)
+            })
+            .unwrap();
+            assert!(step.pages_read <= 1);
+            out.extend(step.entries);
+            steps += 1;
+            assert!(steps < 2048);
+        }
+        assert!(steps > 1);
+        assert_eq!(out.into_iter().collect::<BTreeMap<_, _>>(), expect);
     }
 
     #[test]

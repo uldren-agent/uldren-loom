@@ -3,7 +3,10 @@ use super::*;
 fn mark_step(state: &ReachabilityMarkState, visited: usize) -> ReachabilityMarkStep {
     ReachabilityMarkStep {
         visited,
-        pending: state.queue.len() + state.stream_roots.len(),
+        pending: state.queue.len()
+            + state.stream_roots.len()
+            + state.content_roots.len()
+            + state.prolly_cursors.len(),
         completed: state.completed,
     }
 }
@@ -14,7 +17,15 @@ pub struct ReachabilityMarkState {
     pub marked: BTreeSet<Digest>,
     pub queue: VecDeque<Digest>,
     pub stream_roots: VecDeque<Digest>,
+    pub content_roots: VecDeque<Digest>,
+    pub prolly_cursors: VecDeque<ReachabilityProllyCursor>,
     pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachabilityProllyCursor {
+    pub cursor: crate::prolly::ProllyReachCursor,
+    pub collect_stream_payloads: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +367,8 @@ impl<S: ObjectStore> Loom<S> {
             marked: BTreeSet::new(),
             queue,
             stream_roots,
+            content_roots: VecDeque::new(),
+            prolly_cursors: VecDeque::new(),
             completed: false,
         })
     }
@@ -365,11 +378,23 @@ impl<S: ObjectStore> Loom<S> {
         state: &mut ReachabilityMarkState,
         budget: usize,
     ) -> Result<ReachabilityMarkStep> {
+        self.step_live_object_mark_until(state, budget, None)
+    }
+
+    pub fn step_live_object_mark_until(
+        &self,
+        state: &mut ReachabilityMarkState,
+        budget: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<ReachabilityMarkStep> {
         if state.completed || budget == 0 {
             return Ok(mark_step(state, 0));
         }
         let mut visited = 0usize;
         while visited < budget {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                break;
+            }
             if let Some(d) = state.queue.pop_front() {
                 if !state.marked.insert(d) {
                     continue;
@@ -397,11 +422,39 @@ impl<S: ObjectStore> Loom<S> {
                 }
                 continue;
             }
-            if let Some(root) = state.stream_roots.pop_front() {
+            if let Some(addr) = state.content_roots.pop_front() {
+                self.mark_content_root(addr, state)?;
                 visited += 1;
-                for d in self.stream_reachable(root, &BTreeSet::new())? {
-                    state.marked.insert(d);
+                continue;
+            }
+            if let Some(prolly) = state.prolly_cursors.front_mut() {
+                let step = crate::prolly::step_reachable_with_leaves(
+                    &self.store,
+                    &mut prolly.cursor,
+                    &BTreeSet::new(),
+                    budget.saturating_sub(visited),
+                    deadline,
+                )?;
+                for node in step.nodes {
+                    state.marked.insert(node);
                 }
+                if prolly.collect_stream_payloads {
+                    for value in step.leaf_values {
+                        let payload_addr = stream_payload_address_from_record(&value)?;
+                        state.content_roots.push_back(payload_addr);
+                    }
+                }
+                visited = visited.saturating_add(step.visited);
+                if step.completed {
+                    state.prolly_cursors.pop_front();
+                } else {
+                    break;
+                }
+                continue;
+            }
+            if let Some(root) = state.stream_roots.pop_front() {
+                self.enqueue_stream_root_mark(root, state)?;
+                visited += 1;
                 continue;
             }
             state.completed = true;
@@ -816,26 +869,66 @@ impl<S: ObjectStore> Loom<S> {
             | EntryKind::Columnar
             | EntryKind::Document => state.queue.push_back(entry.target),
             EntryKind::Blob | EntryKind::Symlink => {
-                let obj = self.content.get(&entry.target).copied().ok_or_else(|| {
+                self.content.get(&entry.target).copied().ok_or_else(|| {
                     LoomError::not_found(format!(
                         "content {} for tree entry {:?}",
                         entry.target, entry.name
                     ))
                 })?;
-                state.queue.push_back(obj);
+                state.content_roots.push_back(entry.target);
             }
             EntryKind::ProllyMap => {
-                for node in crate::prolly::reachable_with_leaves(
-                    &self.store,
-                    &entry.target,
-                    &BTreeSet::new(),
-                )?
-                .nodes
-                {
-                    state.marked.insert(node);
-                }
+                state.prolly_cursors.push_back(ReachabilityProllyCursor {
+                    cursor: crate::prolly::ProllyReachCursor::new(entry.target),
+                    collect_stream_payloads: false,
+                });
             }
             EntryKind::Stream => state.stream_roots.push_back(entry.target),
+        }
+        Ok(())
+    }
+
+    fn mark_content_root(&self, addr: Digest, state: &mut ReachabilityMarkState) -> Result<()> {
+        let obj = self
+            .content
+            .get(&addr)
+            .copied()
+            .ok_or_else(|| LoomError::not_found(format!("content {addr}")))?;
+        if !state.marked.insert(obj) {
+            return Ok(());
+        }
+        if let Object::ChunkList { entries, .. } = self.get_object(&obj)? {
+            for chunk in entries {
+                state.queue.push_back(chunk.target);
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_stream_root_mark(
+        &self,
+        root: Digest,
+        state: &mut ReachabilityMarkState,
+    ) -> Result<()> {
+        if !state.marked.insert(root) {
+            return Ok(());
+        }
+        let Object::Tree(entries) = self.get_object(&root)? else {
+            return Err(LoomError::corrupt("stream root is not a Tree"));
+        };
+        for entry in entries {
+            match entry.name.as_str() {
+                "meta" => state.content_roots.push_back(entry.target),
+                "entries" => state.prolly_cursors.push_back(ReachabilityProllyCursor {
+                    cursor: crate::prolly::ProllyReachCursor::new(entry.target),
+                    collect_stream_payloads: true,
+                }),
+                "consumers" => state.prolly_cursors.push_back(ReachabilityProllyCursor {
+                    cursor: crate::prolly::ProllyReachCursor::new(entry.target),
+                    collect_stream_payloads: false,
+                }),
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -1253,4 +1346,17 @@ impl<S: ObjectStore> Loom<S> {
             ))),
         }
     }
+}
+
+fn stream_payload_address_from_record(value: &[u8]) -> Result<Digest> {
+    let mut f = crate::cbor::Fields::new(crate::cbor::decode_array(value)?);
+    if f.uint()? != STREAM_ENTRY_VERSION {
+        return Err(LoomError::corrupt(
+            "unsupported stream entry-record version",
+        ));
+    }
+    let payload_addr = f.digest()?;
+    let _len = f.uint()?;
+    f.end()?;
+    Ok(payload_addr)
 }

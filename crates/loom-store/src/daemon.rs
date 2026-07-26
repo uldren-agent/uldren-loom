@@ -698,27 +698,30 @@ pub fn request(addr_file: &Path, request: &str) -> Result<String> {
 }
 
 fn request_endpoint(endpoint: DaemonEndpoint, request: &str) -> Result<String> {
+    let response = request_endpoint_bytes(endpoint, request.as_bytes())?;
+    String::from_utf8(response)
+        .map_err(|e| LoomError::corrupt(format!("daemon response is not UTF-8: {e}")))
+}
+
+fn request_endpoint_bytes(endpoint: DaemonEndpoint, request: &[u8]) -> Result<Vec<u8>> {
     let mut stream = connect_endpoint(&endpoint)?;
     stream.configure()?;
     stream
-        .write_all(request.as_bytes())
+        .write_all(request)
         .map_err(|e| LoomError::new(Code::Io, format!("write daemon request: {e}")))?;
     stream
         .shutdown_write()
         .map_err(|e| LoomError::new(Code::Io, format!("finish daemon request: {e}")))?;
-    read_daemon_response(&mut stream)
+    read_daemon_response_bytes(&mut stream)
 }
 
-fn read_daemon_response(stream: &mut impl Read) -> Result<String> {
+fn read_daemon_response_bytes(stream: &mut impl Read) -> Result<Vec<u8>> {
     let deadline = std::time::Instant::now() + RESPONSE_TIMEOUT;
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
         match stream.read(&mut buf) {
-            Ok(0) => {
-                return String::from_utf8(response)
-                    .map_err(|e| LoomError::corrupt(format!("daemon response is not UTF-8: {e}")));
-            }
+            Ok(0) => return Ok(response),
             Ok(n) => response.extend_from_slice(&buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1102,6 +1105,124 @@ pub fn request_checked_addr(addr_file: &Path, request_text: &str) -> Result<Stri
     }
 }
 
+pub fn generated_session_open(paths: &DaemonPaths, request_body: &[u8]) -> Result<Vec<u8>> {
+    let request = generated_binary_request(DAEMON_GENERATED_SESSION_OPEN_MAGIC, request_body)?;
+    let response = request_bytes_for_paths(paths, &request)?;
+    parse_generated_binary_response(&response, DAEMON_GENERATED_SESSION_RESPONSE_MAGIC)
+        .and_then(|mut bodies| single_generated_body(&mut bodies))
+}
+
+pub fn generated_call(paths: &DaemonPaths, request_body: &[u8]) -> Result<Vec<u8>> {
+    let request = generated_binary_request(DAEMON_GENERATED_CALL_MAGIC, request_body)?;
+    let response = request_bytes_for_paths(paths, &request)?;
+    parse_generated_binary_response(&response, DAEMON_GENERATED_RESPONSE_MAGIC)
+        .and_then(|mut bodies| single_generated_body(&mut bodies))
+}
+
+pub fn generated_stream(paths: &DaemonPaths, request_body: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let request = generated_binary_request(DAEMON_GENERATED_STREAM_MAGIC, request_body)?;
+    let response = request_bytes_for_paths(paths, &request)?;
+    parse_generated_stream_response(&response)
+}
+
+pub fn generated_stream_cancel(paths: &DaemonPaths, request_body: &[u8]) -> Result<Vec<u8>> {
+    let request = generated_binary_request(DAEMON_GENERATED_STREAM_CANCEL_MAGIC, request_body)?;
+    let response = request_bytes_for_paths(paths, &request)?;
+    parse_generated_binary_response(&response, DAEMON_GENERATED_STREAM_CANCEL_RESPONSE_MAGIC)
+        .and_then(|mut bodies| single_generated_body(&mut bodies))
+}
+
+const DAEMON_GENERATED_SESSION_OPEN_MAGIC: &[u8] = b"loom-daemon-generated-session-open-v1\0";
+const DAEMON_GENERATED_CALL_MAGIC: &[u8] = b"loom-daemon-generated-call-v1\0";
+const DAEMON_GENERATED_STREAM_MAGIC: &[u8] = b"loom-daemon-generated-stream-v1\0";
+const DAEMON_GENERATED_STREAM_CANCEL_MAGIC: &[u8] = b"loom-daemon-generated-stream-cancel-v1\0";
+const DAEMON_GENERATED_SESSION_RESPONSE_MAGIC: &[u8] =
+    b"loom-daemon-generated-session-response-v1\0";
+const DAEMON_GENERATED_RESPONSE_MAGIC: &[u8] = b"loom-daemon-generated-response-v1\0";
+const DAEMON_GENERATED_STREAM_RESPONSE_MAGIC: &[u8] = b"loom-daemon-generated-stream-response-v1\0";
+const DAEMON_GENERATED_STREAM_CANCEL_RESPONSE_MAGIC: &[u8] =
+    b"loom-daemon-generated-stream-cancel-response-v1\0";
+
+fn generated_binary_request(magic: &[u8], body: &[u8]) -> Result<Vec<u8>> {
+    let len = u32::try_from(body.len()).map_err(|_| {
+        LoomError::new(
+            Code::ResourceExhausted,
+            "daemon generated request too large",
+        )
+    })?;
+    let mut out = Vec::with_capacity(magic.len() + 4 + body.len());
+    out.extend_from_slice(magic);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(body);
+    Ok(out)
+}
+
+fn parse_generated_binary_response(response: &[u8], magic: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let rest = response.strip_prefix(magic).ok_or_else(|| {
+        LoomError::corrupt("daemon generated response has an unexpected frame prefix")
+    })?;
+    let count_bytes: [u8; 4] = rest
+        .get(..4)
+        .ok_or_else(|| LoomError::corrupt("daemon generated response is truncated"))?
+        .try_into()
+        .map_err(|_| LoomError::corrupt("daemon generated response count is malformed"))?;
+    let count = u32::from_be_bytes(count_bytes) as usize;
+    let mut rest = &rest[4..];
+    let mut bodies = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len_bytes: [u8; 4] = rest
+            .get(..4)
+            .ok_or_else(|| LoomError::corrupt("daemon generated response frame is truncated"))?
+            .try_into()
+            .map_err(|_| LoomError::corrupt("daemon generated response frame is malformed"))?;
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        let body = rest
+            .get(4..4 + len)
+            .ok_or_else(|| LoomError::corrupt("daemon generated response body is truncated"))?;
+        bodies.push(body.to_vec());
+        rest = &rest[4 + len..];
+    }
+    if !rest.is_empty() {
+        return Err(LoomError::corrupt(
+            "daemon generated response has trailing bytes",
+        ));
+    }
+    Ok(bodies)
+}
+
+fn parse_generated_stream_response(response: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut rest = response
+        .strip_prefix(DAEMON_GENERATED_STREAM_RESPONSE_MAGIC)
+        .ok_or_else(|| {
+            LoomError::corrupt("daemon generated stream response has an unexpected frame prefix")
+        })?;
+    let mut bodies = Vec::new();
+    while !rest.is_empty() {
+        let len_bytes: [u8; 4] = rest
+            .get(..4)
+            .ok_or_else(|| LoomError::corrupt("daemon generated stream frame is truncated"))?
+            .try_into()
+            .map_err(|_| LoomError::corrupt("daemon generated stream frame is malformed"))?;
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        let body = rest
+            .get(4..4 + len)
+            .ok_or_else(|| LoomError::corrupt("daemon generated stream body is truncated"))?;
+        bodies.push(body.to_vec());
+        rest = &rest[4 + len..];
+    }
+    Ok(bodies)
+}
+
+fn single_generated_body(bodies: &mut Vec<Vec<u8>>) -> Result<Vec<u8>> {
+    if bodies.len() == 1 {
+        Ok(bodies.remove(0))
+    } else {
+        Err(LoomError::corrupt(
+            "daemon generated response must contain one frame",
+        ))
+    }
+}
+
 fn parse_daemon_error(err: &str) -> LoomError {
     let err = err.trim_end();
     if let Some((code, message)) = err.split_once(": ")
@@ -1157,6 +1278,10 @@ fn code_from_wire(code: &str) -> Option<Code> {
 
 fn request_for_paths(paths: &DaemonPaths, request_text: &str) -> Result<String> {
     request_endpoint(daemon_transport_endpoint(paths)?, request_text)
+}
+
+fn request_bytes_for_paths(paths: &DaemonPaths, request: &[u8]) -> Result<Vec<u8>> {
+    request_endpoint_bytes(daemon_transport_endpoint(paths)?, request)
 }
 
 pub fn field(value: &str) -> Result<&str> {

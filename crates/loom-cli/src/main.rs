@@ -43,7 +43,8 @@ use loom_interchange_io::{
     parse_meetings_input_profile, persist_import_checkpoint, retain_import_input,
     validate_meetings_source_payload_leaf,
 };
-use loom_lanes::{Lane, LaneDecodeDiagnostic, LaneInput, LaneKind, LaneStatus, LaneView};
+use loom_lanes::{Lane, LaneDecodeDiagnostic, LaneKind, LaneStatus, LaneView};
+use loom_remote_protocol::codec::ToValue;
 use loom_sql::LoomSqlStore;
 use loom_store::{
     AuditConfig, DerivedArtifactRebuild, DerivedArtifactRecord, DerivedArtifactStatus, FileStore,
@@ -53,7 +54,6 @@ use loom_store::{
 use loom_substrate::OperationEnvelope;
 #[cfg(all(test, feature = "integration-tests"))]
 use loom_substrate::body::BlockKind;
-use loom_substrate::body::Body;
 use loom_substrate::drive::{
     DriveOperationLog, DrivePolicyRegistry, DrivePolicyTarget, drive_operation_log_key,
     drive_policy_registry_key,
@@ -70,7 +70,7 @@ use loom_substrate::meetings::{
     Coverage as MeetingsCoverage, InputProfile, MeetingRecordInput, MeetingsProfileSnapshotParts,
     SourceRecord, SourceRecordInput, SpanKind, SpanRecord,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "integration-tests"))]
 use loom_substrate::pages::{PageOperationLog, page_profile_operation_log_key};
 use loom_substrate::search::{
     EMBEDDING_PROJECTION_JOBS_DIR, EmbeddingProjectionJob, EmbeddingProjectionKey,
@@ -2370,8 +2370,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             collection,
             id,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let present = client.doc_delete(keys, &workspace, &collection, &id)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = client.doc_delete(&workspace, &collection, &id)?;
             println!("{present}");
             Ok(())
         }
@@ -2380,8 +2380,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             collection,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let present = client.doc_delete_collection(keys, &workspace, &collection)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = client.doc_delete_collection(&workspace, &collection)?;
             println!("{present}");
             Ok(())
         }
@@ -2392,8 +2392,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(document) = client.doc_get_text(keys, &workspace, &collection, &id)? else {
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let Some(document) = client.doc_get_text(&workspace, &collection, &id)? else {
                 return Err(format!("document id {id:?} not found"));
             };
             write_output(out.as_deref(), document.text.as_bytes()).map_err(|e| e.to_string())
@@ -2408,9 +2408,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
         } => {
             let text = String::from_utf8(read_input(&input).map_err(|e| e.to_string())?)
                 .map_err(|_| Code::DocumentNotText.as_str().to_string())?;
-            let client = remote::open_store_client(&store)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
             let result = client.doc_put_text(
-                keys,
                 &workspace,
                 &collection,
                 &id,
@@ -2427,8 +2426,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(document) = client.doc_get_binary(keys, &workspace, &collection, &id)? else {
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let Some(document) = client.doc_get_binary(&workspace, &collection, &id)? else {
                 return Err(format!("document id {id:?} not found"));
             };
             write_output(out.as_deref(), &document.bytes).map_err(|e| e.to_string())
@@ -2442,9 +2441,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_entity_tag,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
             let result = client.doc_put_binary(
-                keys,
                 &workspace,
                 &collection,
                 &id,
@@ -2460,8 +2458,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             collection,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.doc_list_binary(keys, &workspace, &collection)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let encoded = client.doc_list_binary(&workspace, &collection)?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         DocumentCmd::Find {
@@ -2471,8 +2469,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             index,
             value_json,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let ids = client.doc_find(keys, &workspace, &collection, &index, &value_json)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let ids = client.doc_find(&workspace, &collection, &index, &value_json)?;
             println!("{}", serde_json::json!({ "ids": ids }));
             Ok(())
         }
@@ -2483,8 +2481,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let result = client.doc_query(keys, &workspace, &collection, &bytes)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let result = client.doc_query(&workspace, &collection, bytes)?;
             println!("{result}");
             Ok(())
         }
@@ -2496,8 +2494,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             path,
             unique,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.doc_index_create(keys, &workspace, &collection, &name, &path, unique)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            client.doc_index_create(&workspace, &collection, &name, &path, unique)
         }
         DocumentCmd::IndexCreateJson {
             store,
@@ -2506,8 +2504,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            client.doc_index_create_json(keys, &workspace, &collection, &bytes)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            client.doc_index_create_json(&workspace, &collection, bytes)
         }
         DocumentCmd::IndexDrop {
             store,
@@ -2515,8 +2513,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             collection,
             name,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let dropped = client.doc_index_drop(keys, &workspace, &collection, &name)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let dropped = client.doc_index_drop(&workspace, &collection, &name)?;
             println!("{dropped}");
             Ok(())
         }
@@ -2525,8 +2523,8 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             collection,
         } => {
-            let client = remote::open_store_client(&store)?;
-            println!("{}", client.doc_index_list(keys, &workspace, &collection)?);
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            println!("{}", client.doc_index_list(&workspace, &collection)?);
             Ok(())
         }
         DocumentCmd::IndexRebuild {
@@ -2535,19 +2533,16 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             collection,
             name,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.doc_index_rebuild(keys, &workspace, &collection, &name)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            client.doc_index_rebuild(&workspace, &collection, &name)
         }
         DocumentCmd::IndexStatus {
             store,
             workspace,
             collection,
         } => {
-            let client = remote::open_store_client(&store)?;
-            println!(
-                "{}",
-                client.doc_index_statuses(keys, &workspace, &collection)?
-            );
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            println!("{}", client.doc_index_statuses(&workspace, &collection)?);
             Ok(())
         }
     }
@@ -3070,21 +3065,22 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Vcs)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let workspace_id = client.ensure_workspace_id(&workspace, FacetKind::Vcs)?;
             let profile_id = workspace_id.to_string();
-            let project = loom_tickets::create_project(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &project_id,
-                &key_prefix,
-                &name,
-                expected_root.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_ticket_project(&project, &format)
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_project_create_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    project_id.to_value(),
+                    key_prefix.to_value(),
+                    name.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_project_json(&raw, &format)
         }
         TicketsCmd::ProjectRekey {
             store,
@@ -3094,20 +3090,20 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let project = loom_tickets::rekey_project(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &project_id,
-                &key_prefix,
-                expected_root.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_ticket_project(&project, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_project_rekey_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    project_id.to_value(),
+                    key_prefix.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_project_json(&raw, &format)
         }
         TicketsCmd::ProjectSettingsGet {
             store,
@@ -3116,19 +3112,19 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             include_contracts,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let project = loom_tickets::get_project_with_contract_details(
-                &loom,
-                workspace_id,
-                &profile_id,
-                &project_id,
-                include_contracts,
-            )
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ticket project not found".to_string())?;
-            print_ticket_project(&project, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_project_settings_get_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    project_id.to_value(),
+                    include_contracts.to_value(),
+                ],
+            )?;
+            print_generated_ticket_project_json(&raw, &format)
         }
         TicketsCmd::ProjectSettingsSet {
             store,
@@ -3181,46 +3177,49 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             let owner_contract_details = expand_at_file_opt(owner_contract_details)?;
             let worker_contract_summary = expand_at_file_opt(worker_contract_summary)?;
             let worker_contract_details = expand_at_file_opt(worker_contract_details)?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let project = loom_tickets::set_project_settings(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketProjectSettingsRequest {
-                    workspace_id: &profile_id,
-                    project_id: &project_id,
-                    default_projection,
-                    enable_projections: &[],
-                    disable_projections: &[],
-                    actor_enforcement,
-                    project_owner_principal: project_owner.as_deref(),
-                    clear_project_owner_principal: clear_project_owner,
-                    acceptance_authorities,
-                    acceptance_evidence_enforcement,
-                    required_acceptance_evidence_keys,
-                    owner_contract_summary: owner_contract_summary.as_deref(),
-                    owner_contract_details: owner_contract_details.as_deref(),
-                    worker_contract_summary: worker_contract_summary.as_deref(),
-                    worker_contract_details: worker_contract_details.as_deref(),
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_ticket_project(&project, &format)
+            let patch = ticket_project_settings_patch_to_cbor(TicketProjectSettingsPatchArgs {
+                default_projection,
+                enable_projections: &[],
+                disable_projections: &[],
+                actor_enforcement,
+                project_owner_principal: project_owner.as_deref(),
+                clear_project_owner_principal: clear_project_owner,
+                acceptance_authorities,
+                acceptance_evidence_enforcement,
+                required_acceptance_evidence_keys,
+                owner_contract_summary: owner_contract_summary.as_deref(),
+                owner_contract_details: owner_contract_details.as_deref(),
+                worker_contract_summary: worker_contract_summary.as_deref(),
+                worker_contract_details: worker_contract_details.as_deref(),
+                expected_root: expected_root.as_deref(),
+            })?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_project_settings_set_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    project_id.to_value(),
+                    WireValue::Bytes(patch),
+                ],
+            )?;
+            print_generated_ticket_project_json(&raw, &format)
         }
         TicketsCmd::Projects {
             store,
             workspace,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let projects = loom_tickets::list_projects(&loom, workspace_id, &profile_id)
-                .map_err(|e| e.to_string())?;
-            print_ticket_projects(&projects, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_projects_json",
+                vec![workspace.to_string().to_value(), profile_id.to_value()],
+            )?;
+            print_generated_ticket_projects_json(&raw, &format)
         }
         TicketsCmd::Relations {
             store,
@@ -3228,13 +3227,18 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             ticket_id,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let relations =
-                loom_tickets::list_ticket_relations(&loom, workspace_id, &profile_id, &ticket_id)
-                    .map_err(|e| e.to_string())?;
-            print_ticket_relations(&relations, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_relation_list_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    ticket_id.to_string().to_value(),
+                ],
+            )?;
+            print_generated_ticket_relations_json(&raw, &format)
         }
         TicketsCmd::Fields {
             store,
@@ -3244,25 +3248,20 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             operation,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let projection = loom_tickets::parse_ticket_projection(projection.as_deref())
-                .map_err(|e| e.to_string())?;
-            let catalog = if let Some(project_id) = project_id {
-                loom_tickets::ticket_field_catalog_for_project(
-                    &loom,
-                    workspace_id,
-                    &profile_id,
-                    &project_id,
-                    projection,
-                    operation.as_deref(),
-                )
-            } else {
-                loom_tickets::ticket_field_catalog(projection, operation.as_deref())
-            }
-            .map_err(|e| e.to_string())?;
-            print_ticket_field_catalog(&catalog, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_fields_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    project_id.map(|value| value.to_string()).to_value(),
+                    projection.map(|value| value.to_string()).to_value(),
+                    operation.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_field_catalog_json(&raw, &format)
         }
         TicketsCmd::FieldPut {
             store,
@@ -3283,33 +3282,35 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let catalog = loom_tickets::put_ticket_field_definition(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketFieldDefinitionWriteRequest {
-                    workspace_id: &profile_id,
-                    project_id: &project_id,
-                    field_id: &field_id,
-                    key: &key,
-                    name: &name,
-                    description: description.as_deref(),
-                    field_type: &field_type,
-                    option_set: option_set.as_deref(),
-                    max_length,
-                    required,
-                    searchable,
-                    orderable,
-                    cardinality: parse_ticket_field_cardinality(&cardinality)?,
-                    applicable_type_ids: &applicable_type_ids,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_ticket_field_catalog(&catalog, &format)
+            parse_ticket_field_cardinality(&cardinality)?;
+            let applicable_type_ids_json =
+                serde_json::to_string(&applicable_type_ids).map_err(|e| e.to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_field_put_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    project_id.to_value(),
+                    field_id.to_value(),
+                    key.to_value(),
+                    name.to_value(),
+                    description.map(|value| value.to_string()).to_value(),
+                    field_type.to_value(),
+                    option_set.map(|value| value.to_string()).to_value(),
+                    max_length.unwrap_or(0).to_value(),
+                    max_length.is_some().to_value(),
+                    required.to_value(),
+                    searchable.to_value(),
+                    orderable.to_value(),
+                    cardinality.to_value(),
+                    applicable_type_ids_json.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_field_catalog_json(&raw, &format)
         }
         TicketsCmd::FieldRetire {
             store,
@@ -3319,22 +3320,20 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let catalog = loom_tickets::retire_ticket_field_definition(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketFieldDefinitionRetireRequest {
-                    workspace_id: &profile_id,
-                    project_id: &project_id,
-                    field_id: &field_id,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_ticket_field_catalog(&catalog, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_field_retire_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    project_id.to_value(),
+                    field_id.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_field_catalog_json(&raw, &format)
         }
         TicketsCmd::Create {
             store,
@@ -3354,47 +3353,56 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             format,
         } => {
             let fields_input = parse_ticket_fields(&fields)?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            // Resolve the project: explicit --project-id, else the sole project when unambiguous.
-            let project_id = match project_id {
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let projects_raw = client.generated_json(
+                "Tickets",
+                "tickets_projects_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.clone().to_value(),
+                ],
+            )?;
+            let projects: serde_json::Value =
+                serde_json::from_str(&projects_raw).map_err(|e| e.to_string())?;
+            let projects = projects
+                .as_array()
+                .ok_or_else(|| "ticket projects JSON must be an array".to_string())?;
+            let project = match project_id {
                 Some(project_id) => project_id,
-                None => {
-                    let projects = loom_tickets::list_projects(&loom, workspace_id, &profile_id)
-                        .map_err(|e| e.to_string())?;
-                    match projects.as_slice() {
-                        [only] => only.project_id.clone(),
-                        [] => {
-                            return Err("workspace has no ticket projects; create one with `tickets project create` or pass --project-id".to_string());
-                        }
-                        _ => {
-                            return Err(
-                                "workspace has multiple ticket projects; specify --project-id"
-                                    .to_string(),
-                            );
-                        }
+                None => match projects.as_slice() {
+                    [only] => json_string_field(only, "project_id")?.to_string(),
+                    [] => {
+                        return Err("workspace has no ticket projects; create one with `tickets project create` or pass --project-id".to_string());
                     }
-                }
+                    _ => {
+                        return Err(
+                            "workspace has multiple ticket projects; specify --project-id"
+                                .to_string(),
+                        );
+                    }
+                },
             };
-            // Resolve the input projection: explicit --projection, else the project's default.
             let projection = match projection.as_deref() {
                 Some(projection) => loom_tickets::parse_ticket_projection(Some(projection))
                     .map_err(|e| e.to_string())?,
                 None => {
-                    match loom_tickets::get_project(&loom, workspace_id, &profile_id, &project_id)
-                        .map_err(|e| e.to_string())?
-                    {
-                        Some(project) => {
-                            loom_tickets::parse_ticket_projection(Some(&project.default_projection))
-                                .map_err(|e| e.to_string())?
-                        }
-                        None => None,
-                    }
+                    let project_summary = projects
+                        .iter()
+                        .find(|summary| {
+                            summary
+                                .get("project_id")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(project.as_str())
+                        })
+                        .ok_or_else(|| "ticket project not found".to_string())?;
+                    loom_tickets::parse_ticket_projection(Some(json_string_field(
+                        project_summary,
+                        "default_projection",
+                    )?))
+                    .map_err(|e| e.to_string())?
                 }
             };
-            // `--fields` (projected vocabulary) and first-class canonical flags converge on one
-            // native field map and one create-time validation path (create_ticket).
             let mut fields =
                 loom_tickets::normalize_ticket_fields_for_projection(&fields_input, projection)
                     .map_err(|e| e.to_string())?;
@@ -3416,29 +3424,24 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
                     object.insert(key.to_string(), serde_json::Value::String(value));
                 }
             }
-            let ticket = loom_tickets::create_ticket(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketCreateRequest {
-                    workspace_id: &profile_id,
-                    project_id: &project_id,
-                    ticket_type: &ticket_type,
-                    external_source: external_source.as_deref(),
-                    external_id: external_id.as_deref(),
-                    fields: &fields,
-                    policy_labels: &policy_labels,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            let envelope = ticket_mutation_envelope(
-                ticket,
-                "ticket.created",
-                expected_root.as_deref(),
-                vec![MutationChange::ResourceCreated],
-            );
-            print_ticket_mutation(&envelope, &format)
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_create_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    project.to_value(),
+                    ticket_type.to_value(),
+                    external_source.to_value(),
+                    external_id.to_value(),
+                    fields.to_string().to_value(),
+                    serde_json::to_string(&policy_labels)
+                        .map_err(|e| e.to_string())?
+                        .to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_mutation_json(&raw, &format)
         }
         TicketsCmd::Update {
             store,
@@ -3498,119 +3501,78 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
                 &request.delete_fields,
                 projection,
             );
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &request.workspace)?;
-            let profile_id = workspace_id.to_string();
-            let action = request
-                .action
-                .as_deref()
-                .map(loom_tickets::TicketLifecycleAction::parse)
-                .transpose()
-                .map_err(|error| error.to_string())?;
-            let changes = cli_ticket_update_changes(CliTicketUpdateChangeInputs {
-                set_fields: set_fields.as_ref(),
-                delete_fields: &delete_fields,
-                action_applied: action.is_some(),
-                target_status: request.target_status.as_deref(),
-                observed_source_status: request.observed_source_status.as_deref(),
-                assignee: request.assignee.as_deref(),
-                comment: request.comment.as_ref(),
-                comments: &request.comments,
-                relation_sets: &request.relation_sets,
-                relation_removes: &request.relation_removes,
-            });
-            let comment = request
+            let comment_evidence_json = request
                 .comment
                 .as_ref()
-                .map(|comment| {
-                    comment
-                        .evidence
-                        .as_ref()
-                        .map(loom_tickets::TicketCommentEvidence::from_json)
-                        .transpose()
-                        .map(|evidence| loom_tickets::TicketUpdateCommentRequest {
-                            comment_id: comment.comment_id.as_deref(),
-                            comment_type: comment.comment_type.as_deref(),
-                            body: &comment.body,
-                            evidence,
-                        })
-                })
+                .and_then(|comment| comment.evidence.as_ref())
+                .map(serde_json::to_string)
                 .transpose()
-                .map_err(|error| error.to_string())?;
-            let comments = request
-                .comments
-                .iter()
-                .map(|comment| {
-                    comment
-                        .evidence
+                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&request.workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_update_json",
+                vec![
+                    request.workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    request.ticket_id.to_string().to_value(),
+                    set_fields.map(|fields| fields.to_string()).to_value(),
+                    serde_json::to_string(&delete_fields)
+                        .map_err(|e| e.to_string())?
+                        .to_value(),
+                    request.action.map(|value| value.to_string()).to_value(),
+                    request
+                        .target_status
+                        .map(|value| value.to_string())
+                        .to_value(),
+                    request
+                        .observed_source_status
+                        .map(|value| value.to_string())
+                        .to_value(),
+                    request
+                        .observed_workflow_version
+                        .map(|value| value.to_string())
+                        .to_value(),
+                    request.assignee.map(|value| value.to_string()).to_value(),
+                    request
+                        .comment
                         .as_ref()
-                        .map(loom_tickets::TicketCommentEvidence::from_json)
+                        .and_then(|comment| comment.comment_id.clone())
+                        .to_value(),
+                    request
+                        .comment
+                        .as_ref()
+                        .and_then(|comment| comment.comment_type.clone())
+                        .to_value(),
+                    request
+                        .comment
+                        .as_ref()
+                        .map(|comment| comment.body.clone())
+                        .to_value(),
+                    comment_evidence_json.to_value(),
+                    request
+                        .expected_root
+                        .map(|value| value.to_string())
+                        .to_value(),
+                    (!request.comments.is_empty())
+                        .then(|| serde_json::to_string(&request.comments))
                         .transpose()
-                        .map(|evidence| loom_tickets::TicketUpdateCommentRequest {
-                            comment_id: comment.comment_id.as_deref(),
-                            comment_type: comment.comment_type.as_deref(),
-                            body: &comment.body,
-                            evidence,
-                        })
-                })
-                .collect::<loom_core::Result<Vec<_>>>()
-                .map_err(|error| error.to_string())?;
-            let relation_sets = request
-                .relation_sets
-                .iter()
-                .map(|relation| {
-                    loom_tickets::TicketRelationKind::parse(&relation.kind).map(|kind| {
-                        loom_tickets::TicketUpdateRelationSetRequest {
-                            relation_id: relation.relation_id.as_deref(),
-                            kind,
-                            target_id: &relation.target_id,
-                        }
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())?;
-            let relation_removes = request
-                .relation_removes
-                .iter()
-                .map(|relation| loom_tickets::TicketUpdateRelationRemoveRequest {
-                    relation_id: &relation.relation_id,
-                })
-                .collect::<Vec<_>>();
-            let overlay_only_update = comment.is_none()
-                && comments.is_empty()
-                && relation_sets.is_empty()
-                && relation_removes.is_empty();
-            let ticket = loom_tickets::update_ticket(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketUpdateRequest {
-                    workspace_id: &profile_id,
-                    ticket_id: &request.ticket_id,
-                    set_fields: set_fields.as_ref(),
-                    delete_fields: &delete_fields,
-                    action,
-                    target_status: request.target_status.as_deref(),
-                    observed_source_status: request.observed_source_status.as_deref(),
-                    observed_workflow_version: request.observed_workflow_version.as_deref(),
-                    assignee: request.assignee.as_deref(),
-                    expected_root: request.expected_root.as_deref(),
-                    comment,
-                    comments: &comments,
-                    relation_sets: &relation_sets,
-                    relation_removes: &relation_removes,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            if !overlay_only_update {
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-            }
-            let envelope = ticket_mutation_envelope(
-                ticket,
-                "ticket.updated",
-                request.expected_root.as_deref(),
-                changes,
-            );
-            print_ticket_mutation(&envelope, &format)
+                        .map_err(|e| e.to_string())?
+                        .to_value(),
+                    (!request.relation_sets.is_empty())
+                        .then(|| serde_json::to_string(&request.relation_sets))
+                        .transpose()
+                        .map_err(|e| e.to_string())?
+                        .to_value(),
+                    (!request.relation_removes.is_empty())
+                        .then(|| serde_json::to_string(&request.relation_removes))
+                        .transpose()
+                        .map_err(|e| e.to_string())?
+                        .to_value(),
+                ],
+            )?;
+            print_generated_ticket_mutation_json(&raw, &format)
         }
         TicketsCmd::Delete {
             store,
@@ -3619,27 +3581,19 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let ticket = loom_tickets::delete_ticket(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketDeleteRequest {
-                    workspace_id: &profile_id,
-                    ticket_id: &ticket_id,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            let envelope = ticket_mutation_envelope(
-                ticket,
-                "ticket.deleted",
-                expected_root.as_deref(),
-                vec![MutationChange::ResourceDeleted],
-            );
-            print_ticket_mutation(&envelope, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_delete_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    ticket_id.to_string().to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_mutation_json(&raw, &format)
         }
         TicketsCmd::Comments {
             store,
@@ -3647,13 +3601,18 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             ticket_id,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let comments =
-                loom_tickets::list_ticket_comments(&loom, workspace_id, &profile_id, &ticket_id)
-                    .map_err(|e| e.to_string())?;
-            print_ticket_comments(&comments, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_comments_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    ticket_id.to_string().to_value(),
+                ],
+            )?;
+            print_generated_ticket_comments_json(&raw, &format)
         }
         TicketsCmd::CommentAdd {
             store,
@@ -3666,36 +3625,32 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
             let body = read_ticket_comment_body(&body)?;
             let evidence = evidence
                 .as_deref()
                 .map(parse_ticket_comment_evidence)
                 .transpose()?;
-            let ticket = loom_tickets::add_ticket_comment(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketCommentRequest {
-                    workspace_id: &profile_id,
-                    ticket_id: &ticket_id,
-                    comment_id: comment_id.as_deref(),
-                    comment_type: Some(&comment_type),
-                    body: &body,
-                    evidence,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            let envelope = ticket_mutation_envelope(
-                ticket,
-                "ticket.comment_added",
-                expected_root.as_deref(),
-                vec![MutationChange::field_set("comment", comment_type)],
-            );
-            print_ticket_mutation(&envelope, &format)
+            let evidence_json = evidence
+                .as_ref()
+                .map(|evidence| serde_json::to_string(&evidence).map_err(|e| e.to_string()))
+                .transpose()?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_comment_add_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    ticket_id.to_string().to_value(),
+                    comment_id.map(|value| value.to_string()).to_value(),
+                    Some(comment_type).to_value(),
+                    body.to_value(),
+                    evidence_json.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_mutation_json(&raw, &format)
         }
         TicketsCmd::CommentUpdate {
             store,
@@ -3708,40 +3663,37 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
             let body = body.as_deref().map(read_ticket_comment_body).transpose()?;
             let evidence = evidence
                 .as_deref()
                 .map(parse_ticket_comment_evidence_update)
                 .transpose()?;
-            let ticket = loom_tickets::update_ticket_comment(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketCommentUpdateRequest {
-                    workspace_id: &profile_id,
-                    ticket_id: &ticket_id,
-                    comment_id: &comment_id,
-                    comment_type: comment_type.as_deref(),
-                    body: body.as_deref(),
-                    evidence,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            let envelope = ticket_mutation_envelope(
-                ticket,
-                "ticket.comment_updated",
-                expected_root.as_deref(),
-                vec![MutationChange::field_changed(
-                    "comment",
-                    None::<String>,
-                    Some(comment_id),
-                )],
-            );
-            print_ticket_mutation(&envelope, &format)
+            let evidence_json = evidence
+                .as_ref()
+                .map(|evidence| {
+                    evidence
+                        .as_ref()
+                        .map_or_else(|| Ok("null".to_string()), serde_json::to_string)
+                        .map_err(|e| e.to_string())
+                })
+                .transpose()?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_comment_update_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    ticket_id.to_string().to_value(),
+                    comment_id.to_string().to_value(),
+                    comment_type.map(|value| value.to_string()).to_value(),
+                    body.to_value(),
+                    evidence_json.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_mutation_json(&raw, &format)
         }
         TicketsCmd::CommentDelete {
             store,
@@ -3751,28 +3703,20 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let ticket = loom_tickets::delete_ticket_comment(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketCommentDeleteRequest {
-                    workspace_id: &profile_id,
-                    ticket_id: &ticket_id,
-                    comment_id: &comment_id,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            let envelope = ticket_mutation_envelope(
-                ticket,
-                "ticket.comment_deleted",
-                expected_root.as_deref(),
-                vec![MutationChange::field_deleted("comment", Some(comment_id))],
-            );
-            print_ticket_mutation(&envelope, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_comment_delete_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    ticket_id.to_string().to_value(),
+                    comment_id.to_string().to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_mutation_json(&raw, &format)
         }
         TicketsCmd::BoardCreate {
             store,
@@ -3789,38 +3733,32 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
             let columns = parse_board_columns(&columns)?;
-            let board = loom_tickets::create_board(
-                &mut loom,
-                workspace_id,
-                loom_tickets::BoardCreateRequest {
-                    workspace_id: &profile_id,
-                    board_id: &board_id,
-                    board_key: &board_key,
-                    name: &name,
-                    description: &description,
-                    project_id: &project_id,
-                    scope: if mode == "manual" {
-                        loom_tickets::BoardScope::ManualSet
-                    } else {
-                        loom_tickets::BoardScope::project(project_id.clone())
-                    },
-                    mode: loom_tickets::BoardMode::parse(&mode).map_err(|e| e.to_string())?,
-                    columns: &columns,
-                    swimlanes: &[],
-                    card_display_fields: &card_display_fields,
-                    owner_principal: None,
-                    coordinator_principal: None,
-                    updated_by: &updated_by,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_board(&board, &format)
+            loom_tickets::BoardMode::parse(&mode).map_err(|e| e.to_string())?;
+            let request = serde_json::json!({
+                "board_id": board_id,
+                "board_key": board_key,
+                "name": name,
+                "description": description,
+                "project_id": project_id,
+                "mode": mode,
+                "columns": board_columns_json(&columns),
+                "card_display_fields": card_display_fields,
+                "updated_by": updated_by,
+                "expected_root": expected_root,
+            });
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "boards_create_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    request.to_string().to_value(),
+                ],
+            )?;
+            print_generated_board_json(&raw, &format)
         }
         TicketsCmd::BoardGet {
             store,
@@ -3828,13 +3766,18 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             board_id,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let board = loom_tickets::get_board(&loom, workspace_id, &profile_id, &board_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "board not found".to_string())?;
-            print_board(&board, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "boards_get_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    board_id.to_string().to_value(),
+                ],
+            )?;
+            print_generated_board_json(&raw, &format)
         }
         TicketsCmd::BoardList {
             store,
@@ -3842,13 +3785,18 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             include_deleted,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let boards =
-                loom_tickets::list_boards(&loom, workspace_id, &profile_id, include_deleted)
-                    .map_err(|e| e.to_string())?;
-            print_boards(&boards, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "boards_list_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    include_deleted.to_value(),
+                ],
+            )?;
+            print_generated_boards_json(&raw, &format)
         }
         TicketsCmd::BoardUpdate {
             store,
@@ -3863,10 +3811,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let board_status = board_status
+            board_status
                 .as_deref()
                 .map(loom_tickets::BoardStatus::parse)
                 .transpose()
@@ -3874,29 +3819,30 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             let card_display_fields = if card_display_fields.is_empty() {
                 None
             } else {
-                Some(card_display_fields.as_slice())
+                Some(card_display_fields)
             };
-            let board = loom_tickets::update_board(
-                &mut loom,
-                workspace_id,
-                loom_tickets::BoardUpdateRequest {
-                    workspace_id: &profile_id,
-                    board_id: &board_id,
-                    board_key: board_key.as_deref(),
-                    name: name.as_deref(),
-                    description: description.as_deref(),
-                    scope: None,
-                    owner_principal: None,
-                    coordinator_principal: None,
-                    card_display_fields,
-                    board_status,
-                    updated_by: &updated_by,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_board(&board, &format)
+            let request = serde_json::json!({
+                "board_key": board_key,
+                "name": name,
+                "description": description,
+                "board_status": board_status,
+                "card_display_fields": card_display_fields,
+                "updated_by": updated_by,
+                "expected_root": expected_root,
+            });
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "boards_update_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    board_id.to_string().to_value(),
+                    request.to_string().to_value(),
+                ],
+            )?;
+            print_generated_board_json(&raw, &format)
         }
         TicketsCmd::BoardDelete {
             store,
@@ -3906,30 +3852,20 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let board = loom_tickets::update_board(
-                &mut loom,
-                workspace_id,
-                loom_tickets::BoardUpdateRequest {
-                    workspace_id: &profile_id,
-                    board_id: &board_id,
-                    board_key: None,
-                    name: None,
-                    description: None,
-                    scope: None,
-                    owner_principal: None,
-                    coordinator_principal: None,
-                    card_display_fields: None,
-                    board_status: Some(loom_tickets::BoardStatus::Deleted),
-                    updated_by: &updated_by,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_board(&board, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "boards_delete_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    board_id.to_string().to_value(),
+                    updated_by.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_board_json(&raw, &format)
         }
         TicketsCmd::BoardConfigureColumns {
             store,
@@ -3941,31 +3877,31 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
             let columns = parse_board_columns(&columns)?;
             let mode = mode
                 .as_deref()
                 .map(loom_tickets::BoardMode::parse)
                 .transpose()
                 .map_err(|e| e.to_string())?;
-            let board = loom_tickets::configure_board_columns(
-                &mut loom,
-                workspace_id,
-                loom_tickets::BoardColumnConfigureRequest {
-                    workspace_id: &profile_id,
-                    board_id: &board_id,
-                    mode,
-                    columns: &columns,
-                    swimlanes: &[],
-                    updated_by: &updated_by,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_board(&board, &format)
+            let request = serde_json::json!({
+                "mode": mode.map(loom_tickets::BoardMode::as_str),
+                "columns": board_columns_json(&columns),
+                "updated_by": updated_by,
+                "expected_root": expected_root,
+            });
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "boards_configure_columns_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    board_id.to_string().to_value(),
+                    request.to_string().to_value(),
+                ],
+            )?;
+            print_generated_board_json(&raw, &format)
         }
         TicketsCmd::BoardMoveCard {
             store,
@@ -3979,26 +3915,27 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let board = loom_tickets::move_board_card(
-                &mut loom,
-                workspace_id,
-                loom_tickets::BoardCardMoveRequest {
-                    workspace_id: &profile_id,
-                    board_id: &board_id,
-                    ticket_id: &ticket_id,
-                    column_id: &column_id,
-                    rank_token: &rank_token,
-                    swimlane_id: swimlane_id.as_deref(),
-                    updated_by: &updated_by,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_board(&board, &format)
+            let request = serde_json::json!({
+                "ticket_id": ticket_id,
+                "column_id": column_id,
+                "rank_token": rank_token,
+                "swimlane_id": swimlane_id,
+                "updated_by": updated_by,
+                "expected_root": expected_root,
+            });
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "boards_move_card_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    board_id.to_string().to_value(),
+                    request.to_string().to_value(),
+                ],
+            )?;
+            print_generated_board_json(&raw, &format)
         }
         TicketsCmd::RelationSet {
             store,
@@ -4010,36 +3947,22 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let kind = loom_tickets::TicketRelationKind::parse(&kind).map_err(|e| e.to_string())?;
-            let relation = loom_tickets::add_ticket_relation(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketRelationRequest {
-                    workspace_id: &profile_id,
-                    ticket_id: &ticket_id,
-                    relation_id: relation_id.as_deref(),
-                    kind,
-                    target_id: &target_id,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            let change = MutationChange::relation_set(
-                relation.relation_id.clone(),
-                relation.kind.clone(),
-                relation.target_id.clone(),
-            );
-            let envelope = relation_mutation_envelope(
-                relation,
-                "ticket.relation_set",
-                expected_root.as_deref(),
-                vec![change],
-            );
-            print_ticket_relation_mutation(&envelope, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_relation_set_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    ticket_id.to_string().to_value(),
+                    relation_id.map(|value| value.to_string()).to_value(),
+                    kind.to_value(),
+                    target_id.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_relation_mutation_json(&raw, &format)
         }
         TicketsCmd::RelationRemove {
             store,
@@ -4049,33 +3972,20 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let relation = loom_tickets::remove_ticket_relation(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketRelationRemoveRequest {
-                    workspace_id: &profile_id,
-                    ticket_id: &ticket_id,
-                    relation_id: &relation_id,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            let change = MutationChange::relation_removed(
-                relation.relation_id.clone(),
-                relation.kind.clone(),
-                relation.target_id.clone(),
-            );
-            let envelope = relation_mutation_envelope(
-                relation,
-                "ticket.relation_removed",
-                expected_root.as_deref(),
-                vec![change],
-            );
-            print_ticket_relation_mutation(&envelope, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_relation_remove_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    ticket_id.to_string().to_value(),
+                    relation_id.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_relation_mutation_json(&raw, &format)
         }
         TicketsCmd::List {
             store,
@@ -4095,44 +4005,33 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             cursor,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            // First-class Lane membership: resolve lane -> ticket ids via loom-lanes and pass the
-            // allowlist down; the native list has no lane concept of its own.
-            let lane_member_ids = match lane.as_deref() {
-                Some(lane_id) => {
-                    let lane = loom_lanes::get_lane(&loom, workspace_id, lane_id)
-                        .map_err(|e| e.to_string())?
-                        .ok_or_else(|| format!("lane {lane_id:?} not found"))?;
-                    Some(
-                        lane.lane_tickets
-                            .iter()
-                            .map(|ticket| ticket.ticket_id.clone())
-                            .collect::<Vec<_>>(),
-                    )
-                }
-                None => None,
-            };
-            let query = loom_tickets::TicketListQuery {
-                projection: loom_tickets::parse_ticket_projection(projection.as_deref())
-                    .map_err(|e| e.to_string())?,
-                statuses,
-                assignees,
-                priorities,
-                ticket_types,
-                labels,
-                policy_labels,
-                ready_only: ready,
-                include_completed,
-                lane_member_ids,
-                board_id: board,
-                cursor,
-                limit,
-            };
-            let page = loom_tickets::list_tickets_page(&loom, workspace_id, &profile_id, &query)
-                .map_err(|e| e.to_string())?;
-            print_ticket_page(&page, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let request = serde_json::json!({
+                "projection": projection,
+                "statuses": statuses,
+                "assignees": assignees,
+                "priorities": priorities,
+                "ticket_types": ticket_types,
+                "labels": labels,
+                "policy_labels": policy_labels,
+                "lane": lane,
+                "board": board,
+                "ready": ready,
+                "include_completed": include_completed,
+                "limit": limit,
+                "cursor": cursor,
+            });
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_list_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    Some(request.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_page_json(&raw, &format)
         }
         TicketsCmd::Get {
             store,
@@ -4143,26 +4042,49 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             compact,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let ticket = loom_tickets::get_ticket_with_projection(
-                &loom,
-                workspace_id,
-                &profile_id,
-                &ticket_id,
-                loom_tickets::parse_ticket_projection(projection.as_deref())
-                    .map_err(|e| e.to_string())?,
+            loom_tickets::parse_ticket_projection(projection.as_deref())
+                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let ticket_raw = client.generated_json(
+                "Tickets",
+                "tickets_get_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.clone().to_value(),
+                    ticket_id.to_string().to_value(),
+                    projection.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            let ticket: serde_json::Value =
+                serde_json::from_str(&ticket_raw).map_err(|e| e.to_string())?;
+            let primary_key = generated_ticket_text(&ticket, "primary_key")?.to_string();
+            let history_raw = client.generated_json(
+                "Tickets",
+                "tickets_history_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.clone().to_value(),
+                    Some(primary_key).to_value(),
+                ],
+            )?;
+            let comments_raw = client.generated_json(
+                "Tickets",
+                "tickets_comments_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    ticket_id.to_string().to_value(),
+                ],
+            )?;
+            print_generated_ticket_detail_json(
+                &ticket,
+                &history_raw,
+                &comments_raw,
+                detailed,
+                compact,
+                &format,
             )
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ticket not found".to_string())?;
-            let history =
-                loom_tickets::history(&loom, workspace_id, &profile_id, Some(&ticket.primary_key))
-                    .map_err(|e| e.to_string())?;
-            let comments =
-                loom_tickets::list_ticket_comments(&loom, workspace_id, &profile_id, &ticket_id)
-                    .map_err(|e| e.to_string())?;
-            print_ticket_detail(&ticket, &history, &comments, detailed, compact, &format)
         }
         TicketsCmd::History {
             store,
@@ -4171,13 +4093,18 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             detailed,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let history =
-                loom_tickets::history(&loom, workspace_id, &profile_id, ticket_id.as_deref())
-                    .map_err(|e| e.to_string())?;
-            print_ticket_history(&history, detailed, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Tickets",
+                "tickets_history_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    ticket_id.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_ticket_history_json(&raw, detailed, &format)
         }
     }
 }
@@ -4202,34 +4129,32 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             tickets,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let actor = resolve_lane_actor(&loom, workspace_id, updated_by.as_deref())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let actor = resolve_generated_lane_actor(updated_by.as_deref())?;
             let lane_tickets =
                 loom_lanes::lane_tickets_from_order(&tickets).map_err(|e| e.to_string())?;
             // Large-text lane fields accept `@path` to load from a file (`@@` escapes a literal @).
             let description = expand_at_file(&description)?;
             let status_report = expand_at_file(&status_report)?;
             let reviewer_feedback = expand_at_file(&reviewer_feedback)?;
-            let lane = Lane::new(LaneInput {
-                lane_id: &lane_id,
-                lane_key: &lane_key,
-                title: &title,
-                description: &description,
-                lane_kind: LaneKind::parse(&kind).map_err(|e| e.to_string())?,
-                owner_principal: owner_principal.as_deref(),
-                lane_status: LaneStatus::parse(&lane_status).map_err(|e| e.to_string())?,
-                lane_tickets: &lane_tickets,
-                active_ticket_id: active_ticket_id.as_deref(),
-                status_report: &status_report,
-                reviewer_feedback: &reviewer_feedback,
+            let lane_kind = LaneKind::parse(&kind).map_err(|e| e.to_string())?;
+            let lane_status = LaneStatus::parse(&lane_status).map_err(|e| e.to_string())?;
+            let lane = Lane {
+                lane_id,
+                lane_key,
+                title,
+                description,
+                lane_kind: lane_kind.as_str().to_string(),
+                owner_principal,
+                lane_status: lane_status.as_str().to_string(),
+                lane_tickets,
+                active_ticket_id,
+                status_report,
+                reviewer_feedback,
                 updated_at: updated_at.unwrap_or(current_time_ms()?),
-                updated_by: &actor,
-            })
-            .map_err(|e| e.to_string())?;
-            let lane = loom_lanes::create_lane(&mut loom, workspace_id, lane)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+                updated_by: actor,
+            };
+            let lane = client.lanes_create(&workspace, lane)?;
             let envelope =
                 lane_mutation_envelope(lane, "lane.created", vec![MutationChange::ResourceCreated]);
             print_lane_mutation(&envelope, &format)
@@ -4241,21 +4166,19 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             detailed,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let lane = loom_lanes::get_lane(&loom, workspace_id, &lane_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "lane not found".to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
             if detailed {
-                let workspace_id_text = workspace_id.to_string();
-                let view = loom_client::local::build_lane_view(
-                    &loom,
-                    workspace_id,
-                    &workspace_id_text,
-                    &lane,
-                );
+                let ticket_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+                let raw =
+                    client.lanes_get_view_json(&workspace, &ticket_workspace_id, &lane_id, true)?;
+                let view: Option<LaneView> =
+                    serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                let view = view.ok_or_else(|| "lane not found".to_string())?;
                 print_lane_view(&view, &format, true)
             } else {
+                let lane = client
+                    .lanes_get(&workspace, &lane_id)?
+                    .ok_or_else(|| "lane not found".to_string())?;
                 print_lane(&lane, &format)
             }
         }
@@ -4265,23 +4188,11 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             detailed,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let (lanes, diagnostics) = loom_lanes::list_lanes_with_diagnostics(&loom, workspace_id)
-                .map_err(|e| e.to_string())?;
-            let workspace_id_text = workspace_id.to_string();
-            let views = lanes
-                .iter()
-                .map(|lane| {
-                    loom_client::local::build_lane_view(
-                        &loom,
-                        workspace_id,
-                        &workspace_id_text,
-                        lane,
-                    )
-                })
-                .collect::<Vec<_>>();
-            print_lane_views(&views, &diagnostics, &format, detailed)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let ticket_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.lanes_list_views_json(&workspace, &ticket_workspace_id, true)?;
+            let views: Vec<LaneView> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            print_lane_views(&views, &[], &format, detailed)
         }
         LanesCmd::Update {
             store,
@@ -4335,38 +4246,20 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
                     reviewer_feedback.clone(),
                 ));
             }
-            mutate_lane(
-                &store,
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let actor = resolve_generated_lane_actor(updated_by.as_deref())?;
+            let lane = client.lanes_update(
                 &workspace,
                 &lane_id,
-                keys,
-                &format,
-                "lane.updated",
-                changes,
-                |lane, loom, ns| {
-                    if let Some(title) = title {
-                        lane.title = title;
-                    }
-                    if let Some(description) = description {
-                        lane.description = description;
-                    }
-                    if let Some(lane_status) = lane_status {
-                        lane.lane_status = LaneStatus::parse(&lane_status)
-                            .map_err(|e| e.to_string())?
-                            .as_str()
-                            .to_string();
-                    }
-                    if let Some(status_report) = status_report {
-                        lane.status_report = status_report;
-                    }
-                    if let Some(reviewer_feedback) = reviewer_feedback {
-                        lane.reviewer_feedback = reviewer_feedback;
-                    }
-                    let actor = resolve_lane_actor(loom, ns, updated_by.as_deref())?;
-                    apply_lane_update_metadata(lane, &actor)?;
-                    Ok(())
-                },
-            )
+                title.as_deref(),
+                description.as_deref(),
+                lane_status.as_deref(),
+                status_report.as_deref(),
+                reviewer_feedback.as_deref(),
+                &actor,
+            )?;
+            let envelope = lane_mutation_envelope(lane, "lane.updated", changes);
+            print_lane_mutation(&envelope, &format)
         }
         LanesCmd::Closeout {
             store,
@@ -4387,41 +4280,30 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             if comment_body.trim().is_empty() {
                 return Err("lane closeout requires a non-empty comment body".to_string());
             }
-            let evidence = match evidence {
-                Some(json) => Some(
-                    loom_tickets::TicketCommentEvidence::from_json(
-                        &serde_json::from_str(&json)
-                            .map_err(|e| format!("invalid --evidence json: {e}"))?,
-                    )
-                    .map_err(|e| e.to_string())?,
-                ),
+            let evidence_json = match evidence {
+                Some(json) => {
+                    let value: serde_json::Value = serde_json::from_str(&json)
+                        .map_err(|e| format!("invalid --evidence json: {e}"))?;
+                    loom_tickets::TicketCommentEvidence::from_json(&value)
+                        .map_err(|e| e.to_string())?;
+                    Some(value.to_string())
+                }
                 None => None,
             };
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            loom_tickets::add_ticket_comment(
-                &mut loom,
-                workspace_id,
-                loom_tickets::TicketCommentRequest {
-                    workspace_id: &ticket_workspace_id,
-                    ticket_id: &ticket_id,
-                    comment_id: None,
-                    comment_type: Some(&comment_type),
-                    body: &comment_body,
-                    evidence,
-                    expected_root: None,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            let mut lane = loom_lanes::get_lane(&loom, workspace_id, &lane_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "lane not found".to_string())?;
-            lane.status_report = status_report.clone();
-            let actor = resolve_lane_actor(&loom, workspace_id, updated_by.as_deref())?;
-            apply_lane_update_metadata(&mut lane, &actor)?;
-            let lane =
-                loom_lanes::put_lane(&mut loom, workspace_id, lane).map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let actor = resolve_generated_lane_actor(updated_by.as_deref())?;
+            let lane = client.lanes_closeout(remote::LaneCloseoutArgs {
+                workspace: &workspace,
+                lane_id: &lane_id,
+                ticket_workspace_id: &ticket_workspace_id,
+                ticket_id: &ticket_id,
+                comment_type: &comment_type,
+                comment_body: &comment_body,
+                evidence_json: evidence_json.as_deref(),
+                status_report: &status_report,
+                updated_by: &actor,
+                expected_root: None,
+            })?;
             let changes = vec![
                 MutationChange::field_set("comment_type", comment_type),
                 MutationChange::field_set("status_report", status_report),
@@ -4440,35 +4322,29 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             updated_by,
             format,
         } => {
-            let placement = match (first, before.as_deref(), after.as_deref()) {
-                (false, None, None) => loom_lanes::LaneTicketPlacement::Append,
-                (true, None, None) => loom_lanes::LaneTicketPlacement::First,
-                (false, Some(anchor), None) => loom_lanes::LaneTicketPlacement::Before(anchor),
-                (false, None, Some(anchor)) => loom_lanes::LaneTicketPlacement::After(anchor),
+            let (placement, anchor) = match (first, before.as_deref(), after.as_deref()) {
+                (false, None, None) => (None, None),
+                (true, None, None) => (Some("FIRST"), None),
+                (false, Some(anchor), None) => (Some("BEFORE"), Some(anchor)),
+                (false, None, Some(anchor)) => (Some("AFTER"), Some(anchor)),
                 _ => {
                     return Err("at most one of --first, --before, --after may be set".to_string());
                 }
             };
-            mutate_lane(
-                &store,
-                &workspace,
-                &lane_id,
-                keys,
-                &format,
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let actor = resolve_generated_lane_actor(updated_by.as_deref())?;
+            let lane = client
+                .lanes_ticket_add(&workspace, &lane_id, &ticket_id, placement, anchor, &actor)?;
+            let envelope = lane_mutation_envelope(
+                lane,
                 "lane.ticket_added",
                 vec![MutationChange::relation_set(
                     ticket_id.clone(),
                     "lane_ticket",
                     ticket_id.clone(),
                 )],
-                |lane, loom, ns| {
-                    loom_lanes::place_lane_ticket(lane, &ticket_id, placement)
-                        .map_err(|e| e.to_string())?;
-                    let actor = resolve_lane_actor(loom, ns, updated_by.as_deref())?;
-                    apply_lane_update_metadata(lane, &actor)?;
-                    Ok(())
-                },
-            )
+            );
+            print_lane_mutation(&envelope, &format)
         }
         LanesCmd::TicketRemove {
             store,
@@ -4477,29 +4353,21 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             ticket_id,
             updated_by,
             format,
-        } => mutate_lane(
-            &store,
-            &workspace,
-            &lane_id,
-            keys,
-            &format,
-            "lane.ticket_removed",
-            vec![MutationChange::relation_removed(
-                ticket_id.clone(),
-                "lane_ticket",
-                ticket_id.clone(),
-            )],
-            |lane, loom, ns| {
-                lane.lane_tickets
-                    .retain(|lane_ticket| lane_ticket.ticket_id != ticket_id);
-                if lane.active_ticket_id.as_deref() == Some(&ticket_id) {
-                    lane.active_ticket_id = None;
-                }
-                let actor = resolve_lane_actor(loom, ns, updated_by.as_deref())?;
-                apply_lane_update_metadata(lane, &actor)?;
-                Ok(())
-            },
-        ),
+        } => {
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let actor = resolve_generated_lane_actor(updated_by.as_deref())?;
+            let lane = client.lanes_ticket_remove(&workspace, &lane_id, &ticket_id, &actor)?;
+            let envelope = lane_mutation_envelope(
+                lane,
+                "lane.ticket_removed",
+                vec![MutationChange::relation_removed(
+                    ticket_id.clone(),
+                    "lane_ticket",
+                    ticket_id.clone(),
+                )],
+            );
+            print_lane_mutation(&envelope, &format)
+        }
         LanesCmd::TicketTransfer {
             store,
             workspace,
@@ -4509,19 +4377,15 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             updated_by,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let (_source, target) = loom_lanes::transfer_assignment_lane_ticket(
-                &mut loom,
-                workspace_id,
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let actor = resolve_generated_lane_actor(Some(&updated_by))?;
+            let target = client.lanes_ticket_transfer(
+                &workspace,
                 &source_lane_id,
                 &target_lane_id,
                 &ticket_id,
-                current_time_ms()?,
-                &updated_by,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+                &actor,
+            )?;
             let envelope = lane_mutation_envelope(
                 target,
                 "lane.ticket_transferred",
@@ -4540,17 +4404,9 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             updated_by,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let lane = loom_lanes::delete_lane(
-                &mut loom,
-                workspace_id,
-                &lane_id,
-                current_time_ms()?,
-                &updated_by,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let actor = resolve_generated_lane_actor(Some(&updated_by))?;
+            let lane = client.lanes_delete(&workspace, &lane_id, &actor)?;
             let envelope =
                 lane_mutation_envelope(lane, "lane.deleted", vec![MutationChange::ResourceDeleted]);
             print_lane_mutation(&envelope, &format)
@@ -4563,71 +4419,21 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             updated_by,
             format,
         } => {
-            if apply {
-                let mut loom = cli_open_loom(&store, keys)?;
-                let workspace_id = resolve_ns(&loom, &workspace)?;
-                let workspace_id_text = workspace_id.to_string();
-                let target_ids = cleanup_target_lane_ids(&loom, workspace_id, lane.as_deref())?;
-                let mut reports = Vec::new();
-                for lane_id in target_ids {
-                    let mut lane_rec = loom_lanes::get_lane(&loom, workspace_id, &lane_id)
-                        .map_err(|e| e.to_string())?
-                        .ok_or_else(|| "lane not found".to_string())?;
-                    let view = loom_client::local::build_lane_view(
-                        &loom,
-                        workspace_id,
-                        &workspace_id_text,
-                        &lane_rec,
-                    );
-                    let terminal_ids = loom_lanes::terminal_lane_ticket_ids(&view.lane_tickets);
-                    let (remaining_count, status_counts) =
-                        cleanup_remaining_summary(&view, &terminal_ids);
-                    let removed = loom_lanes::remove_lane_tickets(&mut lane_rec, &terminal_ids);
-                    if !removed.is_empty() {
-                        let actor = resolve_lane_actor(&loom, workspace_id, updated_by.as_deref())?;
-                        apply_lane_update_metadata(&mut lane_rec, &actor)?;
-                        loom_lanes::put_lane(&mut loom, workspace_id, lane_rec)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    reports.push(LaneCleanupReport {
-                        lane_id: view.lane_id.clone(),
-                        would_remove: Vec::new(),
-                        removed,
-                        remaining_count,
-                        status_counts,
-                    });
-                }
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                print_lane_cleanup_reports(&reports, &format)
-            } else {
-                let loom = cli_open_loom_read(&store, keys)?;
-                let workspace_id = resolve_ns(&loom, &workspace)?;
-                let workspace_id_text = workspace_id.to_string();
-                let target_ids = cleanup_target_lane_ids(&loom, workspace_id, lane.as_deref())?;
-                let mut reports = Vec::new();
-                for lane_id in target_ids {
-                    let lane_rec = loom_lanes::get_lane(&loom, workspace_id, &lane_id)
-                        .map_err(|e| e.to_string())?
-                        .ok_or_else(|| "lane not found".to_string())?;
-                    let view = loom_client::local::build_lane_view(
-                        &loom,
-                        workspace_id,
-                        &workspace_id_text,
-                        &lane_rec,
-                    );
-                    let terminal_ids = loom_lanes::terminal_lane_ticket_ids(&view.lane_tickets);
-                    let (remaining_count, status_counts) =
-                        cleanup_remaining_summary(&view, &terminal_ids);
-                    reports.push(LaneCleanupReport {
-                        lane_id: view.lane_id.clone(),
-                        would_remove: terminal_ids,
-                        removed: Vec::new(),
-                        remaining_count,
-                        status_counts,
-                    });
-                }
-                print_lane_cleanup_reports(&reports, &format)
-            }
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let actor = resolve_generated_lane_actor(updated_by.as_deref())?;
+            let raw = client.generated_json(
+                "Lanes",
+                "cleanup_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    lane.to_value(),
+                    apply.to_value(),
+                    actor.to_value(),
+                ],
+            )?;
+            let reports: Vec<LaneCleanupReport> =
+                serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            print_lane_cleanup_reports(&reports, &format)
         }
     }
 }
@@ -4636,47 +4442,13 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
 /// `would_remove` lists the terminal members an apply would drop; in apply mode `removed` lists the
 /// members actually dropped. `remaining_count`/`status_counts` describe the members that remain,
 /// derived from live ticket statuses. Tickets and their history are never mutated.
-#[derive(serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct LaneCleanupReport {
     lane_id: String,
     would_remove: Vec<String>,
     removed: Vec<String>,
     remaining_count: usize,
-    status_counts: loom_lanes::LaneStatusCounts,
-}
-
-/// Resolve the lanes a `lanes cleanup` targets: the single named lane, or every assignment lane when
-/// no id is given.
-fn cleanup_target_lane_ids(
-    loom: &Loom<FileStore>,
-    workspace_id: WorkspaceId,
-    lane_id: Option<&str>,
-) -> Result<Vec<String>, String> {
-    match lane_id {
-        Some(lane_id) => Ok(vec![lane_id.to_string()]),
-        None => Ok(loom_lanes::list_lanes(loom, workspace_id)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter(|lane| lane.lane_kind == LaneKind::Assignment.as_str())
-            .map(|lane| lane.lane_id)
-            .collect()),
-    }
-}
-
-/// The post-cleanup remaining member count and status counts for a lane: the members whose ids are not
-/// in `terminal_ids`, with counts recomputed over their live statuses. Identical for dry-run and apply.
-fn cleanup_remaining_summary(
-    view: &LaneView,
-    terminal_ids: &[String],
-) -> (usize, loom_lanes::LaneStatusCounts) {
-    let remaining: Vec<loom_lanes::LaneTicketView> = view
-        .lane_tickets
-        .iter()
-        .filter(|ticket| !terminal_ids.iter().any(|id| id == &ticket.ticket_id))
-        .cloned()
-        .collect();
-    let counts = loom_lanes::lane_status_counts(&remaining);
-    (remaining.len(), counts)
+    status_counts: serde_json::Value,
 }
 
 fn print_lane_cleanup_reports(reports: &[LaneCleanupReport], format: &str) -> Result<(), String> {
@@ -4717,45 +4489,7 @@ fn expand_at_file_opt(value: Option<String>) -> Result<Option<String>, String> {
     value.map(|value| expand_at_file(&value)).transpose()
 }
 
-fn mutate_lane<F>(
-    store: &str,
-    workspace: &str,
-    lane_id: &str,
-    keys: &KeyOpts,
-    format: &str,
-    operation: &str,
-    changes: Vec<MutationChange>,
-    mutate: F,
-) -> Result<(), String>
-where
-    F: FnOnce(&mut Lane, &Loom<FileStore>, WorkspaceId) -> Result<(), String>,
-{
-    let mut loom = cli_open_loom(store, keys)?;
-    let workspace_id = resolve_ns(&loom, workspace)?;
-    let mut lane = loom_lanes::get_lane(&loom, workspace_id, lane_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "lane not found".to_string())?;
-    let prior_lane = lane.clone();
-    mutate(&mut lane, &loom, workspace_id)?;
-    let lane = if operation == "lane.updated" {
-        loom_lanes::put_lane_current_record(&mut loom, workspace_id, &lane, Some(&prior_lane))
-            .map_err(|e| e.to_string())?;
-        lane
-    } else {
-        let lane =
-            loom_lanes::put_lane(&mut loom, workspace_id, lane).map_err(|e| e.to_string())?;
-        save_loom(&mut loom).map_err(|e| e.to_string())?;
-        lane
-    };
-    let envelope = lane_mutation_envelope(lane, operation, changes);
-    print_lane_mutation(&envelope, format)
-}
-
-fn apply_lane_update_metadata(lane: &mut Lane, updated_by: &str) -> Result<(), String> {
-    lane.updated_at = current_time_ms()?;
-    lane.updated_by = updated_by.to_string();
-    Ok(())
-}
+const DERIVE_LANE_ACTOR: &str = "system:derive-lane-actor";
 
 /// Resolve the actor recorded on a Lane mutation from the CLI.
 ///
@@ -4763,6 +4497,7 @@ fn apply_lane_update_metadata(lane: &mut Lane, updated_by: &str) -> Result<(), S
 /// falling back to the workspace namespace when unauthenticated. An explicit override is honored
 /// as-is when it matches the effective principal; when it differs it is authorized through the
 /// shared ACL substrate (`Tickets` domain, `Admin` right) rather than any bespoke lane-only policy.
+#[cfg(test)]
 fn resolve_lane_actor(
     loom: &Loom<FileStore>,
     workspace_id: WorkspaceId,
@@ -4782,6 +4517,13 @@ fn resolve_lane_actor(
         }
         None => Ok(effective.unwrap_or_else(|| workspace_id.to_string())),
     }
+}
+
+fn resolve_generated_lane_actor(provided: Option<&str>) -> Result<String, String> {
+    if let Some(actor) = provided.filter(|value| !value.trim().is_empty()) {
+        return Ok(actor.to_string());
+    }
+    Ok(DERIVE_LANE_ACTOR.to_string())
 }
 
 fn parse_board_columns(values: &[String]) -> Result<Vec<loom_tickets::BoardColumn>, String> {
@@ -4824,6 +4566,24 @@ fn parse_board_columns(values: &[String]) -> Result<Vec<loom_tickets::BoardColum
         .collect()
 }
 
+fn board_columns_json(columns: &[loom_tickets::BoardColumn]) -> serde_json::Value {
+    serde_json::Value::Array(
+        columns
+            .iter()
+            .map(|column| {
+                serde_json::json!({
+                    "column_id": column.column_id,
+                    "name": column.name,
+                    "mapped_statuses": column.mapped_statuses.iter().collect::<Vec<_>>(),
+                    "wip_limit": column.wip_limit,
+                    "hidden": column.hidden,
+                    "rank": column.rank,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
     match action {
         PagesCmd::SpaceCreate {
@@ -4834,32 +4594,34 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Vcs)?;
-            let profile_id = workspace_id.to_string();
-            let space = loom_pages::create_space(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &space_id,
-                &title,
-                expected_root.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_page_space(&space, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "spaces_create_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    space_id.to_string().to_value(),
+                    title.to_string().to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_page_space_json(&raw, &format)
         }
         PagesCmd::SpaceList {
             store,
             workspace,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let spaces = loom_pages::list_spaces(&loom, workspace_id, &profile_id)
-                .map_err(|e| e.to_string())?;
-            print_page_spaces(&spaces, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "spaces_list_json",
+                vec![workspace.to_string().to_value(), profile_id.to_value()],
+            )?;
+            print_generated_page_spaces_json(&raw, &format)
         }
         PagesCmd::SpaceGet {
             store,
@@ -4867,13 +4629,18 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             space_id,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let space = loom_pages::get_space(&loom, workspace_id, &profile_id, &space_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "space not found".to_string())?;
-            print_page_space(&space, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "spaces_get_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    space_id.to_string().to_value(),
+                ],
+            )?;
+            print_generated_page_space_json(&raw, &format)
         }
         PagesCmd::Create {
             store,
@@ -4885,24 +4652,22 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let page = loom_pages::create_page(
-                &mut loom,
-                workspace_id,
-                loom_pages::PageCreateRequest {
-                    workspace_id: &profile_id,
-                    page_id: &page_id,
-                    space_id: &space_id,
-                    parent_page_id: parent_page_id.as_deref(),
-                    title: &title,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_page(&page, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "pages_create_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    page_id.to_string().to_value(),
+                    space_id.to_string().to_value(),
+                    parent_page_id.map(|value| value.to_string()).to_value(),
+                    title.to_string().to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_page_json(&raw, &format)
         }
         PagesCmd::Update {
             store,
@@ -4912,21 +4677,21 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let body = parse_page_body(&body)?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let update = loom_pages::update_page(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &page_id,
-                body,
-                current_time_ms()?,
-                expected_root.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
-            print_page_update(&update, &format)
+            let body = parse_page_body_text(&body)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "pages_update_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    page_id.to_string().to_value(),
+                    body.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_page_update_json(&raw, &format)
         }
         PagesCmd::Publish {
             store,
@@ -4935,19 +4700,19 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let publish = loom_pages::publish_page(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &page_id,
-                current_time_ms()?,
-                expected_root.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
-            print_page_publish(&publish, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "pages_publish_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    page_id.to_string().to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_page_publish_json(&raw, &format)
         }
         PagesCmd::Get {
             store,
@@ -4955,13 +4720,18 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             page_id,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let page = loom_pages::get_page(&loom, workspace_id, &profile_id, &page_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "page not found".to_string())?;
-            print_page(&page, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "pages_get_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    page_id.to_string().to_value(),
+                ],
+            )?;
+            print_generated_page_json(&raw, &format)
         }
         PagesCmd::History {
             store,
@@ -4969,12 +4739,18 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             page_id,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let history = loom_pages::page_history(&loom, workspace_id, &profile_id, &page_id)
-                .map_err(|e| e.to_string())?;
-            print_page_history(&history, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "pages_history_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    page_id.to_string().to_value(),
+                ],
+            )?;
+            print_generated_page_history_json(&raw, &format)
         }
         PagesCmd::StructureCreate {
             store,
@@ -4986,24 +4762,22 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let render = loom_pages::create_structure(
-                &mut loom,
-                workspace_id,
-                loom_pages::StructureCreateRequest {
-                    workspace_id: &profile_id,
-                    structure_id: &structure_id,
-                    space_id: &space_id,
-                    kind: &kind,
-                    title: &title,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_page_structure_render(&render, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "structures_create_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    structure_id.to_string().to_value(),
+                    space_id.to_string().to_value(),
+                    kind.to_string().to_value(),
+                    title.to_string().to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_page_structure_render_json(&raw, &format)
         }
         PagesCmd::StructureGet {
             store,
@@ -5011,13 +4785,18 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             structure_id,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let render = loom_pages::get_structure(&loom, workspace_id, &profile_id, &structure_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "structure not found".to_string())?;
-            print_page_structure_render(&render, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "structures_get_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    structure_id.to_string().to_value(),
+                ],
+            )?;
+            print_generated_page_structure_render_json(&raw, &format)
         }
         PagesCmd::StructureAddNode {
             store,
@@ -5031,26 +4810,24 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let node = loom_pages::add_structure_node(
-                &mut loom,
-                workspace_id,
-                loom_pages::StructureNodeRequest {
-                    workspace_id: &profile_id,
-                    structure_id: &structure_id,
-                    node_id: &node_id,
-                    kind: &kind,
-                    label: &label,
-                    body_digest: body_digest.as_deref(),
-                    entity_ref,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_page_structure_node(&node, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "structures_add_node_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    structure_id.to_string().to_value(),
+                    node_id.to_string().to_value(),
+                    kind.to_string().to_value(),
+                    label.to_string().to_value(),
+                    body_digest.map(|value| value.to_string()).to_value(),
+                    entity_ref.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_page_structure_node_json(&raw, &format)
         }
         PagesCmd::StructureUpdateNode {
             store,
@@ -5064,26 +4841,24 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let node = loom_pages::update_structure_node(
-                &mut loom,
-                workspace_id,
-                loom_pages::StructureNodeRequest {
-                    workspace_id: &profile_id,
-                    structure_id: &structure_id,
-                    node_id: &node_id,
-                    kind: &kind,
-                    label: &label,
-                    body_digest: body_digest.as_deref(),
-                    entity_ref,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_page_structure_node(&node, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "structures_update_node_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    structure_id.to_string().to_value(),
+                    node_id.to_string().to_value(),
+                    kind.to_string().to_value(),
+                    label.to_string().to_value(),
+                    body_digest.map(|value| value.to_string()).to_value(),
+                    entity_ref.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_page_structure_node_json(&raw, &format)
         }
         PagesCmd::StructureBind {
             store,
@@ -5094,23 +4869,21 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let node = loom_pages::bind_structure_node(
-                &mut loom,
-                workspace_id,
-                loom_pages::StructureBindRequest {
-                    workspace_id: &profile_id,
-                    structure_id: &structure_id,
-                    node_id: &node_id,
-                    entity_ref,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_page_structure_node(&node, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "structures_bind_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    structure_id.to_string().to_value(),
+                    node_id.to_string().to_value(),
+                    entity_ref.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_page_structure_node_json(&raw, &format)
         }
         PagesCmd::StructureMoveNode {
             store,
@@ -5122,24 +4895,22 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let moved = loom_pages::move_structure_node(
-                &mut loom,
-                workspace_id,
-                loom_pages::StructureMoveRequest {
-                    workspace_id: &profile_id,
-                    structure_id: &structure_id,
-                    node_id: &node_id,
-                    parent_node_id: parent_node_id.as_deref(),
-                    label: label.as_deref(),
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_page_structure_move(&moved, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "structures_move_node_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    structure_id.to_string().to_value(),
+                    node_id.to_string().to_value(),
+                    parent_node_id.map(|value| value.to_string()).to_value(),
+                    label.map(|value| value.to_string()).to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_page_structure_move_json(&raw, &format)
         }
         PagesCmd::StructureLinkNode {
             store,
@@ -5153,26 +4924,24 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let edge = loom_pages::link_structure_node(
-                &mut loom,
-                workspace_id,
-                loom_pages::StructureLinkRequest {
-                    workspace_id: &profile_id,
-                    structure_id: &structure_id,
-                    edge_id: &edge_id,
-                    src_node_id: &src_node_id,
-                    dst_node_id: &dst_node_id,
-                    label: &label,
-                    target_ref,
-                    expected_root: expected_root.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_page_structure_edge(&edge, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "structures_link_node_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    structure_id.to_string().to_value(),
+                    edge_id.to_string().to_value(),
+                    src_node_id.to_string().to_value(),
+                    dst_node_id.to_string().to_value(),
+                    label.to_string().to_value(),
+                    target_ref.to_value(),
+                    expected_root.map(|value| value.to_string()).to_value(),
+                ],
+            )?;
+            print_generated_page_structure_edge_json(&raw, &format)
         }
         PagesCmd::StructureDecomposeToTickets {
             store,
@@ -5182,36 +4951,26 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             format,
         } => {
             let parsed_items = parse_page_structure_decompose_items(&items)?;
-            let request_items = parsed_items
-                .iter()
-                .map(|item| loom_pages::StructureDecomposeItem {
-                    node_id: item.node_id.as_str(),
-                    project_id: item.project_id.as_str(),
-                    ticket_type: item.ticket_type.as_deref(),
-                    fields: item.fields.as_ref(),
-                    policy_labels: &item.policy_labels,
-                })
-                .collect::<Vec<_>>();
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let summary = loom_pages::decompose_to_tickets(
-                &mut loom,
-                workspace_id,
-                loom_pages::StructureDecomposeRequest {
-                    workspace_id: &profile_id,
-                    structure_id: &structure_id,
-                    items: &request_items,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_page_structure_decompose(&summary, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let raw = client.generated_json(
+                "Pages",
+                "structures_decompose_to_tickets_json",
+                vec![
+                    workspace.to_string().to_value(),
+                    profile_id.to_value(),
+                    structure_id.to_string().to_value(),
+                    serde_json::to_string(&parsed_items)
+                        .map_err(|e| e.to_string())?
+                        .to_value(),
+                ],
+            )?;
+            print_generated_page_structure_decompose_json(&raw, &format)
         }
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PageStructureDecomposeItemJson {
     node_id: String,
     project_id: String,
@@ -5239,120 +4998,6 @@ fn parse_page_structure_decompose_items(
         }
     }
     Ok(items)
-}
-
-fn print_page_structure_render(
-    render: &loom_pages::StructureRenderSummary,
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(render).map_err(|e| e.to_string())?
-        );
-    } else {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            render.structure.structure_id,
-            render.structure.space_id,
-            render.structure.kind,
-            render.structure.title,
-            render.nodes.len(),
-            render.edges.len(),
-            render.graph_collection
-        );
-    }
-    Ok(())
-}
-
-fn print_page_structure_node(
-    node: &loom_pages::StructureNodeSummary,
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(node).map_err(|e| e.to_string())?
-        );
-    } else {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            node.structure_id,
-            node.node_id,
-            node.kind,
-            node.label,
-            node.entity_ref.as_deref().unwrap_or(""),
-            node.profile_root
-        );
-    }
-    Ok(())
-}
-
-fn print_page_structure_edge(
-    edge: &loom_pages::StructureEdgeSummary,
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(edge).map_err(|e| e.to_string())?
-        );
-    } else {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            edge.structure_id,
-            edge.edge_id,
-            edge.src_node_id,
-            edge.dst_node_id,
-            edge.label,
-            edge.profile_root
-        );
-    }
-    Ok(())
-}
-
-fn print_page_structure_move(
-    moved: &loom_pages::StructureMoveSummary,
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(moved).map_err(|e| e.to_string())?
-        );
-    } else {
-        println!(
-            "{}\t{}\t{}\t{}\t{}",
-            moved.structure_id,
-            moved.node_id,
-            moved.parent_node_id.as_deref().unwrap_or(""),
-            moved.label,
-            moved.profile_root
-        );
-    }
-    Ok(())
-}
-
-fn print_page_structure_decompose(
-    summary: &loom_pages::StructureDecomposeSummary,
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(summary).map_err(|e| e.to_string())?
-        );
-    } else {
-        println!(
-            "{}\t{}\t{}\t{}\t{}",
-            summary.workspace_id,
-            summary.structure_id,
-            summary.tickets.len(),
-            summary.implemented_by_edges.len(),
-            summary.graph_collection
-        );
-    }
-    Ok(())
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -5646,124 +5291,556 @@ fn print_lifecycle<T: serde::Serialize>(value: &T, format: &str) -> Result<(), S
     }
 }
 
-fn parse_page_body(input: &str) -> Result<Vec<u8>, String> {
+fn parse_page_body_text(input: &str) -> Result<String, String> {
     let text = if let Some(path) = input.strip_prefix('@') {
         String::from_utf8(read_input(path).map_err(|e| e.to_string())?)
             .map_err(|_| "page body input must be UTF-8".to_string())?
     } else {
         input.to_string()
     };
-    Body::from_plain_text(text)
-        .and_then(|body| body.encode())
-        .map_err(|e| e.to_string())
+    Ok(text)
 }
 
-fn print_page_space(space: &loom_pages::SpaceSummary, format: &str) -> Result<(), String> {
+fn print_generated_page_space_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if format == "json" {
         println!(
             "{}",
-            serde_json::to_string_pretty(space).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         );
     } else {
         println!(
             "{}\t{}\t{}\t{}",
-            space.space_id, space.title, space.archived, space.profile_root
+            json_string_field(&value, "space_id")?,
+            json_string_field(&value, "title")?,
+            value
+                .get("archived")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| "page space JSON missing boolean archived".to_string())?,
+            json_string_field(&value, "profile_root")?
         );
     }
     Ok(())
 }
 
-fn print_page_spaces(spaces: &[loom_pages::SpaceSummary], format: &str) -> Result<(), String> {
+fn print_generated_page_spaces_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if format == "json" {
         println!(
             "{}",
-            serde_json::to_string_pretty(spaces).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         );
     } else {
+        let spaces = value
+            .as_array()
+            .ok_or_else(|| "page spaces JSON must be an array".to_string())?;
         for space in spaces {
             println!(
                 "{}\t{}\t{}\t{}",
-                space.space_id, space.title, space.archived, space.profile_root
+                json_string_field(space, "space_id")?,
+                json_string_field(space, "title")?,
+                space
+                    .get("archived")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| "page space JSON missing boolean archived".to_string())?,
+                json_string_field(space, "profile_root")?
             );
         }
     }
     Ok(())
 }
 
-fn print_page(page: &loom_pages::PageSummary, format: &str) -> Result<(), String> {
+fn print_generated_page_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if format == "json" {
         println!(
             "{}",
-            serde_json::to_string_pretty(page).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         );
     } else {
         println!(
             "{}\t{}\t{}\t{}\t{}",
-            page.page_id, page.space_id, page.title, page.status, page.profile_root
+            json_string_field(&value, "page_id")?,
+            json_string_field(&value, "space_id")?,
+            json_string_field(&value, "title")?,
+            json_string_field(&value, "status")?,
+            json_string_field(&value, "profile_root")?
         );
     }
     Ok(())
 }
 
-fn print_page_update(update: &loom_pages::PageUpdateSummary, format: &str) -> Result<(), String> {
+fn print_generated_page_update_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if format == "json" {
         println!(
             "{}",
-            serde_json::to_string_pretty(update).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         );
     } else {
         println!(
             "{}\t{}\t{}\t{}",
-            update.page_id, update.status, update.updated_at_ms, update.profile_root
+            json_string_field(&value, "page_id")?,
+            json_string_field(&value, "status")?,
+            value
+                .get("updated_at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "page update JSON missing u64 updated_at_ms".to_string())?,
+            json_string_field(&value, "profile_root")?
         );
     }
     Ok(())
 }
 
-fn print_page_publish(
-    publish: &loom_pages::PagePublishSummary,
-    format: &str,
-) -> Result<(), String> {
+fn print_generated_page_publish_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if format == "json" {
         println!(
             "{}",
-            serde_json::to_string_pretty(publish).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         );
     } else {
         println!(
             "{}\t{}\t{}\t{}",
-            publish.page_id,
-            publish.outcome,
-            publish
-                .revision
+            json_string_field(&value, "page_id")?,
+            json_string_field(&value, "outcome")?,
+            value
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
                 .map(|revision| revision.to_string())
                 .unwrap_or_default(),
-            publish.profile_root
+            json_string_field(&value, "profile_root")?
         );
     }
     Ok(())
 }
 
-fn print_page_history(
-    history: &[loom_pages::PageHistoryEntry],
-    format: &str,
-) -> Result<(), String> {
+fn print_generated_page_history_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if format == "json" {
         println!(
             "{}",
-            serde_json::to_string_pretty(history).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         );
     } else {
-        for entry in history {
+        let entries = value
+            .as_array()
+            .ok_or_else(|| "page history JSON must be an array".to_string())?;
+        for entry in entries {
             println!(
                 "{}\t{}\t{}\t{}",
-                entry.kind,
-                entry.page_id,
+                json_string_field(entry, "kind")?,
+                json_string_field(entry, "page_id")?,
                 entry
-                    .revision
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
                     .map(|revision| revision.to_string())
                     .unwrap_or_default(),
-                entry.body_digest.as_deref().unwrap_or("")
+                entry
+                    .get("body_digest")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_generated_page_structure_render_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        let structure = value
+            .get("structure")
+            .ok_or_else(|| "structure render JSON missing structure".to_string())?;
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            json_string_field(structure, "structure_id")?,
+            json_string_field(structure, "space_id")?,
+            json_string_field(structure, "kind")?,
+            json_string_field(structure, "title")?,
+            json_array_len(&value, "nodes")?,
+            json_array_len(&value, "edges")?,
+            json_string_field(&value, "graph_collection")?
+        );
+    }
+    Ok(())
+}
+
+fn print_generated_page_structure_node_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            json_string_field(&value, "structure_id")?,
+            json_string_field(&value, "node_id")?,
+            json_string_field(&value, "kind")?,
+            json_string_field(&value, "label")?,
+            value
+                .get("entity_ref")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            json_string_field(&value, "profile_root")?
+        );
+    }
+    Ok(())
+}
+
+fn print_generated_page_structure_edge_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            json_string_field(&value, "structure_id")?,
+            json_string_field(&value, "edge_id")?,
+            json_string_field(&value, "src_node_id")?,
+            json_string_field(&value, "dst_node_id")?,
+            json_string_field(&value, "label")?,
+            json_string_field(&value, "profile_root")?
+        );
+    }
+    Ok(())
+}
+
+fn print_generated_page_structure_move_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            json_string_field(&value, "structure_id")?,
+            json_string_field(&value, "node_id")?,
+            value
+                .get("parent_node_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            json_string_field(&value, "label")?,
+            json_string_field(&value, "profile_root")?
+        );
+    }
+    Ok(())
+}
+
+fn print_generated_page_structure_decompose_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            json_string_field(&value, "workspace_id")?,
+            json_string_field(&value, "structure_id")?,
+            json_array_len(&value, "tickets")?,
+            json_array_len(&value, "implemented_by_edges")?,
+            json_string_field(&value, "graph_collection")?
+        );
+    }
+    Ok(())
+}
+
+fn json_string_field<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("JSON value missing string field {field:?}"))
+}
+
+fn json_array_len(value: &serde_json::Value, field: &str) -> Result<usize, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .ok_or_else(|| format!("JSON value missing array field {field:?}"))
+}
+
+fn print_generated_ticket_page_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        let items = value
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "ticket page JSON missing array items".to_string())?;
+        for ticket in items {
+            println!(
+                "{}\t{}\t{}\t{}",
+                json_string_field(ticket, "primary_key")?,
+                json_string_field(ticket, "ticket_id")?,
+                json_string_field(ticket, "project_id")?,
+                json_string_field(ticket, "ticket_type")?
+            );
+        }
+        if let Some(cursor) = value.get("next_cursor").and_then(serde_json::Value::as_str) {
+            println!("next_cursor\t{cursor}");
+        }
+    }
+    Ok(())
+}
+
+fn print_generated_ticket_comments_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        let comments = value
+            .as_array()
+            .ok_or_else(|| "ticket comments JSON must be an array".to_string())?;
+        for comment in comments {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                json_string_field(comment, "comment_id")?,
+                json_string_field(comment, "comment_type")?,
+                json_string_field(comment, "author_principal")?,
+                comment
+                    .get("created_at_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| "ticket comment JSON missing u64 created_at_ms".to_string())?,
+                comment
+                    .get("updated_at_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                comment
+                    .get("redacted")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| "ticket comment JSON missing boolean redacted".to_string())?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn generated_envelope_parts(
+    value: &serde_json::Value,
+) -> Result<(&serde_json::Value, &serde_json::Value), String> {
+    let receipt = value
+        .get("receipt")
+        .ok_or_else(|| "mutation envelope JSON missing receipt".to_string())?;
+    let resource = value
+        .get("resource")
+        .ok_or_else(|| "mutation envelope JSON missing resource".to_string())?;
+    Ok((receipt, resource))
+}
+
+fn print_generated_mutation_receipt(receipt: &serde_json::Value) -> Result<(), String> {
+    println!("operation={}", json_string_field(receipt, "operation")?);
+    println!(
+        "resource_kind={}",
+        json_string_field(receipt, "resource_kind")?
+    );
+    println!("resource_id={}", json_string_field(receipt, "resource_id")?);
+    println!(
+        "operation_id={}",
+        receipt
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    );
+    println!(
+        "root_before={}",
+        receipt
+            .get("root_before")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    );
+    println!(
+        "root_after={}",
+        receipt
+            .get("root_after")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    );
+    let changes = receipt
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "mutation receipt JSON missing array changes".to_string())?;
+    if changes.is_empty() {
+        println!("change=[]");
+    } else {
+        for change in changes {
+            println!(
+                "change={}",
+                serde_json::to_string(change).map_err(|e| e.to_string())?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_generated_ticket_summary_value(ticket: &serde_json::Value) -> Result<(), String> {
+    println!(
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        json_string_field(ticket, "primary_key")?,
+        json_string_field(ticket, "ticket_id")?,
+        json_string_field(ticket, "project_id")?,
+        json_string_field(ticket, "ticket_type")?,
+        json_string_field(ticket, "projection_profile")?,
+        json_string_field(ticket, "profile_root")?
+    );
+    Ok(())
+}
+
+fn print_generated_ticket_relation_value(relation: &serde_json::Value) -> Result<(), String> {
+    println!(
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        json_string_field(relation, "ticket_id")?,
+        json_string_field(relation, "relation_id")?,
+        json_string_field(relation, "kind")?,
+        json_string_field(relation, "target_type")?,
+        json_string_field(relation, "target_id")?,
+        json_string_field(relation, "graph_edge_id")?
+    );
+    Ok(())
+}
+
+fn print_generated_ticket_mutation_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        let (receipt, resource) = generated_envelope_parts(&value)?;
+        print_generated_mutation_receipt(receipt)?;
+        print_generated_ticket_summary_value(resource)?;
+    }
+    Ok(())
+}
+
+fn print_generated_ticket_relation_mutation_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        let (receipt, resource) = generated_envelope_parts(&value)?;
+        print_generated_mutation_receipt(receipt)?;
+        print_generated_ticket_relation_value(resource)?;
+    }
+    Ok(())
+}
+
+fn print_generated_ticket_relations_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    let relations = value
+        .as_array()
+        .ok_or_else(|| "ticket relations JSON must be an array".to_string())?;
+    if format == "json" {
+        let items = relations
+            .iter()
+            .map(|relation| {
+                serde_json::json!({
+                    "direction": relation.get("direction").cloned().unwrap_or(serde_json::Value::Null),
+                    "kind": relation.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                    "target_ticket_id": relation.get("target_ticket_id").cloned().unwrap_or(serde_json::Value::Null),
+                    "target_title": relation.get("target_title").cloned().unwrap_or(serde_json::Value::Null),
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::json!({ "relations": items });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?
+        );
+    } else if relations.is_empty() {
+        println!("(no ticket relations)");
+    } else {
+        for relation in relations {
+            println!(
+                "{}\t{}\t{}\t{}",
+                json_string_field(relation, "direction")?,
+                json_string_field(relation, "kind")?,
+                json_string_field(relation, "target_ticket_id")?,
+                json_string_field(relation, "target_title")?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn generated_ticket_history_summary(record: &serde_json::Value) -> String {
+    if let Some(status) = record
+        .pointer("/envelope/payload/status")
+        .and_then(serde_json::Value::as_str)
+    {
+        return format!("status={status}");
+    }
+    if let Some(target_status) = record
+        .pointer("/envelope/payload/target_status")
+        .and_then(serde_json::Value::as_str)
+    {
+        return format!("status={target_status}");
+    }
+    record
+        .get("target_entity_id")
+        .and_then(serde_json::Value::as_str)
+        .map(|target| format!("target={target}"))
+        .unwrap_or_default()
+}
+
+fn print_generated_ticket_history_json(
+    raw: &str,
+    detailed: bool,
+    format: &str,
+) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" || detailed {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        let history = value
+            .as_array()
+            .ok_or_else(|| "ticket history JSON must be an array".to_string())?;
+        for record in history {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                record
+                    .pointer("/envelope/timestamp_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                record
+                    .pointer("/envelope/actor_principal")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                json_string_field(record, "operation_kind")?,
+                generated_ticket_history_summary(record),
+                record
+                    .get("sequence")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| "ticket history JSON missing u64 sequence".to_string())?,
+                json_string_field(record, "operation_id")?
             );
         }
     }
@@ -5831,6 +5908,83 @@ fn parse_ticket_field_cardinality(
     }
 }
 
+struct TicketProjectSettingsPatchArgs<'a> {
+    default_projection: Option<loom_tickets::TicketProjectionProfile>,
+    enable_projections: &'a [loom_tickets::TicketProjectionProfile],
+    disable_projections: &'a [loom_tickets::TicketProjectionProfile],
+    actor_enforcement: Option<loom_tickets::TicketLifecycleAuthorizationPolicy>,
+    project_owner_principal: Option<&'a str>,
+    clear_project_owner_principal: bool,
+    acceptance_authorities: Option<&'a [String]>,
+    acceptance_evidence_enforcement: Option<bool>,
+    required_acceptance_evidence_keys: Option<&'a [loom_tickets::TicketAcceptanceEvidenceKey]>,
+    owner_contract_summary: Option<&'a str>,
+    owner_contract_details: Option<&'a str>,
+    worker_contract_summary: Option<&'a str>,
+    worker_contract_details: Option<&'a str>,
+    expected_root: Option<&'a str>,
+}
+
+fn ticket_project_settings_patch_to_cbor(
+    args: TicketProjectSettingsPatchArgs<'_>,
+) -> Result<Vec<u8>, String> {
+    let opt_text = |value: Option<&str>| {
+        value
+            .map(|value| WireValue::Text(value.to_string()))
+            .unwrap_or(WireValue::Null)
+    };
+    let projections = |values: &[loom_tickets::TicketProjectionProfile]| {
+        WireValue::Array(
+            values
+                .iter()
+                .map(|profile| WireValue::Text(profile.profile_id().to_string()))
+                .collect(),
+        )
+    };
+    let optional_strings = |values: Option<&[String]>| {
+        values
+            .map(|values| {
+                WireValue::Array(
+                    values
+                        .iter()
+                        .map(|value| WireValue::Text(value.clone()))
+                        .collect(),
+                )
+            })
+            .unwrap_or(WireValue::Null)
+    };
+    let optional_keys = |values: Option<&[loom_tickets::TicketAcceptanceEvidenceKey]>| {
+        values
+            .map(|values| {
+                WireValue::Array(
+                    values
+                        .iter()
+                        .map(|value| WireValue::Text(value.as_str().to_string()))
+                        .collect(),
+                )
+            })
+            .unwrap_or(WireValue::Null)
+    };
+    let optional_bool = |value: Option<bool>| value.map(WireValue::Bool).unwrap_or(WireValue::Null);
+    let value = WireValue::Array(vec![
+        opt_text(args.default_projection.map(|profile| profile.profile_id())),
+        projections(args.enable_projections),
+        projections(args.disable_projections),
+        opt_text(args.actor_enforcement.map(|policy| policy.as_str())),
+        opt_text(args.project_owner_principal),
+        WireValue::Bool(args.clear_project_owner_principal),
+        optional_strings(args.acceptance_authorities),
+        optional_bool(args.acceptance_evidence_enforcement),
+        optional_keys(args.required_acceptance_evidence_keys),
+        opt_text(args.owner_contract_summary),
+        opt_text(args.owner_contract_details),
+        opt_text(args.worker_contract_summary),
+        opt_text(args.worker_contract_details),
+        opt_text(args.expected_root),
+    ]);
+    loom_codec::encode(&value).map_err(|error| error.to_string())
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TicketUpdateInput {
@@ -5864,7 +6018,7 @@ struct TicketUpdateInput {
     relation_removes: Vec<TicketUpdateRelationRemoveInput>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct TicketUpdateCommentInput {
     #[serde(default)]
@@ -5876,7 +6030,7 @@ struct TicketUpdateCommentInput {
     evidence: Option<serde_json::Value>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct TicketUpdateRelationSetInput {
     #[serde(default)]
@@ -5885,7 +6039,7 @@ struct TicketUpdateRelationSetInput {
     target_id: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct TicketUpdateRelationRemoveInput {
     relation_id: String,
@@ -6244,24 +6398,101 @@ fn current_time_ms() -> Result<u64, String> {
     Ok(duration.as_millis() as u64)
 }
 
-fn print_ticket_project(
-    project: &loom_tickets::TicketProjectSummary,
-    format: &str,
-) -> Result<(), String> {
+fn print_generated_ticket_project_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if format == "json" {
         println!(
             "{}",
-            serde_json::to_string_pretty(project).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         );
     } else {
         println!(
             "{}\t{}\t{}\t{}\t{}",
-            project.project_id,
-            project.key_prefix,
-            project.name,
-            project.lifecycle_authorization_policy,
-            project.profile_root
+            json_string_field(&value, "project_id")?,
+            json_string_field(&value, "key_prefix")?,
+            json_string_field(&value, "name")?,
+            json_string_field(&value, "lifecycle_authorization_policy")?,
+            json_string_field(&value, "profile_root")?
         );
+    }
+    Ok(())
+}
+
+fn print_generated_ticket_projects_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        let projects = value
+            .as_array()
+            .ok_or_else(|| "ticket projects JSON must be an array".to_string())?;
+        for project in projects {
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                json_string_field(project, "project_id")?,
+                json_string_field(project, "key_prefix")?,
+                json_string_field(project, "name")?,
+                json_string_field(project, "lifecycle_authorization_policy")?,
+                json_string_field(project, "profile_root")?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_generated_ticket_field_catalog_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!(
+            "projection\t{}\noperation\t{}\nstrict_unknown_fields\t{}\ncustom_fields_source\t{}\nunknown_field_write_behavior\t{}",
+            json_string_field(&value, "projection_profile")?,
+            json_string_field(&value, "operation")?,
+            value
+                .get("strict_unknown_fields")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    "ticket field catalog JSON missing boolean strict_unknown_fields".to_string()
+                })?,
+            json_string_field(&value, "custom_fields_source")?,
+            json_string_field(&value, "unknown_field_write_behavior")?
+        );
+        let fields = value
+            .get("fields")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "ticket field catalog JSON missing array fields".to_string())?;
+        for field in fields {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                json_string_field(field, "native_field")?,
+                json_string_field(field, "write_path")?,
+                json_string_field(field, "field_type")?,
+                json_string_field(field, "cardinality")?,
+                field
+                    .get("max_length")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or_else(String::new, |value| value.to_string()),
+                field
+                    .get("enum_values")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| "ticket field catalog JSON missing enum_values".to_string())?
+                    .iter()
+                    .map(|value| {
+                        value.as_str().ok_or_else(|| {
+                            "ticket field catalog enum_values entries must be strings".to_string()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(",")
+            );
+        }
     }
     Ok(())
 }
@@ -6418,74 +6649,24 @@ fn print_lane_view_text(view: &LaneView, detailed: bool) {
     }
 }
 
-fn print_ticket(ticket: &loom_tickets::TicketSummary, format: &str) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(ticket).map_err(|e| e.to_string())?
-        );
-    } else {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            ticket.primary_key,
-            ticket.ticket_id,
-            ticket.project_id,
-            ticket.ticket_type,
-            ticket.projection_profile,
-            ticket.profile_root
-        );
-    }
-    Ok(())
-}
-
-fn print_ticket_comments(
-    comments: &[loom_tickets::TicketComment],
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(comments).map_err(|e| e.to_string())?
-        );
-    } else {
-        for comment in comments {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
-                comment.comment_id,
-                comment.comment_type,
-                comment.author_principal,
-                comment.created_at_ms,
-                comment.updated_at_ms.unwrap_or(0),
-                comment.redacted
-            );
-        }
-    }
-    Ok(())
-}
-
-fn ticket_field_text(ticket: &loom_tickets::TicketSummary, field: &str) -> Option<String> {
-    match ticket.fields.get(field)? {
-        serde_json::Value::String(value) => Some(value.clone()),
-        serde_json::Value::Object(map) => map
-            .get("String")
-            .or_else(|| map.get("Text"))
-            .or_else(|| map.get("EnumOption"))
-            .or_else(|| map.get("Principal"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        _ => None,
-    }
-}
-
-fn print_ticket_detail(
-    ticket: &loom_tickets::TicketSummary,
-    history: &[loom_tickets::TicketHistoryRecord],
-    comments: &[loom_tickets::TicketComment],
+fn print_generated_ticket_detail_json(
+    ticket: &serde_json::Value,
+    history_raw: &str,
+    comments_raw: &str,
     detailed: bool,
     compact: bool,
     format: &str,
 ) -> Result<(), String> {
-    // `--detailed` wins over `--compact`, matching the MCP `tickets_get` precedence.
+    let history: serde_json::Value =
+        serde_json::from_str(history_raw).map_err(|e| e.to_string())?;
+    let comments: serde_json::Value =
+        serde_json::from_str(comments_raw).map_err(|e| e.to_string())?;
+    let history_items = history
+        .as_array()
+        .ok_or_else(|| "generated ticket history response is not an array".to_string())?;
+    let comment_items = comments
+        .as_array()
+        .ok_or_else(|| "generated ticket comments response is not an array".to_string())?;
     let compact = compact && !detailed;
     if format == "json" {
         if detailed {
@@ -6501,27 +6682,22 @@ fn print_ticket_detail(
             return Ok(());
         }
         if compact {
-            let latest = latest_ticket_update(history);
+            let latest = latest_generated_ticket_update(history_items);
             let value = serde_json::json!({
-                "primary_key": ticket.primary_key,
-                "title": ticket_field_text(ticket, "title"),
-                "status": ticket_field_text(ticket, "status"),
-                "priority": ticket_field_text(ticket, "priority"),
-                "type": ticket.ticket_type,
-                "assignee": ticket_field_text(ticket, "assignee"),
-                "assignee_display": ticket_field_text(ticket, "assignee_display"),
-                "project": ticket.project_id,
+                "primary_key": generated_ticket_text_opt(ticket, "primary_key"),
+                "title": generated_ticket_field_text(ticket, "title"),
+                "status": generated_ticket_field_text(ticket, "status"),
+                "priority": generated_ticket_field_text(ticket, "priority"),
+                "type": generated_ticket_text_opt(ticket, "ticket_type"),
+                "assignee": generated_ticket_field_text(ticket, "assignee"),
+                "assignee_display": generated_ticket_field_text(ticket, "assignee_display"),
+                "project": generated_ticket_text_opt(ticket, "project_id"),
                 "dependencies": {
-                    "depends_on": ticket.depends_on,
-                    "blocks": ticket.blocks,
-                    "relations": ticket.relations.iter().map(|relation| {
-                        serde_json::json!({
-                            "kind": relation.kind,
-                            "target_id": relation.target_id
-                        })
-                    }).collect::<Vec<_>>()
+                    "depends_on": ticket.get("depends_on").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "blocks": ticket.get("blocks").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "relations": generated_ticket_relation_compacts(ticket)
                 },
-                "comment_count": comments.len(),
+                "comment_count": comment_items.len(),
                 "latest_update": latest.map(|latest| serde_json::json!({
                     "actor": latest.actor,
                     "timestamp_ms": latest.timestamp_ms,
@@ -6535,7 +6711,11 @@ fn print_ticket_detail(
             );
             return Ok(());
         }
-        return print_ticket(ticket, format);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(ticket).map_err(|e| e.to_string())?
+        );
+        return Ok(());
     }
     if detailed {
         println!("ticket");
@@ -6546,44 +6726,46 @@ fn print_ticket_detail(
         println!("comments");
         println!(
             "{}",
-            serde_json::to_string_pretty(comments).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&comments).map_err(|e| e.to_string())?
         );
         return Ok(());
     }
-    println!("key\t{}", ticket.primary_key);
+    println!("key\t{}", generated_ticket_text(ticket, "primary_key")?);
     println!(
         "title\t{}",
-        ticket_field_text(ticket, "title").unwrap_or_default()
+        generated_ticket_field_text(ticket, "title").unwrap_or_default()
     );
     println!(
         "status\t{}",
-        ticket_field_text(ticket, "status").unwrap_or_default()
+        generated_ticket_field_text(ticket, "status").unwrap_or_default()
     );
     println!(
         "priority\t{}",
-        ticket_field_text(ticket, "priority").unwrap_or_default()
+        generated_ticket_field_text(ticket, "priority").unwrap_or_default()
     );
-    println!("type\t{}", ticket.ticket_type);
-    let assignee = ticket_field_text(ticket, "assignee").unwrap_or_default();
-    match ticket_field_text(ticket, "assignee_display") {
+    println!("type\t{}", generated_ticket_text(ticket, "ticket_type")?);
+    let assignee = generated_ticket_field_text(ticket, "assignee").unwrap_or_default();
+    match generated_ticket_field_text(ticket, "assignee_display") {
         Some(display) if display != assignee => {
             println!("assignee\t{assignee} ({display})");
         }
         _ => println!("assignee\t{assignee}"),
     }
-    println!("project\t{}", ticket.project_id);
-    // The compact projection deliberately omits the heavy `description` field.
+    println!("project\t{}", generated_ticket_text(ticket, "project_id")?);
     if !compact {
         println!(
             "description\t{}",
-            ticket_field_text(ticket, "description").unwrap_or_default()
+            generated_ticket_field_text(ticket, "description").unwrap_or_default()
         );
     }
-    println!("depends_on\t{}", compact_string_list(&ticket.depends_on));
-    println!("blocks\t{}", compact_string_list(&ticket.blocks));
-    println!("relations\t{}", compact_relation_summary(&ticket.relations));
-    println!("comments\t{}", comments.len());
-    if let Some(latest) = latest_ticket_update(history) {
+    println!(
+        "depends_on\t{}",
+        generated_ticket_string_list(ticket, "depends_on")
+    );
+    println!("blocks\t{}", generated_ticket_string_list(ticket, "blocks"));
+    println!("relations\t{}", generated_ticket_relation_summary(ticket));
+    println!("comments\t{}", comment_items.len());
+    if let Some(latest) = latest_generated_ticket_update(history_items) {
         println!("latest_update_actor\t{}", latest.actor);
         println!("latest_update_at_ms\t{}", latest.timestamp_ms);
         println!("latest_update_operation\t{}", latest.operation_kind);
@@ -6599,12 +6781,17 @@ struct TicketUpdateView {
     sequence: u64,
 }
 
-fn latest_ticket_update(history: &[loom_tickets::TicketHistoryRecord]) -> Option<TicketUpdateView> {
+fn latest_generated_ticket_update(history: &[serde_json::Value]) -> Option<TicketUpdateView> {
     history
         .iter()
-        .max_by_key(|record| record.sequence)
+        .max_by_key(|record| {
+            record
+                .get("sequence")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        })
         .map(|record| {
-            let envelope = &record.envelope;
+            let envelope = record.get("envelope").unwrap_or(&serde_json::Value::Null);
             TicketUpdateView {
                 actor: envelope
                     .get("actor_principal")
@@ -6615,8 +6802,15 @@ fn latest_ticket_update(history: &[loom_tickets::TicketHistoryRecord]) -> Option
                     .get("timestamp_ms")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0),
-                operation_kind: record.operation_kind.clone(),
-                sequence: record.sequence,
+                operation_kind: record
+                    .get("operation_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                sequence: record
+                    .get("sequence")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
             }
         })
 }
@@ -6629,125 +6823,97 @@ fn compact_string_list(values: &[String]) -> String {
     }
 }
 
-fn compact_relation_summary(relations: &[loom_tickets::TicketRelationCompact]) -> String {
+fn generated_ticket_text<'a>(
+    ticket: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, String> {
+    ticket
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("generated ticket response missing {field}"))
+}
+
+fn generated_ticket_text_opt(ticket: &serde_json::Value, field: &str) -> Option<String> {
+    ticket
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn generated_ticket_field_text(ticket: &serde_json::Value, field: &str) -> Option<String> {
+    match ticket.get("fields")?.get(field)? {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Object(map) => map
+            .get("String")
+            .or_else(|| map.get("Text"))
+            .or_else(|| map.get("EnumOption"))
+            .or_else(|| map.get("Principal"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn generated_ticket_string_list(ticket: &serde_json::Value, field: &str) -> String {
+    let values = ticket
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    compact_string_list(&values)
+}
+
+fn generated_ticket_relation_compacts(ticket: &serde_json::Value) -> Vec<serde_json::Value> {
+    ticket
+        .get("relations")
+        .and_then(serde_json::Value::as_array)
+        .map(|relations| {
+            relations
+                .iter()
+                .map(|relation| {
+                    serde_json::json!({
+                        "kind": relation.get("kind").and_then(serde_json::Value::as_str).unwrap_or(""),
+                        "target_id": relation.get("target_id").and_then(serde_json::Value::as_str).unwrap_or("")
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn generated_ticket_relation_summary(ticket: &serde_json::Value) -> String {
+    let Some(relations) = ticket
+        .get("relations")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return "none".to_string();
+    };
     if relations.is_empty() {
         return "none".to_string();
     }
     relations
         .iter()
-        .map(|relation| format!("{}:{}", relation.kind, relation.target_id))
+        .map(|relation| {
+            format!(
+                "{}:{}",
+                relation
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                relation
+                    .get("target_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            )
+        })
         .collect::<Vec<_>>()
         .join(",")
-}
-
-fn ticket_field_value_changes(fields: &serde_json::Value) -> Vec<MutationChange> {
-    fields.as_object().map_or_else(Vec::new, |fields| {
-        fields
-            .iter()
-            .map(|(field, value)| MutationChange::field_set(field.clone(), value.to_string()))
-            .collect()
-    })
-}
-
-struct CliTicketUpdateChangeInputs<'a> {
-    set_fields: Option<&'a serde_json::Value>,
-    delete_fields: &'a [String],
-    action_applied: bool,
-    target_status: Option<&'a str>,
-    observed_source_status: Option<&'a str>,
-    assignee: Option<&'a str>,
-    comment: Option<&'a TicketUpdateCommentInput>,
-    comments: &'a [TicketUpdateCommentInput],
-    relation_sets: &'a [TicketUpdateRelationSetInput],
-    relation_removes: &'a [TicketUpdateRelationRemoveInput],
-}
-
-fn cli_ticket_update_changes(input: CliTicketUpdateChangeInputs<'_>) -> Vec<MutationChange> {
-    let mut changes = input
-        .set_fields
-        .map(ticket_field_value_changes)
-        .unwrap_or_default();
-    changes.extend(
-        input
-            .delete_fields
-            .iter()
-            .map(|field| MutationChange::field_deleted(field.clone(), None::<String>)),
-    );
-    if let Some(target_status) = input.target_status {
-        changes.push(MutationChange::field_changed(
-            "status",
-            input.observed_source_status.map(str::to_string),
-            Some(target_status.to_string()),
-        ));
-    }
-    if let Some(assignee) = input.assignee {
-        changes.push(MutationChange::field_changed(
-            "assignee",
-            None::<String>,
-            Some(assignee.to_string()),
-        ));
-    }
-    if input.action_applied && input.target_status.is_none() {
-        changes.push(MutationChange::field_set("lifecycle_action", "applied"));
-    }
-    if let Some(comment) = input.comment {
-        changes.push(MutationChange::field_set(
-            "comment",
-            comment.comment_type.as_deref().unwrap_or("general"),
-        ));
-    }
-    changes.extend(input.comments.iter().map(|comment| {
-        MutationChange::field_set(
-            "comment",
-            comment.comment_type.as_deref().unwrap_or("general"),
-        )
-    }));
-    changes.extend(input.relation_sets.iter().map(|relation| {
-        MutationChange::relation_set(
-            relation
-                .relation_id
-                .clone()
-                .unwrap_or_else(|| "default".to_string()),
-            relation.kind.clone(),
-            relation.target_id.clone(),
-        )
-    }));
-    changes.extend(input.relation_removes.iter().map(|relation| {
-        MutationChange::field_deleted(format!("relation:{}", relation.relation_id), None::<String>)
-    }));
-    changes
-}
-
-fn ticket_mutation_envelope(
-    ticket: loom_tickets::TicketSummary,
-    operation: &str,
-    root_before: Option<&str>,
-    changes: Vec<MutationChange>,
-) -> MutationEnvelope<loom_tickets::TicketSummary> {
-    let receipt = MutationReceipt::new(operation, "ticket", ticket.primary_key.clone())
-        .operation_id(ticket.operation_id.clone())
-        .roots(
-            root_before.map(str::to_string),
-            Some(ticket.profile_root.clone()),
-        )
-        .changes(changes);
-    MutationEnvelope::new(ticket, receipt)
-}
-
-fn relation_mutation_envelope(
-    relation: loom_tickets::TicketRelationSummary,
-    operation: &str,
-    root_before: Option<&str>,
-    changes: Vec<MutationChange>,
-) -> MutationEnvelope<loom_tickets::TicketRelationSummary> {
-    let receipt = MutationReceipt::new(operation, "ticket_relation", relation.relation_id.clone())
-        .operation_id(Some(relation.operation_id.clone()))
-        .roots(
-            root_before.map(str::to_string),
-            Some(relation.profile_root.clone()),
-        )
-        .changes(changes);
-    MutationEnvelope::new(relation, receipt)
 }
 
 fn print_mutation_changes(changes: &[MutationChange]) -> Result<(), String> {
@@ -6764,322 +6930,58 @@ fn print_mutation_changes(changes: &[MutationChange]) -> Result<(), String> {
     Ok(())
 }
 
-fn print_ticket_mutation(
-    envelope: &MutationEnvelope<loom_tickets::TicketSummary>,
-    format: &str,
-) -> Result<(), String> {
+fn print_generated_board_json(raw: &str, format: &str) -> Result<(), String> {
+    let board: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if format == "json" {
         println!(
             "{}",
-            serde_json::to_string_pretty(envelope).map_err(|e| e.to_string())?
-        );
-    } else {
-        let receipt = &envelope.receipt;
-        println!("operation={}", receipt.operation);
-        println!("resource_kind={}", receipt.resource_kind);
-        println!("resource_id={}", receipt.resource_id);
-        println!(
-            "operation_id={}",
-            receipt.operation_id.as_deref().unwrap_or("")
-        );
-        println!(
-            "root_before={}",
-            receipt.root_before.as_deref().unwrap_or("")
-        );
-        println!("root_after={}", receipt.root_after.as_deref().unwrap_or(""));
-        print_mutation_changes(&receipt.changes)?;
-        print_ticket(&envelope.resource, format)?;
-    }
-    Ok(())
-}
-
-fn print_ticket_relation_mutation(
-    envelope: &MutationEnvelope<loom_tickets::TicketRelationSummary>,
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(envelope).map_err(|e| e.to_string())?
-        );
-    } else {
-        let receipt = &envelope.receipt;
-        println!("operation={}", receipt.operation);
-        println!("resource_kind={}", receipt.resource_kind);
-        println!("resource_id={}", receipt.resource_id);
-        println!(
-            "operation_id={}",
-            receipt.operation_id.as_deref().unwrap_or("")
-        );
-        println!(
-            "root_before={}",
-            receipt.root_before.as_deref().unwrap_or("")
-        );
-        println!("root_after={}", receipt.root_after.as_deref().unwrap_or(""));
-        print_mutation_changes(&receipt.changes)?;
-        print_ticket_relation(&envelope.resource, format)?;
-    }
-    Ok(())
-}
-
-fn print_board(board: &loom_tickets::BoardSummary, format: &str) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(board).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&board).map_err(|e| e.to_string())?
         );
     } else {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            board.board_key,
-            board.board_id,
-            board.name,
-            board.project_id,
-            board.mode,
-            board.board_status,
-            board.profile_root
+            board_text(&board, "board_key")?,
+            board_text(&board, "board_id")?,
+            board_text(&board, "name")?,
+            board_text(&board, "project_id")?,
+            board_text(&board, "mode")?,
+            board_text(&board, "board_status")?,
+            board_text(&board, "profile_root")?
         );
     }
     Ok(())
 }
 
-fn print_boards(boards: &[loom_tickets::BoardSummary], format: &str) -> Result<(), String> {
+fn print_generated_boards_json(raw: &str, format: &str) -> Result<(), String> {
+    let boards: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
     if format == "json" {
         println!(
             "{}",
-            serde_json::to_string_pretty(boards).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&boards).map_err(|e| e.to_string())?
         );
     } else {
-        for board in boards {
+        for board in boards
+            .as_array()
+            .ok_or_else(|| "generated boards response is not an array".to_string())?
+        {
             println!(
                 "{}\t{}\t{}\t{}\t{}",
-                board.board_key, board.board_id, board.name, board.mode, board.board_status
+                board_text(board, "board_key")?,
+                board_text(board, "board_id")?,
+                board_text(board, "name")?,
+                board_text(board, "mode")?,
+                board_text(board, "board_status")?
             );
         }
     }
     Ok(())
 }
 
-fn print_ticket_relation(
-    relation: &loom_tickets::TicketRelationSummary,
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(relation).map_err(|e| e.to_string())?
-        );
-    } else {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            relation.ticket_id,
-            relation.relation_id,
-            relation.kind,
-            relation.target_type,
-            relation.target_id,
-            relation.graph_edge_id
-        );
-    }
-    Ok(())
-}
-
-fn print_ticket_relations(
-    relations: &[loom_tickets::TicketRelationView],
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        let items = relations
-            .iter()
-            .map(|relation| {
-                serde_json::json!({
-                    "direction": relation.direction,
-                    "kind": relation.kind,
-                    "target_ticket_id": relation.target_ticket_id,
-                    "target_title": relation.target_title,
-                })
-            })
-            .collect::<Vec<_>>();
-        let payload = serde_json::json!({ "relations": items });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?
-        );
-    } else if relations.is_empty() {
-        println!("(no ticket relations)");
-    } else {
-        for relation in relations {
-            println!(
-                "{}\t{}\t{}\t{}",
-                relation.direction, relation.kind, relation.target_ticket_id, relation.target_title
-            );
-        }
-    }
-    Ok(())
-}
-
-fn print_ticket_projects(
-    projects: &[loom_tickets::TicketProject],
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        let items = projects
-            .iter()
-            .map(|project| {
-                serde_json::json!({
-                    "project_id": project.project_id,
-                    "key_prefix": project.key_prefix,
-                    "name": project.name,
-                    "next_ticket_number": project.next_ticket_number,
-                    "default_projection": project
-                        .projection_config
-                        .default_display_projection
-                        .profile_id(),
-                })
-            })
-            .collect::<Vec<_>>();
-        let payload = serde_json::json!({ "projects": items });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?
-        );
-    } else if projects.is_empty() {
-        println!("(no ticket projects)");
-    } else {
-        for project in projects {
-            println!(
-                "{}\t{}\t{}\tdefault_projection={}",
-                project.project_id,
-                project.key_prefix,
-                project.name,
-                project
-                    .projection_config
-                    .default_display_projection
-                    .profile_id()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn print_ticket_field_catalog(
-    catalog: &loom_tickets::TicketFieldCatalog,
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(catalog).map_err(|e| e.to_string())?
-        );
-    } else {
-        println!(
-            "projection\t{}\noperation\t{}\nstrict_unknown_fields\t{}\ncustom_fields_source\t{}\nunknown_field_write_behavior\t{}",
-            catalog.projection_profile,
-            catalog.operation,
-            catalog.strict_unknown_fields,
-            catalog.custom_fields_source,
-            catalog.unknown_field_write_behavior
-        );
-        for field in &catalog.fields {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
-                field.native_field,
-                field.write_path,
-                field.field_type,
-                field.cardinality,
-                field
-                    .max_length
-                    .map_or_else(String::new, |value| value.to_string()),
-                field.enum_values.join(",")
-            );
-        }
-    }
-    Ok(())
-}
-
-fn print_ticket_page(page: &loom_tickets::TicketListPage, format: &str) -> Result<(), String> {
-    if format == "json" {
-        let value = serde_json::json!({
-            "items": page.items,
-            "total": page.total,
-            "next_cursor": page.next_cursor,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
-        );
-    } else {
-        for ticket in &page.items {
-            println!(
-                "{}\t{}\t{}\t{}",
-                ticket.primary_key, ticket.ticket_id, ticket.project_id, ticket.ticket_type
-            );
-        }
-        if let Some(cursor) = &page.next_cursor {
-            println!("next_cursor\t{cursor}");
-        }
-    }
-    Ok(())
-}
-
-fn print_ticket_history(
-    history: &[loom_tickets::TicketHistoryRecord],
-    detailed: bool,
-    format: &str,
-) -> Result<(), String> {
-    if format == "json" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(history).map_err(|e| e.to_string())?
-        );
-    } else if detailed {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(history).map_err(|e| e.to_string())?
-        );
-    } else {
-        for record in history {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
-                record
-                    .envelope
-                    .get("timestamp_ms")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                record
-                    .envelope
-                    .get("actor_principal")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(""),
-                record.operation_kind,
-                ticket_history_summary(record),
-                record.sequence,
-                record.operation_id
-            );
-        }
-    }
-    Ok(())
-}
-
-fn ticket_history_summary(record: &loom_tickets::TicketHistoryRecord) -> String {
-    if let Some(status) = record
-        .envelope
-        .pointer("/payload/status")
+fn board_text<'a>(board: &'a serde_json::Value, field: &str) -> Result<&'a str, String> {
+    board
+        .get(field)
         .and_then(serde_json::Value::as_str)
-    {
-        return format!("status={status}");
-    }
-    if let Some(target_status) = record
-        .envelope
-        .pointer("/payload/target_status")
-        .and_then(serde_json::Value::as_str)
-    {
-        return format!("status={target_status}");
-    }
-    record
-        .target_entity_id
-        .as_ref()
-        .map(|target| format!("target={target}"))
-        .unwrap_or_default()
+        .ok_or_else(|| format!("generated board response missing {field}"))
 }
 
 fn meeting_summary_json(meeting: &MeetingRecord) -> serde_json::Value {
@@ -20081,7 +19983,7 @@ mod cli_parse_tests {
             .unwrap()
             .unwrap();
         assert_eq!(page.title, "Home");
-        let body = Body::decode(page.body.as_deref().unwrap()).unwrap();
+        let body = loom_substrate::body::Body::decode(page.body.as_deref().unwrap()).unwrap();
         assert_eq!(body.blocks.len(), 2);
         assert_eq!(body.blocks[0].runs[0].text, "Home");
         assert_eq!(body.blocks[1].runs[0].text, "Redmine wiki body");
@@ -21653,7 +21555,8 @@ mod cli_parse_tests {
             .unwrap();
         assert_eq!(intro.title, "Intro");
         assert!(intro.body.is_some());
-        let intro_body = Body::decode(intro.body.as_deref().unwrap()).unwrap();
+        let intro_body =
+            loom_substrate::body::Body::decode(intro.body.as_deref().unwrap()).unwrap();
         assert_eq!(intro_body.blocks.len(), 6);
         assert!(matches!(
             intro_body.blocks[2].kind,
@@ -21675,7 +21578,8 @@ mod cli_parse_tests {
         let embed = loom_pages::get_page(&loom, ns, "pages", "embed")
             .unwrap()
             .unwrap();
-        let embed_body = Body::decode(embed.body.as_deref().unwrap()).unwrap();
+        let embed_body =
+            loom_substrate::body::Body::decode(embed.body.as_deref().unwrap()).unwrap();
         assert_eq!(embed_body.blocks.len(), 1);
         match &embed_body.blocks[0].kind {
             BlockKind::BlockRef {
@@ -21845,7 +21749,7 @@ mod cli_parse_tests {
         let page = loom_pages::get_page(&loom, ns, "pages", "123")
             .unwrap()
             .unwrap();
-        let body = Body::decode(page.body.as_deref().unwrap()).unwrap();
+        let body = loom_substrate::body::Body::decode(page.body.as_deref().unwrap()).unwrap();
         match &body.blocks[0].kind {
             BlockKind::Opaque { kind, payload } => {
                 assert_eq!(kind, "confluence.storage");
@@ -23388,6 +23292,142 @@ mod mx250_lanes_cli_default_tests {
             lane.updated_by, expected_actor,
             "status-report update without --updated-by should record the derived actor"
         );
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn ticket_project_create_ensures_workspace_through_generated_client() {
+        let store = mx250_temp_store("mx495-ticket-project-create");
+        run(
+            Command::Store {
+                action: StoreCmd::Init {
+                    store: store.clone(),
+                    encrypt: false,
+                    suite: None,
+                    identity_profile: None,
+                    fips: false,
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+
+        run(
+            Command::Tickets {
+                action: TicketsCmd::ProjectCreate {
+                    store: store.clone(),
+                    workspace: "main".to_string(),
+                    project_id: "core".to_string(),
+                    key_prefix: "CORE".to_string(),
+                    name: "Core".to_string(),
+                    expected_root: None,
+                    format: "json".to_string(),
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+
+        let loom = cli_open_loom_read(&store, &KeyOpts::default()).unwrap();
+        let ns = resolve_ns(&loom, "main").unwrap();
+        assert!(loom.registry().has_facet(ns, FacetKind::Vcs).unwrap());
+        let profile_id = ns.to_string();
+        let project = loom_tickets::get_project(&loom, ns, &profile_id, "core")
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.key_prefix, "CORE");
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn lanes_get_and_list_read_through_generated_client() {
+        let store = mx250_temp_store("mx495-lanes-read");
+        run(
+            Command::Store {
+                action: StoreCmd::Init {
+                    store: store.clone(),
+                    encrypt: false,
+                    suite: None,
+                    identity_profile: None,
+                    fips: false,
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        run(
+            Command::Workspace {
+                action: WorkspaceCmd::Create {
+                    store: store.clone(),
+                    name: "main".to_string(),
+                    facet: None,
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        run(
+            Command::Lanes {
+                action: LanesCmd::Create {
+                    store: store.clone(),
+                    workspace: "main".to_string(),
+                    lane_id: "agent-read".to_string(),
+                    lane_key: "agent-read".to_string(),
+                    kind: "assignment".to_string(),
+                    title: "Agent Read".to_string(),
+                    description: String::new(),
+                    owner_principal: Some("agent:read".to_string()),
+                    lane_status: "ready".to_string(),
+                    active_ticket_id: None,
+                    status_report: "ready".to_string(),
+                    reviewer_feedback: String::new(),
+                    updated_at: Some(1),
+                    updated_by: Some("agent:read".to_string()),
+                    tickets: vec!["MX-495".to_string()],
+                    format: "json".to_string(),
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+
+        for detailed in [false, true] {
+            run(
+                Command::Lanes {
+                    action: LanesCmd::Get {
+                        store: store.clone(),
+                        workspace: "main".to_string(),
+                        lane_id: "agent-read".to_string(),
+                        detailed,
+                        format: "json".to_string(),
+                    },
+                },
+                &KeyOpts::default(),
+            )
+            .unwrap();
+            run(
+                Command::Lanes {
+                    action: LanesCmd::List {
+                        store: store.clone(),
+                        workspace: "main".to_string(),
+                        detailed,
+                        format: "json".to_string(),
+                    },
+                },
+                &KeyOpts::default(),
+            )
+            .unwrap();
+        }
+
+        let loom = cli_open_loom_read(&store, &KeyOpts::default()).unwrap();
+        let ns = resolve_ns(&loom, "main").unwrap();
+        let lane = loom_lanes::get_lane(&loom, ns, "agent-read")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lane.lane_key, "agent-read");
+        assert_eq!(lane.lane_tickets[0].ticket_id, "MX-495");
 
         let _ = std::fs::remove_file(&store);
     }

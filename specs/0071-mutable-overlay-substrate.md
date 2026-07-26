@@ -315,7 +315,7 @@ Target components:
 mutable substrate
   WAL or append queue: transaction intent and recovery records
   logical-key index: key -> latest entry
-  current-open index: compact list or root of current-entry addresses
+  current-state root: B-tree root containing only current entries
   owner-token index: owner target -> latest compare token
   MVCC generation index: generation -> visible root set
   retention index: retention class + expiry -> logical key
@@ -329,10 +329,10 @@ retention or reclaim indexes.
 
 Cold open must hydrate only the current logical overlay. Retained history, idempotency records,
 owner-token records, secondary indexes, checkpoint metadata, audit retention records, and other
-control records must live behind distinct persisted roots or a current-open index that lets open find
-current entries without scanning every historical/control record. A store without the current-open
-index may perform one controlled migration scan, but the migrated committed source must converge to
-the indexed format and must not ship ad hoc repair tools.
+control records must live behind distinct persisted roots or a current-state root that lets open
+traverse current entries without scanning every historical/control record. A store without the
+current-state root may be handled only by a controlled migration path; normal open must not keep a
+permanent scan fallback.
 
 Small records must not waste a full durable transaction per tiny payload. The implementation must
 support one or more of:
@@ -727,7 +727,7 @@ The minimum reclaim contract is:
 7. Strict promotion, sync, export, ledger, and audit boundaries pin their selected checkpoint
    generation until the consumer finishes or rejects the checkpoint.
 
-The corresponding blocker names are `current-index-visible`, `pinned-snapshot`,
+The corresponding blocker names are `current-root-visible`, `pinned-snapshot`,
 `retained-history`, `audit-retention`, `tombstone-retention`, `durable-generation-window`, and
 `strict-promotion-boundary`. Reclaim planning may expose multiple blockers for one page run, and it
 must not collapse them into a generic "not reclaimable" state because operators need to know whether

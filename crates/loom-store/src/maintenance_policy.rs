@@ -11,7 +11,8 @@ const POLICY_VERSION_V2: u16 = 2;
 const POLICY_VERSION: u16 = 3;
 const RUN_VERSION_V1: u16 = 1;
 const RUN_VERSION_V2: u16 = 2;
-const RUN_VERSION: u16 = 3;
+const RUN_VERSION_V3: u16 = 3;
+const RUN_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreMaintenancePolicy {
@@ -68,6 +69,9 @@ pub struct StoreMaintenanceRunState {
     pub last_tail_compaction_truncated_pages: u64,
     pub last_tail_compaction_conflicts: u64,
     pub last_shrink_skip_reason: Option<String>,
+    pub last_progress_steps: u64,
+    pub last_yield_count: u64,
+    pub last_overrun_count: u64,
 }
 
 impl Default for StoreMaintenanceRunState {
@@ -87,6 +91,9 @@ impl Default for StoreMaintenanceRunState {
             last_tail_compaction_truncated_pages: 0,
             last_tail_compaction_conflicts: 0,
             last_shrink_skip_reason: Some("never_run".to_string()),
+            last_progress_steps: 0,
+            last_yield_count: 0,
+            last_overrun_count: 0,
         }
     }
 }
@@ -500,6 +507,9 @@ fn encode_run_state(state: &StoreMaintenanceRunState) -> Vec<u8> {
     out.extend_from_slice(&state.last_tail_compaction_truncated_pages.to_le_bytes());
     out.extend_from_slice(&state.last_tail_compaction_conflicts.to_le_bytes());
     put_optional_text(&mut out, state.last_shrink_skip_reason.as_deref());
+    out.extend_from_slice(&state.last_progress_steps.to_le_bytes());
+    out.extend_from_slice(&state.last_yield_count.to_le_bytes());
+    out.extend_from_slice(&state.last_overrun_count.to_le_bytes());
     out
 }
 
@@ -509,7 +519,11 @@ fn decode_run_state(bytes: &[u8]) -> Result<StoreMaintenanceRunState> {
         return Err(corrupt("store maintenance run-state magic"));
     }
     let version = cur.u16()?;
-    if version != RUN_VERSION && version != RUN_VERSION_V2 && version != RUN_VERSION_V1 {
+    if version != RUN_VERSION
+        && version != RUN_VERSION_V3
+        && version != RUN_VERSION_V2
+        && version != RUN_VERSION_V1
+    {
         return Err(corrupt("store maintenance run-state version"));
     }
     let mut state = StoreMaintenanceRunState {
@@ -527,13 +541,16 @@ fn decode_run_state(bytes: &[u8]) -> Result<StoreMaintenanceRunState> {
         last_tail_compaction_truncated_pages: 0,
         last_tail_compaction_conflicts: 0,
         last_shrink_skip_reason: Some("never_run".to_string()),
+        last_progress_steps: 0,
+        last_yield_count: 0,
+        last_overrun_count: 0,
     };
     if version >= RUN_VERSION_V2 {
         state.last_tail_trim_attempted = cur.bool()?;
         state.last_tail_trim_pages = cur.u64()?;
         state.last_tail_trim_bytes = cur.u64()?;
     }
-    if version == RUN_VERSION {
+    if version >= RUN_VERSION_V3 {
         state.last_tail_compaction_attempted = cur.bool()?;
         state.last_tail_compaction_relocated_objects = cur.u64()?;
         state.last_tail_compaction_relocated_pages = cur.u64()?;
@@ -541,6 +558,11 @@ fn decode_run_state(bytes: &[u8]) -> Result<StoreMaintenanceRunState> {
         state.last_tail_compaction_truncated_pages = cur.u64()?;
         state.last_tail_compaction_conflicts = cur.u64()?;
         state.last_shrink_skip_reason = cur.optional_text()?;
+    }
+    if version == RUN_VERSION {
+        state.last_progress_steps = cur.u64()?;
+        state.last_yield_count = cur.u64()?;
+        state.last_overrun_count = cur.u64()?;
     }
     cur.finish()?;
     Ok(state)

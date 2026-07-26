@@ -135,12 +135,12 @@ fn err(e: LoomError) -> ErrorData {
 }
 
 /// Build a [`loom_lanes::LaneTicketPlacement`] from the wire placement verb and optional anchor.
-/// Defaults to append; "before"/"after" require an anchor; unknown verbs are rejected.
+/// Defaults to LAST. BEFORE and AFTER require an anchor; unknown verbs are rejected.
 fn lane_ticket_placement<'a>(
     placement: Option<&str>,
     anchor: Option<&'a str>,
 ) -> Result<loom_lanes::LaneTicketPlacement<'a>, LoomError> {
-    loom_lanes::LaneTicketPlacement::parse(placement.unwrap_or("append"), anchor)
+    loom_lanes::LaneTicketPlacement::parse(placement.unwrap_or("LAST"), anchor)
 }
 
 fn board_columns(columns: Vec<PBoardColumn>) -> Result<Vec<BoardColumn>, LoomError> {
@@ -609,6 +609,9 @@ fn run_mcp_store_maintenance_once(
             last_shrink_skip_reason: tail_compaction
                 .skipped
                 .then(|| "tail_compaction_skipped".to_string()),
+            last_progress_steps: 0,
+            last_yield_count: 0,
+            last_overrun_count: 0,
         })?;
     Ok(outcome)
 }
@@ -2082,6 +2085,18 @@ pub fn execute_promoted_tool(
                 );
             }
             promoted_result_bytes(mcp.write_substrate_transact(ops)?)
+        }
+        "document_replace_text" => {
+            let a: params::PDocReplaceText = promoted_args(args_json)?;
+            promoted_result_bytes(mcp.write_document_replace_text(DocumentReplaceTextRequest {
+                workspace: &a.workspace,
+                name: &a.collection,
+                id: &a.id,
+                base_digest: &a.base_digest,
+                find: &a.find,
+                replace: &a.replace,
+                replace_all: a.replace_all,
+            })?)
         }
         "tickets_project_create" => {
             let a: params::PTicketsProjectCreate = promoted_args(args_json)?;
@@ -9673,7 +9688,7 @@ impl LoomServer {
                 LaneTicketUpdateRequest {
                     lane_id: &a.lane_id,
                     ticket_id: &a.ticket_id,
-                    placement: loom_lanes::LaneTicketPlacement::Append,
+                    placement: loom_lanes::LaneTicketPlacement::Last,
                     updated_by: a.updated_by.as_deref(),
                 },
             )
@@ -16673,11 +16688,14 @@ impl ServerHandler for LoomServer {
         } else {
             None
         };
-        // `ask_answers` falls through to its own remote-aware async handler (its bounded wait runs
-        // client-side). `substrate_transact` fills bound workspace/collection defaults into explicit
-        // per-op fields before server-side execution. Every other tool is routed by the catalog.
+        // `ask_answers` falls through to its own remote-aware async handler. App launchers are dynamic
+        // tools outside TOOL_SURFACE, so they execute beside the served store. Every catalog tool is
+        // routed by its execution target.
         if self.mcp.store().remote_backend().is_some() {
             let name = request.name.as_ref();
+            if name == APP_OPEN_TOOL || name.starts_with(APP_LAUNCH_PREFIX) {
+                return self.execute_tool_server_side(name, request.arguments.clone());
+            }
             if name == "substrate_transact" {
                 return self.execute_tool_server_side(
                     name,

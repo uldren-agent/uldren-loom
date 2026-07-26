@@ -4349,6 +4349,18 @@ mod tests {
                 None,
             ))
         }
+
+        fn open_workflow_planning_snapshot(
+            &self,
+            owner: Option<&str>,
+        ) -> Result<OverlayReadSnapshot> {
+            let _ = owner;
+            Ok(OverlayReadSnapshot::new(
+                self.overlay.lock().unwrap().snapshot(),
+                None,
+                None,
+            ))
+        }
     }
 
     #[derive(Debug)]

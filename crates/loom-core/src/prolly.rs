@@ -666,6 +666,31 @@ pub struct ProllyReach {
     pub leaf_values: Vec<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProllyReachCursor {
+    pub stack: Vec<(Digest, usize)>,
+}
+
+impl ProllyReachCursor {
+    pub fn new(root: Digest) -> Self {
+        Self {
+            stack: vec![(root, 0)],
+        }
+    }
+
+    pub fn completed(&self) -> bool {
+        self.stack.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProllyReachStep {
+    pub nodes: Vec<Digest>,
+    pub leaf_values: Vec<Vec<u8>>,
+    pub visited: usize,
+    pub completed: bool,
+}
+
 /// Walk the tree rooted at `root`, collecting node digests and leaf values, pruning any subtree whose
 /// node digest is already in `have` (a held content-addressed node implies its whole subtree is held).
 /// Pass an empty `have` to retain everything. Bounded by `MAX_DEPTH`.
@@ -674,33 +699,72 @@ pub fn reachable_with_leaves<S: ObjectStore>(
     root: &Digest,
     have: &BTreeSet<Digest>,
 ) -> Result<ProllyReach> {
+    reachable_with_leaves_until(store, root, have, None)
+}
+
+pub fn reachable_with_leaves_until<S: ObjectStore>(
+    store: &S,
+    root: &Digest,
+    have: &BTreeSet<Digest>,
+    deadline: Option<std::time::Instant>,
+) -> Result<ProllyReach> {
+    let mut cursor = ProllyReachCursor::new(*root);
     let mut out = ProllyReach {
         nodes: Vec::new(),
         leaf_values: Vec::new(),
     };
-    let mut stack = vec![(*root, 0usize)];
-    while let Some((d, depth)) = stack.pop() {
+    while !cursor.completed() {
+        let step = step_reachable_with_leaves(store, &mut cursor, have, usize::MAX, deadline)?;
+        out.nodes.extend(step.nodes);
+        out.leaf_values.extend(step.leaf_values);
+    }
+    Ok(out)
+}
+
+pub fn step_reachable_with_leaves<S: ObjectStore>(
+    store: &S,
+    cursor: &mut ProllyReachCursor,
+    have: &BTreeSet<Digest>,
+    budget: usize,
+    deadline: Option<std::time::Instant>,
+) -> Result<ProllyReachStep> {
+    let mut nodes = Vec::new();
+    let mut leaf_values = Vec::new();
+    let mut visited = 0usize;
+    while visited < budget {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            break;
+        }
+        let Some((d, depth)) = cursor.stack.pop() else {
+            break;
+        };
         if depth > MAX_DEPTH {
             return Err(LoomError::corrupt("prolly tree too deep"));
         }
         if have.contains(&d) {
-            continue; // peer already holds this node and everything below it
+            continue;
         }
-        out.nodes.push(d);
+        nodes.push(d);
+        visited += 1;
         match read_node(store, &d)? {
             Node::Leaf(entries) => {
                 for (_, v) in entries {
-                    out.leaf_values.push(v);
+                    leaf_values.push(v);
                 }
             }
             Node::Internal(children) => {
-                for (_, child) in children {
-                    stack.push((child, depth + 1));
+                for (_, child) in children.into_iter().rev() {
+                    cursor.stack.push((child, depth + 1));
                 }
             }
         }
     }
-    Ok(out)
+    Ok(ProllyReachStep {
+        nodes,
+        leaf_values,
+        visited,
+        completed: cursor.completed(),
+    })
 }
 
 /// Every node digest reachable from `root` (diff/sharing measurements and the GC walk). A thin

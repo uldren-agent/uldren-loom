@@ -2076,6 +2076,8 @@ pub trait Lanes {
         workspace: String,
         lane_id: String,
         ticket_id: String,
+        placement: Option<String>,
+        anchor: Option<String>,
         updated_by: String,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
     /// Generated binding for `Lanes.ticket_remove`.
@@ -2105,6 +2107,21 @@ pub trait Lanes {
         lane_id: String,
         updated_by: String,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `Lanes.closeout`.
+    fn closeout(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        lane_id: String,
+        ticket_workspace_id: String,
+        ticket_id: String,
+        comment_type: String,
+        comment_body: String,
+        evidence_json: Option<String>,
+        status_report: String,
+        updated_by: String,
+        expected_root: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
     /// Generated binding for `Lanes.get_view_json`.
     fn get_view_json(
         &self,
@@ -2121,6 +2138,15 @@ pub trait Lanes {
         workspace: String,
         ticket_workspace_id: String,
         detailed: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Lanes.cleanup_json`.
+    fn cleanup_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        lane_id: Option<String>,
+        apply: bool,
+        updated_by: String,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
 }
 
@@ -3102,6 +3128,13 @@ pub trait Tickets {
         key_prefix: String,
         expected_root: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Tickets.tickets_projects_json`.
+    fn tickets_projects_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        ticket_workspace_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Tickets.tickets_project_settings_get_json`.
     fn tickets_project_settings_get_json(
         &self,
@@ -3109,6 +3142,7 @@ pub trait Tickets {
         workspace: String,
         ticket_workspace_id: String,
         project_id: String,
+        include_contracts: bool,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Tickets.tickets_project_settings_set_json`.
     fn tickets_project_settings_set_json(
@@ -3117,14 +3151,7 @@ pub trait Tickets {
         workspace: String,
         ticket_workspace_id: String,
         project_id: String,
-        default_projection: Option<String>,
-        enable_projections_json: String,
-        disable_projections_json: String,
-        actor_enforcement: Option<String>,
-        project_owner_principal: Option<String>,
-        clear_project_owner_principal: bool,
-        acceptance_authorities_json: Option<String>,
-        expected_root: Option<String>,
+        patch: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Tickets.tickets_fields_json`.
     fn tickets_fields_json(
@@ -3199,6 +3226,7 @@ pub trait Tickets {
         comment_id: Option<String>,
         comment_type: Option<String>,
         comment_body: Option<String>,
+        comment_evidence_json: Option<String>,
         expected_root: Option<String>,
         comments_json: Option<String>,
         relation_sets_json: Option<String>,
@@ -3231,6 +3259,7 @@ pub trait Tickets {
         comment_id: Option<String>,
         comment_type: Option<String>,
         body: String,
+        evidence_json: Option<String>,
         expected_root: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Tickets.tickets_comment_update_json`.
@@ -3243,6 +3272,7 @@ pub trait Tickets {
         comment_id: String,
         comment_type: Option<String>,
         body: Option<String>,
+        evidence_json: Option<String>,
         expected_root: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Tickets.tickets_comment_delete_json`.
@@ -3334,6 +3364,7 @@ pub trait Tickets {
         workspace: String,
         ticket_workspace_id: String,
         board_id: String,
+        updated_by: String,
         expected_root: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Tickets.boards_configure_columns_json`.

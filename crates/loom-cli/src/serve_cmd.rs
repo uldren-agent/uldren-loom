@@ -512,23 +512,18 @@ fn serve_remote_options(args: &ServeRemoteArgs) -> Result<RemoteServeOptions, St
 }
 
 /// Run MCP tools server-side, beside the served store, through the shared `LoomMcp` domain seam. The
-/// hosted `RemoteRuntime` calls this for an `Mcp.call_tool` request. The server-promoted families and the
-/// single-shot `ask_answers` poll (whose bounded wait is driven client-side) execute here; every other
-/// tool rejects. Opens the served store per request (the runtime serializes the call under its write
-/// authority).
+/// hosted `RemoteRuntime` calls this for an `Mcp.call_tool` request.
 #[cfg(all(feature = "serve", feature = "mcp"))]
 struct ServedMcpExecutor {
-    mcp: uldren_loom_mcp::LoomMcp,
+    store: String,
 }
 
 #[cfg(all(feature = "serve", feature = "mcp"))]
 impl ServedMcpExecutor {
-    fn new(store: &str) -> Self {
-        Self {
-            mcp: uldren_loom_mcp::LoomMcp::new(uldren_loom_mcp::StoreAccess::per_request(
-                store, None,
-            )),
-        }
+    fn new(store: &str) -> Result<Self, String> {
+        Ok(Self {
+            store: store.to_string(),
+        })
     }
 }
 
@@ -536,11 +531,28 @@ impl ServedMcpExecutor {
 impl loom_hosted_core::remote::McpToolExecutor for ServedMcpExecutor {
     fn call_tool(
         &self,
-        _ctx: &loom_hosted_core::remote::McpToolContext,
+        ctx: &loom_hosted_core::remote::McpToolContext,
         name: &str,
         args: &[u8],
     ) -> Result<Vec<u8>, loom_types::LoomError> {
-        uldren_loom_mcp::server::execute_promoted_tool(&self.mcp, name, args)
+        let principal = ctx
+            .session_principal
+            .as_deref()
+            .map(loom_core::WorkspaceId::parse)
+            .transpose()?;
+        let access = uldren_loom_mcp::StoreAccess::per_request_auth(
+            &self.store,
+            loom_store::LocalOpenAuth {
+                preauthenticated_principal: principal,
+                session_id: ctx
+                    .session_principal
+                    .as_ref()
+                    .map(|principal| format!("remote-mcp:{principal}")),
+                ..Default::default()
+            },
+        );
+        let mcp = uldren_loom_mcp::LoomMcp::new(access);
+        uldren_loom_mcp::server::execute_promoted_tool(&mcp, name, args)
     }
 }
 
@@ -563,10 +575,10 @@ pub(crate) async fn bind_remote_endpoint(
     #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
     let mut runtime =
         RemoteRuntime::start(store, options.to_config()).map_err(|e| e.to_string())?;
-    // Install the server-side MCP tool executor so promoted families run beside the served store.
-    // Without the `mcp` feature the executor is absent and promoted tools reject.
+    // Install the server-side MCP tool executor so manifest-routed families run beside the served store.
+    // Without the `mcp` feature the executor is absent and manifest-routed tools reject.
     #[cfg(feature = "mcp")]
-    runtime.set_mcp_executor(std::sync::Arc::new(ServedMcpExecutor::new(store)));
+    runtime.set_mcp_executor(std::sync::Arc::new(ServedMcpExecutor::new(store)?));
     let service = std::sync::Arc::new(RemoteHttpService::new(
         std::sync::Arc::new(runtime),
         options.call_path(),
@@ -1774,5 +1786,319 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&key_path);
+    }
+}
+
+#[cfg(all(test, feature = "serve", feature = "mcp"))]
+mod mcp_executor_tests {
+    use super::*;
+    use loom_codec::Value;
+    use loom_core::identity::{IdentityStore, PrincipalKind};
+    use loom_core::workspace::{FacetKind, WorkspaceId};
+    use loom_core::{AclRight, AclStore, AclSubject, Algo, Digest, Loom};
+    use loom_hosted_core::remote::{
+        McpToolContext, McpToolExecutor, RemoteAuth, RemoteAuthMode, RemoteRuntime,
+        RemoteServeOptions, RemoteTlsTrust,
+    };
+    use loom_remote_protocol::envelope::{Compression, Request, ResponsePayload};
+    use loom_store::{FileStore, save_loom};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_store(tag: &str) -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "loomcli-mcp-{tag}-{}-{seq}.loom",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().into_owned()
+    }
+
+    fn remote_config() -> loom_hosted_core::remote::RemoteServerConfig {
+        RemoteServeOptions::from_cli(
+            "127.0.0.1:0".to_string(),
+            "https://localhost/apps/loom".to_string(),
+            None,
+            vec![RemoteAuthMode::Interactive],
+            vec![RemoteTlsTrust::InsecureDev],
+            60_000,
+            1 << 20,
+            None,
+        )
+        .to_config()
+    }
+
+    fn request(session: &[u8], interface: &str, method: &str, args: Vec<Value>) -> Request {
+        Request {
+            request_id: vec![1],
+            session_id: Some(session.to_vec()),
+            interface: interface.to_string(),
+            method: method.to_string(),
+            args,
+            deadline_ms: 0,
+            idempotency_key: None,
+            principal_hint: None,
+            compression: Compression::None,
+            stream: false,
+        }
+    }
+
+    fn mcp_request(session: &[u8], name: &str, args: serde_json::Value) -> Request {
+        request(
+            session,
+            "Mcp",
+            "call_tool",
+            vec![
+                Value::Text(name.to_string()),
+                Value::Bytes(serde_json::to_vec(&args).expect("json args")),
+            ],
+        )
+    }
+
+    fn seed_app_acl_store(path: &str) -> (WorkspaceId, WorkspaceId) {
+        let root = WorkspaceId::v4_from_bytes([0x21; 16]);
+        let denied = WorkspaceId::v4_from_bytes([0x22; 16]);
+        let workspace = WorkspaceId::v4_from_bytes([0x23; 16]);
+        let store = FileStore::create_with_profile(path, Algo::Blake3).expect("create store");
+        let mut loom = Loom::new(store);
+        loom.registry_mut()
+            .create(FacetKind::Files, Some("repo"), workspace)
+            .expect("workspace");
+        let mut identity = IdentityStore::new(root);
+        identity
+            .add_principal(denied, "denied", PrincipalKind::User)
+            .expect("denied principal");
+        loom.store()
+            .save_identity_store(&identity)
+            .expect("save identity");
+        let mut acl = AclStore::new();
+        acl.allow(
+            AclSubject::Principal(root),
+            Some(workspace),
+            Some(FacetKind::Files),
+            [AclRight::Read, AclRight::Write],
+        )
+        .expect("allow root");
+        loom.store().save_acl_store(&acl).expect("save acl");
+        save_loom(&mut loom).expect("save store");
+        (root, denied)
+    }
+
+    fn executor_call(
+        executor: &ServedMcpExecutor,
+        principal: WorkspaceId,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<Vec<u8>, loom_types::LoomError> {
+        let ctx = McpToolContext {
+            session_principal: Some(principal.to_string()),
+            idempotency_key: None,
+            deadline_ms: None,
+        };
+        McpToolExecutor::call_tool(
+            executor,
+            &ctx,
+            name,
+            &serde_json::to_vec(&args).expect("json args"),
+        )
+    }
+
+    #[test]
+    fn served_mcp_executor_binds_principal_for_server_executed_read_and_write() {
+        let store = temp_store("principal-pep");
+        let (allowed, denied) = seed_app_acl_store(&store);
+        let executor = ServedMcpExecutor::new(&store).expect("executor");
+
+        executor_call(
+            &executor,
+            allowed,
+            "apps_create",
+            serde_json::json!({
+                "workspace": "repo",
+                "app": "panel",
+                "index_html": b"<!doctype html><html><body>allowed</body></html>".to_vec(),
+                "meta_md": b"---\nname: Panel\n---\n".to_vec()
+            }),
+        )
+        .expect("allowed server-executed write");
+
+        let denied_write = executor_call(
+            &executor,
+            denied,
+            "apps_write_file",
+            serde_json::json!({
+                "workspace": "repo",
+                "app": "panel",
+                "path": "assets/data.json",
+                "content": b"{\"mutated\":true}".to_vec(),
+                "mode": 0o100644
+            }),
+        )
+        .expect_err("denied server-executed write");
+        assert_eq!(denied_write.code, loom_types::Code::PermissionDenied);
+
+        let denied_read = executor_call(
+            &executor,
+            denied,
+            "apps_read_file",
+            serde_json::json!({
+                "workspace": "repo",
+                "app": "panel",
+                "path": "index.html"
+            }),
+        )
+        .expect_err("denied server-executed read");
+        assert_eq!(denied_read.code, loom_types::Code::PermissionDenied);
+
+        let read = executor_call(
+            &executor,
+            allowed,
+            "apps_read_file",
+            serde_json::json!({
+                "workspace": "repo",
+                "app": "panel",
+                "path": "index.html"
+            }),
+        )
+        .expect("allowed server-executed read");
+        let value: serde_json::Value = serde_json::from_slice(&read).expect("json result");
+        assert_eq!(
+            value["value"],
+            serde_json::json!(b"<!doctype html><html><body>allowed</body></html>".to_vec())
+        );
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn remote_runtime_alternates_generated_and_server_executed_document_paths() {
+        let store = temp_store("alternating-coherence");
+        FileStore::create_with_profile(&store, Algo::Blake3).expect("create store");
+        let mut runtime = RemoteRuntime::start(&store, remote_config()).expect("start runtime");
+        runtime.set_mcp_executor(std::sync::Arc::new(
+            ServedMcpExecutor::new(&store).expect("executor"),
+        ));
+        let conn = runtime.register_connection("peer");
+        let session = runtime
+            .open_session(conn, RemoteAuth::Unauthenticated)
+            .expect("session");
+
+        let first = b"one alpha".to_vec();
+        let first_digest = Digest::hash(Algo::Blake3, &first).to_string();
+        match runtime
+            .dispatch(&request(
+                &session.id,
+                "Document",
+                "put_binary",
+                vec![
+                    Value::Null,
+                    Value::Text("repo".to_string()),
+                    Value::Text("notes".to_string()),
+                    Value::Text("doc".to_string()),
+                    Value::Bytes(first),
+                    Value::Null,
+                ],
+            ))
+            .payload
+        {
+            ResponsePayload::Ok(Value::Bytes(_)) => {}
+            other => panic!("generated document put failed: {other:?}"),
+        }
+
+        match runtime
+            .dispatch(&mcp_request(
+                &session.id,
+                "document_replace_text",
+                serde_json::json!({
+                    "workspace": "repo",
+                    "collection": "notes",
+                    "id": "doc",
+                    "base_digest": first_digest,
+                    "find": "one",
+                    "replace": "two",
+                    "replace_all": false
+                }),
+            ))
+            .payload
+        {
+            ResponsePayload::Ok(Value::Bytes(bytes)) => {
+                let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json result");
+                assert_eq!(value["value"]["replacements"], serde_json::json!(1));
+            }
+            other => panic!("server-executed replace failed: {other:?}"),
+        }
+
+        match runtime
+            .dispatch(&request(
+                &session.id,
+                "Document",
+                "get_binary",
+                vec![
+                    Value::Null,
+                    Value::Text("repo".to_string()),
+                    Value::Text("notes".to_string()),
+                    Value::Text("doc".to_string()),
+                ],
+            ))
+            .payload
+        {
+            ResponsePayload::Ok(Value::Bytes(bytes)) => {
+                let decoded = loom_codec::decode(&bytes).expect("document cbor");
+                let Value::Array(items) = decoded else {
+                    panic!("document result shape: {decoded:?}");
+                };
+                assert_eq!(items.first(), Some(&Value::Bytes(b"two alpha".to_vec())));
+            }
+            other => panic!("generated document get failed: {other:?}"),
+        }
+
+        let second_base_digest = Digest::hash(Algo::Blake3, b"two alpha").to_string();
+        match runtime
+            .dispatch(&mcp_request(
+                &session.id,
+                "document_replace_text",
+                serde_json::json!({
+                    "workspace": "repo",
+                    "collection": "notes",
+                    "id": "doc",
+                    "base_digest": second_base_digest,
+                    "find": "two alpha",
+                    "replace": "three beta",
+                    "replace_all": false
+                }),
+            ))
+            .payload
+        {
+            ResponsePayload::Ok(Value::Bytes(_)) => {}
+            other => panic!("server-executed document write failed: {other:?}"),
+        }
+
+        match runtime
+            .dispatch(&request(
+                &session.id,
+                "Document",
+                "get_binary",
+                vec![
+                    Value::Null,
+                    Value::Text("repo".to_string()),
+                    Value::Text("notes".to_string()),
+                    Value::Text("doc".to_string()),
+                ],
+            ))
+            .payload
+        {
+            ResponsePayload::Ok(Value::Bytes(bytes)) => {
+                let decoded = loom_codec::decode(&bytes).expect("document cbor");
+                let Value::Array(items) = decoded else {
+                    panic!("document result shape: {decoded:?}");
+                };
+                assert_eq!(items.first(), Some(&Value::Bytes(b"three beta".to_vec())));
+            }
+            other => panic!("generated document get after server write failed: {other:?}"),
+        }
+
+        runtime.shutdown();
+        let _ = std::fs::remove_file(&store);
     }
 }

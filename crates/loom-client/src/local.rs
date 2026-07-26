@@ -63,7 +63,7 @@ use loom_store::{
 use loom_types::{Code, LoomError};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
@@ -78,6 +78,22 @@ fn update_lane_metadata(lane: &mut Lane, updated_by: &str) {
     lane.updated_by = updated_by.to_string();
 }
 
+const DERIVE_LANE_ACTOR: &str = "system:derive-lane-actor";
+
+fn lane_actor_for_update(
+    loom: &Loom<FileStore>,
+    workspace_id: WorkspaceId,
+    updated_by: &str,
+) -> Result<String, LoomError> {
+    if !updated_by.trim().is_empty() && updated_by != DERIVE_LANE_ACTOR {
+        return Ok(updated_by.to_string());
+    }
+    Ok(loom
+        .effective_principal()?
+        .map(|principal| principal.to_string())
+        .unwrap_or_else(|| workspace_id.to_string()))
+}
+
 pub struct LaneUpdateInput<'a> {
     pub lane_id: &'a str,
     pub title: Option<&'a str>,
@@ -86,6 +102,27 @@ pub struct LaneUpdateInput<'a> {
     pub status_report: Option<&'a str>,
     pub reviewer_feedback: Option<&'a str>,
     pub updated_by: &'a str,
+}
+
+pub struct LaneCloseoutInput<'a> {
+    pub lane_id: &'a str,
+    pub ticket_workspace_id: &'a str,
+    pub ticket_id: &'a str,
+    pub comment_type: &'a str,
+    pub comment_body: &'a str,
+    pub evidence: Option<loom_tickets::TicketCommentEvidence>,
+    pub status_report: &'a str,
+    pub updated_by: &'a str,
+    pub expected_root: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LaneCleanupReport {
+    pub lane_id: String,
+    pub would_remove: Vec<String>,
+    pub removed: Vec<String>,
+    pub remaining_count: usize,
+    pub status_counts: loom_lanes::LaneStatusCounts,
 }
 
 pub fn build_lane_view(
@@ -173,6 +210,38 @@ fn closeout_comment_matches(event: &str, comment_type: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn cleanup_target_lanes(
+    loom: &Loom<FileStore>,
+    ns: WorkspaceId,
+    lane_id: Option<&str>,
+) -> Result<Vec<Lane>, LoomError> {
+    match lane_id {
+        Some(lane_id) => {
+            let lane = loom_lanes::get_lane(loom, ns, lane_id)?
+                .ok_or_else(|| LoomError::new(Code::NotFound, "lane not found"))?;
+            Ok(vec![lane])
+        }
+        None => Ok(loom_lanes::list_lanes(loom, ns)?
+            .into_iter()
+            .filter(|lane| lane.lane_kind == loom_lanes::LaneKind::Assignment.as_str())
+            .collect()),
+    }
+}
+
+fn cleanup_remaining_summary(
+    view: &loom_lanes::LaneView,
+    terminal_ids: &[String],
+) -> (usize, loom_lanes::LaneStatusCounts) {
+    let remaining = view
+        .lane_tickets
+        .iter()
+        .filter(|ticket| !terminal_ids.iter().any(|id| id == &ticket.ticket_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let counts = loom_lanes::lane_status_counts(&remaining);
+    (remaining.len(), counts)
 }
 
 fn ticket_text_field(ticket: &loom_tickets::TicketSummary, field: &str) -> Option<String> {
@@ -471,7 +540,7 @@ enum TaskState {
 /// A local Loom client bound to one `.loom` path.
 pub struct LocalLoomClient {
     path: PathBuf,
-    sessions: Mutex<HashMap<u64, Loom<FileStore>>>,
+    sessions: Mutex<HashMap<u64, LocalSessionSlot>>,
     sql_sessions: Mutex<HashMap<u64, SqlSessionState>>,
     sql_batches: Mutex<HashMap<u64, SqlBatchState>>,
     row_iters: Mutex<HashMap<u64, VecDeque<Vec<u8>>>>,
@@ -481,6 +550,22 @@ pub struct LocalLoomClient {
     coordinator: Mutex<LockCoordinator>,
     last_error: Mutex<Option<LoomError>>,
     transfers: Mutex<HashMap<Vec<u8>, TransferEntry>>,
+}
+
+#[derive(Clone)]
+struct LocalSessionSlot {
+    loom: Arc<Mutex<Loom<FileStore>>>,
+    auth_view: LocalSessionAuthView,
+}
+
+#[derive(Clone)]
+enum LocalSessionAuthView {
+    Preserve,
+    Clear,
+    Authenticated {
+        principal: PrincipalId,
+        session_id: String,
+    },
 }
 
 /// One in-flight byte-transfer import staging area (`specs/0067` §17.3), keyed by its opaque
@@ -649,7 +734,43 @@ impl LocalLoomClient {
             *next += 1;
             *next
         };
-        self.sessions.lock().expect("session lock").insert(id, loom);
+        self.sessions.lock().expect("session lock").insert(
+            id,
+            LocalSessionSlot {
+                loom: Arc::new(Mutex::new(loom)),
+                auth_view: LocalSessionAuthView::Preserve,
+            },
+        );
+        Ok(LoomSession(HandleId {
+            kind: "session".to_string(),
+            id: id.to_be_bytes().to_vec(),
+            generation: 1,
+            owner_session: Vec::new(),
+        }))
+    }
+
+    /// Register an existing daemon-owned engine slot as a client session handle.
+    pub fn register_daemon_shared_loom(
+        &self,
+        loom: Arc<Mutex<Loom<FileStore>>>,
+        auth_session: Option<(PrincipalId, String)>,
+    ) -> Result<LoomSession, LoomError> {
+        let id = {
+            let mut next = self.next_id.lock().expect("session id lock");
+            *next += 1;
+            *next
+        };
+        let auth_view = match auth_session {
+            Some((principal, session_id)) => LocalSessionAuthView::Authenticated {
+                principal,
+                session_id,
+            },
+            None => LocalSessionAuthView::Clear,
+        };
+        self.sessions
+            .lock()
+            .expect("session lock")
+            .insert(id, LocalSessionSlot { loom, auth_view });
         Ok(LoomSession(HandleId {
             kind: "session".to_string(),
             id: id.to_be_bytes().to_vec(),
@@ -690,14 +811,34 @@ impl LocalLoomClient {
         f: impl FnOnce(&mut Loom<FileStore>) -> Result<T, LoomError>,
     ) -> Result<T, LoomError> {
         let key = handle_key(session)?;
-        let mut sessions = self.sessions.lock().expect("session lock");
-        let loom = sessions
-            .get_mut(&key)
+        let slot = self
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(&key)
+            .cloned()
             .ok_or_else(|| LoomError::new(Code::NotFound, "unknown session handle"))?;
+        let mut loom = slot
+            .loom
+            .lock()
+            .map_err(|_| LoomError::new(Code::Internal, "session lock poisoned"))?;
         if materialize {
             loom.ensure_full_state_loaded()?;
         }
-        f(loom)
+        match &slot.auth_view {
+            LocalSessionAuthView::Preserve => {}
+            LocalSessionAuthView::Clear => loom.clear_session(),
+            LocalSessionAuthView::Authenticated {
+                principal,
+                session_id,
+            } => {
+                if let Some(identity) = loom.identity_store_mut() {
+                    identity.bind_session(*principal, session_id.clone())?;
+                }
+                loom.set_session(session_id.clone());
+            }
+        }
+        f(&mut loom)
     }
 
     /// Persist the working state of `session` (the save boundary).
@@ -1481,13 +1622,14 @@ impl LocalLoomClient {
         &self,
         session: &LoomSession,
         workspace: &str,
-        lane: Lane,
+        mut lane: Lane,
     ) -> Result<Lane, LoomError> {
         self.with_session(session, |loom| {
             let ns = loom.registry_mut().ensure_for_write(
                 &ns_selector(workspace, FacetKind::Document),
                 mint_workspace_id()?,
             )?;
+            lane.updated_by = lane_actor_for_update(loom, ns, &lane.updated_by)?;
             let lane = loom_lanes::create_lane(loom, ns, lane)?;
             save_loom(loom)?;
             Ok(lane)
@@ -1596,7 +1738,8 @@ impl LocalLoomClient {
             if let Some(reviewer_feedback) = input.reviewer_feedback {
                 lane.reviewer_feedback = reviewer_feedback.to_string();
             }
-            update_lane_metadata(&mut lane, input.updated_by);
+            let actor = lane_actor_for_update(loom, ns, input.updated_by)?;
+            update_lane_metadata(&mut lane, &actor);
             loom_lanes::put_lane_current_record(loom, ns, &lane, Some(&prior_lane))?;
             Ok(lane)
         })
@@ -1608,11 +1751,13 @@ impl LocalLoomClient {
         workspace: &str,
         lane_id: &str,
         ticket_id: &str,
+        placement: loom_lanes::LaneTicketPlacement<'_>,
         updated_by: &str,
     ) -> Result<Lane, LoomError> {
-        self.lanes_mutate(session, workspace, lane_id, |lane| {
-            loom_lanes::append_lane_ticket(lane, ticket_id)?;
-            update_lane_metadata(lane, updated_by);
+        self.lanes_mutate(session, workspace, lane_id, |lane, loom, ns| {
+            loom_lanes::place_lane_ticket(lane, ticket_id, placement)?;
+            let actor = lane_actor_for_update(loom, ns, updated_by)?;
+            update_lane_metadata(lane, &actor);
             Ok(())
         })
     }
@@ -1625,13 +1770,14 @@ impl LocalLoomClient {
         ticket_id: &str,
         updated_by: &str,
     ) -> Result<Lane, LoomError> {
-        self.lanes_mutate(session, workspace, lane_id, |lane| {
+        self.lanes_mutate(session, workspace, lane_id, |lane, loom, ns| {
             lane.lane_tickets
                 .retain(|lane_ticket| lane_ticket.ticket_id != ticket_id);
             if lane.active_ticket_id.as_deref() == Some(ticket_id) {
                 lane.active_ticket_id = None;
             }
-            update_lane_metadata(lane, updated_by);
+            let actor = lane_actor_for_update(loom, ns, updated_by)?;
+            update_lane_metadata(lane, &actor);
             Ok(())
         })
     }
@@ -1650,6 +1796,7 @@ impl LocalLoomClient {
                 &ns_selector(workspace, FacetKind::Document),
                 mint_workspace_id()?,
             )?;
+            let actor = lane_actor_for_update(loom, ns, updated_by)?;
             let (_, target) = loom_lanes::transfer_assignment_lane_ticket(
                 loom,
                 ns,
@@ -1657,11 +1804,104 @@ impl LocalLoomClient {
                 target_lane_id,
                 ticket_id,
                 now_ms(),
-                updated_by,
+                &actor,
             )?;
             save_loom(loom)?;
             Ok(target)
         })
+    }
+
+    pub fn lanes_closeout(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        input: LaneCloseoutInput<'_>,
+    ) -> Result<Lane, LoomError> {
+        if input.comment_body.trim().is_empty() {
+            return Err(LoomError::invalid(
+                "lane closeout requires a non-empty ticket comment body",
+            ));
+        }
+        self.lanes_mutate(session, workspace, input.lane_id, |lane, loom, ns| {
+            loom_tickets::add_ticket_comment(
+                loom,
+                ns,
+                loom_tickets::TicketCommentRequest {
+                    workspace_id: input.ticket_workspace_id,
+                    ticket_id: input.ticket_id,
+                    comment_id: None,
+                    comment_type: Some(input.comment_type),
+                    body: input.comment_body,
+                    evidence: input.evidence,
+                    expected_root: input.expected_root,
+                },
+            )?;
+            lane.status_report = input.status_report.to_string();
+            let actor = lane_actor_for_update(loom, ns, input.updated_by)?;
+            update_lane_metadata(lane, &actor);
+            Ok(())
+        })
+    }
+
+    pub fn lanes_cleanup(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        lane_id: Option<&str>,
+        apply: bool,
+        updated_by: &str,
+    ) -> Result<Vec<LaneCleanupReport>, LoomError> {
+        if apply {
+            self.with_session(session, |loom| {
+                let ns = loom.registry_mut().ensure_for_write(
+                    &ns_selector(workspace, FacetKind::Document),
+                    mint_workspace_id()?,
+                )?;
+                let mut reports = Vec::new();
+                for mut lane in cleanup_target_lanes(loom, ns, lane_id)? {
+                    let view = build_lane_view(loom, ns, &ns.to_string(), &lane);
+                    let terminal_ids = loom_lanes::terminal_lane_ticket_ids(&view.lane_tickets);
+                    let (remaining_count, status_counts) =
+                        cleanup_remaining_summary(&view, &terminal_ids);
+                    let removed = loom_lanes::remove_lane_tickets(&mut lane, &terminal_ids);
+                    if !removed.is_empty() {
+                        let actor = lane_actor_for_update(loom, ns, updated_by)?;
+                        update_lane_metadata(&mut lane, &actor);
+                        loom_lanes::put_lane(loom, ns, lane)?;
+                    }
+                    reports.push(LaneCleanupReport {
+                        lane_id: view.lane_id,
+                        would_remove: Vec::new(),
+                        removed,
+                        remaining_count,
+                        status_counts,
+                    });
+                }
+                save_loom(loom)?;
+                Ok(reports)
+            })
+        } else {
+            self.with_session(session, |loom| {
+                let Some(ns) = read_ns(loom, workspace, FacetKind::Document)? else {
+                    return Ok(Vec::new());
+                };
+                let mut reports = Vec::new();
+                for lane in cleanup_target_lanes(loom, ns, lane_id)? {
+                    let view = build_lane_view(loom, ns, &ns.to_string(), &lane);
+                    let terminal_ids = loom_lanes::terminal_lane_ticket_ids(&view.lane_tickets);
+                    let (remaining_count, status_counts) =
+                        cleanup_remaining_summary(&view, &terminal_ids);
+                    reports.push(LaneCleanupReport {
+                        lane_id: view.lane_id,
+                        would_remove: terminal_ids,
+                        removed: Vec::new(),
+                        remaining_count,
+                        status_counts,
+                    });
+                }
+                Ok(reports)
+            })
+        }
     }
 
     pub fn lanes_delete(
@@ -1676,7 +1916,8 @@ impl LocalLoomClient {
                 &ns_selector(workspace, FacetKind::Document),
                 mint_workspace_id()?,
             )?;
-            let lane = loom_lanes::delete_lane(loom, ns, lane_id, now_ms(), updated_by)?;
+            let actor = lane_actor_for_update(loom, ns, updated_by)?;
+            let lane = loom_lanes::delete_lane(loom, ns, lane_id, now_ms(), &actor)?;
             save_loom(loom)?;
             Ok(lane)
         })
@@ -1690,7 +1931,7 @@ impl LocalLoomClient {
         mutate: F,
     ) -> Result<Lane, LoomError>
     where
-        F: FnOnce(&mut Lane) -> Result<(), LoomError>,
+        F: FnOnce(&mut Lane, &mut Loom<FileStore>, WorkspaceId) -> Result<(), LoomError>,
     {
         self.with_session(session, |loom| {
             let ns = loom.registry_mut().ensure_for_write(
@@ -1699,7 +1940,7 @@ impl LocalLoomClient {
             )?;
             let mut lane = loom_lanes::get_lane(loom, ns, lane_id)?
                 .ok_or_else(|| LoomError::new(Code::NotFound, "lane not found"))?;
-            mutate(&mut lane)?;
+            mutate(&mut lane, loom, ns)?;
             let lane = loom_lanes::put_lane(loom, ns, lane)?;
             save_loom(loom)?;
             Ok(lane)

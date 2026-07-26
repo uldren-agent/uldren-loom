@@ -1,12 +1,14 @@
 use crate::maintenance_policy::{MAINTENANCE_POLICY_KEY, MAINTENANCE_RUN_KEY};
 use crate::{FileStore, corrupt};
 use loom_core::error::{Code, LoomError, Result};
-use loom_core::{Algo, Digest, Loom, ReachabilityMarkState, ReachabilityMarkStep};
+use loom_core::{
+    Algo, Digest, Loom, ReachabilityMarkState, ReachabilityMarkStep, ReachabilityProllyCursor,
+};
 use std::collections::{BTreeSet, VecDeque};
 
 const MARK_EPOCH_KEY: &[u8] = b"maintenance/v1/reachability-mark/active";
 const MARK_EPOCH_MAGIC: &[u8; 8] = b"LMARKEP1";
-const MARK_EPOCH_VERSION: u16 = 2;
+const MARK_EPOCH_VERSION: u16 = 3;
 const MAX_DIGEST_LIST: usize = 1_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,11 +189,19 @@ pub fn step_loom_reachability_mark_epoch(
     loom: &Loom<FileStore>,
     budget: usize,
 ) -> Result<ReachabilityMarkStep> {
+    step_loom_reachability_mark_epoch_until(loom, budget, None)
+}
+
+pub fn step_loom_reachability_mark_epoch_until(
+    loom: &Loom<FileStore>,
+    budget: usize,
+    deadline: Option<std::time::Instant>,
+) -> Result<ReachabilityMarkStep> {
     let store = loom.store();
     let mut epoch = store
         .active_reachability_mark_epoch()?
         .ok_or_else(|| LoomError::not_found("reachability mark epoch not found"))?;
-    let step = loom.step_live_object_mark(&mut epoch.state, budget)?;
+    let step = loom.step_live_object_mark_until(&mut epoch.state, budget, deadline)?;
     if step.completed {
         store.complete_reachability_mark_epoch(&epoch)?;
     } else {
@@ -214,6 +224,8 @@ fn encode_mark_epoch(epoch: &ReachabilityMarkEpoch) -> Vec<u8> {
     put_digest_set(&mut out, &epoch.state.marked);
     put_digest_queue(&mut out, &epoch.state.queue);
     put_digest_queue(&mut out, &epoch.state.stream_roots);
+    put_digest_queue(&mut out, &epoch.state.content_roots);
+    put_prolly_cursor_queue(&mut out, &epoch.state.prolly_cursors);
     out
 }
 
@@ -223,7 +235,7 @@ fn decode_mark_epoch(bytes: &[u8], algo: Algo) -> Result<ReachabilityMarkEpoch> 
         return Err(corrupt("reachability mark epoch magic"));
     }
     let version = cur.u16()?;
-    if version != 1 && version != MARK_EPOCH_VERSION {
+    if !(1..=MARK_EPOCH_VERSION).contains(&version) {
         return Err(corrupt("reachability mark epoch version"));
     }
     let epoch = cur.u64()?;
@@ -244,6 +256,16 @@ fn decode_mark_epoch(bytes: &[u8], algo: Algo) -> Result<ReachabilityMarkEpoch> 
     let marked = cur.digest_set(algo)?;
     let queue = cur.digest_queue(algo)?;
     let stream_roots = cur.digest_queue(algo)?;
+    let content_roots = if version >= 3 {
+        cur.digest_queue(algo)?
+    } else {
+        VecDeque::new()
+    };
+    let prolly_cursors = if version >= 3 {
+        cur.prolly_cursor_queue(algo)?
+    } else {
+        VecDeque::new()
+    };
     if cur.pos != bytes.len() {
         return Err(corrupt("reachability mark epoch trailing bytes"));
     }
@@ -258,6 +280,8 @@ fn decode_mark_epoch(bytes: &[u8], algo: Algo) -> Result<ReachabilityMarkEpoch> 
             marked,
             queue,
             stream_roots,
+            content_roots,
+            prolly_cursors,
             completed,
         },
     })
@@ -284,6 +308,18 @@ fn put_digest_queue(out: &mut Vec<u8>, digests: &VecDeque<Digest>) {
     out.extend_from_slice(&(digests.len() as u32).to_le_bytes());
     for digest in digests {
         out.extend_from_slice(digest.bytes());
+    }
+}
+
+fn put_prolly_cursor_queue(out: &mut Vec<u8>, queue: &VecDeque<ReachabilityProllyCursor>) {
+    out.extend_from_slice(&(queue.len() as u32).to_le_bytes());
+    for entry in queue {
+        out.push(u8::from(entry.collect_stream_payloads));
+        out.extend_from_slice(&(entry.cursor.stack.len() as u32).to_le_bytes());
+        for (digest, depth) in &entry.cursor.stack {
+            out.extend_from_slice(digest.bytes());
+            out.extend_from_slice(&(*depth as u32).to_le_bytes());
+        }
     }
 }
 
@@ -350,6 +386,29 @@ impl<'a> Cursor<'a> {
         let mut out = VecDeque::with_capacity(len);
         for _ in 0..len {
             out.push_back(self.digest(algo)?);
+        }
+        Ok(out)
+    }
+
+    fn prolly_cursor_queue(&mut self, algo: Algo) -> Result<VecDeque<ReachabilityProllyCursor>> {
+        let len = self.digest_len()?;
+        let mut out = VecDeque::with_capacity(len);
+        for _ in 0..len {
+            let collect_stream_payloads = match self.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(corrupt("reachability mark epoch prolly cursor kind")),
+            };
+            let stack_len = self.digest_len()?;
+            let mut stack = Vec::with_capacity(stack_len);
+            for _ in 0..stack_len {
+                let digest = self.digest(algo)?;
+                stack.push((digest, self.u32()? as usize));
+            }
+            out.push_back(ReachabilityProllyCursor {
+                cursor: loom_core::prolly::ProllyReachCursor { stack },
+                collect_stream_payloads,
+            });
         }
         Ok(out)
     }

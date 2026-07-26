@@ -1,6 +1,9 @@
 use loom_core::document::{document_get_text, document_put_text};
-use loom_core::{Algo, Code, FacetKind, OverlayKey};
-use loom_store::{FileStore, StoreDurabilityPolicy, StoreMaintenanceReport, open_loom, save_loom};
+use loom_core::{Algo, Code, FacetKind, ObjectStore, OverlayKey};
+use loom_store::{
+    FileStore, GcSegmentBudget, StoreDurabilityPolicy, StoreMaintenanceReport,
+    StoreMaintenanceRunState, open_loom, save_loom,
+};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -51,6 +54,10 @@ fn run() -> loom_core::Result<()> {
         .scenarios
         .push(vcs_promotion(&run_dir, iterations.min(12).max(4))?);
     report.scenarios.extend(durability_mode_scenarios(
+        &run_dir,
+        iterations.min(12).max(4),
+    )?);
+    report.scenarios.push(maintenance_latency_breakdown(
         &run_dir,
         iterations.min(12).max(4),
     )?);
@@ -310,6 +317,427 @@ fn vcs_promotion(run_dir: &Path, iterations: u64) -> loom_core::Result<ScenarioR
         read.text.len().to_string(),
     );
     Ok(report)
+}
+
+fn maintenance_latency_breakdown(
+    run_dir: &Path,
+    iterations: u64,
+) -> loom_core::Result<ScenarioReport> {
+    let path = run_dir.join("maintenance-breakdown.loom");
+    let mut loom = open_loom(&path)?;
+    let _workspace = loom.registry_mut().create(
+        FacetKind::Document,
+        Some("maintenance-breakdown-docs"),
+        loom_core::WorkspaceId::from_bytes([43; 16]),
+    )?;
+    save_loom(&mut loom)?;
+    drop(loom);
+    let maintenance_store = FileStore::open(&path)?;
+    let live = maintenance_store.put(b"maintenance-live")?;
+    drop(maintenance_store);
+    let loom = open_loom(&path)?;
+    let mut marked = loom.live_object_set(loom.store().reference_root())?;
+    drop(loom);
+    let maintenance_store = FileStore::open(&path)?;
+    marked.insert(live);
+    let state = loom_core::ReachabilityMarkState {
+        pinned: std::collections::BTreeSet::new(),
+        marked,
+        queue: std::collections::VecDeque::new(),
+        stream_roots: std::collections::VecDeque::new(),
+        content_roots: std::collections::VecDeque::new(),
+        prolly_cursors: std::collections::VecDeque::new(),
+        completed: true,
+    };
+    let epoch = maintenance_store.begin_reachability_mark_epoch(
+        maintenance_store.reference_root(),
+        std::collections::BTreeSet::new(),
+        state,
+    )?;
+    maintenance_store.complete_reachability_mark_epoch(&epoch)?;
+    for update in 0..iterations.saturating_mul(32) {
+        maintenance_store.put(format!("maintenance-dead-{update}").as_bytes())?;
+    }
+    let initial_report = maintenance_store.store_maintenance_report(now_ms())?;
+    drop(maintenance_store);
+
+    let mut open_latencies = Vec::new();
+    let mut operation_latencies = Vec::new();
+    let mut save_latencies = Vec::new();
+    let maintenance_start = Arc::new(Barrier::new(2));
+    let foreground_done = Arc::new(AtomicBool::new(false));
+    let maintenance_path = path.clone();
+    let maintenance_gate = Arc::clone(&maintenance_start);
+    let maintenance_done = Arc::clone(&foreground_done);
+    let min_maintenance_slices = iterations.max(4);
+    let max_maintenance_slices = min_maintenance_slices.saturating_mul(32);
+    let maintenance_worker =
+        thread::spawn(move || -> loom_core::Result<MaintenanceDiagnosticResult> {
+            maintenance_gate.wait();
+            let mut result = MaintenanceDiagnosticResult::default();
+            let mut slices = 0u64;
+            while slices < max_maintenance_slices {
+                let started = Instant::now();
+                let Ok(mut store) = FileStore::open(&maintenance_path) else {
+                    if maintenance_done.load(Ordering::Acquire) {
+                        result.latencies.push(started.elapsed());
+                        result.yield_count = result.yield_count.saturating_add(1);
+                        result.last_outcome = "yielded:store-open-conflict".to_string();
+                        slices = slices.saturating_add(1);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                    thread::yield_now();
+                    continue;
+                };
+                let deadline = started
+                    .checked_add(Duration::from_millis(50))
+                    .unwrap_or(started);
+                let gc = store.gc_validated_segments_until(
+                    GcSegmentBudget {
+                        max_segments: 1,
+                        max_pages: 256,
+                    },
+                    true,
+                    deadline,
+                );
+                let elapsed = started.elapsed();
+                result.latencies.push(elapsed);
+                if elapsed >= Duration::from_millis(50) {
+                    result.overrun_count = result.overrun_count.saturating_add(1);
+                }
+                match gc {
+                    Ok(stats) => {
+                        let progress = stats
+                            .segments_reclaimed
+                            .saturating_add(stats.pages_freed)
+                            .saturating_add(stats.objects_relocated)
+                            .saturating_add(stats.objects_dropped);
+                        result.completed_work = result.completed_work.saturating_add(progress);
+                        result.last_outcome = format!(
+                            "completed:segments={}:pages={}:relocated={}:dropped={}",
+                            stats.segments_reclaimed,
+                            stats.pages_freed,
+                            stats.objects_relocated,
+                            stats.objects_dropped
+                        );
+                    }
+                    Err(error) if error.code == Code::ResourceExhausted => {
+                        result.yield_count = result.yield_count.saturating_add(1);
+                        result.last_outcome = format!("yielded:{:?}:{}", error.code, error.message);
+                    }
+                    Err(error) => {
+                        result.last_outcome = format!("error:{:?}:{}", error.code, error.message);
+                        result.error_count = result.error_count.saturating_add(1);
+                    }
+                }
+                let run_state = StoreMaintenanceRunState {
+                    last_run_ms: Some(now_ms()),
+                    next_eligible_ms: now_ms(),
+                    last_skip_reason: (result.yield_count > 0)
+                        .then(|| "budget_exhausted".to_string()),
+                    last_error: (result.error_count > 0).then(|| result.last_outcome.clone()),
+                    last_progress_steps: result.completed_work,
+                    last_yield_count: result.yield_count,
+                    last_overrun_count: result.overrun_count,
+                    ..StoreMaintenanceRunState::default()
+                };
+                store.record_store_maintenance_run_state(run_state)?;
+                let report = store.store_maintenance_report(now_ms())?;
+                result.final_candidate_pages = report.status.candidate_dead_pages;
+                result.final_candidate_bytes = report.candidate_reclaimable_bytes;
+                result.final_reusable_pages = report.status.reusable_free_pages;
+                result.final_mark_completed = report.mark_completed;
+                result.final_eligible = report.eligible;
+                result.final_reason = report.reason;
+                result.debt_samples.push(report.status.candidate_dead_pages);
+                if maintenance_done.load(Ordering::Acquire)
+                    && result.latencies.len() as u64 >= min_maintenance_slices
+                {
+                    result.no_new_debt_slices = result.no_new_debt_slices.saturating_add(1);
+                    if !result.final_eligible {
+                        break;
+                    }
+                }
+                slices = slices.saturating_add(1);
+                if slices < max_maintenance_slices {
+                    thread::yield_now();
+                }
+            }
+            Ok(result)
+        });
+    let start = Instant::now();
+    maintenance_start.wait();
+    for update in 0..iterations {
+        let open_start = Instant::now();
+        let store = open_filestore_with_retry(&path, Duration::from_secs(2))?;
+        open_latencies.push(open_start.elapsed());
+
+        let operation_start = Instant::now();
+        store.put_mutable_overlay_value(
+            overlay_key("documents", "maintenance-breakdown", update)?,
+            format!("maintenance-breakdown-{update}").into_bytes(),
+        )?;
+        operation_latencies.push(operation_start.elapsed());
+
+        let save_start = Instant::now();
+        store.flush_hot_mutable_commits()?;
+        save_latencies.push(save_start.elapsed());
+        drop(store);
+    }
+    foreground_done.store(true, Ordering::Release);
+    let maintenance_result = maintenance_worker
+        .join()
+        .map_err(|_| loom_core::LoomError::new(Code::Internal, "maintenance worker panicked"))??;
+    let elapsed = start.elapsed();
+    let reopened = open_loom(&path)?;
+    let final_report = reopened.store().store_maintenance_report(now_ms())?;
+    let diagnostic_status = classify_maintenance_diagnostic(
+        initial_report.status.candidate_dead_pages,
+        final_report.status.candidate_dead_pages,
+        maintenance_result.error_count,
+        final_report.eligible,
+        &final_report.reason,
+    );
+    let mut report = scenario_report(
+        "maintenance_latency_breakdown",
+        diagnostic_status.status,
+        iterations,
+        elapsed,
+        &operation_latencies,
+        reopened.store(),
+        &path,
+        Some("separates open, foreground operation, save, and maintenance diagnostic latency"),
+    )?;
+    insert_latency_breakdown(&mut report, "open", &open_latencies);
+    insert_latency_breakdown(&mut report, "operation", &operation_latencies);
+    insert_latency_breakdown(&mut report, "save", &save_latencies);
+    insert_latency_breakdown(&mut report, "maintenance", &maintenance_result.latencies);
+    report.extra.insert(
+        "maintenance_outcome".to_string(),
+        maintenance_result.last_outcome,
+    );
+    report.extra.insert(
+        "maintenance_slice_samples".to_string(),
+        maintenance_result.latencies.len().to_string(),
+    );
+    report.extra.insert(
+        "maintenance_initial_candidate_pages".to_string(),
+        initial_report.status.candidate_dead_pages.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_final_candidate_pages".to_string(),
+        final_report.status.candidate_dead_pages.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_initial_candidate_bytes".to_string(),
+        initial_report.candidate_reclaimable_bytes.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_final_candidate_bytes".to_string(),
+        final_report.candidate_reclaimable_bytes.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_policy_min_candidate_pages".to_string(),
+        final_report.policy.min_candidate_pages.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_policy_min_reusable_pages".to_string(),
+        final_report.policy.min_reusable_pages.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_final_reusable_pages".to_string(),
+        final_report.status.reusable_free_pages.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_final_mark_completed".to_string(),
+        final_report.mark_completed.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_completed_work".to_string(),
+        maintenance_result.completed_work.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_no_new_debt_slices".to_string(),
+        maintenance_result.no_new_debt_slices.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_yield_count".to_string(),
+        maintenance_result.yield_count.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_overrun_count".to_string(),
+        maintenance_result.overrun_count.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_error_count".to_string(),
+        maintenance_result.error_count.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_converged".to_string(),
+        diagnostic_status.converged.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_debt_decreased".to_string(),
+        diagnostic_status.debt_decreased.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_final_eligible".to_string(),
+        final_report.eligible.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_final_reason".to_string(),
+        final_report.reason.clone(),
+    );
+    report.extra.insert(
+        "maintenance_run_state_progress_steps".to_string(),
+        final_report.run_state.last_progress_steps.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_run_state_yield_count".to_string(),
+        final_report.run_state.last_yield_count.to_string(),
+    );
+    report.extra.insert(
+        "maintenance_run_state_overrun_count".to_string(),
+        final_report.run_state.last_overrun_count.to_string(),
+    );
+    Ok(report)
+}
+
+fn open_filestore_with_retry(path: &Path, timeout: Duration) -> loom_core::Result<FileStore> {
+    let started = Instant::now();
+    loop {
+        match FileStore::open(path) {
+            Ok(store) => return Ok(store),
+            Err(error) if error.code == Code::Conflict && started.elapsed() < timeout => {
+                thread::yield_now();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct MaintenanceDiagnosticStatus {
+    status: &'static str,
+    debt_decreased: bool,
+    converged: bool,
+}
+
+fn classify_maintenance_diagnostic(
+    initial_candidate_pages: u64,
+    final_candidate_pages: u64,
+    error_count: u64,
+    final_eligible: bool,
+    final_reason: &str,
+) -> MaintenanceDiagnosticStatus {
+    let debt_decreased = final_candidate_pages < initial_candidate_pages;
+    let structurally_ineligible = matches!(
+        final_reason,
+        "candidate_debt_below_threshold" | "free_debt_below_threshold"
+    );
+    let converged = final_candidate_pages == 0 || (!final_eligible && structurally_ineligible);
+    let status = if error_count > 0 {
+        "maintenance_errors"
+    } else if !debt_decreased {
+        "debt_not_decreased"
+    } else if final_eligible {
+        "residual_reclaimable_debt"
+    } else if !converged {
+        "residual_unclassified_debt"
+    } else {
+        "completed"
+    };
+    MaintenanceDiagnosticStatus {
+        status,
+        debt_decreased,
+        converged,
+    }
+}
+
+#[cfg(test)]
+mod maintenance_diagnostic_status_tests {
+    use super::classify_maintenance_diagnostic;
+
+    #[test]
+    fn completed_work_with_flat_debt_fails() {
+        let status =
+            classify_maintenance_diagnostic(10, 10, 0, false, "candidate_debt_below_threshold");
+
+        assert_eq!(status.status, "debt_not_decreased");
+        assert!(!status.debt_decreased);
+    }
+
+    #[test]
+    fn maintenance_errors_fail() {
+        let status =
+            classify_maintenance_diagnostic(10, 0, 1, false, "candidate_debt_below_threshold");
+
+        assert_eq!(status.status, "maintenance_errors");
+        assert!(status.debt_decreased);
+        assert!(status.converged);
+    }
+
+    #[test]
+    fn converged_run_passes() {
+        let status =
+            classify_maintenance_diagnostic(10, 0, 0, false, "candidate_debt_below_threshold");
+
+        assert_eq!(status.status, "completed");
+        assert!(status.debt_decreased);
+        assert!(status.converged);
+    }
+
+    #[test]
+    fn reclaimable_residual_debt_fails() {
+        let status = classify_maintenance_diagnostic(10, 3, 0, true, "eligible");
+
+        assert_eq!(status.status, "residual_reclaimable_debt");
+        assert!(status.debt_decreased);
+        assert!(!status.converged);
+    }
+
+    #[test]
+    fn structurally_ineligible_residual_pages_pass() {
+        let status =
+            classify_maintenance_diagnostic(10, 3, 0, false, "candidate_debt_below_threshold");
+
+        assert_eq!(status.status, "completed");
+        assert!(status.debt_decreased);
+        assert!(status.converged);
+    }
+}
+
+#[derive(Default)]
+struct MaintenanceDiagnosticResult {
+    latencies: Vec<Duration>,
+    debt_samples: Vec<u64>,
+    completed_work: u64,
+    yield_count: u64,
+    overrun_count: u64,
+    error_count: u64,
+    no_new_debt_slices: u64,
+    final_candidate_pages: u64,
+    final_candidate_bytes: u64,
+    final_reusable_pages: u64,
+    final_mark_completed: bool,
+    final_eligible: bool,
+    final_reason: String,
+    last_outcome: String,
+}
+
+fn insert_latency_breakdown(report: &mut ScenarioReport, prefix: &str, latencies: &[Duration]) {
+    let latency = LatencyReport::from_durations(latencies);
+    report.extra.insert(
+        format!("{prefix}_p50_latency_ms"),
+        latency.p50_ms.unwrap_or(0.0).to_string(),
+    );
+    report.extra.insert(
+        format!("{prefix}_p95_latency_ms"),
+        latency.p95_ms.unwrap_or(0.0).to_string(),
+    );
+    report.extra.insert(
+        format!("{prefix}_p99_latency_ms"),
+        latency.p99_ms.unwrap_or(0.0).to_string(),
+    );
 }
 
 fn durability_mode_scenarios(

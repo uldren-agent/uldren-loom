@@ -109,30 +109,30 @@ pub struct LaneTicket {
 /// never by caller-supplied numeric ranks; callers choose only where a ticket lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneTicketPlacement<'a> {
-    Append,
     First,
+    Last,
     Before(&'a str),
     After(&'a str),
 }
 
 impl<'a> LaneTicketPlacement<'a> {
-    /// Parse a public placement verb + optional anchor ticket id. Empty/"append" -> Append,
-    /// "first" -> First, "before"/"after" require a non-empty anchor. Unknown verbs are rejected.
+    /// Parse a public placement verb and optional anchor ticket id. Empty defaults to Last.
+    /// Before and After require a non-empty anchor. Unknown verbs are rejected.
     pub fn parse(placement: &str, anchor: Option<&'a str>) -> Result<Self> {
         match placement {
-            "" | "append" => Ok(Self::Append),
-            "first" => Ok(Self::First),
-            "before" => anchor
+            "" | "LAST" => Ok(Self::Last),
+            "FIRST" => Ok(Self::First),
+            "BEFORE" => anchor
                 .filter(|a| !a.is_empty())
                 .map(Self::Before)
                 .ok_or_else(|| {
-                    LoomError::invalid("placement 'before' requires an anchor ticket id")
+                    LoomError::invalid("placement 'BEFORE' requires an anchor ticket id")
                 }),
-            "after" => anchor
+            "AFTER" => anchor
                 .filter(|a| !a.is_empty())
                 .map(Self::After)
                 .ok_or_else(|| {
-                    LoomError::invalid("placement 'after' requires an anchor ticket id")
+                    LoomError::invalid("placement 'AFTER' requires an anchor ticket id")
                 }),
             other => Err(LoomError::invalid(format!(
                 "unknown lane ticket placement: {other}"
@@ -141,7 +141,7 @@ impl<'a> LaneTicketPlacement<'a> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneTicketView {
     pub ticket_id: String,
     pub status: Option<String>,
@@ -149,7 +149,7 @@ pub struct LaneTicketView {
     pub title: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneView {
     pub lane_id: String,
     pub lane_key: String,
@@ -175,7 +175,7 @@ pub struct LaneView {
     pub updated_by: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicLane {
     pub lane_id: String,
     pub lane_key: String,
@@ -195,7 +195,7 @@ pub struct PublicLane {
 /// Compact projection of a [`LaneView`] for list/overview surfaces: the display label, the derived
 /// display status, and the ordered ticket ids only. Detailed inspection (owner, stored status,
 /// coordination prose, per-ticket summaries) stays behind the full [`LaneView`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneCompactView {
     pub lane_id: String,
     pub lane_key: String,
@@ -206,7 +206,7 @@ pub struct LaneCompactView {
     pub lane_tickets: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneStatusTextWarning {
     pub field: String,
     pub stated_status: String,
@@ -215,7 +215,7 @@ pub struct LaneStatusTextWarning {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneStatusCounts {
     pub blocked: usize,
     pub waiting_for_decision: usize,
@@ -951,7 +951,7 @@ fn lane_workflow_secondary_index_deletes(
 }
 
 pub fn append_lane_ticket(lane: &mut Lane, ticket_id: &str) -> Result<()> {
-    place_lane_ticket(lane, ticket_id, LaneTicketPlacement::Append)
+    place_lane_ticket(lane, ticket_id, LaneTicketPlacement::Last)
 }
 
 /// Insert `ticket_id` into `lane.lane_tickets` at the position selected by `placement`, minting an
@@ -970,8 +970,8 @@ pub fn place_lane_ticket(
         return Err(LoomError::invalid("lane_tickets must not repeat ticket_id"));
     }
     let idx = match placement {
-        LaneTicketPlacement::Append => lane.lane_tickets.len(),
         LaneTicketPlacement::First => 0,
+        LaneTicketPlacement::Last => lane.lane_tickets.len(),
         LaneTicketPlacement::Before(anchor) => lane
             .lane_tickets
             .iter()
@@ -1921,41 +1921,41 @@ mod tests {
     fn parse_placement_verbs_and_anchors() {
         assert_eq!(
             LaneTicketPlacement::parse("", None).unwrap(),
-            LaneTicketPlacement::Append
+            LaneTicketPlacement::Last
         );
         assert_eq!(
-            LaneTicketPlacement::parse("append", None).unwrap(),
-            LaneTicketPlacement::Append
+            LaneTicketPlacement::parse("LAST", None).unwrap(),
+            LaneTicketPlacement::Last
         );
         assert_eq!(
-            LaneTicketPlacement::parse("first", None).unwrap(),
+            LaneTicketPlacement::parse("FIRST", None).unwrap(),
             LaneTicketPlacement::First
         );
         assert_eq!(
-            LaneTicketPlacement::parse("before", Some("A")).unwrap(),
+            LaneTicketPlacement::parse("BEFORE", Some("A")).unwrap(),
             LaneTicketPlacement::Before("A")
         );
         assert_eq!(
-            LaneTicketPlacement::parse("after", Some("A")).unwrap(),
+            LaneTicketPlacement::parse("AFTER", Some("A")).unwrap(),
             LaneTicketPlacement::After("A")
         );
-        // before/after require a non-empty anchor.
+        // Before and After require a non-empty anchor.
         assert_eq!(
-            LaneTicketPlacement::parse("before", None).unwrap_err().code,
+            LaneTicketPlacement::parse("BEFORE", None).unwrap_err().code,
             Code::InvalidArgument
         );
         assert_eq!(
-            LaneTicketPlacement::parse("before", Some(""))
+            LaneTicketPlacement::parse("BEFORE", Some(""))
                 .unwrap_err()
                 .code,
             Code::InvalidArgument
         );
         assert_eq!(
-            LaneTicketPlacement::parse("after", None).unwrap_err().code,
+            LaneTicketPlacement::parse("AFTER", None).unwrap_err().code,
             Code::InvalidArgument
         );
         assert_eq!(
-            LaneTicketPlacement::parse("after", Some(""))
+            LaneTicketPlacement::parse("AFTER", Some(""))
                 .unwrap_err()
                 .code,
             Code::InvalidArgument
@@ -1967,13 +1967,21 @@ mod tests {
                 .code,
             Code::InvalidArgument
         );
+        assert_eq!(
+            LaneTicketPlacement::parse("APPEND", None).unwrap_err().code,
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            LaneTicketPlacement::parse("first", None).unwrap_err().code,
+            Code::InvalidArgument
+        );
     }
 
     #[test]
-    fn place_lane_ticket_append_first_before_after_produce_expected_order() {
+    fn place_lane_ticket_last_first_before_after_produce_expected_order() {
         let mut lane = empty_lane();
-        place_lane_ticket(&mut lane, "A", LaneTicketPlacement::Append).unwrap();
-        place_lane_ticket(&mut lane, "B", LaneTicketPlacement::Append).unwrap();
+        place_lane_ticket(&mut lane, "A", LaneTicketPlacement::Last).unwrap();
+        place_lane_ticket(&mut lane, "B", LaneTicketPlacement::Last).unwrap();
         assert_eq!(ticket_ids(&lane), vec!["A", "B"]);
 
         place_lane_ticket(&mut lane, "C", LaneTicketPlacement::First).unwrap();
@@ -1992,7 +2000,7 @@ mod tests {
     #[test]
     fn place_lane_ticket_unknown_anchor_is_not_found() {
         let mut lane = empty_lane();
-        place_lane_ticket(&mut lane, "A", LaneTicketPlacement::Append).unwrap();
+        place_lane_ticket(&mut lane, "A", LaneTicketPlacement::Last).unwrap();
         assert_eq!(
             place_lane_ticket(&mut lane, "B", LaneTicketPlacement::Before("Z"))
                 .unwrap_err()
@@ -2010,9 +2018,9 @@ mod tests {
     #[test]
     fn place_lane_ticket_rejects_duplicate_ticket_id() {
         let mut lane = empty_lane();
-        place_lane_ticket(&mut lane, "A", LaneTicketPlacement::Append).unwrap();
+        place_lane_ticket(&mut lane, "A", LaneTicketPlacement::Last).unwrap();
         assert_eq!(
-            place_lane_ticket(&mut lane, "A", LaneTicketPlacement::Append)
+            place_lane_ticket(&mut lane, "A", LaneTicketPlacement::Last)
                 .unwrap_err()
                 .code,
             Code::InvalidArgument
@@ -2023,7 +2031,7 @@ mod tests {
     fn remove_preserves_order_and_reorder_by_ids_works() {
         let mut lane = empty_lane();
         for id in ["A", "B", "C"] {
-            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Append).unwrap();
+            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Last).unwrap();
         }
         lane.lane_tickets
             .retain(|lane_ticket| lane_ticket.ticket_id != "B");
@@ -2074,7 +2082,7 @@ mod tests {
     fn terminal_lane_ticket_ids_dry_run_preview_does_not_mutate_membership() {
         let mut lane = empty_lane();
         for id in ["A", "B", "C"] {
-            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Append).unwrap();
+            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Last).unwrap();
         }
         let before = ticket_ids(&lane)
             .into_iter()
@@ -2101,7 +2109,7 @@ mod tests {
     fn remove_lane_tickets_preserves_remaining_order_and_clears_active_when_removed() {
         let mut lane = empty_lane();
         for id in ["A", "B", "C", "D"] {
-            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Append).unwrap();
+            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Last).unwrap();
         }
         lane.active_ticket_id = Some("C".to_string());
         lane.validate().unwrap();
@@ -2124,7 +2132,7 @@ mod tests {
     fn remove_lane_tickets_preserves_non_terminal_and_active_when_untouched() {
         let mut lane = empty_lane();
         for id in ["A", "B", "C"] {
-            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Append).unwrap();
+            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Last).unwrap();
         }
         lane.active_ticket_id = Some("B".to_string());
         lane.validate().unwrap();
@@ -2148,7 +2156,7 @@ mod tests {
     fn remove_lane_tickets_on_closed_lane_still_edits_membership() {
         let mut lane = empty_lane();
         for id in ["A", "B"] {
-            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Append).unwrap();
+            place_lane_ticket(&mut lane, id, LaneTicketPlacement::Last).unwrap();
         }
         lane.lane_status = LaneStatus::Closed.as_str().to_string();
         lane.validate().unwrap();

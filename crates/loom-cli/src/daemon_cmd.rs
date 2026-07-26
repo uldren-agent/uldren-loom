@@ -52,8 +52,8 @@ pub(crate) fn run_daemon(action: DaemonCmd, keys: &KeyOpts) -> Result<(), String
 }
 
 #[cfg(feature = "mcp")]
-/// How `loom mcp` should launch for a resolved locator. A local target keeps the existing local
-/// `StoreAccess` path; a remote target serves the MCP surface backed by a remote Loom.
+/// How `loom mcp` should launch for a resolved locator. Local targets use the daemon as the single
+/// mutable authority; remote targets serve the MCP surface backed by a remote Loom.
 #[cfg(feature = "mcp")]
 #[derive(Debug)]
 enum McpLaunchTarget {
@@ -62,8 +62,8 @@ enum McpLaunchTarget {
     Remote(loom_locator::RemoteTarget),
 }
 
-/// Resolve the `loom mcp` locator to a launch target. `--stateless` is a local-only MCP mode, so a
-/// remote locator combined with `--stateless` is refused immediately, before any connection.
+/// Resolve the `loom mcp` locator to a launch target. Local MCP always attaches to the daemon-owned
+/// generated boundary, so `--stateless` is rejected instead of opening an offline store owner.
 #[cfg(feature = "mcp")]
 fn resolve_mcp_target(
     cx: &crate::locator_cx::LocatorContext,
@@ -71,7 +71,15 @@ fn resolve_mcp_target(
     stateless: bool,
 ) -> Result<McpLaunchTarget, String> {
     match cx.resolve_target(locator)? {
-        loom_locator::Target::Local(_) => Ok(McpLaunchTarget::Local),
+        loom_locator::Target::Local(_) => {
+            if stateless {
+                return Err(
+                    "--stateless is not supported for local MCP; local MCP uses the daemon-owned generated boundary"
+                        .to_string(),
+                );
+            }
+            Ok(McpLaunchTarget::Local)
+        }
         loom_locator::Target::Remote(target) => {
             if stateless {
                 return Err(format!(
@@ -105,13 +113,24 @@ pub(crate) fn run_mcp(
     };
     let access = match launch {
         McpLaunchTarget::Local => {
-            let auth = mount_open_auth(store, keys)?;
-            match uldren_loom_mcp::StoreAccess::per_request_attached_auth(store, auth.clone()) {
-                Ok(access) => access,
-                Err(e) if e.code == loom_core::error::Code::NotFound => {
-                    uldren_loom_mcp::StoreAccess::per_request_auth(store, auth)
+            #[cfg(all(feature = "serve", feature = "remote-client"))]
+            {
+                if daemon::paths(store)
+                    .ok()
+                    .and_then(|paths| daemon::status_response(&paths).ok())
+                    .is_none()
+                {
+                    daemon_start_selected(store, DaemonTransportSelection::Native)?;
                 }
-                Err(e) => return Err(e.to_string()),
+                let backend = crate::remote::McpRemoteBackend::connect_local_daemon(store, keys)?;
+                uldren_loom_mcp::StoreAccess::remote(std::sync::Arc::new(backend))
+            }
+            #[cfg(not(all(feature = "serve", feature = "remote-client")))]
+            {
+                return Err(
+                    "local MCP requires a build with the `serve` and `remote-client` features"
+                        .to_string(),
+                );
             }
         }
         McpLaunchTarget::Remote(_target) => {
@@ -616,11 +635,14 @@ fn maintenance_report_text(
         )
         + "\n"
         + &format!(
-            "maintenance_run\tlast_run_ms={}\tnext_eligible_ms={}\tlast_skip_reason={}\tlast_error={}",
+            "maintenance_run\tlast_run_ms={}\tnext_eligible_ms={}\tlast_skip_reason={}\tlast_error={}\tlast_progress_steps={}\tlast_yield_count={}\tlast_overrun_count={}",
             optional_u64_text(report.run_state.last_run_ms),
             report.run_state.next_eligible_ms,
             optional_text(report.run_state.last_skip_reason.as_deref()),
-            optional_text(report.run_state.last_error.as_deref())
+            optional_text(report.run_state.last_error.as_deref()),
+            report.run_state.last_progress_steps,
+            report.run_state.last_yield_count,
+            report.run_state.last_overrun_count
         )
         + "\n";
     for domain in &report.growth_domains {
@@ -695,10 +717,81 @@ fn run_store_maintenance_once(
     max_segments: Option<u64>,
     max_pages: Option<u64>,
 ) -> Result<String, String> {
+    run_store_maintenance_once_with_budget(loom, now, manual, max_segments, max_pages, None, None)
+}
+
+const DAEMON_MAINTENANCE_MARK_OBJECTS: u64 = 256;
+const DAEMON_MAINTENANCE_MAX_SEGMENTS: u64 = 1;
+const DAEMON_MAINTENANCE_MAX_PAGES: u64 = 1024;
+const DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_PAGES: u64 = 64;
+const DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_OBJECTS: u64 = 32;
+const DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const DAEMON_MAINTENANCE_SLICE_MS: u64 = 250;
+
+#[derive(Debug, Clone, Copy)]
+struct StoreMaintenanceRunBudget {
+    mark_objects: u64,
+    max_segments: u64,
+    max_pages: u64,
+    tail_compaction_max_pages: u64,
+    tail_compaction_max_objects: u64,
+    tail_compaction_max_bytes: u64,
+    slice_ms: u64,
+}
+
+impl StoreMaintenanceRunBudget {
+    fn daemon_automatic() -> Self {
+        Self {
+            mark_objects: DAEMON_MAINTENANCE_MARK_OBJECTS,
+            max_segments: DAEMON_MAINTENANCE_MAX_SEGMENTS,
+            max_pages: DAEMON_MAINTENANCE_MAX_PAGES,
+            tail_compaction_max_pages: DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_PAGES,
+            tail_compaction_max_objects: DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_OBJECTS,
+            tail_compaction_max_bytes: DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_BYTES,
+            slice_ms: DAEMON_MAINTENANCE_SLICE_MS,
+        }
+    }
+
+    fn apply(self, policy: &mut loom_store::StoreMaintenancePolicy) {
+        policy.max_segments = policy.max_segments.min(self.max_segments);
+        policy.max_pages = policy.max_pages.min(self.max_pages);
+        policy.tail_compaction_max_pages = policy
+            .tail_compaction_max_pages
+            .min(self.tail_compaction_max_pages);
+        policy.tail_compaction_max_objects = policy
+            .tail_compaction_max_objects
+            .min(self.tail_compaction_max_objects);
+        policy.tail_compaction_max_bytes = policy
+            .tail_compaction_max_bytes
+            .min(self.tail_compaction_max_bytes);
+    }
+}
+
+fn run_store_maintenance_once_with_budget(
+    loom: &mut Loom<FileStore>,
+    now: u64,
+    manual: bool,
+    max_segments: Option<u64>,
+    max_pages: Option<u64>,
+    budget: Option<StoreMaintenanceRunBudget>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<String, String> {
+    if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
+        return Ok("maintenance\tskipped\treason=shutdown_cancelled".to_string());
+    }
+    let started = std::time::Instant::now();
+    let mut progress_steps = 0u64;
+    let mut yield_count = 0u64;
+    let mut overrun_count = 0u64;
+    let deadline = budget
+        .and_then(|budget| started.checked_add(std::time::Duration::from_millis(budget.slice_ms)));
     let mut policy = loom
         .store()
         .store_maintenance_policy()
         .map_err(|e| e.to_string())?;
+    if let Some(budget) = budget {
+        budget.apply(&mut policy);
+    }
     if let Some(value) = max_segments {
         if value == 0 {
             return Err("max-segments must be nonzero".to_string());
@@ -741,14 +834,33 @@ fn run_store_maintenance_once(
         if active.is_none() {
             loom_store::begin_loom_reachability_mark_epoch(loom).map_err(|e| e.to_string())?;
         }
-        let step =
-            loom_store::step_loom_reachability_mark_epoch(loom, 1024).map_err(|e| e.to_string())?;
+        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
+            return Ok("maintenance\tskipped\treason=shutdown_cancelled".to_string());
+        }
+        let step = loom_store::step_loom_reachability_mark_epoch_until(
+            loom,
+            budget.map_or(1024, |budget| {
+                usize::try_from(budget.mark_objects).unwrap_or(usize::MAX)
+            }),
+            deadline,
+        )
+        .map_err(|e| e.to_string())?;
         if !step.completed {
+            progress_steps = u64::try_from(step.visited).unwrap_or(u64::MAX);
+            yield_count = 1;
+            if budget
+                .is_some_and(|budget| started.elapsed().as_millis() >= u128::from(budget.slice_ms))
+            {
+                overrun_count = 1;
+            }
             let state = StoreMaintenanceRunState {
                 last_run_ms: Some(now),
                 next_eligible_ms: now.saturating_add(policy.interval_ms),
                 last_skip_reason: Some("mark_epoch_incomplete".to_string()),
                 last_error: None,
+                last_progress_steps: progress_steps,
+                last_yield_count: yield_count,
+                last_overrun_count: overrun_count,
                 ..StoreMaintenanceRunState::default()
             };
             loom.store()
@@ -788,39 +900,101 @@ fn run_store_maintenance_once(
             optional_u64_text(capacity.available_temp_bytes)
         )
     } else {
-        let budget = GcSegmentBudget {
+        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
+            return Ok("maintenance\tskipped\treason=shutdown_cancelled".to_string());
+        }
+        let reclaim_budget = GcSegmentBudget {
             max_segments: policy.max_segments,
             max_pages: policy.max_pages,
         };
-        let stats = if policy.tail_trim_enabled {
+        let reclaim = if let Some(deadline) = deadline {
+            tail_trim_attempted = policy.tail_trim_enabled;
+            loom.store_mut().gc_validated_segments_until(
+                reclaim_budget,
+                policy.tail_trim_enabled,
+                deadline,
+            )
+        } else if policy.tail_trim_enabled {
             tail_trim_attempted = true;
-            loom.store_mut().gc_validated_segments(budget)
+            loom.store_mut().gc_validated_segments(reclaim_budget)
         } else {
             loom.store_mut()
-                .gc_validated_segments_without_tail_trim(budget)
-        }
-        .map_err(|e| e.to_string())?;
+                .gc_validated_segments_without_tail_trim(reclaim_budget)
+        };
+        let stats = match reclaim {
+            Ok(stats) => stats,
+            Err(error) if error.code == loom_core::error::Code::ResourceExhausted => {
+                if shrink_skip_reason.is_none() {
+                    shrink_skip_reason = Some("budget_exhausted".to_string());
+                }
+                yield_count = yield_count.saturating_add(1);
+                loom_store::GcStats::default()
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        progress_steps = progress_steps
+            .saturating_add(stats.segments_reclaimed)
+            .saturating_add(stats.pages_freed)
+            .saturating_add(stats.objects_relocated)
+            .saturating_add(stats.objects_dropped);
         tail_trim_pages = stats.pages_trimmed;
         tail_trim_bytes = stats
             .pages_trimmed
             .saturating_mul(loom_store::STORE_PAGE_SIZE);
-        if policy.tail_compaction_enabled {
-            tail_compaction = loom
-                .store_mut()
-                .compact_tail_once(
+        let slice_exhausted = budget
+            .is_some_and(|budget| started.elapsed().as_millis() >= u128::from(budget.slice_ms));
+        if slice_exhausted {
+            overrun_count = overrun_count.saturating_add(1);
+        }
+        if policy.tail_compaction_enabled && !slice_exhausted {
+            if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
+                return Ok("maintenance\tskipped\treason=shutdown_cancelled".to_string());
+            }
+            let tail_result = if let Some(deadline) = deadline {
+                loom.store_mut().compact_tail_once_until(
+                    policy.tail_compaction_max_pages,
+                    policy.tail_compaction_max_objects,
+                    policy.tail_compaction_max_bytes,
+                    deadline,
+                )
+            } else {
+                loom.store_mut().compact_tail_once(
                     policy.tail_compaction_max_pages,
                     policy.tail_compaction_max_objects,
                     policy.tail_compaction_max_bytes,
                 )
-                .map_err(|e| e.to_string())?;
+            };
+            tail_compaction = match tail_result {
+                Ok(stats) => stats,
+                Err(error) if error.code == loom_core::error::Code::ResourceExhausted => {
+                    if shrink_skip_reason.is_none() {
+                        shrink_skip_reason = Some("budget_exhausted".to_string());
+                    }
+                    yield_count = yield_count.saturating_add(1);
+                    loom_store::TailCompactionStats {
+                        attempted: true,
+                        skipped: true,
+                        ..loom_store::TailCompactionStats::default()
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            progress_steps = progress_steps
+                .saturating_add(tail_compaction.relocated_objects)
+                .saturating_add(tail_compaction.relocated_pages)
+                .saturating_add(tail_compaction.truncated_pages);
             if tail_compaction.truncated_pages > 0 {
                 tail_trim_attempted = true;
                 tail_trim_pages = tail_trim_pages.saturating_add(tail_compaction.truncated_pages);
                 tail_trim_bytes = tail_trim_pages.saturating_mul(loom_store::STORE_PAGE_SIZE);
             }
+        } else if policy.tail_compaction_enabled && slice_exhausted && shrink_skip_reason.is_none()
+        {
+            shrink_skip_reason = Some("budget_exhausted".to_string());
+            yield_count = yield_count.saturating_add(1);
         }
         format!(
-            "maintenance\treclaimed\tsegments_reclaimed={}\tpages_freed={}\ttail_trim_pages={}\ttail_trim_bytes={}\ttail_compaction_attempted={}\ttail_compaction_relocated_objects={}\ttail_compaction_relocated_pages={}\ttail_compaction_truncated_pages={}\tobjects_relocated={}\tobjects_dropped={}",
+            "maintenance\treclaimed\tsegments_reclaimed={}\tpages_freed={}\ttail_trim_pages={}\ttail_trim_bytes={}\ttail_compaction_attempted={}\ttail_compaction_relocated_objects={}\ttail_compaction_relocated_pages={}\ttail_compaction_truncated_pages={}\tobjects_relocated={}\tobjects_dropped={}\telapsed_ms={}",
             stats.segments_reclaimed,
             stats.pages_freed,
             tail_trim_pages,
@@ -830,7 +1004,8 @@ fn run_store_maintenance_once(
             tail_compaction.relocated_pages,
             tail_compaction.truncated_pages,
             stats.objects_relocated,
-            stats.objects_dropped
+            stats.objects_dropped,
+            started.elapsed().as_millis()
         )
     };
     let state = StoreMaintenanceRunState {
@@ -852,6 +1027,9 @@ fn run_store_maintenance_once(
                 .skipped
                 .then(|| "tail_compaction_skipped".to_string())
         }),
+        last_progress_steps: progress_steps,
+        last_yield_count: yield_count,
+        last_overrun_count: overrun_count,
     };
     loom.store()
         .record_store_maintenance_run_state(state)
@@ -1026,6 +1204,9 @@ fn maintenance_report_json(
         "last_tail_compaction_truncated_pages": report.run_state.last_tail_compaction_truncated_pages,
         "last_tail_compaction_conflicts": report.run_state.last_tail_compaction_conflicts,
         "last_shrink_skip_reason": report.run_state.last_shrink_skip_reason,
+        "last_progress_steps": report.run_state.last_progress_steps,
+        "last_yield_count": report.run_state.last_yield_count,
+        "last_overrun_count": report.run_state.last_overrun_count,
     });
     let mut value = serde_json::json!({
         "eligible": report.eligible,
@@ -7052,6 +7233,8 @@ pub(crate) struct DaemonRuntime {
     store_id: String,
     transport: daemon::DaemonTransport,
     coordinator: LockCoordinator,
+    #[cfg(feature = "serve")]
+    generated_runtime: DaemonGeneratedRuntime,
     kv_loom: Option<Loom<FileStore>>,
     kv_unavailable: Option<loom_core::error::LoomError>,
     sessions: std::collections::BTreeSet<String>,
@@ -7059,12 +7242,117 @@ pub(crate) struct DaemonRuntime {
     authority_replication_next: std::collections::BTreeMap<String, u64>,
     maintenance_next_ms: u64,
     maintenance_worker: Option<std::thread::JoinHandle<Result<(), String>>>,
+    maintenance_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "serve")]
     hosted_listeners: std::collections::BTreeMap<String, HostedListenerRuntime>,
     #[cfg(feature = "serve")]
     drive_policy_next_ms: u64,
     #[cfg(feature = "serve")]
     reference_reconcile_next_ms: u64,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MaintenanceWorkerTestHook {
+    state: std::sync::Mutex<MaintenanceWorkerTestHookState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MaintenanceWorkerTestHookState {
+    entered: bool,
+    released: bool,
+    cancel_observed: bool,
+}
+
+#[cfg(test)]
+impl MaintenanceWorkerTestHook {
+    fn enter_and_wait(&self, cancel: &std::sync::atomic::AtomicBool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.entered = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+        let cancelled = cancel.load(std::sync::atomic::Ordering::Acquire);
+        state.cancel_observed = cancelled;
+        self.changed.notify_all();
+        cancelled
+    }
+
+    fn wait_until_entered(&self) {
+        let started = std::time::Instant::now();
+        let mut state = self.state.lock().unwrap();
+        while !state.entered {
+            let wait = self
+                .changed
+                .wait_timeout(state, std::time::Duration::from_millis(25))
+                .unwrap();
+            state = wait.0;
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.changed.notify_all();
+    }
+
+    fn wait_until_cancel_observed(&self) {
+        let started = std::time::Instant::now();
+        let mut state = self.state.lock().unwrap();
+        while !state.cancel_observed {
+            let wait = self
+                .changed
+                .wait_timeout(state, std::time::Duration::from_millis(25))
+                .unwrap();
+            state = wait.0;
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        }
+    }
+}
+
+#[cfg(test)]
+static MAINTENANCE_WORKER_TEST_HOOKS: std::sync::Mutex<
+    std::collections::BTreeMap<String, std::sync::Arc<MaintenanceWorkerTestHook>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn set_maintenance_worker_test_hook(
+    store: String,
+    hook: std::sync::Arc<MaintenanceWorkerTestHook>,
+) -> Option<std::sync::Arc<MaintenanceWorkerTestHook>> {
+    MAINTENANCE_WORKER_TEST_HOOKS
+        .lock()
+        .unwrap()
+        .insert(store, hook)
+}
+
+#[cfg(test)]
+fn restore_maintenance_worker_test_hook(
+    store: String,
+    hook: Option<std::sync::Arc<MaintenanceWorkerTestHook>>,
+) {
+    let mut hooks = MAINTENANCE_WORKER_TEST_HOOKS.lock().unwrap();
+    match hook {
+        Some(hook) => {
+            hooks.insert(store, hook);
+        }
+        None => {
+            hooks.remove(&store);
+        }
+    }
+}
+
+#[cfg(test)]
+fn maintenance_worker_test_hook(store: &str) -> Option<std::sync::Arc<MaintenanceWorkerTestHook>> {
+    MAINTENANCE_WORKER_TEST_HOOKS
+        .lock()
+        .unwrap()
+        .get(store)
+        .cloned()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7083,6 +7371,739 @@ struct DaemonRequestAuth {
 struct DaemonStopRequest {
     hard: bool,
     wait_ms: u64,
+}
+
+#[cfg(feature = "serve")]
+const DAEMON_GENERATED_SESSION_OPEN_MAGIC: &[u8] = b"loom-daemon-generated-session-open-v1\0";
+#[cfg(feature = "serve")]
+const DAEMON_GENERATED_CALL_MAGIC: &[u8] = b"loom-daemon-generated-call-v1\0";
+#[cfg(feature = "serve")]
+const DAEMON_GENERATED_STREAM_MAGIC: &[u8] = b"loom-daemon-generated-stream-v1\0";
+#[cfg(feature = "serve")]
+const DAEMON_GENERATED_STREAM_CANCEL_MAGIC: &[u8] = b"loom-daemon-generated-stream-cancel-v1\0";
+#[cfg(feature = "serve")]
+const DAEMON_GENERATED_SESSION_RESPONSE_MAGIC: &[u8] =
+    b"loom-daemon-generated-session-response-v1\0";
+#[cfg(feature = "serve")]
+const DAEMON_GENERATED_RESPONSE_MAGIC: &[u8] = b"loom-daemon-generated-response-v1\0";
+#[cfg(feature = "serve")]
+const DAEMON_GENERATED_STREAM_RESPONSE_MAGIC: &[u8] = b"loom-daemon-generated-stream-response-v1\0";
+#[cfg(feature = "serve")]
+const DAEMON_GENERATED_STREAM_CANCEL_RESPONSE_MAGIC: &[u8] =
+    b"loom-daemon-generated-stream-cancel-response-v1\0";
+
+#[cfg(feature = "serve")]
+fn generated_binary_body<'a>(request: &'a [u8], magic: &[u8]) -> Option<&'a [u8]> {
+    let rest = request.strip_prefix(magic)?;
+    let len_bytes: [u8; 4] = rest.get(..4)?.try_into().ok()?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    let body = rest.get(4..)?;
+    (body.len() == len).then_some(body)
+}
+
+#[cfg(feature = "serve")]
+fn generated_binary_response(magic: &[u8], bodies: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(magic);
+    out.extend_from_slice(&(bodies.len() as u32).to_be_bytes());
+    for body in bodies {
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(body);
+    }
+    out
+}
+
+#[cfg(feature = "serve")]
+struct DaemonGeneratedRuntime {
+    client: loom_client::LocalLoomClient,
+    engine: std::sync::Arc<std::sync::Mutex<Loom<FileStore>>>,
+    sessions: std::collections::BTreeMap<Vec<u8>, DaemonGeneratedSession>,
+    idempotency:
+        std::collections::BTreeMap<DaemonGeneratedIdempotencyKey, DaemonGeneratedIdempotencyEntry>,
+    stream_cancellations: std::collections::BTreeMap<
+        DaemonGeneratedStreamKey,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    >,
+    next_session: u64,
+}
+
+#[cfg(feature = "serve")]
+#[derive(Clone)]
+struct DaemonGeneratedSession {
+    handle: loom_client::types::LoomSession,
+    lease_expires_ms: u64,
+}
+
+#[cfg(feature = "serve")]
+type DaemonGeneratedIdempotencyKey = (Vec<u8>, String, String, Vec<u8>);
+
+#[cfg(feature = "serve")]
+type DaemonGeneratedIdempotencyEntry = (Vec<u8>, loom_remote_protocol::envelope::ResponsePayload);
+
+#[cfg(feature = "serve")]
+type DaemonGeneratedStreamKey = (Vec<u8>, Vec<u8>);
+
+#[cfg(feature = "serve")]
+type DaemonGeneratedOpenStream = (
+    loom_remote_protocol::api_types::LoomStream<Vec<u8>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    DaemonGeneratedStreamKey,
+);
+
+#[cfg(feature = "serve")]
+impl DaemonGeneratedRuntime {
+    fn start(store: &str) -> Result<Self, String> {
+        let loom = loom_store::open_loom_daemon_authorized_unlocked(store, None)
+            .and_then(|loom| {
+                loom_store::attach_local_auth(loom, &loom_store::LocalOpenAuth::default())
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            client: loom_client::LocalLoomClient::new(store),
+            engine: std::sync::Arc::new(std::sync::Mutex::new(loom)),
+            sessions: std::collections::BTreeMap::new(),
+            idempotency: std::collections::BTreeMap::new(),
+            stream_cancellations: std::collections::BTreeMap::new(),
+            next_session: 0,
+        })
+    }
+
+    fn open_session(
+        &mut self,
+        auth: loom_remote_protocol::session::SessionAuth,
+    ) -> loom_remote_protocol::session::SessionOpenReply {
+        self.next_session = self.next_session.saturating_add(1);
+        let session_id = self.next_session.to_be_bytes().to_vec();
+        let local_session_id = format!("daemon-generated-{}", self.next_session);
+        let auth_session = match auth {
+            loom_remote_protocol::session::SessionAuth::Unauthenticated => None,
+            loom_remote_protocol::session::SessionAuth::Passphrase {
+                principal,
+                passphrase,
+            } => {
+                let passphrase = match String::from_utf8(passphrase) {
+                    Ok(passphrase) => passphrase,
+                    Err(_) => {
+                        let error = loom_core::error::LoomError::new(
+                            loom_core::error::Code::InvalidArgument,
+                            "passphrase is not valid utf-8",
+                        );
+                        return loom_remote_protocol::session::SessionOpenReply::Err(
+                            loom_remote_protocol::RemoteError::from_loom_error(&error),
+                        );
+                    }
+                };
+                let auth_result = self
+                    .engine
+                    .lock()
+                    .map_err(|_| {
+                        loom_core::error::LoomError::new(
+                            loom_core::error::Code::Internal,
+                            "daemon generated runtime lock poisoned",
+                        )
+                    })
+                    .and_then(|mut loom| {
+                        let mut identity = loom.store().identity_store()?.ok_or_else(|| {
+                            loom_core::error::LoomError::new(
+                                loom_core::error::Code::Unsupported,
+                                "store is in unauthenticated-root mode; no identity is configured",
+                            )
+                        })?;
+                        let session = identity.authenticate_passphrase(
+                            WorkspaceId::from_bytes(principal),
+                            &passphrase,
+                            local_session_id.clone(),
+                        )?;
+                        let bound_id = session.id;
+                        loom.set_identity_store(identity);
+                        Ok((WorkspaceId::from_bytes(principal), bound_id))
+                    });
+                match auth_result {
+                    Ok(session) => Some(session),
+                    Err(error) => {
+                        return loom_remote_protocol::session::SessionOpenReply::Err(
+                            loom_remote_protocol::RemoteError::from_loom_error(&error),
+                        );
+                    }
+                }
+            }
+        };
+        match self
+            .client
+            .register_daemon_shared_loom(self.engine.clone(), auth_session)
+        {
+            Ok(mut handle) => {
+                handle.0.owner_session = session_id.clone();
+                let lease_expires_ms = now_ms().saturating_add(15 * 60 * 1000);
+                self.sessions.insert(
+                    session_id.clone(),
+                    DaemonGeneratedSession {
+                        handle,
+                        lease_expires_ms,
+                    },
+                );
+                loom_remote_protocol::session::SessionOpenReply::Ok {
+                    session_id,
+                    lease_expires_ms,
+                }
+            }
+            Err(error) => loom_remote_protocol::session::SessionOpenReply::Err(
+                loom_remote_protocol::RemoteError::from_loom_error(&error),
+            ),
+        }
+    }
+
+    fn dispatch(
+        &mut self,
+        request: &loom_remote_protocol::envelope::Request,
+    ) -> loom_remote_protocol::envelope::Response {
+        use loom_remote_protocol::codec::ToValue;
+        use loom_remote_protocol::envelope::Response;
+
+        let request_id = request.request_id.clone();
+        let session_id = request.session_id.clone();
+        let reply_ok = |value| Response::ok(request_id.clone(), session_id.clone(), value);
+        let reply_err = |err: &loom_core::error::LoomError| {
+            Response::err(
+                request_id.clone(),
+                session_id.clone(),
+                loom_remote_protocol::RemoteError::from_loom_error(err),
+            )
+        };
+        let Some(session_bytes) = request.session_id.as_ref() else {
+            return reply_err(&loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "method requires a session",
+            ));
+        };
+        let Some(session) = self.sessions.get(session_bytes).cloned() else {
+            return reply_err(&loom_core::error::LoomError::new(
+                loom_core::error::Code::NotFound,
+                "unknown or expired session",
+            ));
+        };
+        if now_ms() >= session.lease_expires_ms {
+            self.sessions.remove(session_bytes);
+            self.client.close(&session.handle);
+            self.idempotency
+                .retain(|(session, _, _, _), _| session != session_bytes);
+            self.cancel_session_streams(session_bytes);
+            return reply_err(&loom_core::error::LoomError::new(
+                loom_core::error::Code::LockLeaseExpired,
+                "daemon generated session lease expired",
+            ));
+        }
+        let handle = session.handle;
+        if request.interface == "Store" {
+            match request.method.as_str() {
+                "open" | "open_keyed" | "open_with_kek" => return reply_ok(handle.to_value()),
+                "close" => {
+                    self.sessions.remove(session_bytes);
+                    self.client.close(&handle);
+                    self.idempotency
+                        .retain(|(session, _, _, _), _| session != session_bytes);
+                    self.cancel_session_streams(session_bytes);
+                    return reply_ok(loom_codec::Value::Null);
+                }
+                _ => {}
+            }
+        } else if request.args.first() != Some(&handle.to_value()) {
+            return reply_err(&loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "method handle does not belong to the daemon session",
+            ));
+        }
+        let idem_key = request
+            .idempotency_key
+            .as_deref()
+            .filter(|key| !key.is_empty());
+        let fingerprint = idem_key.and_then(|_| {
+            loom_codec::encode(&loom_codec::Value::Array(vec![
+                loom_codec::Value::Text(request.interface.clone()),
+                loom_codec::Value::Text(request.method.clone()),
+                loom_codec::Value::Array(request.args.clone()),
+            ]))
+            .ok()
+        });
+        if let (Some(key), Some(fingerprint)) = (idem_key, fingerprint.as_ref()) {
+            let map_key = (
+                session_bytes.clone(),
+                request.interface.clone(),
+                request.method.clone(),
+                key.to_vec(),
+            );
+            if let Some((stored, payload)) = self.idempotency.get(&map_key) {
+                if stored == fingerprint {
+                    return Response {
+                        request_id,
+                        session_id,
+                        payload: payload.clone(),
+                    };
+                }
+                return reply_err(&loom_core::error::LoomError::new(
+                    loom_core::error::Code::Conflict,
+                    "idempotency key reused with a different request fingerprint",
+                ));
+            }
+        }
+        let response = match loom_hosted_core::generated_dispatch::dispatch(
+            &self.client,
+            &handle,
+            &request.interface,
+            &request.method,
+            &request.args,
+        ) {
+            Ok(loom_hosted_core::generated_dispatch::Dispatched::Unary(value)) => reply_ok(value),
+            Ok(loom_hosted_core::generated_dispatch::Dispatched::Stream(_)) => {
+                reply_err(&loom_core::error::LoomError::new(
+                    loom_core::error::Code::InvalidArgument,
+                    format!(
+                        "method {}.{} is a streaming method; use the streaming route",
+                        request.interface, request.method
+                    ),
+                ))
+            }
+            Err(error) => reply_err(&error),
+        };
+        if let (Some(key), Some(fingerprint)) = (idem_key, fingerprint) {
+            if self.idempotency.len() > 1024 {
+                self.idempotency.clear();
+            }
+            self.idempotency.insert(
+                (
+                    session_bytes.clone(),
+                    request.interface.clone(),
+                    request.method.clone(),
+                    key.to_vec(),
+                ),
+                (fingerprint, response.payload.clone()),
+            );
+        }
+        response
+    }
+
+    fn dispatch_stream(
+        &mut self,
+        request: &loom_remote_protocol::envelope::Request,
+    ) -> Vec<Vec<u8>> {
+        let frames = match self.stream_items(request) {
+            Ok(items) => {
+                let count = items.len() as u64;
+                let mut frames: Vec<loom_remote_protocol::frame::Frame> = items
+                    .into_iter()
+                    .map(loom_remote_protocol::frame::Frame::Item)
+                    .collect();
+                frames.push(loom_remote_protocol::frame::Frame::Trailer(
+                    count.to_be_bytes().to_vec(),
+                ));
+                frames.push(loom_remote_protocol::frame::Frame::Complete);
+                frames
+            }
+            Err(error) => vec![loom_remote_protocol::frame::Frame::Error(
+                loom_remote_protocol::RemoteError::from_loom_error(&error),
+            )],
+        };
+        frames
+            .into_iter()
+            .map(|frame| frame.encode().unwrap_or_default())
+            .collect()
+    }
+
+    fn session_lease_valid(&self, session_id: &[u8]) -> bool {
+        self.sessions
+            .get(session_id)
+            .is_some_and(|session| now_ms() < session.lease_expires_ms)
+    }
+
+    fn open_generated_stream_response(
+        &mut self,
+        request: &loom_remote_protocol::envelope::Request,
+    ) -> Result<DaemonGeneratedOpenStream, loom_core::error::LoomError> {
+        let stream = self.open_stream(request)?;
+        let key = Self::stream_key(request)?;
+        if self.stream_cancellations.contains_key(&key) {
+            return Err(loom_core::error::LoomError::new(
+                loom_core::error::Code::Conflict,
+                "daemon generated stream request is already active",
+            ));
+        }
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.stream_cancellations
+            .insert(key.clone(), cancel.clone());
+        Ok((stream, cancel, key))
+    }
+
+    fn generated_session_lease_valid(&self, session_id: &[u8]) -> bool {
+        self.session_lease_valid(session_id)
+    }
+
+    fn cancel_generated_stream(
+        &mut self,
+        request: &loom_remote_protocol::envelope::Request,
+    ) -> loom_remote_protocol::envelope::Response {
+        let request_id = request.request_id.clone();
+        let session_id = request.session_id.clone();
+        let reply_err = |err: &loom_core::error::LoomError| {
+            loom_remote_protocol::envelope::Response::err(
+                request_id.clone(),
+                session_id.clone(),
+                loom_remote_protocol::RemoteError::from_loom_error(err),
+            )
+        };
+        let key = match Self::stream_key(request) {
+            Ok(key) => key,
+            Err(error) => return reply_err(&error),
+        };
+        let Some(cancel) = self.stream_cancellations.get(&key) else {
+            return reply_err(&loom_core::error::LoomError::new(
+                loom_core::error::Code::NotFound,
+                "unknown daemon generated stream request",
+            ));
+        };
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        loom_remote_protocol::envelope::Response::ok(
+            request_id,
+            session_id,
+            loom_codec::Value::Null,
+        )
+    }
+
+    fn finish_generated_stream(&mut self, key: &DaemonGeneratedStreamKey) {
+        self.stream_cancellations.remove(key);
+    }
+
+    fn cancel_session_streams(&mut self, session_id: &[u8]) {
+        for ((stream_session, _), cancel) in &self.stream_cancellations {
+            if stream_session == session_id {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        self.stream_cancellations
+            .retain(|(stream_session, _), _| stream_session != session_id);
+    }
+
+    fn stream_key(
+        request: &loom_remote_protocol::envelope::Request,
+    ) -> Result<DaemonGeneratedStreamKey, loom_core::error::LoomError> {
+        let session_id = request.session_id.clone().ok_or_else(|| {
+            loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "method requires a session",
+            )
+        })?;
+        if request.request_id.is_empty() {
+            return Err(loom_core::error::LoomError::new(
+                loom_core::error::Code::InvalidArgument,
+                "stream cancellation requires a request id",
+            ));
+        }
+        Ok((session_id, request.request_id.clone()))
+    }
+
+    fn generated_stream_error_frame(
+        error: &loom_core::error::LoomError,
+    ) -> Result<Vec<u8>, String> {
+        loom_remote_protocol::frame::Frame::Error(
+            loom_remote_protocol::RemoteError::from_loom_error(error),
+        )
+        .encode()
+        .map_err(|e| format!("encode generated stream error frame: {e}"))
+    }
+
+    fn generated_stream_lease_error() -> loom_core::error::LoomError {
+        loom_core::error::LoomError::new(
+            loom_core::error::Code::LockLeaseExpired,
+            "daemon generated session lease expired",
+        )
+    }
+
+    fn generated_stream_cancelled_error() -> loom_core::error::LoomError {
+        loom_core::error::LoomError::new(
+            loom_core::error::Code::Unavailable,
+            "daemon generated stream cancelled",
+        )
+    }
+}
+
+#[cfg(feature = "serve")]
+struct DaemonGeneratedStreamWaker {
+    thread: std::thread::Thread,
+}
+
+#[cfg(feature = "serve")]
+impl std::task::Wake for DaemonGeneratedStreamWaker {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.thread.unpark();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.thread.unpark();
+    }
+}
+
+#[cfg(feature = "serve")]
+fn write_generated_open_stream_response(
+    mut stream: loom_remote_protocol::api_types::LoomStream<Vec<u8>>,
+    runtime: Option<&std::sync::Arc<std::sync::Mutex<DaemonRuntime>>>,
+    session_id: Option<&[u8]>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    writer: &mut impl Write,
+) -> Result<(), String> {
+    let lease_valid = |runtime: Option<&std::sync::Arc<std::sync::Mutex<DaemonRuntime>>>| {
+        let Some((runtime, session_id)) = runtime.zip(session_id) else {
+            return true;
+        };
+        runtime
+            .lock()
+            .map(|runtime| {
+                runtime
+                    .generated_runtime
+                    .generated_session_lease_valid(session_id)
+            })
+            .unwrap_or(false)
+    };
+    let cancelled =
+        || cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire));
+    if cancelled() {
+        write_generated_stream_error(
+            writer,
+            DaemonGeneratedRuntime::generated_stream_cancelled_error(),
+        )?;
+        return Ok(());
+    }
+    if !lease_valid(runtime) {
+        write_generated_stream_error(
+            writer,
+            DaemonGeneratedRuntime::generated_stream_lease_error(),
+        )?;
+        return Ok(());
+    }
+    let mut count = 0u64;
+    let waker = std::task::Waker::from(std::sync::Arc::new(DaemonGeneratedStreamWaker {
+        thread: std::thread::current(),
+    }));
+    let mut cx = std::task::Context::from_waker(&waker);
+    loop {
+        if cancelled() {
+            write_generated_stream_error(
+                writer,
+                DaemonGeneratedRuntime::generated_stream_cancelled_error(),
+            )?;
+            return Ok(());
+        }
+        if !lease_valid(runtime) {
+            write_generated_stream_error(
+                writer,
+                DaemonGeneratedRuntime::generated_stream_lease_error(),
+            )?;
+            return Ok(());
+        }
+        match stream.as_mut().poll_next(&mut cx) {
+            std::task::Poll::Ready(Some(Ok(item))) => {
+                count = count.saturating_add(1);
+                let frame = loom_remote_protocol::frame::Frame::Item(item)
+                    .encode()
+                    .map_err(|e| format!("encode generated stream item frame: {e}"))?;
+                write_generated_stream_frame(writer, &frame)?;
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                let frame = DaemonGeneratedRuntime::generated_stream_error_frame(&error)?;
+                write_generated_stream_frame(writer, &frame)?;
+                return Ok(());
+            }
+            std::task::Poll::Ready(None) => {
+                let trailer =
+                    loom_remote_protocol::frame::Frame::Trailer(count.to_be_bytes().to_vec())
+                        .encode()
+                        .map_err(|e| format!("encode generated stream trailer: {e}"))?;
+                write_generated_stream_frame(writer, &trailer)?;
+                let complete = loom_remote_protocol::frame::Frame::Complete
+                    .encode()
+                    .map_err(|e| format!("encode generated stream complete: {e}"))?;
+                write_generated_stream_frame(writer, &complete)?;
+                return Ok(());
+            }
+            std::task::Poll::Pending => {
+                if cancelled() {
+                    write_generated_stream_error(
+                        writer,
+                        DaemonGeneratedRuntime::generated_stream_cancelled_error(),
+                    )?;
+                    return Ok(());
+                }
+                std::thread::park_timeout(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serve")]
+fn write_generated_stream_error(
+    writer: &mut impl Write,
+    error: loom_core::error::LoomError,
+) -> Result<(), String> {
+    let frame = DaemonGeneratedRuntime::generated_stream_error_frame(&error)?;
+    write_generated_stream_frame(writer, &frame)
+}
+
+const DAEMON_MAX_ACTIVE_CONNECTIONS: usize = 64;
+
+fn write_daemon_admission_error(stream: &mut LocalDaemonStream) -> Result<(), String> {
+    stream
+        .write_all(b"error\tdaemon active connection limit reached\n")
+        .map_err(|e| format!("write daemon admission error: {e}"))
+}
+
+struct DaemonWorkerPermit {
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl DaemonWorkerPermit {
+    fn acquire(active: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |current| (current < DAEMON_MAX_ACTIVE_CONNECTIONS).then_some(current + 1),
+            )
+            .ok()?;
+        Some(Self {
+            active: active.clone(),
+        })
+    }
+}
+
+impl Drop for DaemonWorkerPermit {
+    fn drop(&mut self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "serve")]
+impl DaemonGeneratedRuntime {
+    fn open_stream(
+        &mut self,
+        request: &loom_remote_protocol::envelope::Request,
+    ) -> Result<loom_remote_protocol::api_types::LoomStream<Vec<u8>>, loom_core::error::LoomError>
+    {
+        use loom_remote_protocol::codec::ToValue;
+
+        let session_bytes = request.session_id.as_ref().ok_or_else(|| {
+            loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "method requires a session",
+            )
+        })?;
+        let session = self.sessions.get(session_bytes).cloned().ok_or_else(|| {
+            loom_core::error::LoomError::new(
+                loom_core::error::Code::NotFound,
+                "unknown or expired session",
+            )
+        })?;
+        if now_ms() >= session.lease_expires_ms {
+            return Err(loom_core::error::LoomError::new(
+                loom_core::error::Code::LockLeaseExpired,
+                "daemon generated session lease expired",
+            ));
+        }
+        let handle = session.handle;
+        if request.args.first() != Some(&handle.to_value()) {
+            return Err(loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "method handle does not belong to the daemon session",
+            ));
+        }
+        match loom_hosted_core::generated_dispatch::dispatch(
+            &self.client,
+            &handle,
+            &request.interface,
+            &request.method,
+            &request.args,
+        ) {
+            Ok(loom_hosted_core::generated_dispatch::Dispatched::Stream(stream)) => Ok(stream),
+            Ok(loom_hosted_core::generated_dispatch::Dispatched::Unary(_)) => {
+                Err(loom_core::error::LoomError::new(
+                    loom_core::error::Code::InvalidArgument,
+                    format!(
+                        "method {}.{} is not a streaming method; use the unary route",
+                        request.interface, request.method
+                    ),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn stream_items(
+        &self,
+        request: &loom_remote_protocol::envelope::Request,
+    ) -> Result<Vec<Vec<u8>>, loom_core::error::LoomError> {
+        use loom_remote_protocol::codec::ToValue;
+
+        let session_bytes = request.session_id.as_ref().ok_or_else(|| {
+            loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "method requires a session",
+            )
+        })?;
+        let session = self.sessions.get(session_bytes).cloned().ok_or_else(|| {
+            loom_core::error::LoomError::new(
+                loom_core::error::Code::NotFound,
+                "unknown or expired session",
+            )
+        })?;
+        if now_ms() >= session.lease_expires_ms {
+            return Err(loom_core::error::LoomError::new(
+                loom_core::error::Code::LockLeaseExpired,
+                "daemon generated session lease expired",
+            ));
+        }
+        let handle = session.handle;
+        if request.args.first() != Some(&handle.to_value()) {
+            return Err(loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "method handle does not belong to the daemon session",
+            ));
+        }
+        match loom_hosted_core::generated_dispatch::dispatch(
+            &self.client,
+            &handle,
+            &request.interface,
+            &request.method,
+            &request.args,
+        ) {
+            Ok(loom_hosted_core::generated_dispatch::Dispatched::Stream(stream)) => {
+                loom_hosted_core::generated_dispatch::drain_stream(stream)
+            }
+            Ok(loom_hosted_core::generated_dispatch::Dispatched::Unary(_)) => {
+                Err(loom_core::error::LoomError::new(
+                    loom_core::error::Code::InvalidArgument,
+                    format!(
+                        "method {}.{} is not a streaming method; use the unary route",
+                        request.interface, request.method
+                    ),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "serve")]
+fn daemon_generated_runtime(store: &str) -> Result<DaemonGeneratedRuntime, String> {
+    DaemonGeneratedRuntime::start(store)
+}
+
+#[cfg(feature = "serve")]
+fn write_generated_stream_frame(writer: &mut impl Write, frame: &[u8]) -> Result<(), String> {
+    let len = u32::try_from(frame.len()).map_err(|_| "generated stream frame too large")?;
+    writer
+        .write_all(&len.to_be_bytes())
+        .map_err(|e| format!("write generated stream frame length: {e}"))?;
+    writer
+        .write_all(frame)
+        .map_err(|e| format!("write generated stream frame: {e}"))
 }
 
 impl Default for DaemonStopRequest {
@@ -7783,6 +8804,143 @@ fn split_daemon_auth_fields(fields: Vec<&str>) -> Result<(Vec<&str>, DaemonReque
 }
 
 impl DaemonRuntime {
+    #[cfg(feature = "serve")]
+    fn generated_session_open(&mut self, fields: Vec<&str>) -> String {
+        if fields.len() != 1 {
+            return "error\tgenerated session open expects a request body\n".to_string();
+        }
+        let body = match daemon::hex_decode(fields[0]) {
+            Ok(body) => body,
+            Err(error) => return format!("error\t{error}\n"),
+        };
+        let auth = match loom_remote_protocol::session::parse_open_request(&body) {
+            Ok(auth) => auth,
+            Err(error) => return format!("error\t{}\n", error),
+        };
+        let reply = self.generated_runtime.open_session(auth);
+        let bytes = loom_remote_protocol::session::open_reply_bytes(&reply);
+        format!("generated-session\t{}\n", daemon::hex_encode(&bytes))
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_call(&mut self, fields: Vec<&str>) -> String {
+        if fields.len() != 1 {
+            return "error\tgenerated call expects a request body\n".to_string();
+        }
+        let body = match daemon::hex_decode(fields[0]) {
+            Ok(body) => body,
+            Err(error) => return format!("error\t{error}\n"),
+        };
+        let request = match loom_remote_protocol::envelope::Request::decode(&body) {
+            Ok(request) => request,
+            Err(error) => return format!("error\t{}\n", error),
+        };
+        let response = self.generated_runtime.dispatch(&request);
+        let bytes = match response.encode() {
+            Ok(bytes) => bytes,
+            Err(error) => return format!("error\t{}\n", error),
+        };
+        format!("generated-response\t{}\n", daemon::hex_encode(&bytes))
+    }
+
+    #[cfg(feature = "serve")]
+    fn handle_generated_binary(&mut self, request: &[u8]) -> Option<Vec<u8>> {
+        if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_SESSION_OPEN_MAGIC) {
+            let reply = match loom_remote_protocol::session::parse_open_request(body) {
+                Ok(auth) => self.generated_runtime.open_session(auth),
+                Err(error) => {
+                    let error = loom_core::error::LoomError::new(
+                        loom_core::error::Code::InvalidArgument,
+                        format!("decode session-open request: {error}"),
+                    );
+                    loom_remote_protocol::session::SessionOpenReply::Err(
+                        loom_remote_protocol::RemoteError::from_loom_error(&error),
+                    )
+                }
+            };
+            return Some(generated_binary_response(
+                DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+                &[loom_remote_protocol::session::open_reply_bytes(&reply)],
+            ));
+        }
+        if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_CALL_MAGIC) {
+            let response = match loom_remote_protocol::envelope::Request::decode(body) {
+                Ok(request) => self.generated_runtime.dispatch(&request),
+                Err(error) => {
+                    let error = loom_core::error::LoomError::new(
+                        loom_core::error::Code::InvalidArgument,
+                        format!("decode generated request: {error}"),
+                    );
+                    loom_remote_protocol::envelope::Response::err(
+                        Vec::new(),
+                        None,
+                        loom_remote_protocol::RemoteError::from_loom_error(&error),
+                    )
+                }
+            };
+            let body = response.encode().unwrap_or_default();
+            return Some(generated_binary_response(
+                DAEMON_GENERATED_RESPONSE_MAGIC,
+                &[body],
+            ));
+        }
+        if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_STREAM_CANCEL_MAGIC) {
+            let response = match loom_remote_protocol::envelope::Request::decode(body) {
+                Ok(request) => self.generated_runtime.cancel_generated_stream(&request),
+                Err(error) => {
+                    let error = loom_core::error::LoomError::new(
+                        loom_core::error::Code::InvalidArgument,
+                        format!("decode generated stream cancel request: {error}"),
+                    );
+                    loom_remote_protocol::envelope::Response::err(
+                        Vec::new(),
+                        None,
+                        loom_remote_protocol::RemoteError::from_loom_error(&error),
+                    )
+                }
+            };
+            let body = response.encode().unwrap_or_default();
+            return Some(generated_binary_response(
+                DAEMON_GENERATED_STREAM_CANCEL_RESPONSE_MAGIC,
+                &[body],
+            ));
+        }
+        if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_STREAM_MAGIC) {
+            let frames = match loom_remote_protocol::envelope::Request::decode(body) {
+                Ok(request) => self.generated_runtime.dispatch_stream(&request),
+                Err(error) => {
+                    let error = loom_core::error::LoomError::new(
+                        loom_core::error::Code::InvalidArgument,
+                        format!("decode generated stream request: {error}"),
+                    );
+                    vec![
+                        loom_remote_protocol::frame::Frame::Error(
+                            loom_remote_protocol::RemoteError::from_loom_error(&error),
+                        )
+                        .encode()
+                        .unwrap_or_default(),
+                    ]
+                }
+            };
+            return Some(generated_binary_response(
+                DAEMON_GENERATED_STREAM_RESPONSE_MAGIC,
+                &frames,
+            ));
+        }
+        None
+    }
+
+    fn handle_bytes(&mut self, request: &[u8]) -> Vec<u8> {
+        #[cfg(feature = "serve")]
+        if let Some(response) = self.handle_generated_binary(request) {
+            return response;
+        }
+        match std::str::from_utf8(request) {
+            Ok(text) => self.handle(text).into_bytes(),
+            Err(error) => format!("error\tinvalid daemon request utf-8: {error}\n").into_bytes(),
+        }
+    }
+
     fn reconcile_store_maintenance(&mut self) -> Result<(), String> {
         let now = now_ms();
         if self
@@ -7816,10 +8974,30 @@ impl DaemonRuntime {
             return Ok(());
         }
         let store = self.store.clone();
+        self.maintenance_cancel
+            .store(false, std::sync::atomic::Ordering::Release);
+        let cancel = self.maintenance_cancel.clone();
         self.maintenance_worker = Some(std::thread::spawn(move || {
-            let mut loom = loom_store::open_loom_daemon_authorized_unlocked(&store, None)
-                .map_err(|e| e.to_string())?;
-            run_store_maintenance_once(&mut loom, now, false, None, None).map(|_| ())
+            let result = {
+                let mut loom = loom_store::open_loom_daemon_authorized_unlocked(&store, None)
+                    .map_err(|e| e.to_string())?;
+                run_store_maintenance_once_with_budget(
+                    &mut loom,
+                    now,
+                    false,
+                    None,
+                    None,
+                    Some(StoreMaintenanceRunBudget::daemon_automatic()),
+                    Some(cancel.as_ref()),
+                )
+            };
+            #[cfg(test)]
+            if let Some(hook) = maintenance_worker_test_hook(&store)
+                && hook.enter_and_wait(cancel.as_ref())
+            {
+                return Ok(());
+            }
+            result.map(|_| ())
         }));
         Ok(())
     }
@@ -7832,13 +9010,20 @@ impl DaemonRuntime {
             .filter(|pin| pin.deadline_ms.is_none())
             .count();
         let leased_pins = self.pins.len() - permanent_pins;
+        let maintenance_worker = if self.maintenance_worker.is_some() {
+            "running"
+        } else {
+            "idle"
+        };
         let mut response = format!(
-            "{}\tsessions={}\tpins={}\tpermanent_pins={}\tleased_pins={}",
+            "{}\tsessions={}\tpins={}\tpermanent_pins={}\tleased_pins={}\tmaintenance_worker={}\tmaintenance_next_ms={}",
             daemon_running_response(&self.store, &self.store_id, self.transport).trim_end(),
             self.sessions.len(),
             self.pins.len(),
             permanent_pins,
-            leased_pins
+            leased_pins,
+            maintenance_worker,
+            self.maintenance_next_ms
         );
         for (id, pin) in &self.pins {
             match pin.deadline_ms {
@@ -7868,6 +9053,8 @@ impl DaemonRuntime {
             return format!("error\tdaemon has {} live pin(s)\n", self.pins.len());
         }
         let pin_count = self.pins.len();
+        self.maintenance_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
         let (listeners, timed_out) = self.stop_hosted_listeners(request);
         let target = format!(
             "force={force};hard={};wait_ms={};pins={pin_count};listeners={listeners};timed_out={timed_out}",
@@ -7912,6 +9099,10 @@ impl DaemonRuntime {
             "fts-rebuild" => self.fts_rebuild(parts.collect()),
             "maintenance-status" => self.maintenance_status(parts.collect()),
             "maintenance-run" => self.maintenance_run(parts.collect()),
+            #[cfg(feature = "serve")]
+            "generated-session-open" => self.generated_session_open(parts.collect()),
+            #[cfg(feature = "serve")]
+            "generated-call" => self.generated_call(parts.collect()),
             #[cfg(feature = "serve")]
             "reference-reconcile" => self.reference_reconcile(parts.collect()),
             "stop" => {
@@ -9423,8 +10614,12 @@ pub(crate) fn daemon_run(
     let runtime_lock =
         daemon_lock_runtime_file(std::path::Path::new(lock_file)).map_err(|e| e.to_string())?;
     daemon_write_runtime_lock(&runtime_lock, &paths).map_err(|e| e.to_string())?;
-    let fs = FileStore::open_read(store).map_err(|e| e.to_string())?;
-    let coordinator = fs.lock_coordinator().map_err(|e| e.to_string())?;
+    let coordinator = {
+        let fs = FileStore::open_read(store).map_err(|e| e.to_string())?;
+        fs.lock_coordinator().map_err(|e| e.to_string())?
+    };
+    #[cfg(feature = "serve")]
+    let generated_runtime = daemon_generated_runtime(store)?;
     let (kv_loom, kv_unavailable) = match daemon_kv_loom(store) {
         Ok(loom) => (Some(loom), None),
         Err(e) => (None, Some(daemon_kv_unavailable_error(e))),
@@ -9434,11 +10629,13 @@ pub(crate) fn daemon_run(
     #[cfg(feature = "serve")]
     let hosted_listeners = start_hosted_listeners(store)?;
     let store_id = paths.store_id.clone();
-    let mut runtime = DaemonRuntime {
+    let runtime = std::sync::Arc::new(std::sync::Mutex::new(DaemonRuntime {
         store: store.to_string(),
         store_id,
         transport,
         coordinator,
+        #[cfg(feature = "serve")]
+        generated_runtime,
         kv_loom,
         kv_unavailable,
         sessions: std::collections::BTreeSet::new(),
@@ -9446,13 +10643,16 @@ pub(crate) fn daemon_run(
         authority_replication_next: std::collections::BTreeMap::new(),
         maintenance_next_ms: 0,
         maintenance_worker: None,
+        maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         #[cfg(feature = "serve")]
         hosted_listeners,
         #[cfg(feature = "serve")]
         drive_policy_next_ms: 0,
         #[cfg(feature = "serve")]
         reference_reconcile_next_ms: 0,
-    };
+    }));
+    let should_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::fs::write(addr_file, listener.addr_file_contents(&paths)?)
         .map_err(|e| format!("write daemon address file: {e}"))?;
     daemon::align_runtime_artifact_owner(std::path::Path::new(addr_file), "address", &paths)
@@ -9462,12 +10662,24 @@ pub(crate) fn daemon_run(
     daemon::align_runtime_artifact_owner(std::path::Path::new(pid_file), "pid", &paths)
         .map_err(|e| e.to_string())?;
     loop {
-        runtime.reconcile_store_maintenance()?;
-        runtime.reconcile_authority_replication()?;
-        #[cfg(feature = "serve")]
-        runtime.reconcile_hosted_listeners()?;
-        runtime.reconcile_drive_policy_workers()?;
-        runtime.reconcile_reference_workers()?;
+        if should_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = std::fs::remove_file(addr_file);
+            let _ = std::fs::remove_file(pid_file);
+            let _ = std::fs::remove_file(lock_file);
+            let _ = std::fs::remove_file(&paths.sock_file);
+            return Ok(());
+        }
+        {
+            let mut runtime = runtime
+                .lock()
+                .map_err(|_| "daemon runtime lock poisoned".to_string())?;
+            runtime.reconcile_store_maintenance()?;
+            runtime.reconcile_authority_replication()?;
+            #[cfg(feature = "serve")]
+            runtime.reconcile_hosted_listeners()?;
+            runtime.reconcile_drive_policy_workers()?;
+            runtime.reconcile_reference_workers()?;
+        }
         let mut stream = match listener.accept(&paths)? {
             Some(stream) => stream,
             None => {
@@ -9475,24 +10687,96 @@ pub(crate) fn daemon_run(
                 continue;
             }
         };
-        let mut request = String::new();
-        stream
-            .read_to_string(&mut request)
-            .map_err(|e| format!("read daemon request: {e}"))?;
-        let response = runtime.handle(&request);
-        let request_head = request.trim_end().split('\t').next();
-        let should_stop = matches!(request_head, Some("stop" | "stop-force"))
-            && response.starts_with("stopped\t");
-        stream
-            .write_all(response.as_bytes())
-            .map_err(|e| format!("write daemon response: {e}"))?;
-        if should_stop {
-            let _ = std::fs::remove_file(addr_file);
-            let _ = std::fs::remove_file(pid_file);
-            let _ = std::fs::remove_file(lock_file);
-            let _ = std::fs::remove_file(&paths.sock_file);
-            return Ok(());
-        }
+        let runtime = runtime.clone();
+        let should_stop = should_stop.clone();
+        let Some(permit) = DaemonWorkerPermit::acquire(&active_connections) else {
+            write_daemon_admission_error(&mut stream)?;
+            continue;
+        };
+        std::thread::spawn(move || {
+            let _permit = permit;
+            let request = match read_daemon_request_bounded(&mut stream) {
+                Ok(request) => request,
+                Err(error) => {
+                    let _ = stream.write_all(format!("error\t{error}\n").as_bytes());
+                    return;
+                }
+            };
+            #[cfg(feature = "serve")]
+            if let Some(body) = generated_binary_body(&request, DAEMON_GENERATED_STREAM_MAGIC) {
+                let _ = stream.write_all(DAEMON_GENERATED_STREAM_RESPONSE_MAGIC);
+                match loom_remote_protocol::envelope::Request::decode(body) {
+                    Ok(request) => {
+                        let session_id = request.session_id.clone();
+                        let stream_result = runtime
+                            .lock()
+                            .map_err(|_| {
+                                loom_core::error::LoomError::new(
+                                    loom_core::error::Code::Internal,
+                                    "daemon runtime lock poisoned",
+                                )
+                            })
+                            .and_then(|mut runtime| {
+                                runtime
+                                    .generated_runtime
+                                    .open_generated_stream_response(&request)
+                            });
+                        match stream_result {
+                            Ok((open_stream, cancel, stream_key)) => {
+                                let result = write_generated_open_stream_response(
+                                    open_stream,
+                                    Some(&runtime),
+                                    session_id.as_deref(),
+                                    Some(cancel.as_ref()),
+                                    &mut stream,
+                                );
+                                cancel.store(true, std::sync::atomic::Ordering::Release);
+                                if let Ok(mut runtime) = runtime.lock() {
+                                    runtime
+                                        .generated_runtime
+                                        .finish_generated_stream(&stream_key);
+                                }
+                                let _ = result;
+                            }
+                            Err(error) => {
+                                if let Ok(frame) =
+                                    DaemonGeneratedRuntime::generated_stream_error_frame(&error)
+                                {
+                                    let _ = write_generated_stream_frame(&mut stream, &frame);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let error = loom_core::error::LoomError::new(
+                            loom_core::error::Code::InvalidArgument,
+                            format!("decode generated stream request: {error}"),
+                        );
+                        let frame = loom_remote_protocol::frame::Frame::Error(
+                            loom_remote_protocol::RemoteError::from_loom_error(&error),
+                        )
+                        .encode();
+                        if let Ok(frame) = frame {
+                            let _ = write_generated_stream_frame(&mut stream, &frame);
+                        }
+                    }
+                }
+                return;
+            }
+            let response = match runtime.lock() {
+                Ok(mut runtime) => runtime.handle_bytes(&request),
+                Err(_) => b"error\tdaemon runtime lock poisoned\n".to_vec(),
+            };
+            let request_head = std::str::from_utf8(&request)
+                .ok()
+                .and_then(|request| request.trim_end().split('\t').next());
+            let stop_requested = matches!(request_head, Some("stop" | "stop-force"))
+                && response.starts_with(b"stopped\t");
+            let _ = stream.write_all(&response);
+            if stop_requested {
+                should_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
     }
 }
 
@@ -9505,6 +10789,28 @@ fn daemon_lock_runtime_file(lock_file: &std::path::Path) -> std::io::Result<std:
         .open(lock_file)?;
     file.lock()?;
     Ok(file)
+}
+
+const DAEMON_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+fn read_daemon_request_bounded(stream: &mut LocalDaemonStream) -> Result<Vec<u8>, String> {
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("read daemon request: {e}"))?;
+        if read == 0 {
+            return Ok(request);
+        }
+        if request.len().saturating_add(read) > DAEMON_MAX_REQUEST_BYTES {
+            return Err(format!(
+                "daemon request exceeds {} byte limit",
+                DAEMON_MAX_REQUEST_BYTES
+            ));
+        }
+        request.extend_from_slice(&chunk[..read]);
+    }
 }
 
 pub(crate) fn daemon_running_response(
@@ -9524,6 +10830,26 @@ pub(crate) fn daemon_running_response(
 mod maintenance_tail_trim_tests {
     use super::*;
 
+    struct MaintenanceWorkerHookGuard {
+        store: String,
+        previous: Option<std::sync::Arc<MaintenanceWorkerTestHook>>,
+    }
+
+    impl MaintenanceWorkerHookGuard {
+        fn install(store: &str, hook: std::sync::Arc<MaintenanceWorkerTestHook>) -> Self {
+            Self {
+                store: store.to_string(),
+                previous: set_maintenance_worker_test_hook(store.to_string(), hook),
+            }
+        }
+    }
+
+    impl Drop for MaintenanceWorkerHookGuard {
+        fn drop(&mut self) {
+            restore_maintenance_worker_test_hook(self.store.clone(), self.previous.take());
+        }
+    }
+
     fn temp_store(tag: &str) -> String {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -9533,6 +10859,16 @@ mod maintenance_tail_trim_tests {
         path.to_string_lossy().into_owned()
     }
 
+    #[cfg(feature = "serve")]
+    fn test_generated_runtime(tag: &str, store: &str) -> DaemonGeneratedRuntime {
+        if tag.starts_with("generated") {
+            return daemon_generated_runtime(store).unwrap();
+        }
+        let generated_store = temp_store(&format!("{tag}-generated"));
+        FileStore::create_with_profile(&generated_store, Algo::Blake3).unwrap();
+        daemon_generated_runtime(&generated_store).unwrap()
+    }
+
     fn test_runtime(tag: &str) -> (String, DaemonRuntime) {
         let store = temp_store(tag);
         let fs = FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
@@ -9540,12 +10876,14 @@ mod maintenance_tail_trim_tests {
         drop(fs);
         let paths = daemon::paths(&store).unwrap();
         (
-            store,
+            store.clone(),
             DaemonRuntime {
                 store: paths.store,
                 store_id: paths.store_id,
                 transport: daemon::DaemonTransport::TcpLoopback,
                 coordinator,
+                #[cfg(feature = "serve")]
+                generated_runtime: test_generated_runtime(tag, &store),
                 kv_loom: None,
                 kv_unavailable: None,
                 sessions: std::collections::BTreeSet::new(),
@@ -9553,6 +10891,7 @@ mod maintenance_tail_trim_tests {
                 authority_replication_next: std::collections::BTreeMap::new(),
                 maintenance_next_ms: 0,
                 maintenance_worker: None,
+                maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 #[cfg(feature = "serve")]
                 hosted_listeners: std::collections::BTreeMap::new(),
                 #[cfg(feature = "serve")]
@@ -9563,9 +10902,1452 @@ mod maintenance_tail_trim_tests {
         )
     }
 
+    fn runtime_for_existing_store(tag: &str, store: &str) -> DaemonRuntime {
+        #[cfg(not(feature = "serve"))]
+        let _ = tag;
+        let fs = FileStore::open_daemon_authorized(store).unwrap();
+        let coordinator = fs.lock_coordinator().unwrap();
+        drop(fs);
+        let paths = daemon::paths(store).unwrap();
+        DaemonRuntime {
+            store: paths.store,
+            store_id: paths.store_id,
+            transport: daemon::DaemonTransport::TcpLoopback,
+            coordinator,
+            #[cfg(feature = "serve")]
+            generated_runtime: test_generated_runtime(tag, store),
+            kv_loom: None,
+            kv_unavailable: None,
+            sessions: std::collections::BTreeSet::new(),
+            pins: std::collections::BTreeMap::new(),
+            authority_replication_next: std::collections::BTreeMap::new(),
+            maintenance_next_ms: 0,
+            maintenance_worker: None,
+            maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "serve")]
+            hosted_listeners: std::collections::BTreeMap::new(),
+            #[cfg(feature = "serve")]
+            drive_policy_next_ms: 0,
+            #[cfg(feature = "serve")]
+            reference_reconcile_next_ms: 0,
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    fn test_generated_authenticated_runtime(
+        tag: &str,
+    ) -> (String, DaemonRuntime, WorkspaceId, WorkspaceId) {
+        let store = temp_store(tag);
+        let fs = FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+        let root = WorkspaceId::v4_from_bytes([31; 16]);
+        let user = WorkspaceId::v4_from_bytes([32; 16]);
+        let mut identity = IdentityStore::new(root);
+        identity
+            .set_passphrase(root, "root-pass", b"12345678")
+            .unwrap();
+        identity
+            .add_principal(user, "user", PrincipalKind::User)
+            .unwrap();
+        identity
+            .set_passphrase(user, "user-pass", b"abcdefgh")
+            .unwrap();
+        let mut acl = AclStore::new();
+        acl.allow(AclSubject::Principal(root), None, None, [AclRight::Admin])
+            .unwrap();
+        fs.save_identity_store(&identity).unwrap();
+        fs.save_acl_store(&acl).unwrap();
+        let coordinator = fs.lock_coordinator().unwrap();
+        drop(fs);
+        let paths = daemon::paths(&store).unwrap();
+        (
+            store.clone(),
+            DaemonRuntime {
+                store: paths.store,
+                store_id: paths.store_id,
+                transport: daemon::DaemonTransport::TcpLoopback,
+                coordinator,
+                #[cfg(feature = "serve")]
+                generated_runtime: test_generated_runtime(tag, &store),
+                kv_loom: None,
+                kv_unavailable: None,
+                sessions: std::collections::BTreeSet::new(),
+                pins: std::collections::BTreeMap::new(),
+                authority_replication_next: std::collections::BTreeMap::new(),
+                maintenance_next_ms: 0,
+                maintenance_worker: None,
+                maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                #[cfg(feature = "serve")]
+                hosted_listeners: std::collections::BTreeMap::new(),
+                #[cfg(feature = "serve")]
+                drive_policy_next_ms: 0,
+                #[cfg(feature = "serve")]
+                reference_reconcile_next_ms: 0,
+            },
+            root,
+            user,
+        )
+    }
+
     fn wait_for_maintenance(runtime: &mut DaemonRuntime) {
         if let Some(worker) = runtime.maintenance_worker.take() {
             worker.join().unwrap().unwrap();
+        }
+    }
+
+    fn write_many_commits(
+        store: &str,
+        tag: &str,
+        count: u64,
+    ) -> (WorkspaceId, std::collections::BTreeSet<Digest>) {
+        let fs = FileStore::open_daemon_authorized(store).unwrap();
+        let mut loom = loom_core::Loom::new(fs);
+        let ns = loom
+            .registry_mut()
+            .create(
+                loom_core::workspace::FacetKind::Files,
+                Some(tag),
+                WorkspaceId::from_bytes([41; 16]),
+            )
+            .unwrap();
+        for i in 0..count {
+            loom.write_file(
+                ns,
+                &format!("f{i}.txt"),
+                format!("v{i}").as_bytes(),
+                0o100644,
+            )
+            .unwrap();
+            loom.commit(ns, "nas", "edit", i + 1).unwrap();
+        }
+        loom_store::save_loom(&mut loom).unwrap();
+        let expected = loom.live_object_set(loom.store().reference_root()).unwrap();
+        loom.store()
+            .set_store_maintenance_policy(loom_store::StoreMaintenancePolicy {
+                min_candidate_pages: 0,
+                min_reusable_pages: 0,
+                interval_ms: 1,
+                backoff_ms: 2,
+                tail_trim_enabled: false,
+                tail_compaction_enabled: false,
+                ..loom_store::StoreMaintenancePolicy::default()
+            })
+            .unwrap();
+        (ns, expected)
+    }
+
+    fn completed_runtime_maintenance(runtime: &mut DaemonRuntime, store: &str) -> bool {
+        runtime.maintenance_next_ms = 0;
+        runtime.reconcile_store_maintenance().unwrap();
+        wait_for_maintenance(runtime);
+        FileStore::open_read(store)
+            .unwrap()
+            .active_reachability_mark_epoch()
+            .unwrap()
+            .is_some_and(|epoch| epoch.state.completed)
+    }
+
+    fn assert_completed_mark_is(store: &str, expected: &std::collections::BTreeSet<Digest>) {
+        let fs = FileStore::open_read(store).unwrap();
+        let epoch = fs.active_reachability_mark_epoch().unwrap().unwrap();
+        assert!(epoch.state.completed);
+        assert_eq!(&epoch.state.marked, expected);
+    }
+
+    #[cfg(feature = "serve")]
+    fn binary_request(magic: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(magic);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[cfg(feature = "serve")]
+    fn binary_response_body(response: &[u8], magic: &[u8]) -> Vec<u8> {
+        let rest = response
+            .strip_prefix(magic)
+            .expect("binary response prefix");
+        let count = u32::from_be_bytes(rest[..4].try_into().unwrap());
+        assert_eq!(count, 1);
+        let len = u32::from_be_bytes(rest[4..8].try_into().unwrap()) as usize;
+        assert_eq!(rest.len(), 8 + len);
+        rest[8..].to_vec()
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_call(
+        runtime: &mut DaemonRuntime,
+        session_id: Option<Vec<u8>>,
+        interface: &str,
+        method: &str,
+        args: Vec<loom_codec::Value>,
+    ) -> loom_remote_protocol::envelope::ResponsePayload {
+        let request = loom_remote_protocol::envelope::Request {
+            request_id: vec![7],
+            session_id,
+            interface: interface.to_string(),
+            method: method.to_string(),
+            args,
+            deadline_ms: 0,
+            idempotency_key: None,
+            principal_hint: None,
+            compression: loom_remote_protocol::envelope::Compression::None,
+            stream: false,
+        };
+        let response = runtime.handle_bytes(&binary_request(
+            DAEMON_GENERATED_CALL_MAGIC,
+            &request.encode().unwrap(),
+        ));
+        loom_remote_protocol::envelope::Response::decode(&binary_response_body(
+            &response,
+            DAEMON_GENERATED_RESPONSE_MAGIC,
+        ))
+        .unwrap()
+        .payload
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_stream_cancel_call(
+        runtime: &mut DaemonRuntime,
+        session_id: Vec<u8>,
+        request_id: Vec<u8>,
+    ) -> loom_remote_protocol::envelope::ResponsePayload {
+        let request = loom_remote_protocol::envelope::Request {
+            request_id,
+            session_id: Some(session_id),
+            interface: "Store".to_string(),
+            method: "cancel_stream".to_string(),
+            args: vec![],
+            deadline_ms: 0,
+            idempotency_key: None,
+            principal_hint: None,
+            compression: loom_remote_protocol::envelope::Compression::None,
+            stream: false,
+        };
+        let response = runtime.handle_bytes(&binary_request(
+            DAEMON_GENERATED_STREAM_CANCEL_MAGIC,
+            &request.encode().unwrap(),
+        ));
+        loom_remote_protocol::envelope::Response::decode(&binary_response_body(
+            &response,
+            DAEMON_GENERATED_STREAM_CANCEL_RESPONSE_MAGIC,
+        ))
+        .unwrap()
+        .payload
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_open_session(runtime: &mut DaemonRuntime) -> Vec<u8> {
+        let open_bytes = loom_remote_protocol::session::open_request_bytes(
+            &loom_remote_protocol::session::SessionAuth::Unauthenticated,
+        );
+        let response = runtime.handle_bytes(&binary_request(
+            DAEMON_GENERATED_SESSION_OPEN_MAGIC,
+            &open_bytes,
+        ));
+        let reply = loom_remote_protocol::session::parse_open_reply(&binary_response_body(
+            &response,
+            DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+        ))
+        .unwrap();
+        match reply {
+            loom_remote_protocol::session::SessionOpenReply::Ok { session_id, .. } => session_id,
+            loom_remote_protocol::session::SessionOpenReply::Err(error) => {
+                panic!("session open failed: {}", error.message)
+            }
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_open_passphrase_session(
+        runtime: &mut DaemonRuntime,
+        principal: WorkspaceId,
+        passphrase: &str,
+    ) -> Vec<u8> {
+        let open_bytes = loom_remote_protocol::session::open_request_bytes(
+            &loom_remote_protocol::session::SessionAuth::Passphrase {
+                principal: *principal.as_bytes(),
+                passphrase: passphrase.as_bytes().to_vec(),
+            },
+        );
+        let response = runtime.handle_bytes(&binary_request(
+            DAEMON_GENERATED_SESSION_OPEN_MAGIC,
+            &open_bytes,
+        ));
+        let reply = loom_remote_protocol::session::parse_open_reply(&binary_response_body(
+            &response,
+            DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+        ))
+        .unwrap();
+        match reply {
+            loom_remote_protocol::session::SessionOpenReply::Ok { session_id, .. } => session_id,
+            loom_remote_protocol::session::SessionOpenReply::Err(error) => {
+                panic!("session open failed: {}", error.message)
+            }
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_json_ok(
+        payload: loom_remote_protocol::envelope::ResponsePayload,
+    ) -> serde_json::Value {
+        match payload {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Text(value)) => {
+                serde_json::from_str(&value).expect("generated json response")
+            }
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("generated call failed: {}", error.message)
+            }
+            other => panic!("unexpected generated payload: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_stream_frames(bytes: &[u8]) -> Vec<loom_remote_protocol::frame::Frame> {
+        let mut rest = bytes;
+        let mut frames = Vec::new();
+        while !rest.is_empty() {
+            let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+            frames.push(loom_remote_protocol::frame::Frame::decode(&rest[4..4 + len]).unwrap());
+            rest = &rest[4 + len..];
+        }
+        frames
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_dispatch_roundtrips_document_and_file_calls() {
+        let (_store, mut runtime) = test_runtime("generated-dispatch");
+        let session_id = generated_open_session(&mut runtime);
+        let handle = match generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("store open failed: {}", error.message)
+            }
+        };
+        let doc_put = generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Document",
+            "put_text",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("notes".to_string()),
+                loom_codec::Value::Text("hello.md".to_string()),
+                loom_codec::Value::Text("hello from daemon".to_string()),
+                loom_codec::Value::Null,
+            ],
+        );
+        assert!(matches!(
+            doc_put,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(_))
+        ));
+        let doc_get = generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Document",
+            "get_text",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("notes".to_string()),
+                loom_codec::Value::Text("hello.md".to_string()),
+            ],
+        );
+        assert!(matches!(
+            doc_get,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(_))
+        ));
+        let file_put = generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "FileSystem",
+            "write_file",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("/hello.txt".to_string()),
+                loom_codec::Value::Bytes(b"hello file".to_vec()),
+                loom_codec::Value::Uint(0o644),
+            ],
+        );
+        assert!(matches!(
+            file_put,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+        ));
+        let file_get = generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "FileSystem",
+            "read_file",
+            vec![
+                handle,
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("/hello.txt".to_string()),
+            ],
+        );
+        assert_eq!(
+            file_get,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(
+                b"hello file".to_vec()
+            ))
+        );
+        assert!(matches!(
+            generated_call(
+                &mut runtime,
+                Some(session_id.clone()),
+                "Store",
+                "close",
+                vec![]
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_dispatch_roundtrips_ticket_and_page_calls() {
+        let (_store, mut runtime) = test_runtime("generated-ticket-page-dispatch");
+        let session_id = generated_open_session(&mut runtime);
+        let handle = match generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("store open failed: {}", error.message)
+            }
+        };
+        assert!(matches!(
+            generated_call(
+                &mut runtime,
+                Some(session_id.clone()),
+                "Workspaces",
+                "workspace_create",
+                vec![
+                    handle.clone(),
+                    loom_codec::Value::Text("main".to_string()),
+                    loom_codec::Value::Null,
+                ],
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let project = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Tickets",
+            "tickets_project_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("MX".to_string()),
+                loom_codec::Value::Text("Matrix".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        let project_root = project["profile_root"].as_str().expect("project root");
+        let ticket = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Tickets",
+            "tickets_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("task".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Null,
+                loom_codec::Value::Text(
+                    serde_json::json!({"status": "ready", "title": "Daemon ticket"}).to_string(),
+                ),
+                loom_codec::Value::Text("[]".to_string()),
+                loom_codec::Value::Text(project_root.to_string()),
+            ],
+        ));
+        assert_eq!(ticket["resource"]["primary_key"], "MX-1");
+        let ticket_id = ticket["resource"]["ticket_id"].as_str().expect("ticket id");
+        let get_ticket = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Tickets",
+            "tickets_get_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text(ticket_id.to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        assert_eq!(get_ticket["primary_key"], "MX-1");
+        let ticket_list = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Tickets",
+            "tickets_list_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        assert_eq!(
+            ticket_list["items"].as_array().expect("ticket list").len(),
+            1
+        );
+
+        let lane = loom_lanes::Lane {
+            lane_id: "lane-1".to_string(),
+            lane_key: "lane-one".to_string(),
+            title: "Lane one".to_string(),
+            description: "Generated daemon lane".to_string(),
+            lane_kind: loom_lanes::LaneKind::Assignment.as_str().to_string(),
+            owner_principal: None,
+            lane_status: "ready".to_string(),
+            lane_tickets: vec![loom_lanes::LaneTicket {
+                ticket_id: "MX-1".to_string(),
+                order_key: "a".to_string(),
+            }],
+            active_ticket_id: Some("MX-1".to_string()),
+            status_report: "ready".to_string(),
+            reviewer_feedback: String::new(),
+            updated_at: 1,
+            updated_by: "agent-1".to_string(),
+        }
+        .encode()
+        .unwrap();
+        let lane_create = generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Lanes",
+            "create",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Bytes(lane),
+            ],
+        );
+        assert!(matches!(
+            lane_create,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(_))
+        ));
+        let lane_get = generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Lanes",
+            "get",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("lane-1".to_string()),
+            ],
+        );
+        assert!(matches!(
+            lane_get,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(_))
+        ));
+
+        let stale = generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Tickets",
+            "tickets_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("task".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Null,
+                loom_codec::Value::Text(serde_json::json!({"status": "ready"}).to_string()),
+                loom_codec::Value::Text("[]".to_string()),
+                loom_codec::Value::Text(project_root.to_string()),
+            ],
+        );
+        match stale {
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                assert_eq!(error.code, loom_core::Code::Conflict);
+            }
+            other => panic!("expected stale ticket Conflict, got {other:?}"),
+        }
+
+        let space = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "spaces_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("eng".to_string()),
+                loom_codec::Value::Text("Eng".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        let space_root = space["profile_root"].as_str().expect("space root");
+        let page = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "pages_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("page-1".to_string()),
+                loom_codec::Value::Text("eng".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Text("Roadmap".to_string()),
+                loom_codec::Value::Text(space_root.to_string()),
+            ],
+        ));
+        assert_eq!(page["page_id"], "page-1");
+        let get_page = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "pages_get_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("page-1".to_string()),
+            ],
+        ));
+        assert_eq!(get_page["title"], "Roadmap");
+        let stale_page = generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "pages_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("page-2".to_string()),
+                loom_codec::Value::Text("eng".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Text("Stale".to_string()),
+                loom_codec::Value::Text(space_root.to_string()),
+            ],
+        );
+        match stale_page {
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                assert_eq!(error.code, loom_core::Code::Conflict);
+            }
+            other => panic!("expected stale page Conflict, got {other:?}"),
+        }
+        let page_list = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "pages_list_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+            ],
+        ));
+        assert_eq!(page_list.as_array().expect("page list").len(), 1);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_dispatch_preserves_ticket_and_page_acl_denials() {
+        let (_store, mut runtime, root, user) =
+            test_generated_authenticated_runtime("generated-auth-denial");
+        let root_session = generated_open_passphrase_session(&mut runtime, root, "root-pass");
+        let root_handle = match generated_call(
+            &mut runtime,
+            Some(root_session.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("root store open failed: {}", error.message)
+            }
+        };
+        assert!(matches!(
+            generated_call(
+                &mut runtime,
+                Some(root_session.clone()),
+                "Workspaces",
+                "workspace_create",
+                vec![
+                    root_handle.clone(),
+                    loom_codec::Value::Text("main".to_string()),
+                    loom_codec::Value::Null,
+                ],
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let project = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(root_session.clone()),
+            "Tickets",
+            "tickets_project_create_json",
+            vec![
+                root_handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("MX".to_string()),
+                loom_codec::Value::Text("Matrix".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        let ticket = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(root_session.clone()),
+            "Tickets",
+            "tickets_create_json",
+            vec![
+                root_handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("task".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Null,
+                loom_codec::Value::Text(
+                    serde_json::json!({"status": "ready", "title": "Seed"}).to_string(),
+                ),
+                loom_codec::Value::Text("[]".to_string()),
+                loom_codec::Value::Text(project["profile_root"].as_str().unwrap().to_string()),
+            ],
+        ));
+        let ticket_id = ticket["resource"]["ticket_id"].as_str().expect("ticket id");
+        let space = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(root_session.clone()),
+            "Pages",
+            "spaces_create_json",
+            vec![
+                root_handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("eng".to_string()),
+                loom_codec::Value::Text("Eng".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        generated_json_ok(generated_call(
+            &mut runtime,
+            Some(root_session.clone()),
+            "Pages",
+            "pages_create_json",
+            vec![
+                root_handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("page-1".to_string()),
+                loom_codec::Value::Text("eng".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Text("Seed page".to_string()),
+                loom_codec::Value::Text(space["profile_root"].as_str().unwrap().to_string()),
+            ],
+        ));
+
+        let user_session = generated_open_passphrase_session(&mut runtime, user, "user-pass");
+        let user_handle = match generated_call(
+            &mut runtime,
+            Some(user_session.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("user store open failed: {}", error.message)
+            }
+        };
+        let assert_denied = |payload| match payload {
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                assert_eq!(error.code, loom_core::Code::PermissionDenied);
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        };
+        assert_denied(generated_call(
+            &mut runtime,
+            Some(user_session.clone()),
+            "Tickets",
+            "tickets_create_json",
+            vec![
+                user_handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("task".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Null,
+                loom_codec::Value::Text(serde_json::json!({"status": "ready"}).to_string()),
+                loom_codec::Value::Text("[]".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        assert_denied(generated_call(
+            &mut runtime,
+            Some(user_session.clone()),
+            "Tickets",
+            "tickets_get_json",
+            vec![
+                user_handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text(ticket_id.to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        assert_denied(generated_call(
+            &mut runtime,
+            Some(user_session.clone()),
+            "Pages",
+            "pages_create_json",
+            vec![
+                user_handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("page-denied".to_string()),
+                loom_codec::Value::Text("eng".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Text("Denied".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        assert_denied(generated_call(
+            &mut runtime,
+            Some(user_session),
+            "Pages",
+            "pages_get_json",
+            vec![
+                user_handle,
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("page-1".to_string()),
+            ],
+        ));
+
+        let ticket_list = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(root_session.clone()),
+            "Tickets",
+            "tickets_list_json",
+            vec![
+                root_handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        assert_eq!(
+            ticket_list["items"].as_array().expect("ticket list").len(),
+            1
+        );
+        let page_list = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(root_session),
+            "Pages",
+            "pages_list_json",
+            vec![
+                root_handle,
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+            ],
+        ));
+        assert_eq!(page_list.as_array().expect("page list").len(), 1);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_sessions_share_daemon_engine_state() {
+        let (_store, mut runtime) = test_runtime("generated-shared-engine");
+        let session_a = generated_open_session(&mut runtime);
+        let handle_a = match generated_call(
+            &mut runtime,
+            Some(session_a.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("store open failed: {}", error.message)
+            }
+        };
+        let put = generated_call(
+            &mut runtime,
+            Some(session_a),
+            "Document",
+            "put_text",
+            vec![
+                handle_a,
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("notes".to_string()),
+                loom_codec::Value::Text("shared.md".to_string()),
+                loom_codec::Value::Text("shared daemon state".to_string()),
+                loom_codec::Value::Null,
+            ],
+        );
+        assert!(matches!(
+            put,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(_))
+        ));
+
+        let session_b = generated_open_session(&mut runtime);
+        let handle_b = match generated_call(
+            &mut runtime,
+            Some(session_b.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("store open failed: {}", error.message)
+            }
+        };
+        let get = generated_call(
+            &mut runtime,
+            Some(session_b),
+            "Document",
+            "get_text",
+            vec![
+                handle_b,
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("notes".to_string()),
+                loom_codec::Value::Text("shared.md".to_string()),
+            ],
+        );
+        assert!(matches!(
+            get,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(_))
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_dispatch_persists_ticket_page_document_and_file_across_restart() {
+        let (store, mut runtime) = test_runtime("generated-dispatch-restart");
+        let session_id = generated_open_session(&mut runtime);
+        let handle = match generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("store open failed: {}", error.message)
+            }
+        };
+        assert!(matches!(
+            generated_call(
+                &mut runtime,
+                Some(session_id.clone()),
+                "Workspaces",
+                "workspace_create",
+                vec![
+                    handle.clone(),
+                    loom_codec::Value::Text("main".to_string()),
+                    loom_codec::Value::Null,
+                ],
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let project = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Tickets",
+            "tickets_project_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("MX".to_string()),
+                loom_codec::Value::Text("Matrix".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        let project_root = project["profile_root"].as_str().expect("project root");
+        let ticket = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Tickets",
+            "tickets_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text("task".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Null,
+                loom_codec::Value::Text(
+                    serde_json::json!({"status": "ready", "title": "Restart ticket"}).to_string(),
+                ),
+                loom_codec::Value::Text("[]".to_string()),
+                loom_codec::Value::Text(project_root.to_string()),
+            ],
+        ));
+        let ticket_id = ticket["resource"]["ticket_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let space = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "spaces_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("eng".to_string()),
+                loom_codec::Value::Text("Eng".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "pages_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("restart-page".to_string()),
+                loom_codec::Value::Text("eng".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Text("Restart page".to_string()),
+                loom_codec::Value::Text(space["profile_root"].as_str().unwrap().to_string()),
+            ],
+        ));
+        assert!(matches!(
+            generated_call(
+                &mut runtime,
+                Some(session_id.clone()),
+                "Document",
+                "put_text",
+                vec![
+                    handle.clone(),
+                    loom_codec::Value::Text("main".to_string()),
+                    loom_codec::Value::Text("notes".to_string()),
+                    loom_codec::Value::Text("restart.md".to_string()),
+                    loom_codec::Value::Text("restart document".to_string()),
+                    loom_codec::Value::Null,
+                ],
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(_))
+        ));
+        assert!(matches!(
+            generated_call(
+                &mut runtime,
+                Some(session_id.clone()),
+                "FileSystem",
+                "write_file",
+                vec![
+                    handle.clone(),
+                    loom_codec::Value::Text("main".to_string()),
+                    loom_codec::Value::Text("/restart.txt".to_string()),
+                    loom_codec::Value::Bytes(b"restart file".to_vec()),
+                    loom_codec::Value::Uint(0o644),
+                ],
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+        ));
+        drop(runtime);
+
+        let mut runtime = runtime_for_existing_store("generated-dispatch-restart-reopen", &store);
+        let session_id = generated_open_session(&mut runtime);
+        let handle = match generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("store reopen failed: {}", error.message)
+            }
+        };
+        let reopened_ticket = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Tickets",
+            "tickets_get_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("matrix".to_string()),
+                loom_codec::Value::Text(ticket_id),
+                loom_codec::Value::Null,
+            ],
+        ));
+        assert_eq!(reopened_ticket["primary_key"], "MX-1");
+        let reopened_page = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "pages_get_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("restart-page".to_string()),
+            ],
+        ));
+        assert_eq!(reopened_page["title"], "Restart page");
+        assert!(matches!(
+            generated_call(
+                &mut runtime,
+                Some(session_id.clone()),
+                "Document",
+                "get_text",
+                vec![
+                    handle.clone(),
+                    loom_codec::Value::Text("main".to_string()),
+                    loom_codec::Value::Text("notes".to_string()),
+                    loom_codec::Value::Text("restart.md".to_string()),
+                ],
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(_))
+        ));
+        assert_eq!(
+            generated_call(
+                &mut runtime,
+                Some(session_id),
+                "FileSystem",
+                "read_file",
+                vec![
+                    handle,
+                    loom_codec::Value::Text("main".to_string()),
+                    loom_codec::Value::Text("/restart.txt".to_string()),
+                ],
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(
+                b"restart file".to_vec()
+            ))
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_dispatch_enforces_session_lease_expiry() {
+        let (_store, mut runtime) = test_runtime("generated-lease-expiry");
+        let session_id = generated_open_session(&mut runtime);
+        runtime
+            .generated_runtime
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .lease_expires_ms = 0;
+        match generated_call(&mut runtime, Some(session_id), "Store", "open", vec![]) {
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                assert_eq!(error.code, loom_core::error::Code::LockLeaseExpired);
+            }
+            payload => panic!("expected lease expiry error, got {payload:?}"),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_worker_admission_is_bounded() {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut permits = Vec::new();
+        for _ in 0..DAEMON_MAX_ACTIVE_CONNECTIONS {
+            permits.push(DaemonWorkerPermit::acquire(&active).expect("permit"));
+        }
+        assert!(DaemonWorkerPermit::acquire(&active).is_none());
+        drop(permits.pop());
+        assert!(DaemonWorkerPermit::acquire(&active).is_some());
+    }
+
+    #[cfg(all(feature = "serve", unix))]
+    #[test]
+    fn daemon_generated_live_admission_saturation_reports_backpressure() {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut permits = Vec::new();
+        for _ in 0..DAEMON_MAX_ACTIVE_CONNECTIONS {
+            permits.push(DaemonWorkerPermit::acquire(&active).expect("permit"));
+        }
+        assert!(DaemonWorkerPermit::acquire(&active).is_none());
+
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut stream = LocalDaemonStream::Unix(server);
+        write_daemon_admission_error(&mut stream).unwrap();
+
+        let mut bytes = [0u8; 128];
+        let read = client.read(&mut bytes).unwrap();
+        assert_eq!(
+            &bytes[..read],
+            b"error\tdaemon active connection limit reached\n"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_stream_resumes_after_pending() {
+        struct PendingOnceStream {
+            state: u8,
+        }
+
+        impl futures::Stream for PendingOnceStream {
+            type Item = Result<Vec<u8>, loom_core::error::LoomError>;
+
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                match self.state {
+                    0 => {
+                        self.state = 1;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                    1 => {
+                        self.state = 2;
+                        std::task::Poll::Ready(Some(Ok(b"after-pending".to_vec())))
+                    }
+                    _ => std::task::Poll::Ready(None),
+                }
+            }
+        }
+
+        let stream: loom_remote_protocol::api_types::LoomStream<Vec<u8>> =
+            Box::pin(PendingOnceStream { state: 0 });
+        let mut bytes = Vec::new();
+        write_generated_open_stream_response(stream, None, None, None, &mut bytes).unwrap();
+        let frames = generated_stream_frames(&bytes);
+
+        assert!(matches!(
+            &frames[..],
+            [
+                loom_remote_protocol::frame::Frame::Item(item),
+                loom_remote_protocol::frame::Frame::Trailer(_),
+                loom_remote_protocol::frame::Frame::Complete
+            ] if item == b"after-pending"
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_stream_reports_explicit_cancellation() {
+        struct CancellingPendingStream {
+            cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl futures::Stream for CancellingPendingStream {
+            type Item = Result<Vec<u8>, loom_core::error::LoomError>;
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream: loom_remote_protocol::api_types::LoomStream<Vec<u8>> =
+            Box::pin(CancellingPendingStream {
+                cancel: cancel.clone(),
+            });
+        let mut bytes = Vec::new();
+        write_generated_open_stream_response(stream, None, None, Some(cancel.as_ref()), &mut bytes)
+            .unwrap();
+        let frames = generated_stream_frames(&bytes);
+
+        match frames.as_slice() {
+            [loom_remote_protocol::frame::Frame::Error(error)] => {
+                assert_eq!(error.code, loom_core::error::Code::Unavailable);
+                assert_eq!(error.message, "daemon generated stream cancelled");
+            }
+            frames => panic!("expected cancellation error frame, got {frames:?}"),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_stream_cancel_request_releases_pending_writer_and_allows_unary_progress() {
+        struct PendingStream {
+            entered: std::sync::mpsc::Sender<()>,
+        }
+
+        impl futures::Stream for PendingStream {
+            type Item = Result<Vec<u8>, loom_core::error::LoomError>;
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                let _ = self.entered.send(());
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+
+        let (_store, mut runtime) = test_runtime("generated-stream-cancel-request");
+        let session_id = generated_open_session(&mut runtime);
+        let stream_request_id = b"stream-request".to_vec();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runtime.generated_runtime.stream_cancellations.insert(
+            (session_id.clone(), stream_request_id.clone()),
+            cancel.clone(),
+        );
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let writer_runtime = runtime.clone();
+        let writer_session_id = session_id.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let writer_cancel = cancel.clone();
+        let writer = std::thread::spawn(move || {
+            let stream: loom_remote_protocol::api_types::LoomStream<Vec<u8>> =
+                Box::pin(PendingStream {
+                    entered: entered_tx,
+                });
+            let mut bytes = Vec::new();
+            write_generated_open_stream_response(
+                stream,
+                Some(&writer_runtime),
+                Some(&writer_session_id),
+                Some(writer_cancel.as_ref()),
+                &mut bytes,
+            )
+            .unwrap();
+            bytes
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        {
+            let mut runtime = runtime.lock().unwrap();
+            let open = generated_call(
+                &mut runtime,
+                Some(session_id.clone()),
+                "Store",
+                "open",
+                vec![],
+            );
+            assert!(matches!(
+                open,
+                loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+            ));
+            let cancel_response = generated_stream_cancel_call(
+                &mut runtime,
+                session_id.clone(),
+                stream_request_id.clone(),
+            );
+            assert_eq!(
+                cancel_response,
+                loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+            );
+            runtime
+                .generated_runtime
+                .finish_generated_stream(&(session_id.clone(), stream_request_id));
+        }
+
+        let frames = generated_stream_frames(&writer.join().unwrap());
+        match frames.as_slice() {
+            [loom_remote_protocol::frame::Frame::Error(error)] => {
+                assert_eq!(error.code, loom_core::error::Code::Unavailable);
+                assert_eq!(error.message, "daemon generated stream cancelled");
+            }
+            frames => panic!("expected cancellation error frame, got {frames:?}"),
+        }
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_stream_checks_lease_between_frames() {
+        struct ExpiringWriter {
+            runtime: std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+            session_id: Vec<u8>,
+            writes: usize,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for ExpiringWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(buf);
+                if self.writes == 2 {
+                    self.runtime
+                        .lock()
+                        .unwrap()
+                        .generated_runtime
+                        .sessions
+                        .get_mut(&self.session_id)
+                        .unwrap()
+                        .lease_expires_ms = 0;
+                }
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (_store, mut runtime) = test_runtime("generated-stream-lease-midflight");
+        let session_id = generated_open_session(&mut runtime);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let stream: loom_remote_protocol::api_types::LoomStream<Vec<u8>> =
+            Box::pin(futures::stream::iter(vec![
+                Ok(b"first".to_vec()),
+                Ok(b"second".to_vec()),
+            ]));
+        let mut writer = ExpiringWriter {
+            runtime: runtime.clone(),
+            session_id: session_id.clone(),
+            writes: 0,
+            bytes: Vec::new(),
+        };
+        write_generated_open_stream_response(
+            stream,
+            Some(&runtime),
+            Some(&session_id),
+            None,
+            &mut writer,
+        )
+        .unwrap();
+
+        let frames = generated_stream_frames(&writer.bytes);
+        assert!(matches!(
+            frames.first(),
+            Some(loom_remote_protocol::frame::Frame::Item(_))
+        ));
+        match &frames[1] {
+            loom_remote_protocol::frame::Frame::Error(error) => {
+                assert_eq!(error.code, loom_core::error::Code::LockLeaseExpired);
+            }
+            frame => panic!("expected lease error frame, got {frame:?}"),
         }
     }
 
@@ -9580,6 +12362,8 @@ mod maintenance_tail_trim_tests {
             marked: std::collections::BTreeSet::from([live]),
             queue: std::collections::VecDeque::new(),
             stream_roots: std::collections::VecDeque::new(),
+            content_roots: std::collections::VecDeque::new(),
+            prolly_cursors: std::collections::VecDeque::new(),
             completed: true,
         };
         let epoch = fs
@@ -9700,6 +12484,8 @@ mod maintenance_tail_trim_tests {
             marked: std::collections::BTreeSet::from([live]),
             queue: std::collections::VecDeque::new(),
             stream_roots: std::collections::VecDeque::new(),
+            content_roots: std::collections::VecDeque::new(),
+            prolly_cursors: std::collections::VecDeque::new(),
             completed: true,
         };
         let epoch = fs
@@ -9744,6 +12530,8 @@ mod maintenance_tail_trim_tests {
             marked: std::collections::BTreeSet::from([live]),
             queue: std::collections::VecDeque::new(),
             stream_roots: std::collections::VecDeque::new(),
+            content_roots: std::collections::VecDeque::new(),
+            prolly_cursors: std::collections::VecDeque::new(),
             completed: true,
         };
         let epoch = fs
@@ -9779,6 +12567,53 @@ mod maintenance_tail_trim_tests {
     }
 
     #[test]
+    fn automatic_maintenance_admits_one_worker() {
+        let (_store, mut runtime) = test_runtime("maintenance-single-worker-unit");
+        let (release, wait) = std::sync::mpsc::channel();
+        runtime.maintenance_worker = Some(std::thread::spawn(move || {
+            wait.recv().unwrap();
+            Ok(())
+        }));
+
+        runtime.reconcile_store_maintenance().unwrap();
+        assert!(runtime.maintenance_worker.is_some());
+        release.send(()).unwrap();
+        wait_for_maintenance(&mut runtime);
+    }
+
+    #[test]
+    fn daemon_status_reports_maintenance_scheduler_state() {
+        let (_store, mut runtime) = test_runtime("maintenance-status-worker-unit");
+        let status = runtime.status_response();
+        assert!(status.contains("maintenance_worker=idle"));
+        assert!(status.contains("maintenance_next_ms=0"));
+    }
+
+    #[test]
+    fn stop_requests_maintenance_cancellation() {
+        let (_store, mut runtime) = test_runtime("maintenance-stop-cancel-unit");
+        runtime
+            .maintenance_cancel
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        let response = runtime.stop_daemon(
+            true,
+            DaemonStopRequest {
+                hard: true,
+                wait_ms: 0,
+            },
+            None,
+        );
+
+        assert!(response.starts_with("stopped\t"));
+        assert!(
+            runtime
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[test]
     fn daemon_runtime_starts_missing_reachability_mark_epoch() {
         let (store, mut runtime) = test_runtime("maintenance-auto-mark-unit");
         let fs = FileStore::open_daemon_authorized(&store).unwrap();
@@ -9808,6 +12643,270 @@ mod maintenance_tail_trim_tests {
                 .last_run_ms
                 .is_some()
         );
+    }
+
+    #[test]
+    fn daemon_maintenance_converges_across_bounded_mark_slices_after_foreground_write() {
+        let (store, _runtime) = test_runtime("maintenance-bounded-mark-unit");
+        let fs = FileStore::open_daemon_authorized(&store).unwrap();
+        let mut loom = loom_core::Loom::new(fs);
+        let ns = loom
+            .registry_mut()
+            .create(
+                loom_core::workspace::FacetKind::Files,
+                Some("p"),
+                WorkspaceId::from_bytes([41; 16]),
+            )
+            .unwrap();
+        for i in 0..16u64 {
+            loom.write_file(
+                ns,
+                &format!("f{i}.txt"),
+                format!("v{i}").as_bytes(),
+                0o100644,
+            )
+            .unwrap();
+            loom.commit(ns, "nas", "edit", i + 1).unwrap();
+        }
+        loom_store::save_loom(&mut loom).unwrap();
+        loom.store()
+            .set_store_maintenance_policy(loom_store::StoreMaintenancePolicy {
+                min_candidate_pages: 0,
+                min_reusable_pages: 0,
+                interval_ms: 1_000,
+                backoff_ms: 2_000,
+                tail_trim_enabled: false,
+                tail_compaction_enabled: false,
+                ..loom_store::StoreMaintenancePolicy::default()
+            })
+            .unwrap();
+
+        let first = run_store_maintenance_once_with_budget(
+            &mut loom,
+            100,
+            false,
+            None,
+            None,
+            Some(StoreMaintenanceRunBudget {
+                mark_objects: 1,
+                max_segments: 1,
+                max_pages: 1,
+                tail_compaction_max_pages: 1,
+                tail_compaction_max_objects: 1,
+                tail_compaction_max_bytes: 4096,
+                slice_ms: 1_000,
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(first.contains("maintenance\tmarked"));
+        assert!(
+            loom.store()
+                .store_maintenance_run_state()
+                .unwrap()
+                .last_yield_count
+                > 0
+        );
+
+        loom.write_file(ns, "foreground.txt", b"foreground", 0o100644)
+            .unwrap();
+        loom.commit(ns, "nas", "foreground", 17).unwrap();
+        loom_store::save_loom(&mut loom).unwrap();
+        let mut completed = false;
+        for slice in 0..128u64 {
+            let _ = run_store_maintenance_once_with_budget(
+                &mut loom,
+                2_000 + slice.saturating_mul(2_000),
+                false,
+                None,
+                None,
+                Some(StoreMaintenanceRunBudget {
+                    mark_objects: 4,
+                    max_segments: 1,
+                    max_pages: 1,
+                    tail_compaction_max_pages: 1,
+                    tail_compaction_max_objects: 1,
+                    tail_compaction_max_bytes: 4096,
+                    slice_ms: 1_000,
+                }),
+                None,
+            )
+            .unwrap();
+            completed = loom
+                .store()
+                .active_reachability_mark_epoch()
+                .unwrap()
+                .is_some_and(|epoch| epoch.state.completed);
+            if completed {
+                break;
+            }
+        }
+        assert!(completed);
+        let epoch = loom
+            .store()
+            .active_reachability_mark_epoch()
+            .unwrap()
+            .unwrap();
+        assert!(epoch.state.completed);
+        assert_eq!(loom.read_file(ns, "foreground.txt").unwrap(), b"foreground");
+        assert!(
+            loom.store()
+                .store_maintenance_run_state()
+                .unwrap()
+                .last_progress_steps
+                > 0
+        );
+    }
+
+    #[test]
+    fn daemon_runtime_maintenance_converges_across_worker_slices() {
+        let (store, mut runtime) = test_runtime("maintenance-runtime-slices-unit");
+        let (_ns, expected) = write_many_commits(&store, "runtime-slices", 96);
+
+        runtime.maintenance_next_ms = 0;
+        runtime.reconcile_store_maintenance().unwrap();
+        wait_for_maintenance(&mut runtime);
+        let first = FileStore::open_read(&store)
+            .unwrap()
+            .store_maintenance_run_state()
+            .unwrap();
+        assert!(first.last_yield_count > 0);
+
+        let mut completed = FileStore::open_read(&store)
+            .unwrap()
+            .active_reachability_mark_epoch()
+            .unwrap()
+            .is_some_and(|epoch| epoch.state.completed);
+        for _ in 0..32 {
+            if completed {
+                break;
+            }
+            completed = completed_runtime_maintenance(&mut runtime, &store);
+        }
+
+        assert!(completed);
+        assert_completed_mark_is(&store, &expected);
+    }
+
+    #[test]
+    fn daemon_runtime_maintenance_allows_foreground_store_calls_during_worker_slice() {
+        let (store, mut runtime) = test_runtime("maintenance-runtime-foreground-unit");
+        let (_ns, _before_mutation) = write_many_commits(&store, "runtime-foreground", 96);
+        let hook = std::sync::Arc::new(MaintenanceWorkerTestHook::default());
+        let _hook_guard = MaintenanceWorkerHookGuard::install(&runtime.store, hook.clone());
+
+        runtime.maintenance_next_ms = 0;
+        runtime.reconcile_store_maintenance().unwrap();
+        assert!(runtime.maintenance_worker.is_some());
+        hook.wait_until_entered();
+        assert!(
+            FileStore::open_read(&store)
+                .unwrap()
+                .active_reachability_mark_epoch()
+                .unwrap()
+                .is_some_and(|epoch| !epoch.state.completed)
+        );
+        assert!(
+            runtime
+                .maintenance_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        );
+        let started = std::time::Instant::now();
+        let status = runtime.handle("maintenance-status\n");
+        assert!(
+            runtime
+                .maintenance_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        );
+        let pin = runtime.handle("pin-add\tforeground-pin\n");
+        assert!(
+            runtime
+                .maintenance_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2));
+        assert!(status.contains("maintenance\t"));
+        assert!(pin.starts_with("pinned\tforeground-pin"));
+        hook.release();
+        wait_for_maintenance(&mut runtime);
+        let expected = {
+            let loom = loom_store::open_loom_read_unlocked(&store, None).unwrap();
+            loom.live_object_set(loom.store().reference_root()).unwrap()
+        };
+
+        let mut completed = FileStore::open_read(&store)
+            .unwrap()
+            .active_reachability_mark_epoch()
+            .unwrap()
+            .is_some_and(|epoch| epoch.state.completed);
+        for _ in 0..64 {
+            if completed {
+                break;
+            }
+            completed = completed_runtime_maintenance(&mut runtime, &store);
+        }
+
+        assert!(completed);
+        assert_completed_mark_is(&store, &expected);
+    }
+
+    #[test]
+    fn daemon_runtime_maintenance_cancellation_resumes_after_restart() {
+        let (store, mut runtime) = test_runtime("maintenance-runtime-cancel-unit");
+        let (_ns, expected) = write_many_commits(&store, "runtime-cancel", 96);
+        let hook = std::sync::Arc::new(MaintenanceWorkerTestHook::default());
+        let _hook_guard = MaintenanceWorkerHookGuard::install(&runtime.store, hook.clone());
+
+        runtime.maintenance_next_ms = 0;
+        runtime.reconcile_store_maintenance().unwrap();
+        assert!(runtime.maintenance_worker.is_some());
+        hook.wait_until_entered();
+        assert!(
+            FileStore::open_read(&store)
+                .unwrap()
+                .active_reachability_mark_epoch()
+                .unwrap()
+                .is_some_and(|epoch| !epoch.state.completed)
+        );
+        assert!(
+            runtime
+                .maintenance_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        );
+        runtime
+            .maintenance_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            runtime
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        hook.release();
+        hook.wait_until_cancel_observed();
+        wait_for_maintenance(&mut runtime);
+        drop(runtime);
+
+        let mut runtime =
+            runtime_for_existing_store("maintenance-runtime-cancel-unit-restart", &store);
+        let mut completed = FileStore::open_read(&store)
+            .unwrap()
+            .active_reachability_mark_epoch()
+            .unwrap()
+            .is_some_and(|epoch| epoch.state.completed);
+        for _ in 0..64 {
+            if completed {
+                break;
+            }
+            completed = completed_runtime_maintenance(&mut runtime, &store);
+        }
+
+        assert!(completed);
+        assert_completed_mark_is(&store, &expected);
     }
 }
 
@@ -9912,7 +13011,7 @@ mod tests {
 
     #[cfg(feature = "mcp")]
     #[test]
-    fn mcp_accepts_local_path_locator() {
+    fn mcp_local_path_uses_daemon_boundary_and_rejects_stateless() {
         let (dir, cx) = mcp_locator_context("local", "");
         assert!(
             matches!(
@@ -9920,6 +13019,12 @@ mod tests {
                 McpLaunchTarget::Local
             ),
             "a local path should be a local launch"
+        );
+        let err = resolve_mcp_target(&cx, "./local.loom", true)
+            .expect_err("local MCP + --stateless must be rejected");
+        assert!(
+            err.contains("daemon-owned generated boundary"),
+            "unexpected error: {err}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -9931,12 +13036,14 @@ mod tests {
         drop(fs);
         let paths = daemon::paths(&store).unwrap();
         (
-            store,
+            store.clone(),
             DaemonRuntime {
                 store: paths.store,
                 store_id: paths.store_id,
                 transport: daemon::DaemonTransport::TcpLoopback,
                 coordinator,
+                #[cfg(feature = "serve")]
+                generated_runtime: test_generated_runtime(tag, &store),
                 kv_loom: None,
                 kv_unavailable: None,
                 sessions: std::collections::BTreeSet::new(),
@@ -9944,6 +13051,7 @@ mod tests {
                 authority_replication_next: std::collections::BTreeMap::new(),
                 maintenance_next_ms: 0,
                 maintenance_worker: None,
+                maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 #[cfg(feature = "serve")]
                 hosted_listeners: std::collections::BTreeMap::new(),
                 #[cfg(feature = "serve")]
@@ -10004,6 +13112,8 @@ mod tests {
             marked: std::collections::BTreeSet::from([live]),
             queue: std::collections::VecDeque::new(),
             stream_roots: std::collections::VecDeque::new(),
+            content_roots: std::collections::VecDeque::new(),
+            prolly_cursors: std::collections::VecDeque::new(),
             completed: true,
         };
         let epoch = fs
@@ -10205,12 +13315,14 @@ mod tests {
         drop(fs);
         let paths = daemon::paths(&store).unwrap();
         (
-            store,
+            store.clone(),
             DaemonRuntime {
                 store: paths.store,
                 store_id: paths.store_id,
                 transport: daemon::DaemonTransport::TcpLoopback,
                 coordinator,
+                #[cfg(feature = "serve")]
+                generated_runtime: daemon_generated_runtime(&store).unwrap(),
                 kv_loom: None,
                 kv_unavailable: None,
                 sessions: std::collections::BTreeSet::new(),
@@ -10218,6 +13330,7 @@ mod tests {
                 authority_replication_next: std::collections::BTreeMap::new(),
                 maintenance_next_ms: 0,
                 maintenance_worker: None,
+                maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 #[cfg(feature = "serve")]
                 hosted_listeners: std::collections::BTreeMap::new(),
                 #[cfg(feature = "serve")]
@@ -10316,6 +13429,8 @@ mod tests {
             store_id: paths.store_id,
             transport: daemon::DaemonTransport::TcpLoopback,
             coordinator,
+            #[cfg(feature = "serve")]
+            generated_runtime: daemon_generated_runtime(&store).unwrap(),
             kv_loom: None,
             kv_unavailable: None,
             sessions: std::collections::BTreeSet::new(),
@@ -10323,6 +13438,7 @@ mod tests {
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
             maintenance_worker: None,
+            maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "serve")]
             hosted_listeners: std::collections::BTreeMap::new(),
             #[cfg(feature = "serve")]
@@ -11810,6 +14926,8 @@ mod tests {
             store_id: paths.store_id,
             transport: daemon::DaemonTransport::TcpLoopback,
             coordinator,
+            #[cfg(feature = "serve")]
+            generated_runtime: daemon_generated_runtime(&store).unwrap(),
             kv_loom: None,
             kv_unavailable: None,
             sessions: std::collections::BTreeSet::new(),
@@ -11817,6 +14935,7 @@ mod tests {
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
             maintenance_worker: None,
+            maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hosted_listeners,
             drive_policy_next_ms: 0,
             reference_reconcile_next_ms: 0,
@@ -11891,6 +15010,8 @@ mod tests {
             store_id: paths.store_id,
             transport: daemon::DaemonTransport::TcpLoopback,
             coordinator,
+            #[cfg(feature = "serve")]
+            generated_runtime: daemon_generated_runtime(&store).unwrap(),
             kv_loom: None,
             kv_unavailable: None,
             sessions: std::collections::BTreeSet::new(),
@@ -11898,6 +15019,7 @@ mod tests {
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
             maintenance_worker: None,
+            maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hosted_listeners,
             drive_policy_next_ms: 0,
             reference_reconcile_next_ms: 0,
@@ -12023,6 +15145,8 @@ mod tests {
             store_id: paths.store_id,
             transport: daemon::DaemonTransport::TcpLoopback,
             coordinator,
+            #[cfg(feature = "serve")]
+            generated_runtime: daemon_generated_runtime(&store).unwrap(),
             kv_loom: None,
             kv_unavailable: None,
             sessions: std::collections::BTreeSet::new(),
@@ -12030,6 +15154,7 @@ mod tests {
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
             maintenance_worker: None,
+            maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hosted_listeners,
             drive_policy_next_ms: 0,
             reference_reconcile_next_ms: 0,
@@ -14848,6 +17973,8 @@ mod tests {
             store_id: paths.store_id.clone(),
             transport: daemon::DaemonTransport::TcpLoopback,
             coordinator,
+            #[cfg(feature = "serve")]
+            generated_runtime: daemon_generated_runtime(&paths.store).unwrap(),
             kv_loom,
             kv_unavailable: None,
             sessions: std::collections::BTreeSet::new(),
@@ -14855,6 +17982,7 @@ mod tests {
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
             maintenance_worker: None,
+            maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "serve")]
             hosted_listeners: std::collections::BTreeMap::new(),
             #[cfg(feature = "serve")]
@@ -14950,6 +18078,8 @@ mod tests {
             store_id: paths.store_id.clone(),
             transport: daemon::DaemonTransport::TcpLoopback,
             coordinator,
+            #[cfg(feature = "serve")]
+            generated_runtime: daemon_generated_runtime(&paths.store).unwrap(),
             kv_loom,
             kv_unavailable: None,
             sessions: std::collections::BTreeSet::new(),
@@ -14957,6 +18087,7 @@ mod tests {
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
             maintenance_worker: None,
+            maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "serve")]
             hosted_listeners: std::collections::BTreeMap::new(),
             #[cfg(feature = "serve")]
@@ -14997,6 +18128,8 @@ mod tests {
             store_id: paths.store_id.clone(),
             transport: daemon::DaemonTransport::TcpLoopback,
             coordinator,
+            #[cfg(feature = "serve")]
+            generated_runtime: daemon_generated_runtime(&paths.store).unwrap(),
             kv_loom,
             kv_unavailable,
             sessions: std::collections::BTreeSet::new(),
@@ -15004,6 +18137,7 @@ mod tests {
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
             maintenance_worker: None,
+            maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "serve")]
             hosted_listeners: std::collections::BTreeMap::new(),
             #[cfg(feature = "serve")]
@@ -15118,6 +18252,8 @@ mod tests {
             store_id: paths.store_id.clone(),
             transport: daemon::DaemonTransport::TcpLoopback,
             coordinator,
+            #[cfg(feature = "serve")]
+            generated_runtime: daemon_generated_runtime(&paths.store).unwrap(),
             kv_loom: None,
             kv_unavailable: Some(daemon_kv_unavailable_error(kv_err)),
             sessions: std::collections::BTreeSet::new(),
@@ -15125,6 +18261,7 @@ mod tests {
             authority_replication_next: std::collections::BTreeMap::new(),
             maintenance_next_ms: 0,
             maintenance_worker: None,
+            maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "serve")]
             hosted_listeners: std::collections::BTreeMap::new(),
             #[cfg(feature = "serve")]

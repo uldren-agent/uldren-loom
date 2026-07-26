@@ -488,7 +488,7 @@ pub unsafe extern "C" fn loom_lanes_update_cbor(
 /// Add a ticket to the lane at the position selected by `placement` and return the updated lane as
 /// canonical CBOR.
 ///
-/// `placement` is a public placement verb: null or empty => `append`; `first`; `before`/`after`
+/// `placement` is a public placement verb: null or empty means `LAST`; `FIRST`; `BEFORE`/`AFTER`
 /// require a non-empty `anchor` ticket id. A null `anchor` is treated as absent. Ordering is never
 /// caller-supplied; callers choose only where the ticket lands.
 ///
@@ -514,7 +514,7 @@ pub unsafe extern "C" fn loom_lanes_ticket_add_cbor(
     let lane_id = arg_str!(lane_id, "loom_lanes_ticket_add_cbor");
     let ticket_id = arg_str!(ticket_id, "loom_lanes_ticket_add_cbor");
     let updated_by = arg_str!(updated_by, "loom_lanes_ticket_add_cbor");
-    // A null placement pointer defaults to "append"; `LaneTicketPlacement::parse` maps "" -> Append.
+    // A null placement pointer defaults to LAST.
     let placement = match unsafe { lane_optional_field(placement, "loom_lanes_ticket_add_cbor") } {
         Ok(value) => value.unwrap_or(""),
         Err(e) => return fail(e),

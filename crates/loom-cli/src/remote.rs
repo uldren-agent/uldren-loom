@@ -14,15 +14,23 @@
 use super::*;
 use loom_core::FileKind;
 use loom_locator::Target;
+use loom_remote_protocol::api_types::{Digest as WireDigest, LoomSession};
+use loom_remote_protocol::generated::{METHODS, MethodSig};
 
 #[cfg(feature = "remote-client")]
 use loom_locator::{ContextResolver, Discovery as LocatorDiscovery, RemoteTarget};
 #[cfg(feature = "remote-client")]
 use loom_remote_client::carrier::Http2TlsTransport;
 #[cfg(feature = "remote-client")]
-use loom_remote_client::{RemoteConnection, RemoteLoomClient};
+use loom_remote_client::transport::{FrameSource, Transport};
 #[cfg(feature = "remote-client")]
-use loom_remote_protocol::api_types::{Digest as WireDigest, LoomSession, Uuid};
+use loom_remote_client::{CallOptions, RemoteConnection, RemoteLoomClient};
+#[cfg(feature = "remote-client")]
+use loom_remote_protocol::api_types::Uuid;
+#[cfg(feature = "serve")]
+use loom_remote_protocol::codec::FromValue;
+#[cfg(any(feature = "serve", feature = "remote-client"))]
+use loom_remote_protocol::codec::ToValue;
 #[cfg(feature = "remote-client")]
 use loom_remote_protocol::discovery::DiscoveryMode;
 #[cfg(feature = "remote-client")]
@@ -32,7 +40,7 @@ use loom_remote_protocol::generated_api::{
     Search, Sql, Store, StoreAdmin, TimeSeries, Traces, Transfer, Vector, VersionControl, Watch,
     Workspaces,
 };
-#[cfg(feature = "remote-client")]
+#[cfg(any(feature = "serve", feature = "remote-client"))]
 use loom_remote_protocol::session::SessionAuth;
 #[cfg(feature = "remote-client")]
 use std::sync::Arc;
@@ -49,29 +57,1173 @@ pub(crate) enum StoreClient {
     Remote(Box<RemoteStore>),
 }
 
-/// Open a store client: resolve the locator, connecting remotely for a remote target (or failing
-/// clearly when remote support is not built in).
-///
-/// # Errors
-/// Returns a message when the locator cannot be resolved or a remote connection cannot be established.
-pub(crate) fn open_store_client(store: &str) -> Result<StoreClient, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CliExecutionTarget {
+    DirectLocal,
+    DaemonLocal,
+    Remote,
+}
+
+pub(crate) enum CliExecutionContext {
+    DirectLocal {
+        locator: String,
+    },
+    #[cfg(feature = "serve")]
+    DaemonLocal(Box<DaemonLocalStore>),
+    #[cfg(feature = "remote-client")]
+    Remote(Box<RemoteStore>),
+}
+
+pub(crate) enum CliGeneratedClient {
+    DirectLocal {
+        client: Box<loom_client::LocalLoomClient>,
+        handle: LoomSession,
+    },
+    #[cfg(feature = "serve")]
+    DaemonLocal(Box<DaemonLocalStore>),
+    #[cfg(feature = "remote-client")]
+    Remote(Box<RemoteStore>),
+}
+
+pub(crate) struct LaneCloseoutArgs<'a> {
+    pub(crate) workspace: &'a str,
+    pub(crate) lane_id: &'a str,
+    pub(crate) ticket_workspace_id: &'a str,
+    pub(crate) ticket_id: &'a str,
+    pub(crate) comment_type: &'a str,
+    pub(crate) comment_body: &'a str,
+    pub(crate) evidence_json: Option<&'a str>,
+    pub(crate) status_report: &'a str,
+    pub(crate) updated_by: &'a str,
+    pub(crate) expected_root: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CliGeneratedOperation {
+    method: MethodSig,
+    args_without_handle: Vec<loom_codec::Value>,
+}
+
+impl CliGeneratedOperation {
+    pub(crate) fn new(
+        interface: &str,
+        method: &str,
+        args_without_handle: Vec<loom_codec::Value>,
+    ) -> Result<Self, String> {
+        let method_sig = generated_method(interface, method)
+            .ok_or_else(|| format!("unknown generated operation {interface}.{method}"))?;
+        if method_sig.ret.starts_with("stream<") {
+            return Err(format!(
+                "generated operation {interface}.{method} is streaming; use the streaming boundary"
+            ));
+        }
+        let expected = method_sig
+            .args
+            .iter()
+            .filter(|(_, name)| *name != "handle")
+            .count();
+        if args_without_handle.len() != expected {
+            return Err(format!(
+                "generated operation {interface}.{method} expects {expected} non-handle arguments, got {}",
+                args_without_handle.len()
+            ));
+        }
+        Ok(Self {
+            method: method_sig,
+            args_without_handle,
+        })
+    }
+
+    pub(crate) fn interface(&self) -> &'static str {
+        self.method.interface
+    }
+
+    pub(crate) fn method(&self) -> &'static str {
+        self.method.method
+    }
+
+    fn wire_args(&self, handle: &LoomSession) -> Vec<loom_codec::Value> {
+        let mut args = Vec::with_capacity(self.method.args.len());
+        let mut next_arg = 0usize;
+        for (_, name) in self.method.args {
+            if *name == "handle" {
+                args.push(handle.to_value());
+            } else {
+                args.push(self.args_without_handle[next_arg].clone());
+                next_arg += 1;
+            }
+        }
+        args
+    }
+}
+
+fn generated_method(interface: &str, method: &str) -> Option<MethodSig> {
+    METHODS
+        .iter()
+        .copied()
+        .find(|sig| sig.interface == interface && sig.method == method)
+}
+
+impl CliGeneratedClient {
+    pub(crate) fn target(&self) -> CliExecutionTarget {
+        match self {
+            Self::DirectLocal { client, handle } => {
+                let _ = (client, handle);
+                CliExecutionTarget::DirectLocal
+            }
+            #[cfg(feature = "serve")]
+            Self::DaemonLocal(store) => {
+                let _ = store;
+                CliExecutionTarget::DaemonLocal
+            }
+            #[cfg(feature = "remote-client")]
+            Self::Remote(remote) => {
+                let _ = remote;
+                CliExecutionTarget::Remote
+            }
+        }
+    }
+
+    pub(crate) fn execute_unary(
+        &self,
+        operation: &CliGeneratedOperation,
+    ) -> Result<loom_codec::Value, String> {
+        match self {
+            Self::DirectLocal { client, handle } => {
+                let args = operation.wire_args(handle);
+                match loom_hosted_core::generated_dispatch::dispatch(
+                    client.as_ref(),
+                    handle,
+                    operation.interface(),
+                    operation.method(),
+                    &args,
+                )
+                .map_err(|e| e.to_string())?
+                {
+                    loom_hosted_core::generated_dispatch::Dispatched::Unary(value) => Ok(value),
+                    loom_hosted_core::generated_dispatch::Dispatched::Stream(_) => Err(format!(
+                        "generated operation {}.{} returned a stream on the unary boundary",
+                        operation.interface(),
+                        operation.method()
+                    )),
+                }
+            }
+            #[cfg(feature = "serve")]
+            Self::DaemonLocal(store) => {
+                let args = operation.wire_args(&store.handle);
+                store.generated_unary(operation.interface(), operation.method(), args)
+            }
+            #[cfg(feature = "remote-client")]
+            Self::Remote(remote) => {
+                let args = operation.wire_args(&remote.handle);
+                remote.block(remote.client.call(
+                    operation.interface(),
+                    operation.method(),
+                    args,
+                    &CallOptions::default(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn doc_put_text(
+        &self,
+        workspace: &str,
+        collection: &str,
+        id: &str,
+        text: &str,
+        expected_entity_tag: Option<&str>,
+    ) -> Result<loom_core::document::DocumentPutResult, String> {
+        self.doc_put_binary_value(
+            "put_text",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                id.to_string().to_value(),
+                text.to_string().to_value(),
+                expected_entity_tag.map(str::to_string).to_value(),
+            ],
+        )
+    }
+
+    pub(crate) fn doc_put_binary(
+        &self,
+        workspace: &str,
+        collection: &str,
+        id: &str,
+        content: Vec<u8>,
+        expected_entity_tag: Option<&str>,
+    ) -> Result<loom_core::document::DocumentPutResult, String> {
+        self.doc_put_binary_value(
+            "put_binary",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                id.to_string().to_value(),
+                loom_codec::Value::Bytes(content),
+                expected_entity_tag.map(str::to_string).to_value(),
+            ],
+        )
+    }
+
+    fn doc_put_binary_value(
+        &self,
+        method: &str,
+        args: Vec<loom_codec::Value>,
+    ) -> Result<loom_core::document::DocumentPutResult, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new("Document", method, args)?)?;
+        let loom_codec::Value::Bytes(bytes) = value else {
+            return Err(format!(
+                "Document.{method} returned unexpected value {value:?}"
+            ));
+        };
+        let (digest, entity_tag) =
+            loom_wire::document::put_result_from_cbor(&bytes).map_err(|e| e.to_string())?;
+        let digest = Digest::parse(&digest).map_err(|e| e.to_string())?;
+        Ok(loom_core::document::DocumentPutResult { entity_tag, digest })
+    }
+
+    pub(crate) fn doc_get_text(
+        &self,
+        workspace: &str,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<loom_core::document::DocumentText>, String> {
+        let Some(document) = self.doc_get_binary(workspace, collection, id)? else {
+            return Ok(None);
+        };
+        let text = String::from_utf8(document.bytes).map_err(|_| {
+            loom_types::LoomError::document_not_text("document payload is not valid UTF-8 text")
+                .to_string()
+        })?;
+        Ok(Some(loom_core::document::DocumentText {
+            text,
+            digest: document.digest,
+            entity_tag: document.entity_tag,
+        }))
+    }
+
+    pub(crate) fn doc_get_binary(
+        &self,
+        workspace: &str,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<loom_core::document::DocumentBinary>, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Document",
+            "get_binary",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                id.to_string().to_value(),
+            ],
+        )?)?;
+        let bytes = match value {
+            loom_codec::Value::Null => return Ok(None),
+            loom_codec::Value::Bytes(bytes) => bytes,
+            other => {
+                return Err(format!(
+                    "Document.get_binary returned unexpected value {other:?}"
+                ));
+            }
+        };
+        let (bytes, digest, entity_tag) =
+            loom_wire::document::binary_result_from_cbor(&bytes).map_err(|e| e.to_string())?;
+        Ok(Some(loom_core::document::DocumentBinary {
+            bytes,
+            digest: Digest::parse(&digest).map_err(|e| e.to_string())?,
+            entity_tag,
+        }))
+    }
+
+    pub(crate) fn doc_delete(
+        &self,
+        workspace: &str,
+        collection: &str,
+        id: &str,
+    ) -> Result<bool, String> {
+        self.document_bool(
+            "delete",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                id.to_string().to_value(),
+            ],
+        )
+    }
+
+    pub(crate) fn doc_delete_collection(
+        &self,
+        workspace: &str,
+        collection: &str,
+    ) -> Result<bool, String> {
+        self.document_bool(
+            "delete_collection",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+            ],
+        )
+    }
+
+    pub(crate) fn doc_list_binary(
+        &self,
+        workspace: &str,
+        collection: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.document_bytes(
+            "list_binary",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+            ],
+        )
+    }
+
+    pub(crate) fn doc_index_create(
+        &self,
+        workspace: &str,
+        collection: &str,
+        name: &str,
+        path: &str,
+        unique: bool,
+    ) -> Result<(), String> {
+        self.document_void(
+            "index_create",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                name.to_string().to_value(),
+                path.to_string().to_value(),
+                unique.to_value(),
+            ],
+        )
+    }
+
+    pub(crate) fn doc_index_create_json(
+        &self,
+        workspace: &str,
+        collection: &str,
+        declaration_json: Vec<u8>,
+    ) -> Result<(), String> {
+        self.document_void(
+            "index_create_json",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                loom_codec::Value::Bytes(declaration_json),
+            ],
+        )
+    }
+
+    pub(crate) fn doc_index_drop(
+        &self,
+        workspace: &str,
+        collection: &str,
+        name: &str,
+    ) -> Result<bool, String> {
+        self.document_bool(
+            "index_drop",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                name.to_string().to_value(),
+            ],
+        )
+    }
+
+    pub(crate) fn doc_index_rebuild(
+        &self,
+        workspace: &str,
+        collection: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        self.document_void(
+            "index_rebuild",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                name.to_string().to_value(),
+            ],
+        )
+    }
+
+    pub(crate) fn doc_index_list(
+        &self,
+        workspace: &str,
+        collection: &str,
+    ) -> Result<serde_json::Value, String> {
+        let bytes = self.document_bytes(
+            "index_list_json",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+            ],
+        )?;
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn doc_index_statuses(
+        &self,
+        workspace: &str,
+        collection: &str,
+    ) -> Result<serde_json::Value, String> {
+        let bytes = self.document_bytes(
+            "index_status_json",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+            ],
+        )?;
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn doc_find(
+        &self,
+        workspace: &str,
+        collection: &str,
+        index: &str,
+        value_json: &str,
+    ) -> Result<Vec<String>, String> {
+        let bytes = self.document_bytes(
+            "find_json",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                index.to_string().to_value(),
+                loom_codec::Value::Bytes(value_json.as_bytes().to_vec()),
+            ],
+        )?;
+        serde_json::from_slice::<Vec<String>>(&bytes).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn doc_query(
+        &self,
+        workspace: &str,
+        collection: &str,
+        query_json: Vec<u8>,
+    ) -> Result<serde_json::Value, String> {
+        let bytes = self.document_bytes(
+            "query_json",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                loom_codec::Value::Bytes(query_json),
+            ],
+        )?;
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    }
+
+    fn document_bool(&self, method: &str, args: Vec<loom_codec::Value>) -> Result<bool, String> {
+        match self.execute_unary(&CliGeneratedOperation::new("Document", method, args)?)? {
+            loom_codec::Value::Bool(value) => Ok(value),
+            other => Err(format!(
+                "Document.{method} returned unexpected value {other:?}"
+            )),
+        }
+    }
+
+    fn document_bytes(
+        &self,
+        method: &str,
+        args: Vec<loom_codec::Value>,
+    ) -> Result<Vec<u8>, String> {
+        match self.execute_unary(&CliGeneratedOperation::new("Document", method, args)?)? {
+            loom_codec::Value::Bytes(bytes) => Ok(bytes),
+            other => Err(format!(
+                "Document.{method} returned unexpected value {other:?}"
+            )),
+        }
+    }
+
+    fn document_void(&self, method: &str, args: Vec<loom_codec::Value>) -> Result<(), String> {
+        match self.execute_unary(&CliGeneratedOperation::new("Document", method, args)?)? {
+            loom_codec::Value::Null => Ok(()),
+            other => Err(format!(
+                "Document.{method} returned unexpected value {other:?}"
+            )),
+        }
+    }
+
+    pub(crate) fn lanes_ticket_add(
+        &self,
+        workspace: &str,
+        lane_id: &str,
+        ticket_id: &str,
+        placement: Option<&str>,
+        anchor: Option<&str>,
+        updated_by: &str,
+    ) -> Result<loom_lanes::Lane, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Lanes",
+            "ticket_add",
+            vec![
+                workspace.to_string().to_value(),
+                lane_id.to_string().to_value(),
+                ticket_id.to_string().to_value(),
+                placement.map(str::to_string).to_value(),
+                anchor.map(str::to_string).to_value(),
+                updated_by.to_string().to_value(),
+            ],
+        )?)?;
+        let loom_codec::Value::Bytes(bytes) = value else {
+            return Err(format!(
+                "Lanes.ticket_add returned unexpected value {value:?}"
+            ));
+        };
+        loom_lanes::Lane::decode(&bytes).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn lanes_create(
+        &self,
+        workspace: &str,
+        lane: loom_lanes::Lane,
+    ) -> Result<loom_lanes::Lane, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Lanes",
+            "create",
+            vec![
+                workspace.to_string().to_value(),
+                loom_codec::Value::Bytes(lane.encode().map_err(|e| e.to_string())?),
+            ],
+        )?)?;
+        Self::lane_from_generated_value("create", value)
+    }
+
+    pub(crate) fn lanes_get(
+        &self,
+        workspace: &str,
+        lane_id: &str,
+    ) -> Result<Option<loom_lanes::Lane>, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Lanes",
+            "get",
+            vec![
+                workspace.to_string().to_value(),
+                lane_id.to_string().to_value(),
+            ],
+        )?)?;
+        match value {
+            loom_codec::Value::Null => Ok(None),
+            other => Self::lane_from_generated_value("get", other).map(Some),
+        }
+    }
+
+    pub(crate) fn lanes_update(
+        &self,
+        workspace: &str,
+        lane_id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        lane_status: Option<&str>,
+        status_report: Option<&str>,
+        reviewer_feedback: Option<&str>,
+        updated_by: &str,
+    ) -> Result<loom_lanes::Lane, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Lanes",
+            "update",
+            vec![
+                workspace.to_string().to_value(),
+                lane_id.to_string().to_value(),
+                title.map(str::to_string).to_value(),
+                description.map(str::to_string).to_value(),
+                lane_status.map(str::to_string).to_value(),
+                status_report.map(str::to_string).to_value(),
+                reviewer_feedback.map(str::to_string).to_value(),
+                updated_by.to_string().to_value(),
+            ],
+        )?)?;
+        Self::lane_from_generated_value("update", value)
+    }
+
+    pub(crate) fn lanes_ticket_remove(
+        &self,
+        workspace: &str,
+        lane_id: &str,
+        ticket_id: &str,
+        updated_by: &str,
+    ) -> Result<loom_lanes::Lane, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Lanes",
+            "ticket_remove",
+            vec![
+                workspace.to_string().to_value(),
+                lane_id.to_string().to_value(),
+                ticket_id.to_string().to_value(),
+                updated_by.to_string().to_value(),
+            ],
+        )?)?;
+        Self::lane_from_generated_value("ticket_remove", value)
+    }
+
+    pub(crate) fn lanes_ticket_transfer(
+        &self,
+        workspace: &str,
+        source_lane_id: &str,
+        target_lane_id: &str,
+        ticket_id: &str,
+        updated_by: &str,
+    ) -> Result<loom_lanes::Lane, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Lanes",
+            "ticket_transfer",
+            vec![
+                workspace.to_string().to_value(),
+                source_lane_id.to_string().to_value(),
+                target_lane_id.to_string().to_value(),
+                ticket_id.to_string().to_value(),
+                updated_by.to_string().to_value(),
+            ],
+        )?)?;
+        Self::lane_from_generated_value("ticket_transfer", value)
+    }
+
+    pub(crate) fn lanes_closeout(
+        &self,
+        args: LaneCloseoutArgs<'_>,
+    ) -> Result<loom_lanes::Lane, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Lanes",
+            "closeout",
+            vec![
+                args.workspace.to_string().to_value(),
+                args.lane_id.to_string().to_value(),
+                args.ticket_workspace_id.to_string().to_value(),
+                args.ticket_id.to_string().to_value(),
+                args.comment_type.to_string().to_value(),
+                args.comment_body.to_string().to_value(),
+                args.evidence_json.map(str::to_string).to_value(),
+                args.status_report.to_string().to_value(),
+                args.updated_by.to_string().to_value(),
+                args.expected_root.map(str::to_string).to_value(),
+            ],
+        )?)?;
+        Self::lane_from_generated_value("closeout", value)
+    }
+
+    pub(crate) fn lanes_delete(
+        &self,
+        workspace: &str,
+        lane_id: &str,
+        updated_by: &str,
+    ) -> Result<loom_lanes::Lane, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Lanes",
+            "delete",
+            vec![
+                workspace.to_string().to_value(),
+                lane_id.to_string().to_value(),
+                updated_by.to_string().to_value(),
+            ],
+        )?)?;
+        Self::lane_from_generated_value("delete", value)
+    }
+
+    pub(crate) fn lanes_get_view_json(
+        &self,
+        workspace: &str,
+        ticket_workspace_id: &str,
+        lane_id: &str,
+        detailed: bool,
+    ) -> Result<String, String> {
+        self.generated_json(
+            "Lanes",
+            "get_view_json",
+            vec![
+                workspace.to_string().to_value(),
+                ticket_workspace_id.to_string().to_value(),
+                lane_id.to_string().to_value(),
+                detailed.to_value(),
+            ],
+        )
+    }
+
+    pub(crate) fn lanes_list_views_json(
+        &self,
+        workspace: &str,
+        ticket_workspace_id: &str,
+        detailed: bool,
+    ) -> Result<String, String> {
+        self.generated_json(
+            "Lanes",
+            "list_views_json",
+            vec![
+                workspace.to_string().to_value(),
+                ticket_workspace_id.to_string().to_value(),
+                detailed.to_value(),
+            ],
+        )
+    }
+
+    pub(crate) fn workspace_create(
+        &self,
+        name: Option<&str>,
+        facet: Option<FacetKind>,
+    ) -> Result<loom_core::WorkspaceId, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Workspaces",
+            "workspace_create",
+            vec![
+                name.map(str::to_string).to_value(),
+                facet
+                    .map(|facet| loom_codec::Value::Bytes(vec![facet.stable_tag()]))
+                    .unwrap_or(loom_codec::Value::Null),
+            ],
+        )?)?;
+        let loom_codec::Value::Bytes(bytes) = value else {
+            return Err(format!(
+                "Workspaces.workspace_create returned unexpected value {value:?}"
+            ));
+        };
+        let bytes = <[u8; 16]>::try_from(bytes.as_slice())
+            .map_err(|_| "Workspaces.workspace_create returned invalid UUID bytes".to_string())?;
+        Ok(loom_core::WorkspaceId::from_bytes(bytes))
+    }
+
+    pub(crate) fn ensure_workspace_id(
+        &self,
+        workspace: &str,
+        facet: FacetKind,
+    ) -> Result<loom_core::WorkspaceId, String> {
+        match self.resolve_workspace_id(workspace) {
+            Ok(id) => Ok(id),
+            Err(error) if error == format!("workspace {workspace:?} not found") => {
+                self.workspace_create(Some(workspace), Some(facet))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn lane_from_generated_value(
+        method: &str,
+        value: loom_codec::Value,
+    ) -> Result<loom_lanes::Lane, String> {
+        let loom_codec::Value::Bytes(bytes) = value else {
+            return Err(format!(
+                "Lanes.{method} returned unexpected value {value:?}"
+            ));
+        };
+        loom_lanes::Lane::decode(&bytes).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn generated_json(
+        &self,
+        interface: &str,
+        method: &str,
+        args: Vec<loom_codec::Value>,
+    ) -> Result<String, String> {
+        match self.execute_unary(&CliGeneratedOperation::new(interface, method, args)?)? {
+            loom_codec::Value::Text(text) => Ok(text),
+            other => Err(format!(
+                "{interface}.{method} returned unexpected value {other:?}"
+            )),
+        }
+    }
+
+    pub(crate) fn resolve_workspace_id(
+        &self,
+        workspace: &str,
+    ) -> Result<loom_core::WorkspaceId, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Workspaces",
+            "workspace_list",
+            Vec::new(),
+        )?)?;
+        let loom_codec::Value::Array(records) = value else {
+            return Err(format!(
+                "Workspaces.workspace_list returned unexpected value {value:?}"
+            ));
+        };
+        let infos = records
+            .iter()
+            .map(|record| match record {
+                loom_codec::Value::Bytes(bytes) => cli_workspace_info_from_remote(bytes),
+                other => Err(format!(
+                    "Workspaces.workspace_list returned unexpected record {other:?}"
+                )),
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let parsed = loom_core::WorkspaceId::parse(workspace).ok();
+        for info in infos {
+            let matches = match &parsed {
+                Some(id) => info.id.as_bytes() == id.as_bytes(),
+                None => info.name == workspace,
+            };
+            if matches {
+                return Ok(info.id);
+            }
+        }
+        Err(format!("workspace {workspace:?} not found"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CliStoreAdministrationBoundary {
+    GeneratedStoreAdmin,
+    OfflineStoreOwner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CliExecutionBoundary {
+    GeneratedClient,
+    StoreAdministration(CliStoreAdministrationBoundary),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CliOperation {
+    BundleExport,
+    BundleImport,
+    Clone,
+    Copy,
+    Get,
+    Hash,
+    Init,
+    KeyChange,
+    KeyCreate,
+    KeyStatus,
+    KeyVerify,
+    Policy,
+    Put,
+    Rekey,
+    Replace,
+    Stat,
+}
+
+const CLI_OFFLINE_STORE_OWNER_OPERATIONS: &[CliOperation] = &[
+    CliOperation::BundleExport,
+    CliOperation::BundleImport,
+    CliOperation::Clone,
+    CliOperation::Copy,
+    CliOperation::Get,
+    CliOperation::Hash,
+    CliOperation::Init,
+    CliOperation::KeyChange,
+    CliOperation::KeyCreate,
+    CliOperation::Put,
+    CliOperation::Replace,
+];
+
+const CLI_GENERATED_STORE_ADMIN_OPERATIONS: &[CliOperation] = &[
+    CliOperation::KeyStatus,
+    CliOperation::KeyVerify,
+    CliOperation::Policy,
+    CliOperation::Rekey,
+    CliOperation::Stat,
+];
+
+pub(crate) fn classify_cli_operation(operation: CliOperation) -> CliExecutionBoundary {
+    if CLI_OFFLINE_STORE_OWNER_OPERATIONS.contains(&operation) {
+        return CliExecutionBoundary::StoreAdministration(
+            CliStoreAdministrationBoundary::OfflineStoreOwner,
+        );
+    }
+    if CLI_GENERATED_STORE_ADMIN_OPERATIONS.contains(&operation) {
+        return CliExecutionBoundary::StoreAdministration(
+            CliStoreAdministrationBoundary::GeneratedStoreAdmin,
+        );
+    }
+    CliExecutionBoundary::GeneratedClient
+}
+
+pub(crate) fn classify_generated_operation(
+    interface: &str,
+    method: &str,
+) -> Result<CliExecutionBoundary, String> {
+    let method_sig = generated_method(interface, method)
+        .ok_or_else(|| format!("unknown generated operation {interface}.{method}"))?;
+    if method_sig.ret.starts_with("stream<") {
+        return Err(format!(
+            "generated operation {interface}.{method} is streaming; use the streaming boundary"
+        ));
+    }
+    Ok(CliExecutionBoundary::GeneratedClient)
+}
+
+impl CliExecutionContext {
+    pub(crate) fn target(&self) -> CliExecutionTarget {
+        match self {
+            Self::DirectLocal { locator } => {
+                let _ = locator;
+                CliExecutionTarget::DirectLocal
+            }
+            #[cfg(feature = "serve")]
+            Self::DaemonLocal(store) => {
+                let _ = (&store.locator, &store.session_id, &store.handle);
+                CliExecutionTarget::DaemonLocal
+            }
+            #[cfg(feature = "remote-client")]
+            Self::Remote(remote) => {
+                let _ = &remote.handle;
+                CliExecutionTarget::Remote
+            }
+        }
+    }
+
+    pub(crate) fn into_generated_client(self) -> Result<CliGeneratedClient, String> {
+        self.into_generated_client_with_keys(&KeyOpts::default())
+    }
+
+    pub(crate) fn into_generated_client_with_keys(
+        self,
+        keys: &KeyOpts,
+    ) -> Result<CliGeneratedClient, String> {
+        match self {
+            Self::DirectLocal { locator } => {
+                let client = Box::new(loom_client::LocalLoomClient::new(&locator));
+                let encrypted = {
+                    let fs = FileStore::open(&locator).map_err(|e| e.to_string())?;
+                    fs.is_encrypted()
+                };
+                let handle = if encrypted {
+                    match acquire_key_spec(&keys.source, "Passphrase", false)? {
+                        KeySpec::Passphrase(passphrase) => client
+                            .open_keyed(passphrase.as_bytes())
+                            .map_err(|e| e.to_string())?,
+                        KeySpec::RawKek(kek) => {
+                            client.open_with_kek(*kek).map_err(|e| e.to_string())?
+                        }
+                    }
+                } else {
+                    client.open().map_err(|e| e.to_string())?
+                };
+                if let Some((principal, passphrase)) = acquire_auth_session(keys)? {
+                    client
+                        .authenticate_passphrase(&handle, principal, passphrase.as_bytes())
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(CliGeneratedClient::DirectLocal { client, handle })
+            }
+            #[cfg(feature = "serve")]
+            Self::DaemonLocal(store) => Ok(CliGeneratedClient::DaemonLocal(store)),
+            #[cfg(feature = "remote-client")]
+            Self::Remote(remote) => Ok(CliGeneratedClient::Remote(remote)),
+        }
+    }
+}
+
+pub(crate) fn open_cli_execution_context(store: &str) -> Result<CliExecutionContext, String> {
+    open_cli_execution_context_with_keys(store, &KeyOpts::default())
+}
+
+pub(crate) fn open_cli_generated_client(
+    store: &str,
+    keys: &KeyOpts,
+) -> Result<CliGeneratedClient, String> {
+    open_cli_execution_context_with_keys(store, keys)?.into_generated_client_with_keys(keys)
+}
+
+pub(crate) fn open_cli_execution_context_with_keys(
+    store: &str,
+    keys: &KeyOpts,
+) -> Result<CliExecutionContext, String> {
     match crate::locator_cx::current().resolve_target(store)? {
-        Target::Local(path) => Ok(StoreClient::Local {
-            locator: path.to_string_lossy().into_owned(),
-        }),
+        Target::Local(path) => open_local_execution_context(path.to_string_lossy().as_ref(), keys),
         #[cfg(feature = "remote-client")]
         Target::Remote(target) => {
             let store = match remote_session_auth(&target)? {
                 SessionAuth::Unauthenticated => RemoteStore::connect(&target)?,
                 auth => RemoteStore::connect_with_auth(&target, auth)?,
             };
-            Ok(StoreClient::Remote(Box::new(store)))
+            Ok(CliExecutionContext::Remote(Box::new(store)))
         }
         #[cfg(not(feature = "remote-client"))]
         Target::Remote(target) => Err(format!(
             "locator resolves to remote endpoint {}; rebuild with the `remote-client` feature to forward remote commands",
             target.url
         )),
+    }
+}
+
+fn open_local_execution_context(
+    store: &str,
+    keys: &KeyOpts,
+) -> Result<CliExecutionContext, String> {
+    #[cfg(feature = "serve")]
+    {
+        if let Ok(paths) = daemon::paths(store)
+            && daemon::status_response(&paths).is_ok()
+        {
+            let auth = local_session_auth(keys)?;
+            return DaemonLocalStore::connect(store, auth)
+                .map(Box::new)
+                .map(CliExecutionContext::DaemonLocal);
+        }
+    }
+    Ok(CliExecutionContext::DirectLocal {
+        locator: store.to_string(),
+    })
+}
+
+/// Open a store client: resolve the locator, connecting remotely for a remote target (or failing
+/// clearly when remote support is not built in).
+///
+/// # Errors
+/// Returns a message when the locator cannot be resolved or a remote connection cannot be established.
+pub(crate) fn open_store_client(store: &str) -> Result<StoreClient, String> {
+    let context = open_cli_execution_context(store)?;
+    let _selected_target = context.target();
+    match context {
+        CliExecutionContext::DirectLocal { locator } => Ok(StoreClient::Local { locator }),
+        #[cfg(feature = "remote-client")]
+        CliExecutionContext::Remote(remote) => Ok(StoreClient::Remote(remote)),
+        #[cfg(feature = "serve")]
+        CliExecutionContext::DaemonLocal(daemon_store) => {
+            let generated =
+                CliExecutionContext::DaemonLocal(daemon_store).into_generated_client()?;
+            let version_operation = CliGeneratedOperation::new("Store", "version", Vec::new())?;
+            let _version = generated.execute_unary(&version_operation)?;
+            let generated_boundary = classify_generated_operation("Store", "version")?;
+            let command_boundary = classify_cli_operation(CliOperation::Stat);
+            Err(format!(
+                "daemon-local generated execution selected for {store:?} as {:?}, but this command family still uses the legacy StoreClient path for {:?} after {:?} was validated; migrate it to CliExecutionContext instead of reopening the store directly",
+                generated.target(),
+                command_boundary,
+                generated_boundary
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "serve")]
+pub(crate) struct DaemonLocalStore {
+    locator: String,
+    paths: daemon::DaemonPaths,
+    session_id: Vec<u8>,
+    handle: LoomSession,
+}
+
+#[cfg(feature = "serve")]
+impl DaemonLocalStore {
+    pub(crate) fn connect(store: &str, auth: SessionAuth) -> Result<Self, String> {
+        let paths = daemon::paths(store).map_err(|e| e.to_string())?;
+        daemon::status_response(&paths).map_err(|e| {
+            format!("daemon-local generated dispatch selected but daemon status failed: {e}")
+        })?;
+        let open_bytes = loom_remote_protocol::session::open_request_bytes(&auth);
+        let reply_bytes = daemon::generated_session_open(&paths, &open_bytes)
+            .map_err(|e| format!("daemon-local generated session open failed: {e}"))?;
+        let reply = loom_remote_protocol::session::parse_open_reply(&reply_bytes)
+            .map_err(|e| format!("decode daemon-local generated session open response: {e}"))?;
+        let session_id = match reply {
+            loom_remote_protocol::session::SessionOpenReply::Ok { session_id, .. } => session_id,
+            loom_remote_protocol::session::SessionOpenReply::Err(error) => {
+                return Err(format!(
+                    "daemon-local generated session open failed: {:?}: {}",
+                    error.code, error.message
+                ));
+            }
+        };
+        let handle = daemon_generated_open_store(&paths, &session_id)?;
+        Ok(Self {
+            locator: store.to_string(),
+            paths,
+            session_id,
+            handle,
+        })
+    }
+
+    fn generated_unary(
+        &self,
+        interface: &str,
+        method: &str,
+        args: Vec<loom_codec::Value>,
+    ) -> Result<loom_codec::Value, String> {
+        let operation = format!("{interface}.{method}");
+        let payload = daemon_generated_call(
+            &self.paths,
+            Some(self.session_id.clone()),
+            interface,
+            method,
+            args,
+        )?;
+        let loom_remote_protocol::envelope::ResponsePayload::Ok(value) = payload else {
+            return Err(daemon_generated_payload_error(&operation, payload));
+        };
+        Ok(value)
+    }
+}
+
+#[cfg(feature = "serve")]
+pub(crate) fn local_session_auth(keys: &KeyOpts) -> Result<SessionAuth, String> {
+    match acquire_auth_session(keys)? {
+        Some((principal, passphrase)) => Ok(SessionAuth::Passphrase {
+            principal: *principal.as_bytes(),
+            passphrase: passphrase.into_bytes(),
+        }),
+        None => Ok(SessionAuth::Unauthenticated),
+    }
+}
+
+#[cfg(feature = "serve")]
+impl Drop for DaemonLocalStore {
+    fn drop(&mut self) {
+        let _ = daemon_generated_call(
+            &self.paths,
+            Some(self.session_id.clone()),
+            "Store",
+            "close",
+            vec![],
+        );
+    }
+}
+
+#[cfg(feature = "serve")]
+fn daemon_generated_open_store(
+    paths: &daemon::DaemonPaths,
+    session_id: &[u8],
+) -> Result<LoomSession, String> {
+    let payload = daemon_generated_call(paths, Some(session_id.to_vec()), "Store", "open", vec![])?;
+    let loom_remote_protocol::envelope::ResponsePayload::Ok(value) = payload else {
+        return Err(daemon_generated_payload_error("Store.open", payload));
+    };
+    LoomSession::from_value(&value).map_err(|e| format!("decode daemon-local store handle: {e}"))
+}
+
+#[cfg(feature = "serve")]
+fn daemon_generated_call(
+    paths: &daemon::DaemonPaths,
+    session_id: Option<Vec<u8>>,
+    interface: &str,
+    method: &str,
+    args: Vec<loom_codec::Value>,
+) -> Result<loom_remote_protocol::envelope::ResponsePayload, String> {
+    static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let request = loom_remote_protocol::envelope::Request {
+        request_id: NEXT_REQUEST
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_be_bytes()
+            .to_vec(),
+        session_id,
+        interface: interface.to_string(),
+        method: method.to_string(),
+        args,
+        deadline_ms: 0,
+        idempotency_key: None,
+        principal_hint: None,
+        compression: loom_remote_protocol::envelope::Compression::None,
+        stream: false,
+    };
+    let request = request
+        .encode()
+        .map_err(|e| format!("encode daemon-local generated request: {e}"))?;
+    let response = daemon::generated_call(paths, &request)
+        .map_err(|e| format!("daemon-local generated dispatch failed: {e}"))?;
+    loom_remote_protocol::envelope::Response::decode(&response)
+        .map(|response| response.payload)
+        .map_err(|e| format!("decode daemon-local generated response: {e}"))
+}
+
+#[cfg(feature = "serve")]
+fn daemon_generated_payload_error(
+    operation: &str,
+    payload: loom_remote_protocol::envelope::ResponsePayload,
+) -> String {
+    match payload {
+        loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+            format!("{operation} failed: {:?}: {}", error.code, error.message)
+        }
+        other => format!("{operation} returned unexpected payload {other:?}"),
     }
 }
 
@@ -747,479 +1899,6 @@ impl StoreClient {
                 wire.into_iter()
                     .map(|d| Digest::parse(&d.0).map_err(|e| e.to_string()))
                     .collect()
-            }
-        }
-    }
-
-    /// Store UTF-8 `text` under document `id` in `collection` of `workspace`.
-    pub(crate) fn doc_put_text(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        id: &str,
-        text: &str,
-        expected_entity_tag: Option<&str>,
-    ) -> Result<loom_core::document::DocumentPutResult, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let existing = resolve_ns(&loom, workspace).ok();
-                let ns = match existing {
-                    Some(ns) => ns,
-                    None => ensure_facet_workspace(&mut loom, workspace, FacetKind::Document)?,
-                };
-                let result = loom_core::document::document_put_text_with_entity_tag(
-                    &mut loom,
-                    ns,
-                    collection,
-                    id,
-                    text,
-                    expected_entity_tag,
-                )
-                .map_err(|e| e.to_string())?;
-                if existing.is_none() {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(result)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote
-                .doc_put_binary_guarded(
-                    workspace,
-                    collection,
-                    id,
-                    text.as_bytes().to_vec(),
-                    expected_entity_tag,
-                )
-                .map(|digest| loom_core::document::DocumentPutResult {
-                    entity_tag: loom_core::document_entity_tag_string_from_digest(digest),
-                    digest,
-                }),
-        }
-    }
-
-    /// Read document `id` as UTF-8 text in `collection` of `workspace`, or `None` when absent.
-    pub(crate) fn doc_get_text(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        id: &str,
-    ) -> Result<Option<loom_core::document::DocumentText>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::document::document_get_text(&loom, ns, collection, id)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.doc_get_text(workspace, collection, id),
-        }
-    }
-
-    /// Store raw `content` under document `id` in `collection` of `workspace`.
-    pub(crate) fn doc_put_binary(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        id: &str,
-        content: Vec<u8>,
-        expected_entity_tag: Option<&str>,
-    ) -> Result<loom_core::document::DocumentPutResult, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let existing = resolve_ns(&loom, workspace).ok();
-                let ns = match existing {
-                    Some(ns) => ns,
-                    None => ensure_facet_workspace(&mut loom, workspace, FacetKind::Document)?,
-                };
-                let result = loom_core::document::document_put_binary_with_entity_tag(
-                    &mut loom,
-                    ns,
-                    collection,
-                    id,
-                    content,
-                    expected_entity_tag,
-                )
-                .map_err(|e| e.to_string())?;
-                if existing.is_none() {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(result)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote
-                .doc_put_binary_guarded(workspace, collection, id, content, expected_entity_tag)
-                .map(|digest| loom_core::document::DocumentPutResult {
-                    entity_tag: loom_core::document_entity_tag_string_from_digest(digest),
-                    digest,
-                }),
-        }
-    }
-
-    /// Read raw document bytes in `collection` of `workspace`, or `None` when absent.
-    pub(crate) fn doc_get_binary(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        id: &str,
-    ) -> Result<Option<loom_core::document::DocumentBinary>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::document::document_get_binary(&loom, ns, collection, id)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.doc_get_binary(workspace, collection, id),
-        }
-    }
-
-    /// Delete document `id` in `collection` of `workspace` (Document delete); returns whether present.
-    pub(crate) fn doc_delete(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        id: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present = loom_core::document::doc_delete(&mut loom, ns, collection, id)
-                    .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Document::delete(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                id.to_string(),
-            )),
-        }
-    }
-
-    /// Delete document `collection` and its structured roots; returns whether present.
-    pub(crate) fn doc_delete_collection(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present = loom_core::document::doc_delete_collection(&mut loom, ns, collection)
-                    .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Document::delete_collection(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-            )),
-        }
-    }
-
-    /// The canonical-CBOR binary document list for `collection` of `workspace`.
-    pub(crate) fn doc_list_binary(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let docs = loom_core::document::doc_list(&loom, ns, collection)
-                    .map_err(|e| e.to_string())?;
-                Ok(docs.encode())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Document::list_binary(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-            )),
-        }
-    }
-
-    pub(crate) fn doc_index_create(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        name: &str,
-        path: &str,
-        unique: bool,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Document)?;
-                let index = loom_core::document::DocumentIndexDef::new(
-                    name,
-                    loom_core::document::DocumentFieldPath::dotted(path)
-                        .map_err(|e| e.to_string())?,
-                    unique,
-                )
-                .map_err(|e| e.to_string())?;
-                loom_core::document::doc_create_index(&mut loom, ns, collection, index)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Document::index_create(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                name.to_string(),
-                path.to_string(),
-                unique,
-            )),
-        }
-    }
-
-    pub(crate) fn doc_index_create_json(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        declaration_json: &[u8],
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Document)?;
-                let value: serde_json::Value =
-                    serde_json::from_slice(declaration_json).map_err(|e| e.to_string())?;
-                let declaration = loom_core::document_index_declaration_from_json(&value)
-                    .map_err(|e| e.to_string())?;
-                loom_core::document::doc_create_index_declaration(
-                    &mut loom,
-                    ns,
-                    collection,
-                    declaration,
-                )
-                .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Document::index_create_json(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                declaration_json.to_vec(),
-            )),
-        }
-    }
-
-    pub(crate) fn doc_index_drop(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        name: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let dropped = loom_core::document::doc_drop_index(&mut loom, ns, collection, name)
-                    .map_err(|e| e.to_string())?;
-                if dropped {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(dropped)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Document::index_drop(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                name.to_string(),
-            )),
-        }
-    }
-
-    /// The `{"indexes":[{name, path, unique}]}` JSON the CLI prints (Document index list). Both arms
-    /// format through `document_indexes_json` (the remote arm decodes the server's identical bytes).
-    pub(crate) fn doc_index_list(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-    ) -> Result<serde_json::Value, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let indexes =
-                    loom_core::document::doc_list_index_declarations(&loom, ns, collection)
-                        .map_err(|e| e.to_string())?;
-                Ok(loom_core::document::document_index_declarations_json(
-                    indexes,
-                ))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let bytes = remote.block(Document::index_list_json(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    collection.to_string(),
-                ))?;
-                serde_json::from_slice(&bytes).map_err(|e| e.to_string())
-            }
-        }
-    }
-
-    /// The `{"indexes":[{name, ready, entries}]}` JSON the CLI prints (Document index status). Both arms
-    /// format through `document_index_statuses_json` (the remote arm decodes the server's identical bytes).
-    pub(crate) fn doc_index_statuses(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-    ) -> Result<serde_json::Value, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let statuses = loom_core::document::doc_index_statuses(&loom, ns, collection)
-                    .map_err(|e| e.to_string())?;
-                Ok(loom_core::document::document_index_statuses_json(statuses))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let bytes = remote.block(Document::index_status_json(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    collection.to_string(),
-                ))?;
-                serde_json::from_slice(&bytes).map_err(|e| e.to_string())
-            }
-        }
-    }
-
-    pub(crate) fn doc_index_rebuild(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        name: &str,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::document::doc_rebuild_index(&mut loom, ns, collection, name)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Document::index_rebuild(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                name.to_string(),
-            )),
-        }
-    }
-
-    /// The ids matching `value` in `index` of `collection` (Document find). `value_json` is the raw JSON
-    /// the user supplied; the local arm parses it, the remote arm forwards it and decodes the id array.
-    pub(crate) fn doc_find(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        index: &str,
-        value_json: &str,
-    ) -> Result<Vec<String>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let value = serde_json::from_str::<serde_json::Value>(value_json)
-                    .map_err(|e| format!("document index value must be JSON: {e}"))?;
-                let value = loom_core::document::document_index_value_from_json(&value)
-                    .map_err(|e| e.to_string())?;
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::document::doc_find(&loom, ns, collection, index, &value)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let bytes = remote.block(Document::find_json(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    collection.to_string(),
-                    index.to_string(),
-                    value_json.as_bytes().to_vec(),
-                ))?;
-                serde_json::from_slice::<Vec<String>>(&bytes).map_err(|e| e.to_string())
-            }
-        }
-    }
-
-    /// The `{"items":[...], "next_cursor":...}` JSON the CLI prints (Document query). `query_json` is the
-    /// raw JSON the user supplied; both arms format through `document_query_result_json` (the remote arm
-    /// decodes the server's identical bytes).
-    pub(crate) fn doc_query(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        query_json: &[u8],
-    ) -> Result<serde_json::Value, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let query = serde_json::from_slice::<serde_json::Value>(query_json)
-                    .map_err(|e| format!("document query must be JSON: {e}"))?;
-                let query = loom_core::document::document_query_from_json(&query)
-                    .map_err(|e| e.to_string())?;
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let result = loom_core::document::doc_query(&loom, ns, collection, &query)
-                    .map_err(|e| e.to_string())?;
-                Ok(loom_core::document::document_query_result_json(result))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let bytes = remote.block(Document::query_json(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    collection.to_string(),
-                    query_json.to_vec(),
-                ))?;
-                serde_json::from_slice(&bytes).map_err(|e| e.to_string())
             }
         }
     }
@@ -5944,7 +6623,6 @@ fn encode_acl_wire_args(args: &AclGrantArgs<'_>) -> Result<AclWireArgs, String> 
 
 /// Decode a canonical `workspace_info_to_cbor` record (`[id, name, [facet_tag...], head]`) into a typed
 /// `WorkspaceInfo` for the CLI workspace-list presentation.
-#[cfg(feature = "remote-client")]
 fn cli_workspace_info_from_remote(wire: &[u8]) -> Result<loom_core::WorkspaceInfo, String> {
     let items = match loom_codec::decode(wire).map_err(|e| e.to_string())? {
         loom_codec::Value::Array(items) => items,
@@ -6148,87 +6826,6 @@ impl RemoteStore {
             .map_err(|e| e.to_string())
     }
 
-    fn doc_get_binary(
-        &self,
-        workspace: &str,
-        collection: &str,
-        id: &str,
-    ) -> Result<Option<loom_core::document::DocumentBinary>, String> {
-        let encoded = self.block(Document::get_binary(
-            &self.client,
-            self.handle.clone(),
-            workspace.to_string(),
-            collection.to_string(),
-            id.to_string(),
-        ))?;
-        encoded
-            .map(|bytes| {
-                let (bytes, digest, entity_tag) =
-                    loom_wire::document::binary_result_from_cbor(&bytes)
-                        .map_err(|e| e.to_string())?;
-                Ok(loom_core::document::DocumentBinary {
-                    bytes,
-                    digest: Digest::parse(&digest).map_err(|e| e.to_string())?,
-                    entity_tag,
-                })
-            })
-            .transpose()
-    }
-
-    fn doc_get_text(
-        &self,
-        workspace: &str,
-        collection: &str,
-        id: &str,
-    ) -> Result<Option<loom_core::document::DocumentText>, String> {
-        let Some(document) = self.doc_get_binary(workspace, collection, id)? else {
-            return Ok(None);
-        };
-        let text = String::from_utf8(document.bytes).map_err(|_| {
-            loom_types::LoomError::document_not_text("document payload is not valid UTF-8 text")
-                .to_string()
-        })?;
-        Ok(Some(loom_core::document::DocumentText {
-            text,
-            digest: document.digest,
-            entity_tag: document.entity_tag,
-        }))
-    }
-
-    fn doc_put_binary_guarded(
-        &self,
-        workspace: &str,
-        collection: &str,
-        id: &str,
-        content: Vec<u8>,
-        expected_entity_tag: Option<&str>,
-    ) -> Result<Digest, String> {
-        if let Some(expected_entity_tag) = expected_entity_tag {
-            let current = self.doc_get_binary(workspace, collection, id)?;
-            match current {
-                Some(document) if document.entity_tag == expected_entity_tag => {}
-                Some(_) | None => {
-                    return Err(loom_types::LoomError::cas_mismatch(
-                        "document entity tag guard did not match",
-                    )
-                    .to_string());
-                }
-            }
-        }
-        let bytes = self.block(Document::put_binary(
-            &self.client,
-            self.handle.clone(),
-            workspace.to_string(),
-            collection.to_string(),
-            id.to_string(),
-            content,
-            None,
-        ))?;
-        let (digest, _) =
-            loom_wire::document::put_result_from_cbor(&bytes).map_err(|e| e.to_string())?;
-        Digest::parse(&digest).map_err(|e| e.to_string())
-    }
-
     /// Resolve `workspace` (an id or a name) to its `WorkspaceId` using the remote workspace list, so a
     /// remote `workspace rename`/`delete` can print the same resolved id as the local path. Mirrors
     /// `resolve_ns`: a parseable id is matched by id, otherwise the value is matched by name.
@@ -6260,9 +6857,9 @@ impl RemoteStore {
 /// own IO runtime and is awaited over a std channel, so it is safe to invoke from inside the MCP host's
 /// serving runtime (no nested `block_on`).
 #[cfg(all(feature = "mcp", feature = "remote-client"))]
-pub(crate) struct McpRemoteBackend {
+pub(crate) struct McpRemoteBackend<T: Transport = Http2TlsTransport> {
     runtime: tokio::runtime::Runtime,
-    client: Arc<RemoteLoomClient<Http2TlsTransport>>,
+    client: Arc<RemoteLoomClient<T>>,
     handle: LoomSession,
 }
 
@@ -6297,6 +6894,56 @@ impl McpRemoteBackend {
                 .open_session(SessionAuth::Unauthenticated)
                 .await
                 .map_err(|e| e.to_string())?;
+            let handle = Store::open(&client).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>((Arc::new(client), handle))
+        })?;
+        Ok(Self {
+            runtime,
+            client,
+            handle,
+        })
+    }
+}
+
+#[cfg(all(feature = "mcp", feature = "remote-client", feature = "serve"))]
+impl McpRemoteBackend<DaemonMcpTransport> {
+    pub(crate) fn connect_local_daemon(store: &str, keys: &KeyOpts) -> Result<Self, String> {
+        let paths = daemon::paths(store).map_err(|e| e.to_string())?;
+        daemon::status_response(&paths)
+            .map_err(|e| format!("local MCP requires a running daemon for {store:?}: {e}"))?;
+        let transport = DaemonMcpTransport { paths };
+        Self::connect_transport(
+            "https://local-daemon.loom/",
+            transport,
+            DiscoveryMode::Default,
+            local_session_auth(keys)?,
+        )
+    }
+}
+
+#[cfg(all(feature = "mcp", feature = "remote-client"))]
+impl<T> McpRemoteBackend<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
+    fn connect_transport(
+        locator: &str,
+        transport: T,
+        mode: DiscoveryMode,
+        auth: SessionAuth,
+    ) -> Result<Self, String> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("build async runtime: {e}"))?;
+        let locator = locator.to_string();
+        let (client, handle) = runtime.block_on(async move {
+            let conn =
+                RemoteConnection::connect(transport, &locator, &ContextResolver::default(), mode)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let client = RemoteLoomClient::new(conn);
+            client.open_session(auth).await.map_err(|e| e.to_string())?;
             let handle = Store::open(&client).await.map_err(|e| e.to_string())?;
             Ok::<_, String>((Arc::new(client), handle))
         })?;
@@ -6344,6 +6991,55 @@ fn remote_backend_channel_closed() -> loom_types::LoomError {
     loom_types::LoomError::corrupt("remote MCP backend response channel closed")
 }
 
+#[cfg(all(feature = "mcp", feature = "remote-client", feature = "serve"))]
+pub(crate) struct DaemonMcpTransport {
+    paths: daemon::DaemonPaths,
+}
+
+#[cfg(all(feature = "mcp", feature = "remote-client", feature = "serve"))]
+fn daemon_mcp_transport_error(
+    context: &str,
+    error: impl std::fmt::Display,
+) -> loom_types::LoomError {
+    loom_types::LoomError::new(loom_types::Code::Io, format!("{context}: {error}"))
+}
+
+#[cfg(all(feature = "mcp", feature = "remote-client", feature = "serve"))]
+impl Transport for DaemonMcpTransport {
+    async fn discover(&self, _path: &str) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        loom_remote_protocol::discovery::Discovery::v1(
+            "https://local-daemon.loom",
+            "https://local-daemon.loom/v1/call",
+            vec!["unauthenticated".to_string(), "passphrase".to_string()],
+            Vec::new(),
+        )
+        .encode()
+        .map_err(|e| daemon_mcp_transport_error("encode local daemon discovery", e))
+    }
+
+    async fn call(&self, request: Vec<u8>) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        daemon::generated_call(&self.paths, &request)
+            .map_err(|e| daemon_mcp_transport_error("local daemon generated call", e))
+    }
+
+    async fn open_stream(
+        &self,
+        request: Vec<u8>,
+    ) -> std::result::Result<FrameSource, loom_types::LoomError> {
+        daemon::generated_stream(&self.paths, &request)
+            .map(FrameSource::from_frames)
+            .map_err(|e| daemon_mcp_transport_error("local daemon generated stream", e))
+    }
+
+    async fn open_session(
+        &self,
+        request: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        daemon::generated_session_open(&self.paths, &request)
+            .map_err(|e| daemon_mcp_transport_error("local daemon session open", e))
+    }
+}
+
 /// Parse an MCP watch change-kind string into a [`loom_core::ChangeKind`]. Mirrors the host's
 /// `parse_watch_change_kind` so remote and local subscribe reject the same invalid inputs.
 #[cfg(all(feature = "mcp", feature = "remote-client"))]
@@ -6361,7 +7057,10 @@ fn parse_watch_change_kind_cli(
 }
 
 #[cfg(all(feature = "mcp", feature = "remote-client"))]
-impl uldren_loom_mcp::RemoteMcpBackend for McpRemoteBackend {
+impl<T> uldren_loom_mcp::RemoteMcpBackend for McpRemoteBackend<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
     fn workspace_create(
         &self,
         name: Option<&str>,
@@ -6525,6 +7224,8 @@ impl uldren_loom_mcp::RemoteMcpBackend for McpRemoteBackend {
         workspace: &str,
         lane_id: &str,
         ticket_id: &str,
+        placement: Option<&str>,
+        anchor: Option<&str>,
         updated_by: &str,
     ) -> std::result::Result<loom_lanes::Lane, loom_types::LoomError> {
         let client = self.client.clone();
@@ -6532,6 +7233,8 @@ impl uldren_loom_mcp::RemoteMcpBackend for McpRemoteBackend {
         let workspace = workspace.to_string();
         let lane_id = lane_id.to_string();
         let ticket_id = ticket_id.to_string();
+        let placement = placement.map(str::to_string);
+        let anchor = anchor.map(str::to_string);
         let updated_by = updated_by.to_string();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.runtime.handle().spawn(async move {
@@ -6542,6 +7245,8 @@ impl uldren_loom_mcp::RemoteMcpBackend for McpRemoteBackend {
                     workspace,
                     lane_id,
                     ticket_id,
+                    placement,
+                    anchor,
                     updated_by,
                 )
                 .await
@@ -10548,6 +11253,673 @@ fn encode_text_list(items: &[String]) -> Vec<u8> {
     loom_codec::encode(&array).expect("encoding a CBOR text array is infallible")
 }
 
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+    use loom_remote_protocol::codec::ToValue;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(feature = "serve")]
+    const DAEMON_GENERATED_SESSION_OPEN_MAGIC: &[u8] = b"loom-daemon-generated-session-open-v1\0";
+    #[cfg(feature = "serve")]
+    const DAEMON_GENERATED_CALL_MAGIC: &[u8] = b"loom-daemon-generated-call-v1\0";
+    #[cfg(feature = "serve")]
+    const DAEMON_GENERATED_SESSION_RESPONSE_MAGIC: &[u8] =
+        b"loom-daemon-generated-session-response-v1\0";
+    #[cfg(feature = "serve")]
+    const DAEMON_GENERATED_RESPONSE_MAGIC: &[u8] = b"loom-daemon-generated-response-v1\0";
+
+    fn temp_store(tag: &str) -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "loomcli-execution-selector-{tag}-{}-{seq}.loom",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let fs = FileStore::create_with_profile(&path, Algo::Blake3).expect("create store");
+        drop(fs);
+        path.to_string_lossy().into_owned()
+    }
+
+    fn cas_put_operation(workspace: &str, content: Vec<u8>) -> CliGeneratedOperation {
+        CliGeneratedOperation::new(
+            "Cas",
+            "put",
+            vec![
+                loom_codec::Value::Text(workspace.to_string()),
+                loom_codec::Value::Bytes(content),
+            ],
+        )
+        .expect("cas put operation")
+    }
+
+    fn cas_get_operation(workspace: &str, digest: WireDigest) -> CliGeneratedOperation {
+        CliGeneratedOperation::new(
+            "Cas",
+            "get",
+            vec![
+                loom_codec::Value::Text(workspace.to_string()),
+                digest.to_value(),
+            ],
+        )
+        .expect("cas get operation")
+    }
+
+    fn workspace_create_operation(name: &str) -> CliGeneratedOperation {
+        CliGeneratedOperation::new(
+            "Workspaces",
+            "workspace_create",
+            vec![Some(name.to_string()).to_value(), loom_codec::Value::Null],
+        )
+        .expect("workspace create operation")
+    }
+
+    fn workspace_id_from_value(value: loom_codec::Value) -> String {
+        match value {
+            loom_codec::Value::Bytes(bytes) => {
+                let id = WorkspaceId::from_bytes(bytes.try_into().expect("workspace id bytes"));
+                id.to_string()
+            }
+            other => panic!("unexpected workspace output {other:?}"),
+        }
+    }
+
+    fn tickets_project_create_operation(workspace: &str) -> CliGeneratedOperation {
+        CliGeneratedOperation::new(
+            "Tickets",
+            "tickets_project_create_json",
+            vec![
+                loom_codec::Value::Text(workspace.to_string()),
+                loom_codec::Value::Text("tickets-workspace".to_string()),
+                loom_codec::Value::Text("selector-project".to_string()),
+                loom_codec::Value::Text("SEL".to_string()),
+                loom_codec::Value::Text("Selector Project".to_string()),
+                loom_codec::Value::Null,
+            ],
+        )
+        .expect("tickets project create operation")
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_binary_body<'a>(request: &'a [u8], magic: &[u8]) -> Option<&'a [u8]> {
+        let rest = request.strip_prefix(magic)?;
+        let len_bytes: [u8; 4] = rest.get(..4)?.try_into().ok()?;
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        rest.get(4..4 + len)
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_binary_response(magic: &[u8], bodies: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(magic);
+        out.extend_from_slice(&(bodies.len() as u32).to_be_bytes());
+        for body in bodies {
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    #[cfg(feature = "serve")]
+    fn success_store_open_response(request_body: &[u8], session_id: &[u8]) -> Vec<u8> {
+        let request =
+            loom_remote_protocol::envelope::Request::decode(request_body).expect("decode request");
+        assert_eq!(request.session_id.as_deref(), Some(session_id));
+        assert_eq!(request.interface, "Store");
+        assert_eq!(request.method, "open");
+        let handle = LoomSession(loom_remote_protocol::api_types::HandleId {
+            kind: "session".to_string(),
+            id: vec![9, 8, 7],
+            generation: 1,
+            owner_session: session_id.to_vec(),
+        });
+        let response = loom_remote_protocol::envelope::Response::ok(
+            request.request_id,
+            request.session_id,
+            handle.to_value(),
+        )
+        .encode()
+        .expect("encode response");
+        generated_binary_response(DAEMON_GENERATED_RESPONSE_MAGIC, &[response])
+    }
+
+    #[cfg(feature = "serve")]
+    fn success_generated_response(
+        request_body: &[u8],
+        session_id: &[u8],
+        interface: &str,
+        method: &str,
+        value: loom_codec::Value,
+    ) -> Vec<u8> {
+        let request =
+            loom_remote_protocol::envelope::Request::decode(request_body).expect("decode request");
+        assert_eq!(request.session_id.as_deref(), Some(session_id));
+        assert_eq!(request.interface, interface);
+        assert_eq!(request.method, method);
+        let response = loom_remote_protocol::envelope::Response::ok(
+            request.request_id,
+            request.session_id,
+            value,
+        )
+        .encode()
+        .expect("encode response");
+        generated_binary_response(DAEMON_GENERATED_RESPONSE_MAGIC, &[response])
+    }
+
+    #[test]
+    fn cli_execution_context_selects_direct_local_without_daemon() {
+        let store = temp_store("direct-local");
+
+        let context = open_cli_execution_context(&store).expect("open execution context");
+
+        assert_eq!(context.target(), CliExecutionTarget::DirectLocal);
+        let generated = context
+            .into_generated_client()
+            .expect("direct local generated client");
+        assert_eq!(generated.target(), CliExecutionTarget::DirectLocal);
+        match generated {
+            CliGeneratedClient::DirectLocal { client, handle } => {
+                let _ = client;
+                assert_eq!(handle.0.kind, "session");
+            }
+            #[cfg(feature = "serve")]
+            CliGeneratedClient::DaemonLocal(_) => panic!("expected direct local"),
+            #[cfg(feature = "remote-client")]
+            CliGeneratedClient::Remote(_) => panic!("expected direct local"),
+        }
+    }
+
+    #[test]
+    fn cli_generated_client_executes_direct_local_operations_without_target_branching() {
+        let store = temp_store("direct-operation");
+        let generated = open_cli_execution_context(&store)
+            .expect("open execution context")
+            .into_generated_client()
+            .expect("direct local generated client");
+        let workspace = "blobs".to_string();
+        let content = b"direct generated operation".to_vec();
+
+        let digest = WireDigest(
+            match generated
+                .execute_unary(&cas_put_operation(&workspace, content.clone()))
+                .expect("cas put")
+            {
+                loom_codec::Value::Text(digest) => digest,
+                other => panic!("unexpected output {other:?}"),
+            },
+        );
+        let read = generated
+            .execute_unary(&cas_get_operation(&workspace, digest))
+            .expect("cas get");
+
+        assert_eq!(read, loom_codec::Value::Bytes(content));
+        let workgraph = workspace_id_from_value(
+            generated
+                .execute_unary(&workspace_create_operation("workgraph"))
+                .expect("workspace create"),
+        );
+        let project = generated
+            .execute_unary(&tickets_project_create_operation(&workgraph))
+            .expect("tickets project create");
+        match project {
+            loom_codec::Value::Text(json) => assert!(json.contains("selector-project"), "{json}"),
+            other => panic!("unexpected output {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_store_administration_classification_is_explicit() {
+        assert_eq!(
+            classify_cli_operation(CliOperation::Init),
+            CliExecutionBoundary::StoreAdministration(
+                CliStoreAdministrationBoundary::OfflineStoreOwner
+            )
+        );
+        assert_eq!(
+            classify_cli_operation(CliOperation::Copy),
+            CliExecutionBoundary::StoreAdministration(
+                CliStoreAdministrationBoundary::OfflineStoreOwner
+            )
+        );
+        assert_eq!(
+            classify_cli_operation(CliOperation::Stat),
+            CliExecutionBoundary::StoreAdministration(
+                CliStoreAdministrationBoundary::GeneratedStoreAdmin
+            )
+        );
+        for method in [
+            "store_stat",
+            "store_policy_get",
+            "store_policy_set",
+            "store_rekey",
+        ] {
+            assert_eq!(
+                classify_generated_operation("StoreAdmin", method).expect("store admin method"),
+                CliExecutionBoundary::GeneratedClient
+            );
+        }
+    }
+
+    #[test]
+    fn generated_operation_boundary_uses_source_inventory_for_hot_families() {
+        for (interface, method) in [
+            ("Tickets", "tickets_create_json"),
+            ("Lanes", "update"),
+            ("Pages", "pages_create_json"),
+            ("Document", "put_text"),
+            ("FileSystem", "write_file"),
+        ] {
+            assert_eq!(
+                classify_generated_operation(interface, method).expect("hot family operation"),
+                CliExecutionBoundary::GeneratedClient
+            );
+        }
+        assert!(CliGeneratedOperation::new("Tickets", "missing", Vec::new()).is_err());
+        assert!(
+            CliGeneratedOperation::new("Transfer", "transfer_export", Vec::new())
+                .expect_err("streaming operation is rejected")
+                .contains("streaming")
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn cli_execution_context_does_not_fallback_when_daemon_generated_dispatch_fails() {
+        let store = temp_store("daemon-fail-closed");
+        let paths = daemon::paths(&store).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(&paths.addr_file, listener.local_addr().unwrap().to_string()).unwrap();
+        let store_path = paths.store.clone();
+        let store_id = paths.store_id.clone();
+        let server = std::thread::spawn(move || {
+            for request_index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                let response = if request_index < 2 {
+                    format!(
+                        "running\tprotocol=1\ttransport=tcp\tfake-pid\t{store_path}\tidentity={store_id}\tsessions=0\tpins=0\n"
+                    )
+                    .into_bytes()
+                } else {
+                    b"not-a-generated-session-response".to_vec()
+                };
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let error = match open_cli_execution_context(&store) {
+            Ok(_) => panic!("daemon failure must not fall back to direct local"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("daemon-local generated session open failed"),
+            "{error}"
+        );
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&paths.addr_file);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn cli_execution_context_selects_daemon_local_and_carries_auth() {
+        let store = temp_store("daemon-auth");
+        let paths = daemon::paths(&store).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(&paths.addr_file, listener.local_addr().unwrap().to_string()).unwrap();
+        let store_path = paths.store.clone();
+        let store_id = paths.store_id.clone();
+        let principal = WorkspaceId::from_bytes([7; 16]);
+        let passphrase_path = std::env::temp_dir().join(format!(
+            "loomcli-execution-selector-passphrase-{}",
+            std::process::id()
+        ));
+        std::fs::write(&passphrase_path, "selector-passphrase").unwrap();
+        let server = std::thread::spawn(move || {
+            let session_id = vec![1, 2, 3, 4];
+            for request_index in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                let response = match request_index {
+                    0 | 1 => format!(
+                        "running\tprotocol=1\ttransport=tcp\tfake-pid\t{store_path}\tidentity={store_id}\tsessions=0\tpins=0\n"
+                    )
+                    .into_bytes(),
+                    2 => {
+                        let body = generated_binary_body(
+                            &request,
+                            DAEMON_GENERATED_SESSION_OPEN_MAGIC,
+                        )
+                        .expect("session open frame");
+                        let auth = loom_remote_protocol::session::parse_open_request(body)
+                            .expect("session auth");
+                        assert_eq!(
+                            auth,
+                            SessionAuth::Passphrase {
+                                principal: [7; 16],
+                                passphrase: b"selector-passphrase".to_vec()
+                            }
+                        );
+                        let reply = loom_remote_protocol::session::SessionOpenReply::Ok {
+                            session_id: session_id.clone(),
+                            lease_expires_ms: 123,
+                        };
+                        generated_binary_response(
+                            DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+                            &[loom_remote_protocol::session::open_reply_bytes(&reply)],
+                        )
+                    }
+                    _ => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("generated call frame");
+                        success_store_open_response(body, &session_id)
+                    }
+                };
+                stream.write_all(&response).unwrap();
+            }
+        });
+        let keys = KeyOpts {
+            auth_principal: Some(principal.to_string()),
+            auth_source: crate::KeySource::File(passphrase_path.to_string_lossy().into_owned()),
+            ..KeyOpts::default()
+        };
+
+        let context =
+            open_cli_execution_context_with_keys(&store, &keys).expect("open daemon context");
+
+        assert_eq!(context.target(), CliExecutionTarget::DaemonLocal);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&paths.addr_file);
+        let _ = std::fs::remove_file(&passphrase_path);
+    }
+
+    #[cfg(all(feature = "serve", feature = "mcp", feature = "remote-client"))]
+    #[test]
+    fn local_mcp_backend_connects_through_daemon_generated_boundary() {
+        let store = temp_store("mcp-daemon-boundary");
+        let paths = daemon::paths(&store).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(&paths.addr_file, listener.local_addr().unwrap().to_string()).unwrap();
+        let store_path = paths.store.clone();
+        let store_id = paths.store_id.clone();
+        let server = std::thread::spawn(move || {
+            let session_id = vec![9, 7, 5, 3];
+            for request_index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                let response = match request_index {
+                    0 => format!(
+                        "running\tprotocol=1\ttransport=tcp\tfake-pid\t{store_path}\tidentity={store_id}\tsessions=0\tpins=0\n"
+                    )
+                    .into_bytes(),
+                    1 => {
+                        let body = generated_binary_body(
+                            &request,
+                            DAEMON_GENERATED_SESSION_OPEN_MAGIC,
+                        )
+                        .expect("session open frame");
+                        let auth = loom_remote_protocol::session::parse_open_request(body)
+                            .expect("session auth");
+                        assert_eq!(auth, SessionAuth::Unauthenticated);
+                        let reply = loom_remote_protocol::session::SessionOpenReply::Ok {
+                            session_id: session_id.clone(),
+                            lease_expires_ms: 123,
+                        };
+                        generated_binary_response(
+                            DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+                            &[loom_remote_protocol::session::open_reply_bytes(&reply)],
+                        )
+                    }
+                    _ => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("store open frame");
+                        success_store_open_response(body, &session_id)
+                    }
+                };
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let backend = McpRemoteBackend::connect_local_daemon(&store, &KeyOpts::default())
+            .expect("local daemon MCP backend");
+
+        assert_eq!(backend.handle.0.owner_session, vec![9, 7, 5, 3]);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&paths.addr_file);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn cli_generated_client_executes_same_operation_through_daemon_local_boundary() {
+        let store = temp_store("daemon-operation");
+        let paths = daemon::paths(&store).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(&paths.addr_file, listener.local_addr().unwrap().to_string()).unwrap();
+        let store_path = paths.store.clone();
+        let store_id = paths.store_id.clone();
+        let digest = WireDigest(
+            "blake3:1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+        );
+        let expected_digest = digest.clone();
+        let expected_content = b"daemon generated operation".to_vec();
+        let expected_read = expected_content.clone();
+        let server = std::thread::spawn(move || {
+            let session_id = vec![4, 3, 2, 1];
+            for request_index in 0..8 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                let response = match request_index {
+                    0 | 1 => format!(
+                        "running\tprotocol=1\ttransport=tcp\tfake-pid\t{store_path}\tidentity={store_id}\tsessions=0\tpins=0\n"
+                    )
+                    .into_bytes(),
+                    2 => {
+                        let reply = loom_remote_protocol::session::SessionOpenReply::Ok {
+                            session_id: session_id.clone(),
+                            lease_expires_ms: 123,
+                        };
+                        generated_binary_response(
+                            DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+                            &[loom_remote_protocol::session::open_reply_bytes(&reply)],
+                        )
+                    }
+                    3 => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("store open frame");
+                        success_store_open_response(body, &session_id)
+                    }
+                    4 => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("cas put frame");
+                        success_generated_response(
+                            body,
+                            &session_id,
+                            "Cas",
+                            "put",
+                            expected_digest.to_value(),
+                        )
+                    }
+                    5 => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("cas get frame");
+                        success_generated_response(
+                            body,
+                            &session_id,
+                            "Cas",
+                            "get",
+                            loom_codec::Value::Bytes(expected_read.clone()),
+                        )
+                    }
+                    6 => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("tickets project create frame");
+                        success_generated_response(
+                            body,
+                            &session_id,
+                            "Tickets",
+                            "tickets_project_create_json",
+                            loom_codec::Value::Text(
+                                "{\"project_id\":\"selector-project\"}".to_string(),
+                            ),
+                        )
+                    }
+                    _ => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("store close frame");
+                        success_generated_response(
+                            body,
+                            &session_id,
+                            "Store",
+                            "close",
+                            loom_codec::Value::Null,
+                        )
+                    }
+                };
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        {
+            let generated = open_cli_execution_context(&store)
+                .expect("open daemon context")
+                .into_generated_client()
+                .expect("daemon generated client");
+            let workspace = "blobs".to_string();
+            let put = generated
+                .execute_unary(&cas_put_operation(&workspace, expected_content))
+                .expect("cas put");
+            assert_eq!(put, digest.to_value());
+            let get = generated
+                .execute_unary(&cas_get_operation(&workspace, digest))
+                .expect("cas get");
+            assert_eq!(
+                get,
+                loom_codec::Value::Bytes(b"daemon generated operation".to_vec())
+            );
+            let project = generated
+                .execute_unary(&tickets_project_create_operation("workgraph"))
+                .expect("tickets project create");
+            assert_eq!(
+                project,
+                loom_codec::Value::Text("{\"project_id\":\"selector-project\"}".to_string())
+            );
+        }
+
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&paths.addr_file);
+    }
+
+    #[cfg(all(feature = "serve", feature = "remote-client"))]
+    #[test]
+    fn cli_generated_client_executes_same_operation_through_remote_boundary() {
+        let store = temp_store("remote-operation");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!(
+            "loomcli-selector-remote-{}.crt",
+            std::process::id()
+        ));
+        let key_path = dir.join(format!(
+            "loomcli-selector-remote-{}.key",
+            std::process::id()
+        ));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
+            &cert_path.to_string_lossy(),
+            &key_path.to_string_lossy(),
+        )
+        .expect("server tls");
+        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
+            "127.0.0.1:0".to_string(),
+            "https://localhost/apps/loom".to_string(),
+            None,
+            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
+            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
+            60_000,
+            1 << 20,
+            None,
+        );
+        let server_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_rt
+            .block_on(crate::serve_cmd::bind_remote_endpoint(
+                &store,
+                &options,
+                tls.server_config(),
+            ))
+            .expect("bind remote endpoint");
+        let target = RemoteTarget {
+            url: format!("https://127.0.0.1:{}/apps/loom", server.local_addr().port()),
+            auth: None,
+            tls: Some("insecure-dev".to_string()),
+            discovery: LocatorDiscovery::Default,
+            discovery_path: None,
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
+        };
+        let context =
+            CliExecutionContext::Remote(Box::new(RemoteStore::connect(&target).expect("connect")));
+
+        assert_eq!(context.target(), CliExecutionTarget::Remote);
+        let generated = context
+            .into_generated_client()
+            .expect("remote generated client");
+        let workspace = "blobs".to_string();
+        let content = b"remote generated operation".to_vec();
+        let digest = WireDigest(
+            match generated
+                .execute_unary(&cas_put_operation(&workspace, content.clone()))
+                .expect("cas put")
+            {
+                loom_codec::Value::Text(digest) => digest,
+                other => panic!("unexpected output {other:?}"),
+            },
+        );
+        let read = generated
+            .execute_unary(&cas_get_operation(&workspace, digest))
+            .expect("cas get");
+
+        assert_eq!(read, loom_codec::Value::Bytes(content));
+        let workgraph = workspace_id_from_value(
+            generated
+                .execute_unary(&workspace_create_operation("workgraph"))
+                .expect("workspace create"),
+        );
+        let project = generated
+            .execute_unary(&tickets_project_create_operation(&workgraph))
+            .expect("tickets project create");
+        match project {
+            loom_codec::Value::Text(json) => assert!(json.contains("selector-project"), "{json}"),
+            other => panic!("unexpected output {other:?}"),
+        }
+        server.shutdown();
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[cfg(not(feature = "remote-client"))]
+    #[test]
+    fn cli_execution_context_rejects_remote_locator_when_remote_client_is_disabled() {
+        let error = match open_cli_execution_context("https://127.0.0.1:1/apps/loom") {
+            Ok(_) => panic!("remote locator must require remote-client feature"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("rebuild with the `remote-client` feature"),
+            "{error}"
+        );
+    }
+}
+
 /// Map the locator discovery mode onto the protocol discovery mode.
 #[cfg(feature = "remote-client")]
 fn discovery_mode(discovery: LocatorDiscovery) -> DiscoveryMode {
@@ -12010,7 +13382,16 @@ mod live_tests {
             r.map_err(|e| (e.code, e.message))
         }
 
-        for name in uldren_loom_mcp::tools::SERVER_PROMOTED_TOOLS {
+        for name in uldren_loom_mcp::tools::tool_surface()
+            .iter()
+            .filter(|tool| {
+                matches!(
+                    tool.remote_capability(),
+                    uldren_loom_mcp::tools::RemoteCapability::ServerExecute
+                )
+            })
+            .map(|tool| tool.name)
+        {
             let over_wire = norm(backend.execute_tool(name, b"{}"));
             let in_process = norm(uldren_loom_mcp::server::execute_promoted_tool(
                 &local, name, b"{}",
@@ -12266,63 +13647,62 @@ mod live_tests {
         );
 
         // Document: put, then get/list/delete through the facade.
-        client
-            .doc_put_text(&keys, "docs", "notes", "d1", "{\"x\":1}", None)
+        let document_client =
+            CliGeneratedClient::Remote(Box::new(RemoteStore::connect(&target).expect("connect")));
+        document_client
+            .doc_put_text("docs", "notes", "d1", "{\"x\":1}", None)
             .expect("doc put");
         assert_eq!(
-            client
-                .doc_get_text(&keys, "docs", "notes", "d1")
+            document_client
+                .doc_get_text("docs", "notes", "d1")
                 .expect("doc get")
                 .map(|document| document.text),
             Some("{\"x\":1}".to_string())
         );
         assert!(
-            !client
-                .doc_list_binary(&keys, "docs", "notes")
+            !document_client
+                .doc_list_binary("docs", "notes")
                 .expect("doc list")
                 .is_empty()
         );
         assert!(
-            client
-                .doc_delete(&keys, "docs", "notes", "d1")
+            document_client
+                .doc_delete("docs", "notes", "d1")
                 .expect("doc delete")
         );
 
         // Document indexing over the wire: create an index, find/query by it, inspect, rebuild, drop.
-        client
-            .doc_put_text(&keys, "docs", "people", "p1", "{\"age\":30}", None)
+        document_client
+            .doc_put_text("docs", "people", "p1", "{\"age\":30}", None)
             .expect("doc put p1");
-        client
-            .doc_index_create(&keys, "docs", "people", "by_age", "age", false)
+        document_client
+            .doc_index_create("docs", "people", "by_age", "age", false)
             .expect("doc index create");
-        // list/status render as `{"indexes":[...]}` and include the new index.
-        let idx_list = client
-            .doc_index_list(&keys, "docs", "people")
+        let idx_list = document_client
+            .doc_index_list("docs", "people")
             .expect("doc index list");
         assert!(idx_list.to_string().contains("by_age"));
-        let idx_status = client
-            .doc_index_statuses(&keys, "docs", "people")
+        let idx_status = document_client
+            .doc_index_statuses("docs", "people")
             .expect("doc index status");
         assert!(idx_status.to_string().contains("by_age"));
-        // find by the indexed value returns the document id.
         assert_eq!(
-            client
-                .doc_find(&keys, "docs", "people", "by_age", "30")
+            document_client
+                .doc_find("docs", "people", "by_age", "30")
                 .expect("doc find"),
             vec!["p1".to_string()]
         );
-        // query returns the canonical `{"items":[...],"next_cursor":...}` shape.
         let query = br#"{"collection":"people"}"#;
-        let query_result = client
-            .doc_query(&keys, "docs", "people", query)
+        let query_result = document_client
+            .doc_query("docs", "people", query.to_vec())
             .expect("doc query");
         assert!(query_result.get("items").is_some());
-        client
-            .doc_index_rebuild(&keys, "docs", "people", "by_age")
+        document_client
+            .doc_index_rebuild("docs", "people", "by_age")
             .expect("doc index rebuild");
         assert!(
-            client
-                .doc_index_drop(&keys, "docs", "people", "by_age")
+            document_client
+                .doc_index_drop("docs", "people", "by_age")
                 .expect("doc index drop")
         );
 

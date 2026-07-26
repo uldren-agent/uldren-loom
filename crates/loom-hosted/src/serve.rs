@@ -13065,7 +13065,7 @@ async fn lanes_ticket_remove(
         HostedLaneTicketUpdate {
             lane_id,
             ticket_id,
-            placement: loom_lanes::LaneTicketPlacement::Append,
+            placement: loom_lanes::LaneTicketPlacement::Last,
             updated_by,
         },
     ) {
@@ -15159,7 +15159,7 @@ fn data_jsonrpc_result(
                 HostedLaneTicketUpdate {
                     lane_id: &lane_id,
                     ticket_id: &ticket_id,
-                    placement: loom_lanes::LaneTicketPlacement::Append,
+                    placement: loom_lanes::LaneTicketPlacement::Last,
                     updated_by: &updated_by,
                 },
             ))
@@ -22072,12 +22072,12 @@ fn required_str<'a>(value: &'a Value, name: &str) -> HostedHttpResult<&'a str> {
 }
 
 /// Build a lane ticket placement from the wire placement verb and optional anchor. Defaults to
-/// append; "before"/"after" require an anchor; unknown verbs are rejected.
+/// LAST. BEFORE and AFTER require an anchor; unknown verbs are rejected.
 fn hosted_lane_placement<'a>(
     placement: Option<&str>,
     anchor: Option<&'a str>,
 ) -> Result<loom_lanes::LaneTicketPlacement<'a>, LoomError> {
-    loom_lanes::LaneTicketPlacement::parse(placement.unwrap_or("append"), anchor)
+    loom_lanes::LaneTicketPlacement::parse(placement.unwrap_or("LAST"), anchor)
 }
 
 fn document_index_value_from_json(value: &Value) -> HostedHttpResult<DataValue> {

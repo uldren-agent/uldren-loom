@@ -96,6 +96,7 @@ pub use maintenance_policy::{
 };
 pub use mark_epoch::{
     ReachabilityMarkEpoch, begin_loom_reachability_mark_epoch, step_loom_reachability_mark_epoch,
+    step_loom_reachability_mark_epoch_until,
 };
 
 const MAGIC: &[u8; 8] = b"LOOMFS\x00\x01";
@@ -126,7 +127,7 @@ const CERTIFICATE_BUNDLE_PREFIX: &[u8] = b"certificate/v1/bundle/";
 const NETWORK_ACCESS_POLICY_PREFIX: &[u8] = b"network-access/v1/policy/";
 const STORE_POLICY_KEY: &[u8] = b"store/v1/policy";
 const MUTABLE_OVERLAY_META_ADDRESS: &[u8] = b"mutable-overlay/v1/meta";
-const MUTABLE_OVERLAY_CURRENT_INDEX_ADDRESS: &[u8] = b"mutable-overlay/v1/current-index";
+const MUTABLE_OVERLAY_CURRENT_ROOT_ADDRESS: &[u8] = b"mutable-overlay/v1/current-root";
 const MUTABLE_OVERLAY_ENTRY_ADDRESS_PREFIX: &[u8] = b"mutable-overlay/v1/current/";
 const MUTABLE_OVERLAY_OWNER_TOKEN_ADDRESS_PREFIX: &[u8] = b"mutable-overlay/v1/owner-token/";
 const MUTABLE_OVERLAY_SECONDARY_INDEX_ADDRESS_PREFIX: &[u8] =
@@ -142,7 +143,7 @@ const MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD: &[u8] =
 const MUTABLE_OVERLAY_IDEMPOTENCY_RECORD: &[u8] = b"loom.store.mutable-overlay.idempotency.v1";
 const MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD: &[u8] =
     b"loom.store.mutable-overlay.transaction-idempotency.v1";
-const MUTABLE_OVERLAY_CURRENT_INDEX_RECORD: &[u8] = b"loom.store.mutable-overlay.current-index.v1";
+const MUTABLE_OVERLAY_CURRENT_ROOT_RECORD: &[u8] = b"loom.store.mutable-overlay.current-root.v1";
 const RETAINED_HISTORY_HEAD_RECORD: &[u8] = b"loom.store.retained-history.head.v1";
 const RETAINED_HISTORY_ENTRY_RECORD: &[u8] = b"loom.store.retained-history.entry.v1";
 const AUDIT_RECORD_MAGIC: &[u8; 8] = b"LAUDIT1\0";
@@ -575,7 +576,7 @@ pub struct StoreIoStats {
     pub materialized_index_lookup_count: u64,
     pub open_mutable_current_records_loaded: u64,
     pub open_mutable_control_records_skipped: u64,
-    pub open_mutable_used_current_index: bool,
+    pub open_mutable_used_current_root: bool,
     pub open_index_materialized: bool,
 }
 
@@ -888,6 +889,7 @@ pub struct FileStore {
     pending_workflow_idempotency: Mutex<BTreeMap<Vec<u8>, PendingWorkflowIdempotency>>,
     mvcc_snapshot_registry: Arc<Mutex<StoreMvccSnapshotRegistry>>,
     pub(crate) hot_mutable_queue: Mutex<HotMutableCommitQueue>,
+    maintenance_index_scan: Mutex<Option<Vec<u8>>>,
     // The unlocked data-encryption-key session for an encrypted Loom, or `None` when
     // the store is unencrypted or still locked. Object seal/unseal requires this; a read that
     // needs it while `None` is `E2eLocked`. Behind its own lock so `unlock` takes `&self`.
@@ -1388,6 +1390,7 @@ impl FileStore {
                 pending_workflow_idempotency: Mutex::new(BTreeMap::new()),
                 mvcc_snapshot_registry: Arc::new(Mutex::new(StoreMvccSnapshotRegistry::default())),
                 hot_mutable_queue: Mutex::new(HotMutableCommitQueue::default()),
+                maintenance_index_scan: Mutex::new(None),
                 dek: Mutex::new(None),
                 digest_algo: create_digest_algo,
             };
@@ -1557,6 +1560,7 @@ impl FileStore {
             pending_workflow_idempotency: Mutex::new(BTreeMap::new()),
             mvcc_snapshot_registry: Arc::new(Mutex::new(StoreMvccSnapshotRegistry::default())),
             hot_mutable_queue: Mutex::new(HotMutableCommitQueue::default()),
+            maintenance_index_scan: Mutex::new(None),
             dek: Mutex::new(None),
             digest_algo: sb.digest_algo,
         };
@@ -1772,10 +1776,8 @@ impl FileStore {
             .rev()
             .find(|entry| entry.key == key)
             .ok_or_else(|| corrupt("mutable overlay idempotent write missing current entry"))?;
-        let current_index =
-            mutable_overlay_current_index_record(&overlay.export_entries()?, self.store_policy()?)?;
         drop(overlay);
-        let mut records = vec![
+        let records = vec![
             (
                 mutable_overlay_entry_address(&key),
                 encode_mutable_overlay_entry(&latest),
@@ -1789,7 +1791,6 @@ impl FileStore {
                 encode_mutable_overlay_idempotency_record(&request_digest, &token),
             ),
         ];
-        records.push(current_index);
         if durability == StoreDurabilityPolicy::Normal {
             let (waiter, lead) = self.enqueue_normal_mutable_records(records)?;
             self.pending_mutable_idempotency
@@ -2020,12 +2021,6 @@ impl FileStore {
             ));
             record_durabilities.push(durability);
         }
-        if !records.is_empty() {
-            records.push(mutable_overlay_current_index_record(
-                &overlay.export_entries()?,
-                self.store_policy()?,
-            )?);
-        }
         drop(overlay);
         let durability = self.mutable_overlay_records_durability(&record_durabilities);
         if durability == StoreDurabilityPolicy::Normal {
@@ -2151,17 +2146,6 @@ impl FileStore {
             ));
         }
         let overlay_generation = overlay.generation();
-        let current_index = if writes
-            .iter()
-            .any(|(_, durability, _)| *durability != StoreDurabilityPolicy::Ephemeral)
-        {
-            Some(mutable_overlay_current_index_record(
-                &overlay.export_entries()?,
-                policy,
-            )?)
-        } else {
-            None
-        };
         let mut records = Vec::new();
         let mut record_durabilities = Vec::new();
         for (key, durability, secondary_indexes) in &writes {
@@ -2188,9 +2172,6 @@ impl FileStore {
             record_durabilities.push(*durability);
         }
         drop(overlay);
-        if let Some(current_index) = current_index {
-            records.push(current_index);
-        }
         let root_after = workflow_transaction_root_digest(self.digest_algo, overlay_generation);
         let receipt = CommitReceipt {
             generation: overlay_generation,
@@ -2377,31 +2358,67 @@ impl FileStore {
                 new_gen,
                 inner.free.clone(),
             );
+            let (current_records, control_records) = split_mutable_overlay_records(&records);
+            let current_root_before = read_mutable_overlay_current_root(
+                &mut **file,
+                inner.overlay_root,
+                inner.page_count,
+            )?;
+            let current_entries = overlay_current_record_locs(
+                &mut **file,
+                current_root_before,
+                inner.page_count,
+                current_records.iter().map(|(address, _)| *address),
+            )?;
+            let mut reclaimed = reclaim_superseded_overlay_blobs_from_current(
+                &mut **file,
+                &mut alloc,
+                &current_entries,
+                current_records.iter().copied(),
+                oldest_pinned_snapshot_generation,
+                audit_retention_active,
+            )?;
+            let current_placements = write_overlay_blob_pages(
+                &mut **file,
+                &mut alloc,
+                &current_entries,
+                &current_records,
+            )?;
+            let mut current_root = current_root_before;
+            for (address, loc) in &current_placements {
+                let bound = alloc.page_count();
+                current_root = Some(pagebtree::insert(
+                    &mut **file,
+                    DATA_START,
+                    &mut alloc,
+                    current_root,
+                    address,
+                    *loc,
+                    bound,
+                )?);
+            }
+            let current_root_record = mutable_overlay_current_root_record(current_root);
+            let mut control_records = control_records;
+            control_records.push((current_root_record.0, current_root_record.1.as_slice()));
             let overlay_entries = overlay_current_record_locs(
                 &mut **file,
                 inner.overlay_root,
                 inner.page_count,
-                records.iter().map(|(address, _)| *address),
+                control_records.iter().map(|(address, _)| *address),
             )?;
-            let reclaimed = reclaim_superseded_overlay_blobs_from_current(
+            reclaimed.extend(reclaim_superseded_overlay_blobs_from_current(
                 &mut **file,
                 &mut alloc,
                 &overlay_entries,
-                records
-                    .iter()
-                    .map(|(address, value)| (*address, value.as_slice())),
+                control_records.iter().copied(),
                 oldest_pinned_snapshot_generation,
                 audit_retention_active,
-            )?;
-            let overlay_borrowed = records
-                .iter()
-                .map(|(key, value)| (*key, value.as_slice()))
-                .collect::<Vec<_>>();
+            )?);
             let overlay_placements = write_overlay_blob_pages(
                 &mut **file,
                 &mut alloc,
                 &overlay_entries,
-                &overlay_borrowed,
+                &control_records,
             )?;
             let mut overlay_root = inner.overlay_root;
             for (address, loc) in &overlay_placements {
@@ -2499,8 +2516,6 @@ impl FileStore {
         let latest = overlay
             .current_entry(&key)
             .ok_or_else(|| corrupt("mutable overlay tombstone missing current entry"))?;
-        let current_index =
-            mutable_overlay_current_index_record(&overlay.export_entries()?, self.store_policy()?)?;
         drop(overlay);
         let records = vec![
             (
@@ -2511,7 +2526,6 @@ impl FileStore {
                 mutable_overlay_owner_token_address(&key),
                 encode_mutable_overlay_owner_token_record(&token),
             ),
-            current_index,
         ];
         if durability == StoreDurabilityPolicy::Normal {
             let (waiter, lead) = self.enqueue_normal_mutable_records(records)?;
@@ -2652,7 +2666,7 @@ impl FileStore {
         let Some(root) = root else {
             return Ok(());
         };
-        let mut used_current_index = false;
+        let mut used_current_root = false;
         let mut control_records_skipped = 0u64;
         let mut generation = 0;
         let mut entries = Vec::new();
@@ -2667,23 +2681,13 @@ impl FileStore {
             )? {
                 generation = decode_mutable_overlay_meta(&read_blob_from_loc(&mut **file, loc)?)?;
             }
-            if let Some(loc) = pagebtree::get(
-                &mut **file,
-                DATA_START,
-                Some(root),
-                &mutable_overlay_current_index_address(),
-                page_count,
-            )? {
-                let current_addresses = decode_mutable_overlay_current_index_record(
-                    &read_blob_from_loc(&mut **file, loc)?,
-                )?;
-                used_current_index = true;
-                for address in current_addresses {
-                    let loc =
-                        pagebtree::get(&mut **file, DATA_START, Some(root), &address, page_count)?
-                            .ok_or_else(|| {
-                                corrupt("mutable overlay current-index address missing")
-                            })?;
+            if let Some(current_root) =
+                read_mutable_overlay_current_root(&mut **file, Some(root), page_count)?
+            {
+                used_current_root = true;
+                for (_, loc) in
+                    pagebtree::load_all(&mut **file, DATA_START, current_root, page_count)?
+                {
                     entries.push(decode_mutable_overlay_entry(&read_blob_from_loc(
                         &mut **file,
                         loc,
@@ -2696,9 +2700,8 @@ impl FileStore {
                     let value = read_blob_from_loc(&mut **file, loc)?;
                     if address == mutable_overlay_meta_address() {
                         generation = decode_mutable_overlay_meta(&value)?;
-                    } else if address == mutable_overlay_current_index_address() {
-                        control_records_skipped += 1;
-                    } else if value.starts_with(MUTABLE_OVERLAY_OWNER_TOKEN_RECORD)
+                    } else if address == mutable_overlay_current_root_address()
+                        || value.starts_with(MUTABLE_OVERLAY_OWNER_TOKEN_RECORD)
                         || value.starts_with(MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD)
                         || value.starts_with(MUTABLE_OVERLAY_IDEMPOTENCY_RECORD)
                         || value.starts_with(MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD)
@@ -2707,7 +2710,9 @@ impl FileStore {
                     {
                         control_records_skipped += 1;
                     } else {
-                        entries.push(decode_mutable_overlay_entry(&value)?);
+                        return Err(corrupt(
+                            "mutable overlay current root missing; controlled migration required",
+                        ));
                     }
                 }
             }
@@ -2720,7 +2725,7 @@ impl FileStore {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
         inner.io_stats.open_mutable_current_records_loaded = entries_loaded;
         inner.io_stats.open_mutable_control_records_skipped = control_records_skipped;
-        inner.io_stats.open_mutable_used_current_index = used_current_index;
+        inner.io_stats.open_mutable_used_current_root = used_current_root;
         Ok(())
     }
 
@@ -2781,28 +2786,68 @@ impl FileStore {
                 new_gen,
                 inner.free.clone(),
             );
-            let borrowed = records
-                .iter()
-                .map(|(key, value)| (*key, value.as_slice()))
-                .collect::<Vec<_>>();
+            let (current_records, control_records) = split_mutable_overlay_records(&records);
+            let current_root_before = read_mutable_overlay_current_root(
+                &mut **file,
+                inner.overlay_root,
+                inner.page_count,
+            )?;
+            let current_entries = overlay_current_record_locs(
+                &mut **file,
+                current_root_before,
+                inner.page_count,
+                current_records.iter().map(|(address, _)| *address),
+            )?;
+            let mut reclaimed = reclaim_superseded_overlay_blobs_from_current(
+                &mut **file,
+                &mut alloc,
+                &current_entries,
+                current_records.iter().copied(),
+                oldest_pinned_snapshot_generation,
+                audit_retention_active,
+            )?;
+            let current_placements = write_overlay_blob_pages(
+                &mut **file,
+                &mut alloc,
+                &current_entries,
+                &current_records,
+            )?;
+            let mut current_root = current_root_before;
+            for (address, loc) in &current_placements {
+                let bound = alloc.page_count();
+                current_root = Some(pagebtree::insert(
+                    &mut **file,
+                    DATA_START,
+                    &mut alloc,
+                    current_root,
+                    address,
+                    *loc,
+                    bound,
+                )?);
+            }
+            let current_root_record = mutable_overlay_current_root_record(current_root);
+            let mut control_records = control_records;
+            control_records.push((current_root_record.0, current_root_record.1.as_slice()));
             let overlay_entries = overlay_current_record_locs(
                 &mut **file,
                 inner.overlay_root,
                 inner.page_count,
-                records.iter().map(|(address, _)| *address),
+                control_records.iter().map(|(address, _)| *address),
             )?;
-            let reclaimed = reclaim_superseded_overlay_blobs_from_current(
+            reclaimed.extend(reclaim_superseded_overlay_blobs_from_current(
                 &mut **file,
                 &mut alloc,
                 &overlay_entries,
-                records
-                    .iter()
-                    .map(|(address, value)| (*address, value.as_slice())),
+                control_records.iter().copied(),
                 oldest_pinned_snapshot_generation,
                 audit_retention_active,
+            )?);
+            let placements = write_overlay_blob_pages(
+                &mut **file,
+                &mut alloc,
+                &overlay_entries,
+                &control_records,
             )?;
-            let placements =
-                write_overlay_blob_pages(&mut **file, &mut alloc, &overlay_entries, &borrowed)?;
             let mut overlay_root = inner.overlay_root;
             for (address, loc) in &placements {
                 let bound = alloc.page_count();
@@ -2828,6 +2873,84 @@ impl FileStore {
                 inner.control_root.map(|d| *d.bytes()),
                 &inner.maintenance,
                 &reclaimed,
+                (
+                    inner.freemap,
+                    inner.region_table_root,
+                    inner.maintenance_root,
+                ),
+                inner.encryption_meta.clone(),
+                self.digest_algo,
+                Some(&self.group_commit_metrics),
+            )?
+        };
+        inner.generation = new_gen;
+        inner.page_count = roots.page_count;
+        inner.overlay_root = roots.overlay_root;
+        inner.free = roots.free;
+        inner.freemap = roots.freemap;
+        inner.region_table_root = Some(roots.region_table_root);
+        inner.maintenance_root = Some(roots.maintenance_root);
+        inner.maintenance = roots.maintenance;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn commit_raw_overlay_records_for_test(&self, records: &[([u8; 32], Vec<u8>)]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let records = records
+            .iter()
+            .cloned()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        let new_gen = inner.generation + 1;
+        let roots = {
+            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            let mut alloc = PageAllocator::new_with_current_free_reusable(
+                inner.page_count,
+                new_gen,
+                inner.free.clone(),
+            );
+            let records = records
+                .iter()
+                .map(|(address, value)| (*address, value.as_slice()))
+                .collect::<Vec<_>>();
+            let entries = overlay_current_record_locs(
+                &mut **file,
+                inner.overlay_root,
+                inner.page_count,
+                records.iter().map(|(address, _)| *address),
+            )?;
+            let placements = write_overlay_blob_pages(&mut **file, &mut alloc, &entries, &records)?;
+            let mut overlay_root = inner.overlay_root;
+            for (address, loc) in &placements {
+                let bound = alloc.page_count();
+                overlay_root = Some(pagebtree::insert(
+                    &mut **file,
+                    DATA_START,
+                    &mut alloc,
+                    overlay_root,
+                    address,
+                    *loc,
+                    bound,
+                )?);
+            }
+            let touched_segments = BTreeSet::<u64>::new();
+            finish_txn(
+                &mut **file,
+                &mut alloc,
+                new_gen,
+                inner.maintenance.object_count,
+                inner.index_root,
+                overlay_root,
+                inner.open_segment,
+                inner.reference_root.map(|d| *d.bytes()),
+                inner.control_root.map(|d| *d.bytes()),
+                &inner.maintenance,
+                &touched_segments,
                 (
                     inner.freemap,
                     inner.region_table_root,
@@ -2951,7 +3074,7 @@ impl FileStore {
                 classify_page_run(&mut pages, page.0, 1, "object_index_tree_page");
             }
         }
-        let overlay_locs = if let Some(root) = overlay_root {
+        let mut overlay_locs = if let Some(root) = overlay_root {
             for page in pagebtree::collect_pages(&mut **file, DATA_START, root, page_count)? {
                 classify_page_run(&mut pages, page.0, 1, "mutable_overlay_tree_page");
             }
@@ -2962,6 +3085,18 @@ impl FileStore {
         } else {
             Vec::new()
         };
+        if let Some(root) =
+            read_mutable_overlay_current_root(&mut **file, overlay_root, page_count)?
+        {
+            for page in pagebtree::collect_pages(&mut **file, DATA_START, root, page_count)? {
+                classify_page_run(&mut pages, page.0, 1, "mutable_overlay_current_tree_page");
+            }
+            overlay_locs.extend(
+                pagebtree::load_all(&mut **file, DATA_START, root, page_count)?
+                    .into_iter()
+                    .map(|(_, loc)| loc),
+            );
+        }
         for loc in index_locs {
             classify_record_loc(&mut **file, &mut pages, loc, page_count, "record")?;
         }
@@ -3054,6 +3189,24 @@ impl FileStore {
                 physical_page_count,
             });
         };
+        let current_root = {
+            let mut file = self.file.lock().map_err(|_| poisoned())?;
+            read_mutable_overlay_current_root(&mut **file, Some(root), inner.page_count)?
+        };
+        let Some(current_root) = current_root else {
+            let physical_page_count = inner.maintenance.physical_page_count;
+            drop(inner);
+            let status = self.store_maintenance_report(0)?;
+            return Ok(MutableOverlayCheckpointWriteReport {
+                planned_current_records: plan.current_record_count,
+                compacted_current_records: 0,
+                blocked_current_records: plan.blocked_current_records,
+                rewritten_record_bytes: 0,
+                freed_record_pages: 0,
+                reusable_free_bytes: status.reusable_free_bytes,
+                physical_page_count,
+            });
+        };
         let new_gen = inner.generation + 1;
         let (roots, compacted_current_records, rewritten_record_bytes, freed_record_pages) = {
             let mut file = self.file.lock().map_err(|_| poisoned())?;
@@ -3062,33 +3215,27 @@ impl FileStore {
                 new_gen,
                 inner.free.clone(),
             );
-            let overlay_entries =
-                pagebtree::load_all(&mut **file, DATA_START, root, inner.page_count)?;
-            pagebtree::free_all(&mut **file, DATA_START, &mut alloc, root, inner.page_count)?;
+            let current_entries =
+                pagebtree::load_all(&mut **file, DATA_START, current_root, inner.page_count)?;
+            pagebtree::free_all(
+                &mut **file,
+                DATA_START,
+                &mut alloc,
+                current_root,
+                inner.page_count,
+            )?;
             let mut compacted_current_records = 0u64;
             let mut rewritten_record_bytes = 0u64;
             let mut freed_record_pages = 0u64;
             let mut rewritten = Vec::<([u8; 32], Vec<u8>)>::new();
-            let mut next_entries = Vec::<([u8; 32], RecordLoc)>::new();
+            let mut next_current_entries = Vec::<([u8; 32], RecordLoc)>::new();
             let mut freed_segments = BTreeSet::new();
-            for (address, loc) in overlay_entries {
+            for (address, loc) in current_entries {
                 let value = read_blob_from_loc(&mut **file, loc)?;
-                let rewrite = if address == mutable_overlay_meta_address()
-                    || address == mutable_overlay_current_index_address()
-                    || value.starts_with(MUTABLE_OVERLAY_OWNER_TOKEN_RECORD)
-                    || value.starts_with(MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD)
-                    || value.starts_with(MUTABLE_OVERLAY_IDEMPOTENCY_RECORD)
-                    || value.starts_with(MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD)
-                    || value.starts_with(RETAINED_HISTORY_HEAD_RECORD)
-                    || value.starts_with(RETAINED_HISTORY_ENTRY_RECORD)
-                {
-                    false
-                } else {
-                    let entry = decode_mutable_overlay_entry(&value)?;
-                    compactable
-                        .get(&entry.key)
-                        .is_some_and(|generation| *generation == entry.generation)
-                };
+                let entry = decode_mutable_overlay_entry(&value)?;
+                let rewrite = compactable
+                    .get(&entry.key)
+                    .is_some_and(|generation| *generation == entry.generation);
                 if rewrite {
                     let pages =
                         record_io::blob_pages(&mut **file, loc.global_page(), inner.page_count)?;
@@ -3103,7 +3250,7 @@ impl FileStore {
                     freed_record_pages = freed_record_pages.saturating_add(page_span);
                     rewritten.push((address, value));
                 } else {
-                    next_entries.push((address, loc));
+                    next_current_entries.push((address, loc));
                 }
             }
             let borrowed = rewritten
@@ -3112,10 +3259,45 @@ impl FileStore {
                 .collect::<Vec<_>>();
             let placements =
                 record_io::write_dedicated_blob_pages(&mut **file, &mut alloc, &borrowed)?;
-            next_entries.extend(placements);
-            next_entries.sort_by_key(|entry| entry.0);
-            let mut overlay_root = None;
-            for (address, loc) in &next_entries {
+            next_current_entries.extend(placements);
+            next_current_entries.sort_by_key(|entry| entry.0);
+            let mut next_current_root = None;
+            for (address, loc) in &next_current_entries {
+                let bound = alloc.page_count();
+                next_current_root = Some(pagebtree::insert(
+                    &mut **file,
+                    DATA_START,
+                    &mut alloc,
+                    next_current_root,
+                    address,
+                    *loc,
+                    bound,
+                )?);
+            }
+            let current_root_record = mutable_overlay_current_root_record(next_current_root);
+            let control_entries = overlay_current_record_locs(
+                &mut **file,
+                Some(root),
+                inner.page_count,
+                std::iter::once(current_root_record.0),
+            )?;
+            let control_records = [(current_root_record.0, current_root_record.1.as_slice())];
+            freed_segments.extend(reclaim_superseded_overlay_blobs_from_current(
+                &mut **file,
+                &mut alloc,
+                &control_entries,
+                control_records.iter().copied(),
+                None,
+                false,
+            )?);
+            let placements = write_overlay_blob_pages(
+                &mut **file,
+                &mut alloc,
+                &control_entries,
+                &control_records,
+            )?;
+            let mut overlay_root = Some(root);
+            for (address, loc) in &placements {
                 let bound = alloc.page_count();
                 overlay_root = Some(pagebtree::insert(
                     &mut **file,
@@ -3208,19 +3390,34 @@ impl FileStore {
         let mut current_records = Vec::new();
         if let Some(root) = overlay_root {
             let mut file = self.file.lock().map_err(|_| poisoned())?;
-            for (address, loc) in pagebtree::load_all(&mut **file, DATA_START, root, page_count)? {
+            let Some(current_root) =
+                read_mutable_overlay_current_root(&mut **file, Some(root), page_count)?
+            else {
+                let pinned_generations = mvcc
+                    .pins
+                    .iter()
+                    .map(|pin| pin.identity.overlay_generation)
+                    .collect();
+                return Ok(MutableOverlayCheckpointPlan {
+                    overlay_generation: loom_core::OverlayGeneration::new(
+                        overlay_health.current_generation,
+                    ),
+                    active_snapshot_count: mvcc.active_snapshot_count,
+                    oldest_pinned_generation: mvcc.oldest_pinned_overlay_generation,
+                    pinned_generations,
+                    current_record_count: overlay_health.current_record_count,
+                    tombstone_count: overlay_health.tombstone_count,
+                    compactable_current_records: 0,
+                    blocked_current_records: 0,
+                    stale_record_bytes,
+                    reusable_free_bytes,
+                    current_records,
+                });
+            };
+            for (_address, loc) in
+                pagebtree::load_all(&mut **file, DATA_START, current_root, page_count)?
+            {
                 let value = read_blob_from_loc(&mut **file, loc)?;
-                if address == mutable_overlay_meta_address()
-                    || address == mutable_overlay_current_index_address()
-                    || value.starts_with(MUTABLE_OVERLAY_OWNER_TOKEN_RECORD)
-                    || value.starts_with(MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD)
-                    || value.starts_with(MUTABLE_OVERLAY_IDEMPOTENCY_RECORD)
-                    || value.starts_with(MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD)
-                    || value.starts_with(RETAINED_HISTORY_HEAD_RECORD)
-                    || value.starts_with(RETAINED_HISTORY_ENTRY_RECORD)
-                {
-                    continue;
-                }
                 let entry = decode_mutable_overlay_entry(&value)?;
                 let generation = if entry.generation.as_u64() == 0 {
                     loom_core::OverlayGeneration::new(overlay_health.current_generation)
@@ -6915,8 +7112,8 @@ fn mutable_overlay_meta_address() -> [u8; 32] {
     *Digest::blake3(MUTABLE_OVERLAY_META_ADDRESS).bytes()
 }
 
-fn mutable_overlay_current_index_address() -> [u8; 32] {
-    *Digest::blake3(MUTABLE_OVERLAY_CURRENT_INDEX_ADDRESS).bytes()
+fn mutable_overlay_current_root_address() -> [u8; 32] {
+    *Digest::blake3(MUTABLE_OVERLAY_CURRENT_ROOT_ADDRESS).bytes()
 }
 
 fn mutable_overlay_entry_address(key: &loom_core::OverlayKey) -> [u8; 32] {
@@ -7355,6 +7552,12 @@ fn reclaim_superseded_overlay_blobs_from_current<'a>(
             eligible_locs.push(*loc);
             continue;
         }
+        if decode_mutable_overlay_current_root_record(&prior).is_ok()
+            && decode_mutable_overlay_current_root_record(replacement).is_ok()
+        {
+            eligible_locs.push(*loc);
+            continue;
+        }
         if let (Ok(prior), Ok(replacement)) = (
             decode_mutable_overlay_secondary_index_record(&prior),
             decode_mutable_overlay_secondary_index_record(replacement),
@@ -7538,74 +7741,110 @@ fn decode_mutable_overlay_meta(bytes: &[u8]) -> Result<u64> {
     Ok(generation)
 }
 
-fn mutable_overlay_current_index_record(
-    entries: &[loom_core::MutableOverlayEntrySnapshot],
-    policy: StorePolicy,
-) -> Result<([u8; 32], Vec<u8>)> {
-    let mut addresses = entries
-        .iter()
-        .map(|entry| {
-            let durability = mutable_overlay_key_facet(&entry.key)?
-                .map(|facet| policy.effective_durability(facet))
-                .unwrap_or(policy.default_durability);
-            if durability == StoreDurabilityPolicy::Ephemeral {
-                Ok(None)
-            } else {
-                Ok(Some(mutable_overlay_entry_address(&entry.key)))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    addresses.sort();
-    addresses.dedup();
-    Ok((
-        mutable_overlay_current_index_address(),
-        encode_mutable_overlay_current_index_record(&addresses),
-    ))
-}
-
-fn encode_mutable_overlay_current_index_record(addresses: &[[u8; 32]]) -> Vec<u8> {
+fn encode_mutable_overlay_current_root_record(current_root: Option<PageId>) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(MUTABLE_OVERLAY_CURRENT_INDEX_RECORD);
-    put_uvarint(&mut out, addresses.len() as u64);
-    for address in addresses {
-        out.extend_from_slice(address);
+    out.extend_from_slice(MUTABLE_OVERLAY_CURRENT_ROOT_RECORD);
+    match current_root {
+        Some(root) => {
+            out.push(1);
+            out.extend_from_slice(&root.0.to_be_bytes());
+        }
+        None => out.push(0),
     }
     out
 }
 
-fn decode_mutable_overlay_current_index_record(bytes: &[u8]) -> Result<Vec<[u8; 32]>> {
-    if !bytes.starts_with(MUTABLE_OVERLAY_CURRENT_INDEX_RECORD) {
-        return Err(corrupt("mutable overlay current-index schema mismatch"));
+fn decode_mutable_overlay_current_root_record(bytes: &[u8]) -> Result<Option<PageId>> {
+    if !bytes.starts_with(MUTABLE_OVERLAY_CURRENT_ROOT_RECORD) {
+        return Err(corrupt("mutable overlay current-root schema mismatch"));
     }
-    let mut pos = MUTABLE_OVERLAY_CURRENT_INDEX_RECORD.len();
-    let count = get_uvarint(bytes, &mut pos)
-        .ok_or_else(|| corrupt("mutable overlay current-index count truncated"))?
-        as usize;
-    let mut addresses = Vec::with_capacity(count);
-    for _ in 0..count {
-        let end = pos
-            .checked_add(32)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| corrupt("mutable overlay current-index address truncated"))?;
-        addresses.push(
-            bytes[pos..end]
-                .try_into()
-                .map_err(|_| corrupt("mutable overlay current-index address invalid"))?,
-        );
-        pos = end;
-    }
+    let mut pos = MUTABLE_OVERLAY_CURRENT_ROOT_RECORD.len();
+    let tag = bytes
+        .get(pos)
+        .copied()
+        .ok_or_else(|| corrupt("mutable overlay current-root tag missing"))?;
+    pos += 1;
+    let root = match tag {
+        0 => None,
+        1 => {
+            let end = pos
+                .checked_add(8)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| corrupt("mutable overlay current-root page truncated"))?;
+            let page = u64::from_be_bytes(
+                bytes[pos..end]
+                    .try_into()
+                    .map_err(|_| corrupt("mutable overlay current-root page invalid"))?,
+            );
+            pos = end;
+            Some(PageId(page))
+        }
+        _ => return Err(corrupt("mutable overlay current-root tag invalid")),
+    };
     if pos != bytes.len() {
-        return Err(corrupt("mutable overlay current-index trailing bytes"));
+        return Err(corrupt("mutable overlay current-root trailing bytes"));
     }
-    if !addresses.windows(2).all(|window| window[0] < window[1]) {
-        return Err(corrupt(
-            "mutable overlay current-index addresses must be sorted and unique",
-        ));
+    Ok(root)
+}
+
+fn mutable_overlay_current_root_record(current_root: Option<PageId>) -> ([u8; 32], Vec<u8>) {
+    (
+        mutable_overlay_current_root_address(),
+        encode_mutable_overlay_current_root_record(current_root),
+    )
+}
+
+fn read_mutable_overlay_current_root(
+    file: &mut dyn BackingIo,
+    overlay_root: Option<PageId>,
+    page_count: u64,
+) -> Result<Option<PageId>> {
+    let Some(loc) = pagebtree::get(
+        file,
+        DATA_START,
+        overlay_root,
+        &mutable_overlay_current_root_address(),
+        page_count,
+    )?
+    else {
+        return Ok(None);
+    };
+    decode_mutable_overlay_current_root_record(&read_blob_from_loc(file, loc)?)
+}
+
+type MutableOverlayRecordRef<'a> = ([u8; 32], &'a [u8]);
+
+fn split_mutable_overlay_records(
+    records: &[([u8; 32], Vec<u8>)],
+) -> (
+    Vec<MutableOverlayRecordRef<'_>>,
+    Vec<MutableOverlayRecordRef<'_>>,
+) {
+    let mut current = Vec::new();
+    let mut control = Vec::new();
+    for (address, value) in records {
+        if is_mutable_overlay_current_entry_record(value) {
+            current.push((*address, value.as_slice()));
+        } else {
+            control.push((*address, value.as_slice()));
+        }
     }
-    Ok(addresses)
+    (current, control)
+}
+
+fn is_mutable_overlay_current_entry_record(value: &[u8]) -> bool {
+    value.starts_with(b"loom.store.mutable-overlay.entry.v1")
+        || value.starts_with(b"loom.store.mutable-overlay.entry.v2")
+        || value.starts_with(b"loom.store.mutable-overlay.entry.v3")
+}
+
+fn is_mutable_overlay_control_record_family(value: &[u8]) -> bool {
+    value.starts_with(MUTABLE_OVERLAY_OWNER_TOKEN_RECORD)
+        || value.starts_with(MUTABLE_OVERLAY_SECONDARY_INDEX_RECORD)
+        || value.starts_with(MUTABLE_OVERLAY_IDEMPOTENCY_RECORD)
+        || value.starts_with(MUTABLE_OVERLAY_TRANSACTION_IDEMPOTENCY_RECORD)
+        || value.starts_with(RETAINED_HISTORY_HEAD_RECORD)
+        || value.starts_with(RETAINED_HISTORY_ENTRY_RECORD)
 }
 
 fn encode_mutable_overlay_entry(entry: &loom_core::MutableOverlayEntrySnapshot) -> Vec<u8> {

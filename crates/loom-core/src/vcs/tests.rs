@@ -121,6 +121,18 @@ impl ObjectStore for OverlayMemoryStore {
             replayed: false,
         })
     }
+
+    fn open_workflow_planning_snapshot(
+        &self,
+        owner: Option<&str>,
+    ) -> Result<crate::OverlayReadSnapshot> {
+        let _ = owner;
+        Ok(crate::OverlayReadSnapshot::new(
+            self.overlay.lock().unwrap().snapshot(),
+            None,
+            None,
+        ))
+    }
 }
 
 fn new_vcs_ns(loom: &mut Loom<MemoryStore>, seed: u8) -> WorkspaceId {
@@ -3630,6 +3642,24 @@ fn structured_stream_multi_leaf_root_is_pinned() {
         root.to_string(),
         "blake3:5d69f613f12b0e1a5822d15b4946d0a6690f79e36a4183491f7095eb7c479be1"
     );
+}
+
+#[test]
+fn deadline_preserves_pending_stream_root_mark_work() {
+    let mut loom = Loom::new(MemoryStore::new());
+    let ns = queue_ns(&mut loom, 23);
+    loom.stream_append(ns, "events", b"e0").unwrap();
+    let root = loom.stream_root(ns, "events").unwrap();
+    let mut state = loom.begin_live_object_mark([]).unwrap();
+    state.queue.clear();
+
+    let step = loom
+        .step_live_object_mark_until(&mut state, 1, Some(std::time::Instant::now()))
+        .unwrap();
+
+    assert_eq!(step.visited, 0);
+    assert_eq!(state.stream_roots.front().copied(), Some(root));
+    assert!(!state.completed);
 }
 
 #[test]

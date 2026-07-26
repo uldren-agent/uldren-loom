@@ -1353,6 +1353,7 @@ impl LoomMcp {
         let path = apps::app_file_path(app, path)?;
         self.store.read(|loom| {
             let ns = resolve_ns(loom, workspace)?;
+            loom.authorize(ns, FacetKind::Files, AclRight::Read)?;
             match loom.read_file(ns, &path) {
                 Ok(bytes) => Ok(Some(bytes)),
                 Err(e) if e.code == Code::NotFound => Ok(None),

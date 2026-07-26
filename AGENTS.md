@@ -110,6 +110,10 @@ Rules the tooling can't fully enforce. Breaking them lands a regression.
   parameter names or types. Internal items get a comment only when the code genuinely needs one.
 - **Files are final.** Every committed file reads as a finished version - no placeholders, draft
   banners, or internal process notes.
+- **Generated and compiled output is read-only.** Change the authoritative source and regenerate the
+  artifact. Do not edit build output to create behavior that source, tests, and static analysis cannot see.
+- **Model responsibilities explicitly.** Define stable contracts with traits and interfaces. Prefer
+  composition and polymorphism over external branching on type discriminators.
 
 ## Branch model, commits, releases
 
@@ -163,6 +167,10 @@ smallest diff, the current implementation, or the easiest way to close the activ
 - **Prefer enterprise-grade decisions.** Recommendations must optimize for performant, DRY,
   long-term, enterprise-quality contracts. Shortcuts are acceptable only when they are explicitly
   labeled as temporary patches and do not distort the target design.
+- **Identify one-way decisions.** Separate choices that are inexpensive to revise from choices that
+  determine storage, wire, ABI, rendering, or platform architecture.
+- **Prototype the riskiest assumption.** Before committing to an architecture that depends on uncertain
+  third-party or platform behavior, run a focused experiment with explicit success and fallback criteria.
 
 ### Decision visibility mode
 
@@ -224,6 +232,11 @@ target, future, blocked, deferred, incomplete, or promotion-needed.
   helper or dependency needs a reason the existing pattern doesn't cover.
 - **Minimal diffs.** Change as little as needed. Don't reformat unrelated lines or bump dependencies
   unless the task is the bump. A long comment over a short code change is not a minimal diff.
+- **Distinguish defects from constraints.** Determine whether observed behavior comes from Loom code,
+  a dependency, a protocol, a runtime, or the operating system. Inspect the authoritative implementation
+  and the actual bytes or values crossing the boundary.
+- **Don't silently omit required work.** If the agreed outcome depends on additional work, surface the
+  dependency or gap instead of treating it as unreported out-of-scope work.
 
 ### Done
 

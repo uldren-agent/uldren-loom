@@ -3710,7 +3710,7 @@ fn lane_behavioral_conformance_across_local_mcp_and_hosted() -> Result<(), Strin
             LaneTicketUpdateRequest {
                 lane_id: "mcp",
                 ticket_id: "MX-102",
-                placement: LaneTicketPlacement::Append,
+                placement: LaneTicketPlacement::Last,
                 updated_by: Some("agent:3"),
             },
         )
@@ -3736,7 +3736,7 @@ fn lane_behavioral_conformance_across_local_mcp_and_hosted() -> Result<(), Strin
                 LaneTicketUpdateRequest {
                     lane_id: "mcp",
                     ticket_id: "MX-104",
-                    placement: LaneTicketPlacement::Append,
+                    placement: LaneTicketPlacement::Last,
                     updated_by: Some("agent:3"),
                 },
             )

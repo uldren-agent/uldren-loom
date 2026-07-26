@@ -505,14 +505,14 @@ fn render_dispatch(methods: &[Method]) -> String {
     out.push_str("use loom_remote_protocol::generated_api::*;\n");
     out.push_str("use loom_types::{Code, LoomError};\n\n");
 
-    out.push_str("/// The outcome of a generated dispatch: a unary reply value or a buffered stream of item payloads.\n");
-    out.push_str("pub enum Dispatched {\n    /// A unary reply value.\n    Unary(::loom_codec::Value),\n    /// A buffered stream of canonical-CBOR item payloads.\n    Stream(Vec<Vec<u8>>),\n}\n\n");
+    out.push_str("/// The outcome of a generated dispatch: a unary reply value or a stream of item payloads.\n");
+    out.push_str("pub enum Dispatched {\n    /// A unary reply value.\n    Unary(::loom_codec::Value),\n    /// A stream of canonical-CBOR item payloads.\n    Stream(LoomStream<Vec<u8>>),\n}\n\n");
 
     out.push_str("fn shape(expected: &str) -> LoomError {\n    LoomError::new(Code::InvalidArgument, format!(\"unexpected argument shape (expected {expected})\"))\n}\n\n");
     out.push_str("fn arg_err(err: ::loom_remote_protocol::codec::ArgError) -> LoomError {\n    LoomError::new(Code::InvalidArgument, format!(\"argument decode failed: {err}\"))\n}\n\n");
     out.push_str("fn take(args: &[::loom_codec::Value], idx: usize) -> Result<&::loom_codec::Value, LoomError> {\n    args.get(idx).ok_or_else(|| LoomError::new(Code::InvalidArgument, \"missing request argument\"))\n}\n\n");
     out.push_str("/// Poll an immediately-ready `LocalLoomClient` future once and flatten the result. In-process\n/// futures never pend; a `Pending` is a bug, reported as `INTERNAL` rather than spun on.\nfn poll_ready<T>(fut: impl ::core::future::Future<Output = Result<T, LoomError>>) -> Result<T, LoomError> {\n    let mut fut = ::std::pin::pin!(fut);\n    match fut\n        .as_mut()\n        .poll(&mut ::core::task::Context::from_waker(::std::task::Waker::noop()))\n    {\n        ::core::task::Poll::Ready(output) => output,\n        ::core::task::Poll::Pending => Err(LoomError::new(\n            Code::Internal,\n            \"in-process future returned Pending\",\n        )),\n    }\n}\n\n");
-    out.push_str("/// Drain a buffered `LoomStream` into its item payloads for the buffered stream response. In-process\n/// streams never pend; a `Pending` is a bug, reported as `INTERNAL`.\nfn drain_stream(mut stream: LoomStream<Vec<u8>>) -> Result<Vec<Vec<u8>>, LoomError> {\n    let mut cx = ::core::task::Context::from_waker(::std::task::Waker::noop());\n    let mut items = Vec::new();\n    loop {\n        match stream.as_mut().poll_next(&mut cx) {\n            ::core::task::Poll::Ready(Some(Ok(item))) => items.push(item),\n            ::core::task::Poll::Ready(Some(Err(err))) => return Err(err),\n            ::core::task::Poll::Ready(None) => return Ok(items),\n            ::core::task::Poll::Pending => {\n                return Err(LoomError::new(\n                    Code::Internal,\n                    \"in-process stream returned Pending\",\n                ));\n            }\n        }\n    }\n}\n\n");
+    out.push_str("/// Drain a `LoomStream` into item payloads for transports that still require a buffered response.\n/// In-process streams never pend; a `Pending` is a bug, reported as `INTERNAL`.\npub fn drain_stream(mut stream: LoomStream<Vec<u8>>) -> Result<Vec<Vec<u8>>, LoomError> {\n    let mut cx = ::core::task::Context::from_waker(::std::task::Waker::noop());\n    let mut items = Vec::new();\n    loop {\n        match stream.as_mut().poll_next(&mut cx) {\n            ::core::task::Poll::Ready(Some(Ok(item))) => items.push(item),\n            ::core::task::Poll::Ready(Some(Err(err))) => return Err(err),\n            ::core::task::Poll::Ready(None) => return Ok(items),\n            ::core::task::Poll::Pending => {\n                return Err(LoomError::new(\n                    Code::Internal,\n                    \"in-process stream returned Pending\",\n                ));\n            }\n        }\n    }\n}\n\n");
 
     out.push_str("/// Decode one request onto the `LoomClient` trait implemented by `LocalLoomClient`. The wire `handle`\n/// (a `LoomSession`) is decoded-and-discarded: the runtime substitutes its resolved `engine` session.\npub fn dispatch(\n    client: &LocalLoomClient,\n    engine: &LoomSession,\n    interface: &str,\n    method: &str,\n    args: &[::loom_codec::Value],\n) -> Result<Dispatched, LoomError> {\n    match (interface, method) {\n");
 
@@ -549,7 +549,7 @@ fn render_dispatch(methods: &[Method]) -> String {
         out.push_str(&bindings);
         if strip_stream(&method.ret).is_some() {
             out.push_str(&format!("            let stream = poll_ready({call})?;\n"));
-            out.push_str("            Ok(Dispatched::Stream(drain_stream(stream)?))\n");
+            out.push_str("            Ok(Dispatched::Stream(stream))\n");
         } else {
             let call_expr = if is_sync(iface, &method.name) {
                 format!("{call}?")

@@ -1222,10 +1222,10 @@ pub(crate) struct PLanesTicketAdd {
     pub(crate) workspace: String,
     pub(crate) lane_id: String,
     pub(crate) ticket_id: String,
-    /// Placement verb: "append" (default), "first", "before", or "after".
+    /// Placement verb: "LAST" (default), "FIRST", "BEFORE", or "AFTER".
     #[serde(default)]
     pub(crate) placement: Option<String>,
-    /// Anchor ticket id required by the "before"/"after" placements.
+    /// Anchor ticket id required by the "BEFORE" and "AFTER" placements.
     #[serde(default)]
     pub(crate) anchor: Option<String>,
     #[serde(default)]

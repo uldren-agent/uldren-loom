@@ -1621,7 +1621,7 @@ impl RemoteRuntime {
             &request.args,
         );
         let out = match dispatched {
-            Ok(Dispatched::Stream(items)) => Ok(items),
+            Ok(Dispatched::Stream(stream)) => generated_dispatch::drain_stream(stream),
             Ok(Dispatched::Unary(_)) => Err(LoomError::new(
                 Code::InvalidArgument,
                 format!(
