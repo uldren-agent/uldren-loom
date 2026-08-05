@@ -304,13 +304,13 @@ mod registry_tests {
     fn registry_covers_the_full_idl_surface() {
         assert_eq!(
             METHODS.len(),
-            467,
+            525,
             "generated registry must list every IDL method"
         );
         let interfaces: BTreeSet<&str> = METHODS.iter().map(|m| m.interface).collect();
         assert_eq!(
             interfaces.len(),
-            50,
+            59,
             "generated registry must cover every IDL interface"
         );
     }
@@ -325,6 +325,7 @@ mod registry_tests {
         assert!(has("Triggers", "trigger_put"));
         assert!(has("Triggers", "trigger_history"));
         assert!(has("Exec", "exec_cbor"));
+        assert!(has("Exec", "apply_cbor"));
         assert!(has("Kv", "get"));
         assert!(has("Sql", "sql_query"));
     }

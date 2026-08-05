@@ -25,7 +25,383 @@ pub enum ToolKind {
     Write,
 }
 
-include!(concat!(env!("OUT_DIR"), "/tool_surface_ids.rs"));
+use loom_remote_protocol::generated::{GeneratedOperationId, METHODS, MethodSig};
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum CompositeId {
+    AppsSurfaceAppsCallTool,
+    AppsSurfaceAppsCreate,
+    AppsSurfaceAppsList,
+    AppsSurfaceAppsReadFile,
+    AppsSurfaceAppsRemoveFile,
+    AppsSurfaceAppsShow,
+    AppsSurfaceAppsWriteFile,
+    AskSurfaceAskAnswers,
+    AskSurfaceAskQuestions,
+    AskSurfaceAskRecord,
+    ChatPresence,
+    ChatSetPresence,
+    DocumentReplaceText,
+    DriveAcquireLease,
+    DriveBreakLease,
+    DriveRefreshLease,
+    DriveReleaseLease,
+    GlobalSearchSearch,
+    LanesCleanup,
+    LanesCloseout,
+    LifecycleSurfaceLifecyclesActiveClear,
+    LifecycleSurfaceLifecyclesActiveSet,
+    LifecycleSurfaceLifecyclesCurrentSurface,
+    LifecycleSurfaceLifecyclesDefine,
+    LifecycleSurfaceLifecyclesDefineStandard,
+    LifecycleSurfaceLifecyclesDefinition,
+    LifecycleSurfaceLifecyclesDefinitions,
+    LifecycleSurfaceLifecyclesInstance,
+    LifecycleSurfaceLifecyclesInstances,
+    LifecycleSurfaceLifecyclesInstantiate,
+    LifecycleSurfaceLifecyclesOperationLog,
+    LifecycleSurfaceLifecyclesSnapshot,
+    LifecycleSurfaceLifecyclesSnapshotContent,
+    LifecycleSurfaceLifecyclesSnapshotPlan,
+    LifecycleSurfaceLifecyclesSnapshots,
+    LifecycleSurfaceLifecyclesTransition,
+    MeetingsSurfaceMeetingsAcceptAnnotation,
+    MeetingsSurfaceMeetingsAcceptVocabulary,
+    MeetingsSurfaceMeetingsAddEntityMerge,
+    MeetingsSurfaceMeetingsAddPromotion,
+    MeetingsSurfaceMeetingsExtractionReview,
+    MeetingsSurfaceMeetingsGet,
+    MeetingsSurfaceMeetingsImportSnapshot,
+    MeetingsSurfaceMeetingsList,
+    MeetingsSurfaceMeetingsProjectionOutputs,
+    MeetingsSurfaceMeetingsPromoteArtifactToReferenceArtifact,
+    MeetingsSurfaceMeetingsPromoteDecisionToDecisionLog,
+    MeetingsSurfaceMeetingsPromoteQuestionToLifecycle,
+    MeetingsSurfaceMeetingsPromoteReferenceToReferenceArtifact,
+    MeetingsSurfaceMeetingsPromoteTaskToTicket,
+    MeetingsSurfaceMeetingsProposeVocabulary,
+    MeetingsSurfaceMeetingsRejectAnnotation,
+    MeetingsSurfaceMeetingsRejectVocabulary,
+    MeetingsSurfaceMeetingsSearch,
+    StoreMaintenancePolicySet,
+    StoreMaintenanceRun,
+    StoreMaintenanceStatus,
+    StudioSurfaceStudioReindex,
+    SubstrateSurfaceSubstrateAliasBind,
+    SubstrateSurfaceSubstrateAliasList,
+    SubstrateSurfaceSubstrateAliasRelease,
+    SubstrateSurfaceSubstrateAliasResolve,
+    SubstrateSurfaceSubstrateChanges,
+    SubstrateSurfaceSubstrateCheckpointBefore,
+    SubstrateSurfaceSubstrateHistory,
+    SubstrateSurfaceSubstrateReferenceReconcile,
+    SubstrateSurfaceSubstrateReferenceStatus,
+    SubstrateSurfaceSubstrateRefs,
+    SubstrateSurfaceSubstrateRevisionAsOfRoot,
+    SubstrateSurfaceSubstrateRevisionAt,
+    SubstrateSurfaceSubstrateRevisionLatest,
+    SubstrateSurfaceSubstrateTransact,
+    SubstrateSurfaceSubstrateViewDefine,
+    SubstrateSurfaceSubstrateViewGet,
+    SubstrateSurfaceSubstrateViewList,
+    SubstrateSurfaceSubstrateWriteAdmissionPolicyGet,
+    SubstrateSurfaceSubstrateWriteAdmissionPolicySet,
+    TicketsProjects,
+    WorkgraphSurfaceWorkgraphChanges,
+    WorkgraphSurfaceWorkgraphFactPut,
+    WorkgraphSurfaceWorkgraphMetrics,
+}
+
+impl CompositeId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AppsSurfaceAppsCallTool => "AppsSurface.apps_call_tool",
+            Self::AppsSurfaceAppsCreate => "AppsSurface.apps_create",
+            Self::AppsSurfaceAppsList => "AppsSurface.apps_list",
+            Self::AppsSurfaceAppsReadFile => "AppsSurface.apps_read_file",
+            Self::AppsSurfaceAppsRemoveFile => "AppsSurface.apps_remove_file",
+            Self::AppsSurfaceAppsShow => "AppsSurface.apps_show",
+            Self::AppsSurfaceAppsWriteFile => "AppsSurface.apps_write_file",
+            Self::AskSurfaceAskAnswers => "AskSurface.ask_answers",
+            Self::AskSurfaceAskQuestions => "AskSurface.ask_questions",
+            Self::AskSurfaceAskRecord => "AskSurface.ask_record",
+            Self::ChatPresence => "ChatPresence",
+            Self::ChatSetPresence => "ChatSetPresence",
+            Self::DocumentReplaceText => "DocumentReplaceText",
+            Self::DriveAcquireLease => "DriveAcquireLease",
+            Self::DriveBreakLease => "DriveBreakLease",
+            Self::DriveRefreshLease => "DriveRefreshLease",
+            Self::DriveReleaseLease => "DriveReleaseLease",
+            Self::GlobalSearchSearch => "GlobalSearch.search",
+            Self::LanesCleanup => "LanesCleanup",
+            Self::LanesCloseout => "LanesCloseout",
+            Self::LifecycleSurfaceLifecyclesActiveClear => {
+                "LifecycleSurface.lifecycles_active_clear"
+            }
+            Self::LifecycleSurfaceLifecyclesActiveSet => "LifecycleSurface.lifecycles_active_set",
+            Self::LifecycleSurfaceLifecyclesCurrentSurface => {
+                "LifecycleSurface.lifecycles_current_surface"
+            }
+            Self::LifecycleSurfaceLifecyclesDefine => "LifecycleSurface.lifecycles_define",
+            Self::LifecycleSurfaceLifecyclesDefineStandard => {
+                "LifecycleSurface.lifecycles_define_standard"
+            }
+            Self::LifecycleSurfaceLifecyclesDefinition => "LifecycleSurface.lifecycles_definition",
+            Self::LifecycleSurfaceLifecyclesDefinitions => {
+                "LifecycleSurface.lifecycles_definitions"
+            }
+            Self::LifecycleSurfaceLifecyclesInstance => "LifecycleSurface.lifecycles_instance",
+            Self::LifecycleSurfaceLifecyclesInstances => "LifecycleSurface.lifecycles_instances",
+            Self::LifecycleSurfaceLifecyclesInstantiate => {
+                "LifecycleSurface.lifecycles_instantiate"
+            }
+            Self::LifecycleSurfaceLifecyclesOperationLog => {
+                "LifecycleSurface.lifecycles_operation_log"
+            }
+            Self::LifecycleSurfaceLifecyclesSnapshot => "LifecycleSurface.lifecycles_snapshot",
+            Self::LifecycleSurfaceLifecyclesSnapshotContent => {
+                "LifecycleSurface.lifecycles_snapshot_content"
+            }
+            Self::LifecycleSurfaceLifecyclesSnapshotPlan => {
+                "LifecycleSurface.lifecycles_snapshot_plan"
+            }
+            Self::LifecycleSurfaceLifecyclesSnapshots => "LifecycleSurface.lifecycles_snapshots",
+            Self::LifecycleSurfaceLifecyclesTransition => "LifecycleSurface.lifecycles_transition",
+            Self::MeetingsSurfaceMeetingsAcceptAnnotation => {
+                "MeetingsSurface.meetings_accept_annotation"
+            }
+            Self::MeetingsSurfaceMeetingsAcceptVocabulary => {
+                "MeetingsSurface.meetings_accept_vocabulary"
+            }
+            Self::MeetingsSurfaceMeetingsAddEntityMerge => {
+                "MeetingsSurface.meetings_add_entity_merge"
+            }
+            Self::MeetingsSurfaceMeetingsAddPromotion => "MeetingsSurface.meetings_add_promotion",
+            Self::MeetingsSurfaceMeetingsExtractionReview => {
+                "MeetingsSurface.meetings_extraction_review"
+            }
+            Self::MeetingsSurfaceMeetingsGet => "MeetingsSurface.meetings_get",
+            Self::MeetingsSurfaceMeetingsImportSnapshot => {
+                "MeetingsSurface.meetings_import_snapshot"
+            }
+            Self::MeetingsSurfaceMeetingsList => "MeetingsSurface.meetings_list",
+            Self::MeetingsSurfaceMeetingsProjectionOutputs => {
+                "MeetingsSurface.meetings_projection_outputs"
+            }
+            Self::MeetingsSurfaceMeetingsPromoteArtifactToReferenceArtifact => {
+                "MeetingsSurface.meetings_promote_artifact_to_reference_artifact"
+            }
+            Self::MeetingsSurfaceMeetingsPromoteDecisionToDecisionLog => {
+                "MeetingsSurface.meetings_promote_decision_to_decision_log"
+            }
+            Self::MeetingsSurfaceMeetingsPromoteQuestionToLifecycle => {
+                "MeetingsSurface.meetings_promote_question_to_lifecycle"
+            }
+            Self::MeetingsSurfaceMeetingsPromoteReferenceToReferenceArtifact => {
+                "MeetingsSurface.meetings_promote_reference_to_reference_artifact"
+            }
+            Self::MeetingsSurfaceMeetingsPromoteTaskToTicket => {
+                "MeetingsSurface.meetings_promote_task_to_ticket"
+            }
+            Self::MeetingsSurfaceMeetingsProposeVocabulary => {
+                "MeetingsSurface.meetings_propose_vocabulary"
+            }
+            Self::MeetingsSurfaceMeetingsRejectAnnotation => {
+                "MeetingsSurface.meetings_reject_annotation"
+            }
+            Self::MeetingsSurfaceMeetingsRejectVocabulary => {
+                "MeetingsSurface.meetings_reject_vocabulary"
+            }
+            Self::MeetingsSurfaceMeetingsSearch => "MeetingsSurface.meetings_search",
+            Self::StoreMaintenancePolicySet => "StoreMaintenancePolicySet",
+            Self::StoreMaintenanceRun => "StoreMaintenanceRun",
+            Self::StoreMaintenanceStatus => "StoreMaintenanceStatus",
+            Self::StudioSurfaceStudioReindex => "StudioSurface.studio_reindex",
+            Self::SubstrateSurfaceSubstrateAliasBind => "SubstrateSurface.substrate_alias_bind",
+            Self::SubstrateSurfaceSubstrateAliasList => "SubstrateSurface.substrate_alias_list",
+            Self::SubstrateSurfaceSubstrateAliasRelease => {
+                "SubstrateSurface.substrate_alias_release"
+            }
+            Self::SubstrateSurfaceSubstrateAliasResolve => {
+                "SubstrateSurface.substrate_alias_resolve"
+            }
+            Self::SubstrateSurfaceSubstrateChanges => "SubstrateSurface.substrate_changes",
+            Self::SubstrateSurfaceSubstrateCheckpointBefore => {
+                "SubstrateSurface.substrate_checkpoint_before"
+            }
+            Self::SubstrateSurfaceSubstrateHistory => "SubstrateSurface.substrate_history",
+            Self::SubstrateSurfaceSubstrateReferenceReconcile => {
+                "SubstrateSurface.substrate_reference_reconcile"
+            }
+            Self::SubstrateSurfaceSubstrateReferenceStatus => {
+                "SubstrateSurface.substrate_reference_status"
+            }
+            Self::SubstrateSurfaceSubstrateRefs => "SubstrateSurface.substrate_refs",
+            Self::SubstrateSurfaceSubstrateRevisionAsOfRoot => {
+                "SubstrateSurface.substrate_revision_as_of_root"
+            }
+            Self::SubstrateSurfaceSubstrateRevisionAt => "SubstrateSurface.substrate_revision_at",
+            Self::SubstrateSurfaceSubstrateRevisionLatest => {
+                "SubstrateSurface.substrate_revision_latest"
+            }
+            Self::SubstrateSurfaceSubstrateTransact => "SubstrateSurface.substrate_transact",
+            Self::SubstrateSurfaceSubstrateViewDefine => "SubstrateSurface.substrate_view_define",
+            Self::SubstrateSurfaceSubstrateViewGet => "SubstrateSurface.substrate_view_get",
+            Self::SubstrateSurfaceSubstrateViewList => "SubstrateSurface.substrate_view_list",
+            Self::SubstrateSurfaceSubstrateWriteAdmissionPolicyGet => {
+                "SubstrateSurface.substrate_write_admission_policy_get"
+            }
+            Self::SubstrateSurfaceSubstrateWriteAdmissionPolicySet => {
+                "SubstrateSurface.substrate_write_admission_policy_set"
+            }
+            Self::TicketsProjects => "TicketsProjects",
+            Self::WorkgraphSurfaceWorkgraphChanges => "WorkgraphSurface.workgraph_changes",
+            Self::WorkgraphSurfaceWorkgraphFactPut => "WorkgraphSurface.workgraph_fact_put",
+            Self::WorkgraphSurfaceWorkgraphMetrics => "WorkgraphSurface.workgraph_metrics",
+        }
+    }
+
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::AppsSurfaceAppsCallTool
+            | Self::AppsSurfaceAppsCreate
+            | Self::AppsSurfaceAppsList
+            | Self::AppsSurfaceAppsReadFile
+            | Self::AppsSurfaceAppsRemoveFile
+            | Self::AppsSurfaceAppsShow
+            | Self::AppsSurfaceAppsWriteFile => {
+                "MCP Apps compose app inventory, resources, and file operations outside one IDL method"
+            }
+            Self::AskSurfaceAskAnswers
+            | Self::AskSurfaceAskQuestions
+            | Self::AskSurfaceAskRecord => {
+                "Ask tools manage host-mediated owner interaction state outside one generated method"
+            }
+            Self::ChatPresence | Self::ChatSetPresence => {
+                "Chat presence is runtime-local client state, not durable generated store state"
+            }
+            Self::DocumentReplaceText => {
+                "Document replace-text preserves MCP editing ergonomics over multiple generated document operations"
+            }
+            Self::DriveAcquireLease
+            | Self::DriveBreakLease
+            | Self::DriveRefreshLease
+            | Self::DriveReleaseLease => {
+                "Drive lease tools coordinate runtime cache ownership outside one generated mutation"
+            }
+            Self::GlobalSearchSearch => {
+                "Global search fans out across search-capable facets instead of one IDL method"
+            }
+            Self::LanesCleanup | Self::LanesCloseout => {
+                "Lane helpers compose lane and ticket transitions into one model-facing operation"
+            }
+            Self::LifecycleSurfaceLifecyclesActiveClear
+            | Self::LifecycleSurfaceLifecyclesActiveSet
+            | Self::LifecycleSurfaceLifecyclesCurrentSurface
+            | Self::LifecycleSurfaceLifecyclesDefine
+            | Self::LifecycleSurfaceLifecyclesDefineStandard
+            | Self::LifecycleSurfaceLifecyclesDefinition
+            | Self::LifecycleSurfaceLifecyclesDefinitions
+            | Self::LifecycleSurfaceLifecyclesInstance
+            | Self::LifecycleSurfaceLifecyclesInstances
+            | Self::LifecycleSurfaceLifecyclesInstantiate
+            | Self::LifecycleSurfaceLifecyclesOperationLog
+            | Self::LifecycleSurfaceLifecyclesSnapshot
+            | Self::LifecycleSurfaceLifecyclesSnapshotContent
+            | Self::LifecycleSurfaceLifecyclesSnapshotPlan
+            | Self::LifecycleSurfaceLifecyclesSnapshots
+            | Self::LifecycleSurfaceLifecyclesTransition => {
+                "Lifecycle surface tools bind active lifecycle presentation and snapshots outside raw IDL calls"
+            }
+            Self::MeetingsSurfaceMeetingsAcceptAnnotation
+            | Self::MeetingsSurfaceMeetingsAcceptVocabulary
+            | Self::MeetingsSurfaceMeetingsAddEntityMerge
+            | Self::MeetingsSurfaceMeetingsAddPromotion
+            | Self::MeetingsSurfaceMeetingsExtractionReview
+            | Self::MeetingsSurfaceMeetingsGet
+            | Self::MeetingsSurfaceMeetingsImportSnapshot
+            | Self::MeetingsSurfaceMeetingsList
+            | Self::MeetingsSurfaceMeetingsProjectionOutputs
+            | Self::MeetingsSurfaceMeetingsPromoteArtifactToReferenceArtifact
+            | Self::MeetingsSurfaceMeetingsPromoteDecisionToDecisionLog
+            | Self::MeetingsSurfaceMeetingsPromoteQuestionToLifecycle
+            | Self::MeetingsSurfaceMeetingsPromoteReferenceToReferenceArtifact
+            | Self::MeetingsSurfaceMeetingsPromoteTaskToTicket
+            | Self::MeetingsSurfaceMeetingsProposeVocabulary
+            | Self::MeetingsSurfaceMeetingsRejectAnnotation
+            | Self::MeetingsSurfaceMeetingsRejectVocabulary
+            | Self::MeetingsSurfaceMeetingsSearch => {
+                "Meetings tools compose review, vocabulary, and promotion workflows outside one IDL method"
+            }
+            Self::StoreMaintenancePolicySet
+            | Self::StoreMaintenanceRun
+            | Self::StoreMaintenanceStatus => {
+                "Store maintenance is a host-owned operational workflow over the concrete store"
+            }
+            Self::StudioSurfaceStudioReindex => {
+                "Studio reindex is a host-owned cache rebuild operation"
+            }
+            Self::SubstrateSurfaceSubstrateAliasBind
+            | Self::SubstrateSurfaceSubstrateAliasList
+            | Self::SubstrateSurfaceSubstrateAliasRelease
+            | Self::SubstrateSurfaceSubstrateAliasResolve
+            | Self::SubstrateSurfaceSubstrateChanges
+            | Self::SubstrateSurfaceSubstrateCheckpointBefore
+            | Self::SubstrateSurfaceSubstrateHistory
+            | Self::SubstrateSurfaceSubstrateReferenceReconcile
+            | Self::SubstrateSurfaceSubstrateReferenceStatus
+            | Self::SubstrateSurfaceSubstrateRefs
+            | Self::SubstrateSurfaceSubstrateRevisionAsOfRoot
+            | Self::SubstrateSurfaceSubstrateRevisionAt
+            | Self::SubstrateSurfaceSubstrateRevisionLatest
+            | Self::SubstrateSurfaceSubstrateTransact
+            | Self::SubstrateSurfaceSubstrateViewDefine
+            | Self::SubstrateSurfaceSubstrateViewGet
+            | Self::SubstrateSurfaceSubstrateViewList
+            | Self::SubstrateSurfaceSubstrateWriteAdmissionPolicyGet
+            | Self::SubstrateSurfaceSubstrateWriteAdmissionPolicySet => {
+                "Substrate surface tools compose revision, alias, reference, and admission workflows"
+            }
+            Self::TicketsProjects => {
+                "Ticket project listing aggregates project state into one model-facing summary"
+            }
+            Self::WorkgraphSurfaceWorkgraphChanges
+            | Self::WorkgraphSurfaceWorkgraphFactPut
+            | Self::WorkgraphSurfaceWorkgraphMetrics => {
+                "Workgraph tools compose task graph facts and metrics outside one IDL method"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum AdapterId {
+    InterchangeAdapterImportExecuteBatch,
+    InterchangeAdapterImportSubmitBatch,
+    InterchangeAdapterRedmineImportSnapshot,
+}
+
+impl AdapterId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InterchangeAdapterImportExecuteBatch => "InterchangeAdapter.import_execute_batch",
+            Self::InterchangeAdapterImportSubmitBatch => "InterchangeAdapter.import_submit_batch",
+            Self::InterchangeAdapterRedmineImportSnapshot => {
+                "InterchangeAdapter.redmine_import_snapshot"
+            }
+        }
+    }
+
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::InterchangeAdapterImportExecuteBatch
+            | Self::InterchangeAdapterImportSubmitBatch
+            | Self::InterchangeAdapterRedmineImportSnapshot => {
+                "Interchange imports own external format parsing and batch execution before generated store effects"
+            }
+        }
+    }
+}
 
 /// The accepted execution-boundary target for one MCP tool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,6 +409,13 @@ pub enum ExecutionTarget {
     Generated(GeneratedOperationId),
     Composite(CompositeId),
     OwningAdapter(AdapterId),
+}
+
+/// Runtime adapter contract for generated MCP tools that have been explicitly migrated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GeneratedMcpProjection {
+    Canonical,
+    GraphRemoveEdge,
 }
 
 /// How a tool is served when the MCP host is backed by a remote Loom endpoint.
@@ -58,6 +441,13 @@ pub enum RemoteCapability {
 /// content-addressed commit digest would diverge.
 const HANDLE_STREAM_METHODS: &[(&str, &str)] = &[];
 
+#[cfg(test)]
+const SHARED_GENERATED_OPERATION_OWNERSHIP: &[(GeneratedOperationId, &[&str], &str)] = &[(
+    GeneratedOperationId::StoreCapabilities,
+    &["store_capabilities", "store_capabilities_json"],
+    "The same Store.capabilities bytes back the binary and JSON-presented MCP capability tools",
+)];
+
 /// One curated tool in the MCP surface.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolSpec {
@@ -69,6 +459,8 @@ pub struct ToolSpec {
     pub target: ExecutionTarget,
     /// Whether the tool reads or writes.
     pub kind: ToolKind,
+    /// The typed MCP-to-IDL projection contract for generated runtime execution.
+    pub generated_projection: Option<GeneratedMcpProjection>,
 }
 
 const fn read_generated(
@@ -81,6 +473,7 @@ const fn read_generated(
         area,
         target: ExecutionTarget::Generated(operation),
         kind: ToolKind::Read,
+        generated_projection: None,
     }
 }
 
@@ -94,6 +487,37 @@ const fn write_generated(
         area,
         target: ExecutionTarget::Generated(operation),
         kind: ToolKind::Write,
+        generated_projection: None,
+    }
+}
+
+const fn read_projected(
+    name: &'static str,
+    area: &'static str,
+    operation: GeneratedOperationId,
+    projection: GeneratedMcpProjection,
+) -> ToolSpec {
+    ToolSpec {
+        name,
+        area,
+        target: ExecutionTarget::Generated(operation),
+        kind: ToolKind::Read,
+        generated_projection: Some(projection),
+    }
+}
+
+const fn write_projected(
+    name: &'static str,
+    area: &'static str,
+    operation: GeneratedOperationId,
+    projection: GeneratedMcpProjection,
+) -> ToolSpec {
+    ToolSpec {
+        name,
+        area,
+        target: ExecutionTarget::Generated(operation),
+        kind: ToolKind::Write,
+        generated_projection: Some(projection),
     }
 }
 
@@ -107,6 +531,7 @@ const fn read_composite(
         area,
         target: ExecutionTarget::Composite(composite_id),
         kind: ToolKind::Read,
+        generated_projection: None,
     }
 }
 
@@ -120,6 +545,7 @@ const fn write_composite(
         area,
         target: ExecutionTarget::Composite(composite_id),
         kind: ToolKind::Write,
+        generated_projection: None,
     }
 }
 
@@ -133,13 +559,19 @@ const fn write_owning_adapter(
         area,
         target: ExecutionTarget::OwningAdapter(adapter_id),
         kind: ToolKind::Write,
+        generated_projection: None,
     }
 }
 
 /// The curated tool surface. Ordered by area.
 pub const TOOL_SURFACE: &[ToolSpec] = &[
     // store
-    read_generated("store_version", "store", GeneratedOperationId::StoreVersion),
+    read_projected(
+        "store_version",
+        "store",
+        GeneratedOperationId::StoreVersion,
+        GeneratedMcpProjection::Canonical,
+    ),
     read_generated(
         "store_capabilities",
         "store",
@@ -165,20 +597,25 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
         "store",
         GeneratedOperationId::StoreAdminStorePolicySet,
     ),
-    read_composite(
+    write_generated(
+        "store_bundle_import",
+        "store",
+        GeneratedOperationId::StoreAdminStoreBundleImport,
+    ),
+    read_generated(
         "store_maintenance_status",
         "store",
-        CompositeId::StoreMaintenanceStatus,
+        GeneratedOperationId::StoreAdminStoreMaintenanceStatus,
     ),
-    write_composite(
+    write_generated(
         "store_maintenance_policy_set",
         "store",
-        CompositeId::StoreMaintenancePolicySet,
+        GeneratedOperationId::StoreAdminStoreMaintenancePolicySet,
     ),
-    write_composite(
+    write_generated(
         "store_maintenance_run",
         "store",
-        CompositeId::StoreMaintenanceRun,
+        GeneratedOperationId::StoreAdminStoreMaintenanceRun,
     ),
     // metrics
     write_generated(
@@ -491,10 +928,11 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
         "graph",
         GeneratedOperationId::GraphGetEdge,
     ),
-    write_generated(
+    write_projected(
         "graph_remove_edge",
         "graph",
         GeneratedOperationId::GraphRemoveEdge,
+        GeneratedMcpProjection::GraphRemoveEdge,
     ),
     read_generated(
         "graph_neighbors",
@@ -585,6 +1023,16 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
         "vector",
         GeneratedOperationId::VectorSearchPolicy,
     ),
+    write_generated(
+        "vector_text_upsert",
+        "vector",
+        GeneratedOperationId::VectorVectorTextUpsert,
+    ),
+    write_generated(
+        "vector_workspace_configure_json",
+        "vector",
+        GeneratedOperationId::VectorVectorWorkspaceConfigureJson,
+    ),
     // columnar
     write_generated(
         "columnar_create",
@@ -635,6 +1083,16 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
         "columnar_aggregate",
         "columnar",
         GeneratedOperationId::ColumnarAggregate,
+    ),
+    write_generated(
+        "columnar_import_arrow",
+        "columnar",
+        GeneratedOperationId::ColumnarColumnarImportArrow,
+    ),
+    write_generated(
+        "columnar_import_parquet",
+        "columnar",
+        GeneratedOperationId::ColumnarColumnarImportParquet,
     ),
     // dataframe
     write_generated(
@@ -1122,9 +1580,19 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
         GeneratedOperationId::ChatChatPostMessageJson,
     ),
     write_generated(
+        "chat_post_message_bytes",
+        "chat",
+        GeneratedOperationId::ChatChatPostMessageBytesJson,
+    ),
+    write_generated(
         "chat_edit_message",
         "chat",
         GeneratedOperationId::ChatChatEditMessageJson,
+    ),
+    write_generated(
+        "chat_edit_message_bytes",
+        "chat",
+        GeneratedOperationId::ChatChatEditMessageBytesJson,
     ),
     write_generated(
         "chat_redact_message",
@@ -1180,6 +1648,11 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
         "chat_invoke_agent",
         "chat",
         GeneratedOperationId::ChatChatInvokeAgentJson,
+    ),
+    write_generated(
+        "chat_invoke_agent_bytes",
+        "chat",
+        GeneratedOperationId::ChatChatInvokeAgentBytesJson,
     ),
     write_generated(
         "chat_agent_reply",
@@ -1780,6 +2253,11 @@ pub const TOOL_SURFACE: &[ToolSpec] = &[
     read_generated("mail_search", "mail", GeneratedOperationId::MailSearch),
     // sql
     write_generated("sql_exec", "sql", GeneratedOperationId::SqlSqlExec),
+    write_generated(
+        "sql_exec_result",
+        "sql",
+        GeneratedOperationId::SqlSqlExecResult,
+    ),
     read_generated("sql_query", "sql", GeneratedOperationId::SqlSqlQuery),
     write_generated("sql_commit", "sql", GeneratedOperationId::SqlSqlCommit),
     read_generated(
@@ -2021,6 +2499,12 @@ pub fn remote_tool_route_for(name: &str, capability: Option<RemoteCapability>) -
     }
 }
 
+pub fn generated_operation_signature(
+    operation: GeneratedOperationId,
+) -> Option<&'static MethodSig> {
+    METHODS.iter().find(|sig| sig.operation == operation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2028,6 +2512,185 @@ mod tests {
 
     const IDL: &str = include_str!("../../../idl/loom.idl");
     const SPEC: &str = include_str!("../../../specs/0008-wire-protocols.md");
+
+    #[derive(Clone, Copy)]
+    struct GeneratedClassificationExpectation {
+        owner: &'static str,
+        operation: GeneratedOperationId,
+        interface: &'static str,
+        method: &'static str,
+        args: &'static [(&'static str, &'static str)],
+        ret: &'static str,
+    }
+
+    fn generated_expectation_for_tool(
+        tool: &ToolSpec,
+    ) -> Option<GeneratedClassificationExpectation> {
+        let ExecutionTarget::Generated(operation) = tool.target else {
+            return None;
+        };
+        let sig =
+            generated_operation_signature(operation).expect("generated operation has signature");
+        Some(GeneratedClassificationExpectation {
+            owner: tool.name,
+            operation,
+            interface: sig.interface,
+            method: sig.method,
+            args: sig.args,
+            ret: sig.ret,
+        })
+    }
+
+    fn validate_generated_classifications(
+        records: &[GeneratedClassificationExpectation],
+    ) -> Result<(), String> {
+        validate_generated_classifications_with_shared(
+            records,
+            SHARED_GENERATED_OPERATION_OWNERSHIP,
+        )
+    }
+
+    fn validate_generated_classifications_with_shared(
+        records: &[GeneratedClassificationExpectation],
+        shared_ownership: &[(GeneratedOperationId, &[&str], &str)],
+    ) -> Result<(), String> {
+        let mut owners = BTreeSet::new();
+        let mut operations: BTreeMap<GeneratedOperationId, Vec<&str>> = BTreeMap::new();
+        for record in records {
+            if !owners.insert(record.owner) {
+                return Err(format!(
+                    "duplicate generated classification owner {}",
+                    record.owner
+                ));
+            }
+            let (projected_interface, projected_method) = record.operation.projection();
+            if projected_interface != record.interface || projected_method != record.method {
+                return Err(format!(
+                    "{} declares stale operation identity {}.{} for {:?}, canonical is {}.{}",
+                    record.owner,
+                    record.interface,
+                    record.method,
+                    record.operation,
+                    projected_interface,
+                    projected_method
+                ));
+            }
+            let sig = generated_operation_signature(record.operation).ok_or_else(|| {
+                format!(
+                    "{} references {:?}, which has no generated MethodSig",
+                    record.owner, record.operation
+                )
+            })?;
+            if sig.args != record.args {
+                return Err(format!(
+                    "{} declares stale argument shape for {}.{}",
+                    record.owner, sig.interface, sig.method
+                ));
+            }
+            if sig.ret != record.ret {
+                return Err(format!(
+                    "{} declares stale return shape for {}.{}",
+                    record.owner, sig.interface, sig.method
+                ));
+            }
+            operations
+                .entry(record.operation)
+                .or_default()
+                .push(record.owner);
+        }
+        let mut observed_shared = BTreeMap::new();
+        for (operation, mut observed) in operations {
+            if observed.len() <= 1 {
+                continue;
+            }
+            observed.sort_unstable();
+            observed_shared.insert(operation, observed.clone());
+            let Some((declared, reason)) =
+                shared_ownership
+                    .iter()
+                    .find_map(|(shared, owners, reason)| {
+                        (*shared == operation).then_some((*owners, *reason))
+                    })
+            else {
+                return Err(format!(
+                    "{operation:?} has duplicate generated classification owners {observed:?}"
+                ));
+            };
+            let mut declared = declared.to_vec();
+            declared.sort_unstable();
+            if declared != observed {
+                return Err(format!(
+                    "{operation:?} shared ownership declares {declared:?} but observed {observed:?}"
+                ));
+            }
+            if reason.trim().is_empty() {
+                return Err(format!("{operation:?} shared ownership reason is empty"));
+            }
+        }
+        let mut declared_operations = BTreeSet::new();
+        for (operation, declared, reason) in shared_ownership {
+            if !declared_operations.insert(*operation) {
+                return Err(format!(
+                    "{operation:?} has duplicate shared ownership declarations"
+                ));
+            }
+            if reason.trim().is_empty() {
+                return Err(format!("{operation:?} shared ownership reason is empty"));
+            }
+            let mut declared = declared.to_vec();
+            declared.sort_unstable();
+            match observed_shared.get(operation) {
+                Some(observed) if *observed == declared => {}
+                Some(observed) => {
+                    return Err(format!(
+                        "{operation:?} shared ownership declares {declared:?} but observed {observed:?}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "{operation:?} shared ownership declaration is stale"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    struct ExceptionExpectation {
+        owner: &'static str,
+        reason: &'static str,
+    }
+
+    fn validate_exception_records(records: &[ExceptionExpectation]) -> Result<(), String> {
+        let mut owners = BTreeSet::new();
+        for record in records {
+            if !owners.insert(record.owner) {
+                return Err(format!("duplicate exception owner {}", record.owner));
+            }
+            if record.reason.trim().is_empty() {
+                return Err(format!("{} has an implicit exception", record.owner));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_exception_reasons(surface: &[ToolSpec]) -> Result<(), String> {
+        let records: Vec<_> = surface
+            .iter()
+            .filter_map(|tool| match tool.target {
+                ExecutionTarget::Generated(_) => None,
+                ExecutionTarget::Composite(composite_id) => Some(ExceptionExpectation {
+                    owner: tool.name,
+                    reason: composite_id.reason(),
+                }),
+                ExecutionTarget::OwningAdapter(adapter_id) => Some(ExceptionExpectation {
+                    owner: tool.name,
+                    reason: adapter_id.reason(),
+                }),
+            })
+            .collect();
+        validate_exception_records(&records)
+    }
 
     #[test]
     fn remote_capability_partitions_the_surface() {
@@ -2108,13 +2771,329 @@ mod tests {
                 }
             }
         }
-        assert_eq!(generated.len(), 294);
-        assert_eq!(composite.len(), 81);
+        assert_eq!(generated.len(), 306);
+        assert_eq!(composite.len(), 78);
         assert_eq!(adapters.len(), 3);
         assert!(generated.contains(&GeneratedOperationId::StoreAdminStorePolicyGet));
         assert!(generated.contains(&GeneratedOperationId::StoreAdminStorePolicySet));
         assert!(composite.contains(&CompositeId::ChatSetPresence));
         assert!(adapters.contains(&AdapterId::InterchangeAdapterImportExecuteBatch));
+    }
+
+    #[test]
+    fn generated_tool_surface_entries_resolve_to_single_method_signature_once() {
+        for tool in TOOL_SURFACE {
+            let ExecutionTarget::Generated(operation) = tool.target else {
+                continue;
+            };
+            let matches: Vec<_> = METHODS
+                .iter()
+                .filter(|sig| sig.operation == operation)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "{} must resolve to exactly one generated method signature record",
+                tool.name
+            );
+            let sig = generated_operation_signature(operation)
+                .unwrap_or_else(|| panic!("{} references absent generated operation", tool.name));
+            let (projected_interface, projected_method) = operation.projection();
+            assert_eq!(sig.interface, projected_interface);
+            assert_eq!(sig.method, projected_method);
+            let expected_args_without_handle = sig
+                .args
+                .strip_prefix(&[("LoomSession", "handle")])
+                .unwrap_or(sig.args);
+            assert_eq!(
+                sig.args_without_handle, expected_args_without_handle,
+                "{} generated method signature must preserve handle-stripped argument order",
+                tool.name
+            );
+            assert!(
+                !sig.request_json_schema.is_empty(),
+                "{} must carry an IDL-derived request JSON Schema",
+                tool.name
+            );
+            assert!(
+                !sig.response_json_schema.is_empty(),
+                "{} must carry an IDL-derived response JSON Schema",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn generated_methods_have_one_record_per_generated_operation_id() {
+        let mut operations = BTreeSet::new();
+        for sig in METHODS {
+            assert!(
+                operations.insert(sig.operation),
+                "duplicate generated method signature for {:?}",
+                sig.operation
+            );
+        }
+        assert_eq!(operations.len(), METHODS.len());
+    }
+
+    #[test]
+    fn generated_method_json_schemas_are_idl_derived_and_complete() {
+        for sig in METHODS {
+            let request: serde_json::Value = serde_json::from_str(sig.request_json_schema)
+                .unwrap_or_else(|err| {
+                    panic!("{} request schema is invalid JSON: {err}", sig.method)
+                });
+            let response: serde_json::Value = serde_json::from_str(sig.response_json_schema)
+                .unwrap_or_else(|err| {
+                    panic!("{} response schema is invalid JSON: {err}", sig.method)
+                });
+            assert_eq!(
+                request.get("$schema").and_then(serde_json::Value::as_str),
+                Some("https://json-schema.org/draft/2020-12/schema"),
+                "{} request schema missing dialect",
+                sig.method
+            );
+            assert_eq!(
+                response.get("$schema").and_then(serde_json::Value::as_str),
+                Some("https://json-schema.org/draft/2020-12/schema"),
+                "{} response schema missing dialect",
+                sig.method
+            );
+        }
+    }
+
+    #[test]
+    fn generated_nested_json_schema_covers_records_enums_optionals_lists_and_bytes() {
+        let workspace_list =
+            generated_operation_signature(GeneratedOperationId::WorkspacesWorkspaceList)
+                .expect("workspace_list signature");
+        let response: serde_json::Value =
+            serde_json::from_str(workspace_list.response_json_schema).expect("workspace schema");
+        assert_eq!(
+            response.get("type").and_then(serde_json::Value::as_str),
+            Some("array")
+        );
+        assert_eq!(
+            response
+                .pointer("/items/$ref")
+                .and_then(serde_json::Value::as_str),
+            Some("#/$defs/Workspace")
+        );
+        let workspace = response
+            .pointer("/$defs/Workspace")
+            .expect("Workspace definition");
+        assert_eq!(
+            workspace
+                .pointer("/properties/id/type")
+                .and_then(serde_json::Value::as_str),
+            Some("string")
+        );
+        assert_eq!(
+            workspace
+                .pointer("/properties/id/format")
+                .and_then(serde_json::Value::as_str),
+            Some("uuid")
+        );
+        assert_eq!(
+            workspace
+                .pointer("/properties/facets/type")
+                .and_then(serde_json::Value::as_str),
+            Some("array")
+        );
+        assert_eq!(
+            workspace
+                .pointer("/properties/facets/items/$ref")
+                .and_then(serde_json::Value::as_str),
+            Some("#/$defs/FacetKind")
+        );
+        assert!(
+            workspace
+                .pointer("/properties/head/anyOf")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| items
+                    .iter()
+                    .any(
+                        |item| item.get("type").and_then(serde_json::Value::as_str) == Some("null")
+                    )),
+            "optional Digest head must preserve nullability"
+        );
+        assert!(
+            response
+                .pointer("/$defs/FacetKind/enum")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("FILES"))),
+            "FacetKind enum values must be schema-visible"
+        );
+
+        let blob_digest = generated_operation_signature(GeneratedOperationId::StoreBlobDigest)
+            .expect("blob_digest signature");
+        let request: serde_json::Value =
+            serde_json::from_str(blob_digest.request_json_schema).expect("blob_digest schema");
+        assert_eq!(
+            request
+                .pointer("/properties/data/contentEncoding")
+                .and_then(serde_json::Value::as_str),
+            Some("base64")
+        );
+        assert_eq!(
+            request
+                .pointer("/properties/data/x-loom-bytes")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        let policy_get =
+            generated_operation_signature(GeneratedOperationId::StoreAdminStorePolicySet)
+                .expect("store_policy_set signature");
+        let request: serde_json::Value =
+            serde_json::from_str(policy_get.request_json_schema).expect("policy request schema");
+        assert!(
+            request.pointer("/properties/handle").is_some(),
+            "IDL request schema must retain the full generated handle argument"
+        );
+        assert_eq!(
+            policy_get.args_without_handle,
+            &[("bool", "fips_required")],
+            "MCP presentation transforms stay outside the IDL schema authority"
+        );
+    }
+
+    #[test]
+    fn non_generated_tool_surface_entries_remain_typed_exclusions() {
+        let mut composite = 0usize;
+        let mut adapters = 0usize;
+        for tool in TOOL_SURFACE {
+            match tool.target {
+                ExecutionTarget::Generated(_) => {}
+                ExecutionTarget::Composite(composite_id) => {
+                    composite += 1;
+                    assert!(!composite_id.as_str().is_empty());
+                    assert!(!composite_id.reason().is_empty());
+                }
+                ExecutionTarget::OwningAdapter(adapter_id) => {
+                    adapters += 1;
+                    assert!(!adapter_id.as_str().is_empty());
+                    assert!(!adapter_id.reason().is_empty());
+                }
+            }
+        }
+        assert_eq!(composite, 78);
+        assert_eq!(adapters, 3);
+    }
+
+    #[test]
+    fn generated_classifications_match_canonical_method_signatures() {
+        let records: Vec<_> = TOOL_SURFACE
+            .iter()
+            .filter_map(generated_expectation_for_tool)
+            .collect();
+        validate_generated_classifications(&records)
+            .expect("generated classifications must match canonical generated method signatures");
+    }
+
+    #[test]
+    fn generated_classification_gate_rejects_stale_identity() {
+        let record =
+            generated_expectation_for_tool(tool("lanes_create").expect("lanes_create tool"))
+                .expect("generated record");
+        let stale = [GeneratedClassificationExpectation {
+            interface: "Lanes",
+            method: "not_create",
+            ..record
+        }];
+        let err = validate_generated_classifications(&stale).expect_err("stale identity rejected");
+        assert!(err.contains("stale operation identity"), "{err}");
+    }
+
+    #[test]
+    fn generated_classification_gate_rejects_stale_argument_order() {
+        let record =
+            generated_expectation_for_tool(tool("lanes_create").expect("lanes_create tool"))
+                .expect("generated record");
+        const STALE_ARGS: &[(&str, &str)] = &[("string", "lane"), ("LoomSession", "handle")];
+        let stale = [GeneratedClassificationExpectation {
+            args: STALE_ARGS,
+            ..record
+        }];
+        let err = validate_generated_classifications(&stale).expect_err("stale args rejected");
+        assert!(err.contains("stale argument shape"), "{err}");
+    }
+
+    #[test]
+    fn generated_classification_gate_rejects_stale_return_type() {
+        let record =
+            generated_expectation_for_tool(tool("lanes_create").expect("lanes_create tool"))
+                .expect("generated record");
+        let stale = [GeneratedClassificationExpectation {
+            ret: "void",
+            ..record
+        }];
+        let err = validate_generated_classifications(&stale).expect_err("stale return rejected");
+        assert!(err.contains("stale return shape"), "{err}");
+    }
+
+    #[test]
+    fn generated_classification_gate_rejects_duplicate_owners_without_explicit_sharing() {
+        let record = generated_expectation_for_tool(tool("lanes_get").expect("lanes_get tool"))
+            .expect("generated record");
+        let records = [
+            record,
+            GeneratedClassificationExpectation {
+                owner: "lanes_get_duplicate",
+                ..record
+            },
+        ];
+        let err = validate_generated_classifications(&records).expect_err("duplicate rejected");
+        assert!(
+            err.contains("duplicate generated classification owners"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn generated_classification_gate_accepts_declared_shared_ownership() {
+        let records: Vec<_> = ["store_capabilities", "store_capabilities_json"]
+            .into_iter()
+            .map(|name| {
+                generated_expectation_for_tool(tool(name).expect("shared tool"))
+                    .expect("generated record")
+            })
+            .collect();
+        validate_generated_classifications(&records)
+            .expect("declared shared operation ownership is accepted");
+    }
+
+    #[test]
+    fn generated_classification_gate_rejects_stale_shared_ownership_declaration() {
+        let record = generated_expectation_for_tool(tool("lanes_get").expect("lanes_get tool"))
+            .expect("generated record");
+        let stale_shared = [(
+            GeneratedOperationId::LanesGet,
+            &["lanes_get", "lanes_get_duplicate"][..],
+            "stale declaration for a duplicate that is not present",
+        )];
+        let err = validate_generated_classifications_with_shared(&[record], &stale_shared)
+            .expect_err("stale shared ownership rejected");
+        assert!(
+            err.contains("shared ownership declaration is stale"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn composite_and_adapter_exceptions_are_explicit() {
+        validate_exception_reasons(TOOL_SURFACE)
+            .expect("composite and owning-adapter exceptions must have source-declared reasons");
+    }
+
+    #[test]
+    fn exception_gate_rejects_implicit_composite_exception() {
+        let implicit = [ExceptionExpectation {
+            owner: "implicit_exception",
+            reason: "",
+        }];
+        let err = validate_exception_records(&implicit).expect_err("implicit exception rejected");
+        assert!(err.contains("implicit exception"), "{err}");
     }
 
     /// The IDL `enum FacetKind` must mirror `loom_core::FacetKind`, so a facet added on one side but

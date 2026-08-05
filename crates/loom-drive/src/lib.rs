@@ -2,9 +2,8 @@ use loom_core::error::{Code, LoomError, Result};
 use loom_core::workspace::{FacetKind, WorkspaceId};
 use loom_core::{
     AclDomain, AclEffect, AclGrant, AclResource, AclResourceScope, AclRight, AclScope,
-    AclScopeKind, AclSubject, Digest, Loom, cas_get, cas_put,
+    AclScopeKind, AclStore, AclSubject, Digest, Loom, ObjectStore, cas_get, cas_put,
 };
-use loom_store::FileStore;
 use loom_substrate::drive::{
     APP_ID, DriveChunkManifest, DriveChunkRef, DriveConflictIndex, DriveConflictRecord,
     DriveConflictResolution, DriveContentRef, DriveDehydratedFileMarker, DriveFileVersion,
@@ -22,9 +21,9 @@ use loom_substrate::versioning::{
     load_current_revision_index, persist_current_revision_index_with_owner_state,
 };
 use loom_substrate::{ActorKind, OperationEnvelope, OperationEnvelopeInput};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveEntry {
     pub name: String,
     pub fold_key: String,
@@ -32,7 +31,7 @@ pub struct HostedDriveEntry {
     pub kind: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveFolder {
     pub workspace_id: String,
     pub folder_id: String,
@@ -40,7 +39,7 @@ pub struct HostedDriveFolder {
     pub entries: Vec<HostedDriveEntry>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveStat {
     pub workspace_id: String,
     pub node_id: String,
@@ -50,7 +49,7 @@ pub struct HostedDriveStat {
     pub latest_version: Option<HostedDriveVersion>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveVersion {
     pub file_id: String,
     pub version: u64,
@@ -62,7 +61,7 @@ pub struct HostedDriveVersion {
     pub size: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveUploadSession {
     pub workspace_id: String,
     pub upload_id: String,
@@ -75,7 +74,7 @@ pub struct HostedDriveUploadSession {
     pub total_size: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveWrite {
     pub workspace_id: String,
     pub operation_id: String,
@@ -86,7 +85,7 @@ pub struct HostedDriveWrite {
     pub conflict_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveConflict {
     pub conflict_id: String,
     pub folder_id: String,
@@ -97,7 +96,7 @@ pub struct HostedDriveConflict {
     pub resolution: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveShareGrant {
     pub grant_id: String,
     pub target_kind: String,
@@ -109,7 +108,7 @@ pub struct HostedDriveShareGrant {
     pub expires_at_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveRetentionPin {
     pub pin_id: String,
     pub kind: String,
@@ -120,7 +119,7 @@ pub struct HostedDriveRetentionPin {
     pub expires_at_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveRetentionApply {
     pub workspace_id: String,
     pub now_ms: u64,
@@ -129,7 +128,7 @@ pub struct HostedDriveRetentionApply {
     pub operation: Option<HostedDriveWrite>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedDriveShareExpiryApply {
     pub workspace_id: String,
     pub now_ms: u64,
@@ -225,8 +224,8 @@ pub enum HostedDriveConflictResolution {
     KeepBoth,
 }
 
-pub fn list_folder(
-    loom: &Loom<FileStore>,
+pub fn list_folder<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     folder_id: &str,
@@ -266,8 +265,8 @@ pub fn list_folder(
     })
 }
 
-pub fn stat_node(
-    loom: &Loom<FileStore>,
+pub fn stat_node<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     folder_id: &str,
@@ -303,8 +302,8 @@ pub fn stat_node(
     })
 }
 
-pub fn read_file(
-    loom: &Loom<FileStore>,
+pub fn read_file<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     file_id: &str,
@@ -325,8 +324,8 @@ pub fn read_file(
     read_content(loom, workspace, &version.content)
 }
 
-pub fn dehydrate_file_for_os(
-    loom: &Loom<FileStore>,
+pub fn dehydrate_file_for_os<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     file_id: &str,
@@ -360,8 +359,8 @@ pub fn dehydrate_file_for_os(
     })
 }
 
-pub fn hydrate_file_for_os(
-    loom: &Loom<FileStore>,
+pub fn hydrate_file_for_os<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     marker_bytes: &[u8],
@@ -394,8 +393,8 @@ pub fn hydrate_file_for_os(
     })
 }
 
-pub fn plan_os_projection_worker(
-    loom: &Loom<FileStore>,
+pub fn plan_os_projection_worker<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     materialized: &[HostedDriveOsMaterializedFile],
@@ -437,8 +436,8 @@ pub fn plan_os_projection_worker(
     })
 }
 
-pub fn write_file_from_os(
-    loom: &mut Loom<FileStore>,
+pub fn write_file_from_os<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     request: HostedDriveOsWrite<'_>,
 ) -> Result<HostedDriveWrite> {
@@ -471,8 +470,8 @@ pub fn write_file_from_os(
     commit_upload(loom, workspace, request.workspace_id, request.upload_id)
 }
 
-pub fn list_versions(
-    loom: &Loom<FileStore>,
+pub fn list_versions<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     file_id: &str,
@@ -499,8 +498,8 @@ pub fn list_versions(
     Ok(versions)
 }
 
-pub fn list_conflicts(
-    loom: &Loom<FileStore>,
+pub fn list_conflicts<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
 ) -> Result<Vec<HostedDriveConflict>> {
@@ -512,8 +511,8 @@ pub fn list_conflicts(
         .collect()
 }
 
-pub fn list_shares(
-    loom: &Loom<FileStore>,
+pub fn list_shares<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
 ) -> Result<Vec<HostedDriveShareGrant>> {
@@ -525,12 +524,20 @@ pub fn list_shares(
         .collect())
 }
 
-pub fn grant_share(
-    loom: &mut Loom<FileStore>,
+pub fn grant_share<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     request: HostedDriveGrantShare<'_>,
 ) -> Result<HostedDriveWrite> {
     authorize_drive_collection(loom, workspace, request.workspace_id, AclRight::Admin)?;
+    authorize_drive_target(
+        loom,
+        workspace,
+        request.workspace_id,
+        request.target_kind,
+        request.target_id,
+        AclRight::Admin,
+    )?;
     let actor = loom.effective_principal()?.unwrap_or(workspace);
     let grant = DriveShareGrant::new(DriveShareGrantInput {
         grant_id: request.grant_id.to_string(),
@@ -556,7 +563,7 @@ pub fn grant_share(
     let acl_grant = drive_share_acl_grant(request.workspace_id, &grant);
     shares.grants.push(grant);
     shares = DriveShareIndex::new(request.workspace_id, shares.grants)?;
-    let mut acl_snapshot = loom.acl_store().clone();
+    let mut acl_snapshot = persisted_acl_snapshot(loom)?;
     acl_snapshot.grant(acl_grant)?;
     let snapshot = load_snapshot_or_empty(loom, request.workspace_id)?;
     let operation = record_operation_with_owner_state(
@@ -590,8 +597,8 @@ pub fn grant_share(
     Ok(operation)
 }
 
-pub fn revoke_share(
-    loom: &mut Loom<FileStore>,
+pub fn revoke_share<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     grant_id: &str,
@@ -603,10 +610,19 @@ pub fn revoke_share(
         .iter()
         .position(|candidate| candidate.grant_id == grant_id)
         .ok_or_else(|| LoomError::not_found("drive share grant not found"))?;
+    let grant = shares.grants[idx].clone();
+    authorize_drive_target(
+        loom,
+        workspace,
+        workspace_id,
+        share_target_kind(grant.target_kind),
+        &grant.target_id,
+        AclRight::Admin,
+    )?;
     let grant = shares.grants.remove(idx);
     shares = DriveShareIndex::new(workspace_id, shares.grants)?;
     let acl_grant = drive_share_acl_grant(workspace_id, &grant);
-    let mut acl_snapshot = loom.acl_store().clone();
+    let mut acl_snapshot = persisted_acl_snapshot(loom)?;
     let acl_changed = acl_snapshot.revoke_one(&acl_grant);
     let snapshot = load_snapshot_or_empty(loom, workspace_id)?;
     let mut owner_state = loom_core::WorkflowOwnerState {
@@ -642,8 +658,8 @@ pub fn revoke_share(
     Ok(operation)
 }
 
-pub fn apply_share_expiry(
-    loom: &mut Loom<FileStore>,
+pub fn apply_share_expiry<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     now_ms: u64,
@@ -665,12 +681,22 @@ pub fn apply_share_expiry(
     let operation = if expired.is_empty() {
         None
     } else {
+        for grant in &expired {
+            authorize_drive_target(
+                loom,
+                workspace,
+                workspace_id,
+                share_target_kind(grant.target_kind),
+                &grant.target_id,
+                AclRight::Admin,
+            )?;
+        }
         let expired_grant_ids = expired
             .iter()
             .map(|grant| grant.grant_id.clone())
             .collect::<Vec<_>>();
         let shares = DriveShareIndex::new(workspace_id, retained.clone())?;
-        let mut acl_snapshot = loom.acl_store().clone();
+        let mut acl_snapshot = persisted_acl_snapshot(loom)?;
         let mut acl_changed = false;
         for grant in &expired {
             acl_changed |= acl_snapshot.revoke_one(&drive_share_acl_grant(workspace_id, grant));
@@ -718,8 +744,8 @@ pub fn apply_share_expiry(
     })
 }
 
-pub fn list_retention(
-    loom: &Loom<FileStore>,
+pub fn list_retention<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
 ) -> Result<Vec<HostedDriveRetentionPin>> {
@@ -731,12 +757,23 @@ pub fn list_retention(
         .collect())
 }
 
-pub fn pin_retention(
-    loom: &mut Loom<FileStore>,
+pub fn pin_retention<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     request: HostedDrivePinRetention<'_>,
 ) -> Result<HostedDriveWrite> {
     authorize_drive_collection(loom, workspace, request.workspace_id, AclRight::Admin)?;
+    if let Some(target_entity_id) = request.target_entity_id {
+        let (target_kind, target_id) = parse_drive_target_entity_id(target_entity_id)?;
+        authorize_drive_target(
+            loom,
+            workspace,
+            request.workspace_id,
+            target_kind,
+            target_id,
+            AclRight::Admin,
+        )?;
+    }
     let actor = loom.effective_principal()?.unwrap_or(workspace);
     let pin = DriveRetentionPin::new(DriveRetentionPinInput {
         pin_id: request.pin_id.to_string(),
@@ -776,8 +813,8 @@ pub fn pin_retention(
     )
 }
 
-pub fn unpin_retention(
-    loom: &mut Loom<FileStore>,
+pub fn unpin_retention<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     pin_id: &str,
@@ -807,8 +844,8 @@ pub fn unpin_retention(
     )
 }
 
-pub fn apply_retention(
-    loom: &mut Loom<FileStore>,
+pub fn apply_retention<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     now_ms: u64,
@@ -855,8 +892,8 @@ pub fn apply_retention(
     })
 }
 
-pub fn create_folder(
-    loom: &mut Loom<FileStore>,
+pub fn create_folder<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     parent_folder_id: &str,
@@ -898,8 +935,8 @@ pub fn create_folder(
     )
 }
 
-pub fn record_lease_operation(
-    loom: &mut Loom<FileStore>,
+pub fn record_lease_operation<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     operation_kind: &str,
@@ -928,8 +965,8 @@ pub fn record_lease_operation(
     )
 }
 
-pub fn create_upload(
-    loom: &mut Loom<FileStore>,
+pub fn create_upload<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     request: HostedDriveCreateUpload<'_>,
 ) -> Result<HostedDriveUploadSession> {
@@ -976,8 +1013,8 @@ pub fn create_upload(
     upload_summary(&session)
 }
 
-pub fn upload_chunk(
-    loom: &mut Loom<FileStore>,
+pub fn upload_chunk<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     upload_id: &str,
@@ -1006,8 +1043,8 @@ pub fn upload_chunk(
     upload_summary(&session)
 }
 
-pub fn commit_upload(
-    loom: &mut Loom<FileStore>,
+pub fn commit_upload<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     upload_id: &str,
@@ -1140,8 +1177,8 @@ pub fn commit_upload(
     Ok(summary)
 }
 
-pub fn resolve_conflict(
-    loom: &mut Loom<FileStore>,
+pub fn resolve_conflict<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     conflict_id: &str,
@@ -1219,8 +1256,8 @@ pub fn resolve_conflict(
     )
 }
 
-pub fn rename_node(
-    loom: &mut Loom<FileStore>,
+pub fn rename_node<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     folder_id: &str,
@@ -1258,8 +1295,8 @@ pub fn rename_node(
     )
 }
 
-pub fn move_node(
-    loom: &mut Loom<FileStore>,
+pub fn move_node<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     source_folder_id: &str,
@@ -1310,8 +1347,8 @@ pub fn move_node(
     )
 }
 
-pub fn delete_node(
-    loom: &mut Loom<FileStore>,
+pub fn delete_node<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     folder_id: &str,
@@ -1373,7 +1410,10 @@ pub fn delete_node(
     )
 }
 
-fn load_snapshot(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveProfileSnapshot> {
+fn load_snapshot<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace_id: &str,
+) -> Result<DriveProfileSnapshot> {
     match loom
         .store()
         .control_get(&drive_profile_key(workspace_id)?)?
@@ -1383,8 +1423,8 @@ fn load_snapshot(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveProf
     }
 }
 
-fn load_snapshot_or_empty(
-    loom: &Loom<FileStore>,
+fn load_snapshot_or_empty<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace_id: &str,
 ) -> Result<DriveProfileSnapshot> {
     match loom
@@ -1407,23 +1447,23 @@ fn empty_snapshot(workspace_id: &str) -> Result<DriveProfileSnapshot> {
     )
 }
 
-fn profile_root(loom: &Loom<FileStore>, snapshot: &DriveProfileSnapshot) -> Result<Digest> {
+fn profile_root<S: ObjectStore>(loom: &Loom<S>, snapshot: &DriveProfileSnapshot) -> Result<Digest> {
     Ok(Digest::hash(
         loom.store().digest_algo(),
         &snapshot.encode()?,
     ))
 }
 
-fn enforce_expected_root(
-    loom: &Loom<FileStore>,
+fn enforce_expected_root<S: ObjectStore>(
+    loom: &Loom<S>,
     snapshot: &DriveProfileSnapshot,
     expected_root: &str,
 ) -> Result<Digest> {
     enforce_expected_digest(loom, snapshot, Digest::parse(expected_root)?)
 }
 
-fn enforce_expected_digest(
-    loom: &Loom<FileStore>,
+fn enforce_expected_digest<S: ObjectStore>(
+    loom: &Loom<S>,
     snapshot: &DriveProfileSnapshot,
     expected: Digest,
 ) -> Result<Digest> {
@@ -1568,8 +1608,8 @@ fn held_delete_operation_kind(kind: DriveNodeKind) -> &'static str {
     }
 }
 
-fn append_held_delete_conflicts(
-    loom: &Loom<FileStore>,
+fn append_held_delete_conflicts<S: ObjectStore>(
+    loom: &Loom<S>,
     snapshot: &DriveProfileSnapshot,
     workspace_id: &str,
     folder_id: &str,
@@ -1629,8 +1669,8 @@ fn descendant_entries(
     Ok(out)
 }
 
-fn authorize_drive_collection(
-    loom: &Loom<FileStore>,
+fn authorize_drive_collection<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     right: AclRight,
@@ -1638,8 +1678,8 @@ fn authorize_drive_collection(
     authorize_drive_scope(loom, workspace, workspace_id.as_bytes(), right)
 }
 
-fn authorize_drive_target(
-    loom: &Loom<FileStore>,
+fn authorize_drive_target<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     target_kind: &str,
@@ -1654,8 +1694,8 @@ fn authorize_drive_target(
     )
 }
 
-fn authorize_drive_scope(
-    loom: &Loom<FileStore>,
+fn authorize_drive_scope<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     value: &[u8],
     right: AclRight,
@@ -1672,6 +1712,15 @@ fn authorize_drive_scope(
         ),
         right,
     )
+}
+
+fn persisted_acl_snapshot<S: ObjectStore>(loom: &Loom<S>) -> Result<AclStore> {
+    Ok(loom
+        .store()
+        .control_get(b"acl")?
+        .map(|bytes| AclStore::decode(&bytes))
+        .transpose()?
+        .unwrap_or_else(|| loom.acl_store().clone()))
 }
 
 fn drive_share_acl_grant(workspace_id: &str, grant: &DriveShareGrant) -> AclGrant {
@@ -1713,8 +1762,8 @@ fn drive_share_acl_rights(role: DriveShareRole) -> std::collections::BTreeSet<Ac
     }
 }
 
-fn load_upload_session(
-    loom: &Loom<FileStore>,
+fn load_upload_session<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace_id: &str,
     upload_id: &str,
 ) -> Result<DriveUploadSession> {
@@ -1727,14 +1776,17 @@ fn load_upload_session(
     }
 }
 
-fn save_upload_session(loom: &Loom<FileStore>, session: &DriveUploadSession) -> Result<()> {
+fn save_upload_session<S: ObjectStore>(loom: &Loom<S>, session: &DriveUploadSession) -> Result<()> {
     loom.store().control_set(
         &drive_upload_session_key(&session.workspace_id, &session.upload_id)?,
         session.encode()?,
     )
 }
 
-fn load_operation_log(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveOperationLog> {
+fn load_operation_log<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace_id: &str,
+) -> Result<DriveOperationLog> {
     match loom
         .store()
         .control_get(&drive_operation_log_key(workspace_id)?)?
@@ -1744,7 +1796,10 @@ fn load_operation_log(loom: &Loom<FileStore>, workspace_id: &str) -> Result<Driv
     }
 }
 
-fn load_conflicts(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveConflictIndex> {
+fn load_conflicts<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace_id: &str,
+) -> Result<DriveConflictIndex> {
     match loom
         .store()
         .control_get(&drive_conflict_index_key(workspace_id)?)?
@@ -1754,14 +1809,14 @@ fn load_conflicts(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveCon
     }
 }
 
-fn save_conflicts(loom: &Loom<FileStore>, conflicts: &DriveConflictIndex) -> Result<()> {
+fn save_conflicts<S: ObjectStore>(loom: &Loom<S>, conflicts: &DriveConflictIndex) -> Result<()> {
     loom.store().control_set(
         &drive_conflict_index_key(&conflicts.workspace_id)?,
         conflicts.encode()?,
     )
 }
 
-fn load_shares(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveShareIndex> {
+fn load_shares<S: ObjectStore>(loom: &Loom<S>, workspace_id: &str) -> Result<DriveShareIndex> {
     match loom
         .store()
         .control_get(&drive_share_index_key(workspace_id)?)?
@@ -1771,7 +1826,10 @@ fn load_shares(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveShareI
     }
 }
 
-fn load_retention(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveRetentionIndex> {
+fn load_retention<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace_id: &str,
+) -> Result<DriveRetentionIndex> {
     match loom
         .store()
         .control_get(&drive_retention_index_key(workspace_id)?)?
@@ -1781,8 +1839,8 @@ fn load_retention(loom: &Loom<FileStore>, workspace_id: &str) -> Result<DriveRet
     }
 }
 
-fn record_operation(
-    loom: &mut Loom<FileStore>,
+fn record_operation<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     snapshot: &DriveProfileSnapshot,
     operation_kind: &str,
@@ -1802,8 +1860,8 @@ fn record_operation(
     )
 }
 
-fn record_operation_with_controls(
-    loom: &mut Loom<FileStore>,
+fn record_operation_with_controls<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     snapshot: &DriveProfileSnapshot,
     operation_kind: &str,
@@ -1827,8 +1885,8 @@ fn record_operation_with_controls(
     )
 }
 
-fn record_operation_with_owner_state(
-    loom: &mut Loom<FileStore>,
+fn record_operation_with_owner_state<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     snapshot: &DriveProfileSnapshot,
     operation_kind: &str,
@@ -1885,8 +1943,8 @@ fn record_operation_with_owner_state(
     Ok(summary)
 }
 
-fn next_metadata_revision_index(
-    loom: &Loom<FileStore>,
+fn next_metadata_revision_index<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     target_entity_id: Option<&str>,
@@ -1923,8 +1981,8 @@ fn next_metadata_revision_index(
     Ok(state.into_revision_index())
 }
 
-fn prepare_operation(
-    loom: &Loom<FileStore>,
+fn prepare_operation<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     snapshot: &DriveProfileSnapshot,
     operation_kind: &str,
@@ -1982,8 +2040,8 @@ fn prepare_operation(
     ))
 }
 
-fn upload_content_ref(
-    loom: &mut Loom<FileStore>,
+fn upload_content_ref<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     session: &DriveUploadSession,
 ) -> Result<DriveContentRef> {
@@ -2028,8 +2086,8 @@ fn upload_content_ref(
     })
 }
 
-fn read_content(
-    loom: &Loom<FileStore>,
+fn read_content<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     content: &DriveContentRef,
 ) -> Result<Vec<u8>> {
@@ -2063,8 +2121,8 @@ fn read_content(
     }
 }
 
-fn read_cas_blob(
-    loom: &Loom<FileStore>,
+fn read_cas_blob<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     digest: &Digest,
 ) -> Result<Vec<u8>> {
@@ -2082,8 +2140,8 @@ fn content_digest_and_size(content: &DriveContentRef) -> (Digest, u64) {
     }
 }
 
-fn update_file_revision_index(
-    loom: &mut Loom<FileStore>,
+fn update_file_revision_index<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     file_version: &DriveFileVersion,
@@ -2329,6 +2387,20 @@ fn parse_retention_kind(value: &str) -> Result<DriveRetentionPinKind> {
             "drive retention kind must be current_root, trash_subtree, legal_hold, or revision_retention",
         )),
     }
+}
+
+fn parse_drive_target_entity_id(value: &str) -> Result<(&str, &str)> {
+    let Some((kind, id)) = value.split_once(':') else {
+        return Err(LoomError::invalid(
+            "drive target entity id must be formatted as kind:id",
+        ));
+    };
+    if kind.is_empty() || id.is_empty() {
+        return Err(LoomError::invalid(
+            "drive target entity id must be formatted as kind:id",
+        ));
+    }
+    Ok((kind, id))
 }
 
 fn retention_kind(kind: DriveRetentionPinKind) -> &'static str {

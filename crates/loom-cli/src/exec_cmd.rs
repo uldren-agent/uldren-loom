@@ -18,7 +18,6 @@ pub(crate) fn run_exec_cmd(action: ExecCmd, keys: &KeyOpts) -> Result<(), String
             request,
             input,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
             let raw =
                 std::fs::read(&request).map_err(|e| format!("read exec request {request}: {e}"))?;
             let overlays = parse_inputs(&input)?;
@@ -27,9 +26,13 @@ pub(crate) fn run_exec_cmd(action: ExecCmd, keys: &KeyOpts) -> Result<(), String
             } else {
                 overlay_inputs(&raw, &overlays)?
             };
-            let response = loom_compute::execute_cbor(&mut *loom, &request_bytes)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let response = execute_generated_bytes(
+                &client,
+                "Exec",
+                "exec_cbor",
+                vec![WireValue::Bytes(request_bytes)],
+            )?;
             let value = decode(&response).map_err(|e| format!("decode exec result: {e}"))?;
             println!("{}", cbor_to_json(&value));
             Ok(())
@@ -49,15 +52,52 @@ pub(crate) fn run_exec_cmd(action: ExecCmd, keys: &KeyOpts) -> Result<(), String
             author,
             timestamp_ms,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let outcome = loom_compute::apply(&mut *loom, ns, &base, &fork, &author, timestamp_ms)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            println!("{}", merge_outcome_json(&outcome));
+            let request =
+                encode_exec_apply_request(&workspace, &base, &fork, &author, timestamp_ms)
+                    .map_err(|e| format!("encode exec apply request: {e}"))?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let response = execute_generated_bytes(
+                &client,
+                "Exec",
+                "apply_cbor",
+                vec![WireValue::Bytes(request)],
+            )?;
+            let value = decode(&response).map_err(|e| format!("decode exec apply result: {e}"))?;
+            println!("{}", cbor_to_json(&value));
             Ok(())
         }
     }
+}
+
+fn encode_exec_apply_request(
+    workspace: &str,
+    base: &str,
+    fork: &str,
+    author: &str,
+    timestamp_ms: u64,
+) -> Result<Vec<u8>, loom_codec::CodecError> {
+    encode(&Value::Map(vec![
+        (
+            Value::Text("workspace".to_string()),
+            Value::Text(workspace.to_string()),
+        ),
+        (
+            Value::Text("base".to_string()),
+            Value::Text(base.to_string()),
+        ),
+        (
+            Value::Text("fork".to_string()),
+            Value::Text(fork.to_string()),
+        ),
+        (
+            Value::Text("author".to_string()),
+            Value::Text(author.to_string()),
+        ),
+        (
+            Value::Text("timestamp_ms".to_string()),
+            Value::Uint(timestamp_ms),
+        ),
+    ]))
 }
 
 /// Parse repeated `--input name=@file` specifications into named blobs read from disk.
@@ -122,10 +162,6 @@ fn set_text_key(entries: &mut Vec<(Value, Value)>, key: &str, val: Value) {
         }
     }
     entries.push((Value::Text(key.to_string()), val));
-}
-
-fn merge_outcome_json(outcome: &MergeOutcome) -> String {
-    format!("{{\"outcome\":{}}}", json_string(&format!("{outcome:?}")))
 }
 
 /// Render a canonical CBOR value as JSON: text is escaped, byte strings become lowercase hex, maps keyed

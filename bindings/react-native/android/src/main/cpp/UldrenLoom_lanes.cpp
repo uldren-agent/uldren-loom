@@ -140,23 +140,21 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeLanesUpdate(
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_ai_uldren_loom_rn_UldrenLoomNative_nativeLanesTicketAdd(
     JNIEnv *env, jobject thiz, jstring loomPath, jstring ns, jstring laneId, jstring ticketId,
-    jstring updatedBy, jstring placement, jstring anchor, jbyteArray passphrase, jbyteArray kek,
+    jstring updatedBy, jdouble placement, jstring anchor, jbyteArray passphrase, jbyteArray kek,
     jstring authPrincipal, jbyteArray authPassphrase) {
   (void)thiz;
   LANES_OPEN();
   const char *lane = env->GetStringUTFChars(laneId, nullptr);
   const char *ticket = env->GetStringUTFChars(ticketId, nullptr);
   const char *actor = env->GetStringUTFChars(updatedBy, nullptr);
-  const char *place = placement ? env->GetStringUTFChars(placement, nullptr) : nullptr;
   const char *anchorChars = anchor ? env->GetStringUTFChars(anchor, nullptr) : nullptr;
   unsigned char *ptr = nullptr;
   uintptr_t len = 0;
-  st = loom_lanes_ticket_add_cbor(h, n, lane, ticket, actor, place, anchorChars, &ptr, &len);
+  st = loom_lanes_ticket_add_cbor(h, n, lane, ticket, actor, (int32_t)placement, anchorChars, &ptr, &len);
   LANES_RELEASE_NS();
   env->ReleaseStringUTFChars(laneId, lane);
   env->ReleaseStringUTFChars(ticketId, ticket);
   env->ReleaseStringUTFChars(updatedBy, actor);
-  if (placement) env->ReleaseStringUTFChars(placement, place);
   if (anchor) env->ReleaseStringUTFChars(anchor, anchorChars);
   return finishLanesBytes(env, h, st, ptr, len);
 }

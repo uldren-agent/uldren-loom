@@ -316,6 +316,7 @@ Current registry:
 | `runtime-ipfs-activation` | 1/1 | _FACET_PRIMITIVES | source-backed |
 | `runtime-heavy-engine-activation` | 1/1 | _FACET_PRIMITIVES | source-backed |
 | `live-sync-transport` | 1/1 | 0008 | target |
+| `inference-facet` | 1/1 | 0062 | source-backed |
 | `inference` | 1/1 | 0043 | executable |
 | `providers.embedding` | 1/1 | 0050 | executable |
 | `set-reconciliation` | 1/1 | 0006 | target |
@@ -334,6 +335,7 @@ Current registry:
 | `acl-fine` | 1/1 | 0028 | target |
 | `e2e-sync` | 1/1 | 0031 | target |
 | `audit` | 1/1 | 0009 | target |
+| `certificate-generate-self-signed` | 1/1 | 0009 | source-backed |
 | `retention` | 1/1 | 0009 | target |
 | `redact` | 1/1 | 0009 | target |
 | `digest-migration` | 1/1 | 0002 | target |

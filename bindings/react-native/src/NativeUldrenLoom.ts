@@ -181,6 +181,49 @@ export interface Spec extends TurboModule {
     authPrincipal: string,
     authPassphrase: string
   ): Promise<void>;
+  identityForceDetachAuthorityJson(
+    loomPath: string,
+    principal: string,
+    generation: number,
+    reason: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  identityReplicateAuthorityJson(
+    loomPath: string,
+    source: string,
+    becomeAuthority: boolean,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  identityConfigureAuthorityReplicationJson(
+    loomPath: string,
+    id: string,
+    source: string,
+    disabled: boolean,
+    pullOnStart: boolean,
+    intervalMs: number,
+    intervalMsPresent: boolean,
+    jitterMs: number,
+    backoffMs: number,
+    publishWitness: boolean,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  identityRemoveAuthorityReplicationJson(
+    loomPath: string,
+    id: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
   aclListJson(
     loomPath: string,
     passphrase: string,
@@ -524,9 +567,236 @@ export interface Spec extends TurboModule {
   // The runtime provider/profile report as Loom Canonical CBOR.
   runtimeProfile(): Promise<number[]>;
   studioSurfaceCatalogJson(workspace: string, set: string): Promise<string>;
-  execCbor(
+  lifecycleDefineStandardJson(
+    loomPath: string,
+    workspace: string,
+    kind: string,
+    version: string,
+    completionPredicateDigest: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  lifecycleDefineJson(
+    loomPath: string,
+    workspace: string,
+    definition: number[],
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  lifecycleInstantiateJson(
+    loomPath: string,
+    workspace: string,
+    instanceId: string,
+    definitionId: string,
+    subjectRefsJson: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  lifecycleTransitionJson(
+    loomPath: string,
+    workspace: string,
+    instanceId: string,
+    transitionId: string,
+    toStageId: string,
+    actorPrincipalId: string | null,
+    gateEvaluationsJson: string,
+    snapshotDigest: string | null,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  refsReconcileJson(
+    loomPath: string,
+    workspace: string,
+    max: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  importTableCsv(loomPath: string, workspace: string, sourceScope: string, csvPayload: number[], database: string, table: string, schema: string, primaryKey: string, mode: string, commit: boolean, author: string | null, message: string | null, dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  importRedmine(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: number[], fieldPolicy: string, dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  importAsana(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: number[], fieldPolicy: string, dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  importJira(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: number[], fieldPolicy: string, dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  importConfluence(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: number[], defaultSpace: string, dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  importSlack(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: number[], dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  importDrive(loomPath: string, workspace: string, profile: string, sourceScope: string, archivePayload: number[], dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  importMarkdown(loomPath: string, workspace: string, profile: string, sourceScope: string, archivePayload: number[], space: string, dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  importNotion(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: number[], defaultSpace: string, dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  columnarImportArrow(
+    loomPath: string,
+    workspace: string,
+    name: string,
+    payload: number[],
+    targetSegmentRows: string,
+    replace: boolean,
+    dryRun: boolean,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<number[]>;
+  columnarImportParquet(
+    loomPath: string,
+    workspace: string,
+    name: string,
+    payload: number[],
+    targetSegmentRows: string,
+    replace: boolean,
+    dryRun: boolean,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<number[]>;
+  vectorTextUpsert(
     loomPath: string,
     request: number[],
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<number[]>;
+  vectorWorkspaceConfigureJson(
+    loomPath: string,
+    workspace: string,
+    requestJson: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  studioReindexJson(loomPath: string, workspace: string, profile: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  studioRevisionsRebuildJson(loomPath: string, workspace: string, profile: string, dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  storeBundleImport(loomPath: string, bundle: number[], dryRun: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  auditCompact(loomPath: string, throughSeq: number, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  storeMaintenanceStatus(loomPath: string, request: number[], passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  storeMaintenancePolicySet(loomPath: string, update: number[], passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  storeMaintenanceRun(loomPath: string, request: number[], passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  inferenceInstanceCreateJson(loomPath: string, workspace: string, name: string, model: string, kind: string, runtime: string, preset: string | null, settingsJson: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  inferenceInstanceUpdateJson(loomPath: string, workspace: string, name: string, preset: string | null, settingsJson: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  inferenceInstanceDeleteJson(loomPath: string, workspace: string, name: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  serveListenerConfigureJson(loomPath: string, requestJson: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  serveListenerListJson(loomPath: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  serveListenerSetEnabledJson(loomPath: string, listenerId: string, enabled: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  serveListenerRemoveJson(loomPath: string, listenerId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  serveWebRouteListJson(loomPath: string, listenerId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  serveWebRouteSetJson(loomPath: string, requestJson: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  serveWebRouteRemoveJson(loomPath: string, listenerId: string, routeId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  applyCbor(
+    loomPath: string,
+    request: number[],
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<number[]>;
+  meetingsImportSnapshot(
+    loomPath: string,
+    workspace: string,
+    inputProfile: string,
+    snapshot: number[],
+    dryRun: boolean,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  driveListJson(
+    loomPath: string,
+    workspace: string,
+    driveWorkspaceId: string,
+    folderId: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  driveStatJson(
+    loomPath: string,
+    workspace: string,
+    driveWorkspaceId: string,
+    folderId: string,
+    name: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  driveReadFile(
+    loomPath: string,
+    workspace: string,
+    driveWorkspaceId: string,
+    fileId: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<number[]>;
+  driveListVersionsJson(
+    loomPath: string,
+    workspace: string,
+    driveWorkspaceId: string,
+    fileId: string,
+    passphrase: string,
+    kek: number[],
+    authPrincipal: string,
+    authPassphrase: string
+  ): Promise<string>;
+  driveListConflictsJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveListSharesJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveListRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveCreateFolderJson(loomPath: string, workspace: string, driveWorkspaceId: string, parentFolderId: string, folderId: string, name: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveCreateUploadJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, parentFolderId: string, name: string, fileId: string, expectedRoot: string, createdAtMs: string, replaceFile: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveUploadChunkJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, chunk: number[], passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveCommitUploadJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveRenameJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, nodeId: string, newName: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveMoveJson(loomPath: string, workspace: string, driveWorkspaceId: string, sourceFolderId: string, targetFolderId: string, nodeId: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveDeleteJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, nodeId: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveResolveConflictJson(loomPath: string, workspace: string, driveWorkspaceId: string, conflictId: string, resolution: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveGrantShareJson(loomPath: string, workspace: string, driveWorkspaceId: string, grantId: string, targetKind: string, targetId: string, principal: string, role: string, grantedAtMs: string, expiresAtMs: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveRevokeShareJson(loomPath: string, workspace: string, driveWorkspaceId: string, grantId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveApplyShareExpiryJson(loomPath: string, workspace: string, driveWorkspaceId: string, nowMs: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  drivePinRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, pinId: string, kind: string, root: string, targetEntityId: string | null, addedAtMs: string, expiresAtMs: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveUnpinRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, pinId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  driveApplyRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, nowMs: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatCreateChannelJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, channelHandle: string, name: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatRenameChannelJson(loomPath: string, workspace: string, chatWorkspaceId: string, selector: string, channelHandle: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatListChannelsJson(loomPath: string, workspace: string, chatWorkspaceId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatPostMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, threadId: string | null, bodyText: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatPostMessageBytesJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, threadId: string | null, body: number[], expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatEditMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, bodyText: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatEditMessageBytesJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, body: number[], expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatRedactMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, reason: string | null, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatCreateThreadJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, threadId: string, parentMessageId: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatCreateTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, messageId: string, title: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatClaimTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, leaseToken: string | null, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatCompleteTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, resultMessageId: string | null, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatInvokeAgentJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, agentPrincipal: string, sourceMessageIdsJson: string, promptText: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatInvokeAgentBytesJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, agentPrincipal: string, sourceMessageIdsJson: string, prompt: number[], expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatAgentReplyJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, messageId: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatRequestHandoffJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, handoffId: string, fromAgentPrincipal: string, toPrincipal: string | null, reason: string | null, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatAddReactionJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatRemoveReactionJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatEmojiListJson(loomPath: string, workspace: string, chatWorkspaceId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatEmojiRegisterJson(loomPath: string, workspace: string, chatWorkspaceId: string, kind: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatEmojiUnregisterJson(loomPath: string, workspace: string, chatWorkspaceId: string, kind: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatMessagesJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatCursorJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatUpdateCursorJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, nextSequence: string, expectedEntityTag: string | null, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  chatFetchEventsJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, fromSequence: string, max: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  sqlExecResult(
+    loomPath: string,
+    ns: string,
+    db: string,
+    sql: string,
     passphrase: string,
     kek: number[],
     authPrincipal: string,
@@ -585,17 +855,6 @@ export interface Spec extends TurboModule {
     authPrincipal: string,
     authPassphrase: string
   ): Promise<boolean>;
-  meetingsImportSnapshot(
-    loomPath: string,
-    workspace: string,
-    inputProfile: string,
-    snapshot: number[],
-    dryRun: boolean,
-    passphrase: string,
-    kek: number[],
-    authPrincipal: string,
-    authPassphrase: string
-  ): Promise<string>;
   meetingsSourceRead(
     loomPath: string,
     workspace: string,
@@ -606,68 +865,10 @@ export interface Spec extends TurboModule {
     authPrincipal: string,
     authPassphrase: string
   ): Promise<number[]>;
-  driveListJson(
-    loomPath: string,
-    workspace: string,
-    driveWorkspaceId: string,
-    folderId: string,
-    passphrase: string,
-    kek: number[],
-    authPrincipal: string,
-    authPassphrase: string
-  ): Promise<string>;
-  driveStatJson(
-    loomPath: string,
-    workspace: string,
-    driveWorkspaceId: string,
-    folderId: string,
-    name: string,
-    passphrase: string,
-    kek: number[],
-    authPrincipal: string,
-    authPassphrase: string
-  ): Promise<string>;
-  driveReadFile(
-    loomPath: string,
-    workspace: string,
-    driveWorkspaceId: string,
-    fileId: string,
-    passphrase: string,
-    kek: number[],
-    authPrincipal: string,
-    authPassphrase: string
-  ): Promise<number[]>;
-  driveListVersionsJson(
-    loomPath: string,
-    workspace: string,
-    driveWorkspaceId: string,
-    fileId: string,
-    passphrase: string,
-    kek: number[],
-    authPrincipal: string,
-    authPassphrase: string
-  ): Promise<string>;
-  driveListConflictsJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveListSharesJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveListRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveCreateFolderJson(loomPath: string, workspace: string, driveWorkspaceId: string, parentFolderId: string, folderId: string, name: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveCreateUploadJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, parentFolderId: string, name: string, fileId: string, expectedRoot: string, createdAtMs: string, replaceFile: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveUploadChunkJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, chunk: number[], passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveCommitUploadJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveRenameJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, nodeId: string, newName: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveMoveJson(loomPath: string, workspace: string, driveWorkspaceId: string, sourceFolderId: string, targetFolderId: string, nodeId: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveDeleteJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, nodeId: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveResolveConflictJson(loomPath: string, workspace: string, driveWorkspaceId: string, conflictId: string, resolution: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveGrantShareJson(loomPath: string, workspace: string, driveWorkspaceId: string, grantId: string, targetKind: string, targetId: string, principal: string, role: string, grantedAtMs: string, expiresAtMs: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveRevokeShareJson(loomPath: string, workspace: string, driveWorkspaceId: string, grantId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveApplyShareExpiryJson(loomPath: string, workspace: string, driveWorkspaceId: string, nowMs: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  drivePinRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, pinId: string, kind: string, root: string, targetEntityId: string, addedAtMs: string, expiresAtMs: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveUnpinRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, pinId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  driveApplyRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, nowMs: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
   ticketsProjectCreateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, keyPrefix: string, name: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
   ticketsProjectRekeyJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, keyPrefix: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  ticketsProjectSettingsGetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  ticketsProjectSettingsSetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, defaultProjection: string, enableProjectionsJson: string, disableProjectionsJson: string, actorEnforcement: string, projectOwnerPrincipal: string, clearProjectOwnerPrincipal: boolean, acceptanceAuthoritiesJson: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  ticketsProjectSettingsGetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, includeContracts: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  ticketsProjectSettingsSetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, defaultProjection: string, enableProjectionsJson: string, disableProjectionsJson: string, actorEnforcement: string, projectOwnerPrincipal: string, clearProjectOwnerPrincipal: boolean, acceptanceAuthoritiesJson: string, acceptanceEvidenceEnforcement: boolean, hasAcceptanceEvidenceEnforcement: boolean, requiredAcceptanceEvidenceKeysJson: string, requiredAcceptanceReviewsJson: string, ownerContractSummary: string, ownerContractDetails: string, workerContractSummary: string, workerContractDetails: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
   ticketsFieldsJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, projection: string, operation: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
   ticketsFieldPutJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, fieldId: string, fieldKey: string, name: string, description: string, fieldType: string, optionSet: string, maxLength: number, hasMaxLength: boolean, required: boolean, searchable: boolean, orderable: boolean, cardinality: string, applicableTypeIdsJson: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
   ticketsFieldRetireJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, fieldId: string, expectedRoot: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
@@ -705,34 +906,28 @@ export interface Spec extends TurboModule {
   lanesGet(loomPath: string, workspace: string, laneId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[] | null>;
   lanesList(loomPath: string, workspace: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
   lanesUpdate(loomPath: string, workspace: string, laneId: string, title: string | null, description: string | null, laneStatus: string | null, statusReport: string | null, reviewerFeedback: string | null, updatedBy: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
-  lanesTicketAdd(loomPath: string, workspace: string, laneId: string, ticketId: string, updatedBy: string, placement: string, anchor: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  lanesTicketAdd(loomPath: string, workspace: string, laneId: string, ticketId: string, updatedBy: string, placement: number, anchor: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
   lanesTicketRemove(loomPath: string, workspace: string, laneId: string, ticketId: string, updatedBy: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
-  chatCreateChannelJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, channelHandle: string, name: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatRenameChannelJson(loomPath: string, workspace: string, chatWorkspaceId: string, selector: string, channelHandle: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatListChannelsJson(loomPath: string, workspace: string, chatWorkspaceId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatPostMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, threadId: string, bodyText: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatEditMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, bodyText: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatRedactMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, reason: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatCreateThreadJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, threadId: string, parentMessageId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatCreateTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, messageId: string, title: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatClaimTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, leaseToken: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatCompleteTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, resultMessageId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatInvokeAgentJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, agentPrincipal: string, sourceMessageIdsJson: string, promptText: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatAgentReplyJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, messageId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatRequestHandoffJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, handoffId: string, fromAgentPrincipal: string, toPrincipal: string, reason: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatAddReactionJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatRemoveReactionJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatEmojiListJson(loomPath: string, workspace: string, chatWorkspaceId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatEmojiRegisterJson(loomPath: string, workspace: string, chatWorkspaceId: string, kind: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatEmojiUnregisterJson(loomPath: string, workspace: string, chatWorkspaceId: string, kind: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatMessagesJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatCursorJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatUpdateCursorJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, nextSequence: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
-  chatFetchEventsJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, fromSequence: string, max: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  auditConfigShowJson(loomPath: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  auditConfigSetJson(loomPath: string, retentionDays: number, hasRetentionDays: boolean, legalHold: boolean, hasLegalHold: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  auditListJson(loomPath: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  auditViewJson(loomPath: string, record: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  certificateListJson(loomPath: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  certificateImportJson(loomPath: string, name: string, certChainPem: number[], privateKeyPem: number[], trustBundlePem: number[], hasTrustBundlePem: boolean, force: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  certificateExport(loomPath: string, name: string, includeCertChain: boolean, includePrivateKey: boolean, includeTrustBundle: boolean, force: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<number[]>;
+  certificateGenerateSelfSignedJson(loomPath: string, name: string, dnsNamesJson: string, ipAddressesJson: string, cn: string, hasCn: boolean, days: number, algorithm: string, force: boolean, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  certificateRemoveJson(loomPath: string, name: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  certificateAuditJson(loomPath: string, name: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  networkAccessListJson(loomPath: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  networkAccessSetJson(loomPath: string, name: string, description: string, hasDescription: boolean, defaultAction: string, rulesJson: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  networkAccessRemoveJson(loomPath: string, name: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
+  networkAccessAuditJson(loomPath: string, name: string, passphrase: string, kek: number[], authPrincipal: string, authPassphrase: string): Promise<string>;
   fsImport(
     loomPath: string,
     workspace: string,
     srcPath: string,
+    author: string,
+    message: string,
     commit: boolean,
     dryRun: boolean,
     passphrase: string,
@@ -756,6 +951,10 @@ export interface Spec extends TurboModule {
     workspace: string,
     srcPath: string,
     kind: string,
+    gzipOutputPath: string,
+    commit: boolean,
+    author: string,
+    message: string,
     dryRun: boolean,
     passphrase: string,
     kek: number[],

@@ -5,6 +5,8 @@
 - (void)fsImport:(NSString *)loomPath
        workspace:(NSString *)ns
          srcPath:(NSString *)srcPath
+          author:(NSString *)author
+         message:(NSString *)message
           commit:(BOOL)commit
           dryRun:(BOOL)dryRun
       passphrase:(NSString *)passphrase
@@ -24,8 +26,10 @@
     uintptr_t len = 0;
     int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
     if (st == 0) {
-      st = loom_fs_import(h, ns.UTF8String, srcPath.UTF8String, commit ? 1 : 0,
-                          dryRun ? 1 : 0, &ptr, &len);
+      const char *authorArg = author.length > 0 ? author.UTF8String : NULL;
+      const char *messageArg = message.length > 0 ? message.UTF8String : NULL;
+      st = loom_fs_import(h, ns.UTF8String, srcPath.UTF8String, authorArg, messageArg,
+                          commit ? 1 : 0, dryRun ? 1 : 0, &ptr, &len);
     }
     loom_close(h);
     if (st != 0) {
@@ -76,6 +80,10 @@
             workspace:(NSString *)ns
               srcPath:(NSString *)srcPath
                  kind:(NSString *)kind
+       gzipOutputPath:(NSString *)gzipOutputPath
+               commit:(BOOL)commit
+               author:(NSString *)author
+              message:(NSString *)message
                dryRun:(BOOL)dryRun
            passphrase:(NSString *)passphrase
                   kek:(NSArray *)kek
@@ -94,8 +102,12 @@
     uintptr_t len = 0;
     int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
     if (st == 0) {
+      const char *gzipArg = gzipOutputPath.length > 0 ? gzipOutputPath.UTF8String : NULL;
+      const char *authorArg = author.length > 0 ? author.UTF8String : NULL;
+      const char *messageArg = message.length > 0 ? message.UTF8String : NULL;
       st = loom_archive_import(h, ns.UTF8String, srcPath.UTF8String, kind.UTF8String,
-                               dryRun ? 1 : 0, &ptr, &len);
+                               gzipArg, commit ? 1 : 0, authorArg, messageArg, dryRun ? 1 : 0,
+                               &ptr, &len);
     }
     loom_close(h);
     if (st != 0) {

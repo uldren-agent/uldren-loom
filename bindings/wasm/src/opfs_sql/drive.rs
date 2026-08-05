@@ -99,11 +99,7 @@ impl LoomStore {
         drive_workspace_id: String,
     ) -> Result<String, JsError> {
         let ns = resolve_workspace_arg(&self.loom, &workspace)?;
-        to_json(loom_drive::list_shares(
-            &self.loom,
-            ns,
-            &drive_workspace_id,
-        ))
+        to_json(loom_drive::list_shares(&self.loom, ns, &drive_workspace_id))
     }
 
     pub fn drive_list_retention_json(

@@ -124,3 +124,31 @@ expect fun Loom.columnarAggregateCbor(
         authPrincipal: String? = null,
         authPassphrase: String? = null,
     ): ByteArray
+
+expect fun Loom.columnarImportArrow(
+        path: String,
+        workspace: String,
+        name: String,
+        payload: ByteArray,
+        targetSegmentRows: ULong,
+        replace: Boolean,
+        dryRun: Boolean = false,
+        passphrase: String? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: String? = null,
+    ): ByteArray
+
+expect fun Loom.columnarImportParquet(
+        path: String,
+        workspace: String,
+        name: String,
+        payload: ByteArray,
+        targetSegmentRows: ULong,
+        replace: Boolean,
+        dryRun: Boolean = false,
+        passphrase: String? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: String? = null,
+    ): ByteArray

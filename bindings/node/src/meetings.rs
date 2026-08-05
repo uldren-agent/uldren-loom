@@ -2,10 +2,9 @@
 
 use super::*;
 
-use loom_interchange_io::{
-    import_meetings_bytes, import_report_json, meetings_source_payload_path,
-    parse_meetings_input_profile, validate_meetings_source_payload_leaf,
-};
+use futures::executor::block_on;
+use loom_client::generated_api::Meetings as GeneratedMeetings;
+use loom_interchange_io::{meetings_source_payload_path, validate_meetings_source_payload_leaf};
 
 #[napi]
 pub fn meetings_import_snapshot(
@@ -14,15 +13,27 @@ pub fn meetings_import_snapshot(
     input_profile: String,
     snapshot: Uint8Array,
     dry_run: bool,
-    passphrase: Option<String>,
+    store_passphrase: Option<String>,
+    auth_principal: Option<String>,
+    auth_passphrase: Option<String>,
 ) -> napi::Result<String> {
-    let mut loom =
-        open_loom_unlocked(&loom_path, key_spec(passphrase.as_deref()).as_ref()).map_err(reason)?;
-    let workspace_id = resolve_workspace_arg(&loom, &workspace)?;
-    let profile = parse_meetings_input_profile(&input_profile).map_err(reason)?;
-    let result = import_meetings_bytes(&mut loom, workspace_id, profile, &snapshot, dry_run)
-        .map_err(reason)?;
-    import_report_json(&result.report).map_err(reason)
+    let generated = generated_session::open_generated_session(
+        &loom_path,
+        store_passphrase.as_deref(),
+        auth_principal.as_deref(),
+        auth_passphrase.as_deref(),
+    )?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedMeetings>::meetings_import_snapshot(
+            &generated.client,
+            generated.session.clone(),
+            workspace,
+            input_profile,
+            snapshot.to_vec(),
+            dry_run,
+        ),
+    )
+    .map_err(reason)
 }
 
 #[napi]

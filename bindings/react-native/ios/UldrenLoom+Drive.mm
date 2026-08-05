@@ -18,7 +18,7 @@ static BOOL parseDriveU64(NSString *value, uint64_t *out, RCTPromiseRejectBlock 
 
 static BOOL parseOptionalDriveU64(NSString *value, uint64_t *out, int32_t *has,
                                   RCTPromiseRejectBlock reject) {
-  if (value == nil || value.length == 0) {
+  if (value == nil) {
     *out = 0;
     *has = 0;
     return YES;
@@ -221,7 +221,7 @@ static BOOL parseOptionalDriveU64(NSString *value, uint64_t *out, int32_t *has,
   int32_t hasExpires = 0;
   if (!parseDriveU64(addedAtMs, &added, reject)) return;
   if (!parseOptionalDriveU64(expiresAtMs, &expires, &hasExpires, reject)) return;
-  const char *target = targetEntityId.length ? targetEntityId.UTF8String : NULL;
+  const char *target = targetEntityId != nil ? targetEntityId.UTF8String : NULL;
   [self driveString:loomPath passphrase:passphrase kek:kek authPrincipal:authPrincipal authPassphrase:authPassphrase call:^int32_t(LoomSession *h, char **out) {
     return loom_drive_pin_retention_json(h, workspace.UTF8String, driveWorkspaceId.UTF8String, pinId.UTF8String, kind.UTF8String, root.UTF8String, target, added, expires, hasExpires, out);
   } resolve:resolve reject:reject];

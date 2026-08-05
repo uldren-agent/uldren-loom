@@ -72,6 +72,82 @@
   });
 }
 
+static void columnarImportBytes(UldrenLoom *owner, NSString *loomPath, NSString *ns,
+                                NSString *name, NSArray *payload, NSString *targetSegmentRows,
+                                BOOL replace, BOOL dryRun, NSString *passphrase, NSArray *kek,
+                                NSString *authPrincipal, NSString *authPassphrase,
+                                RCTPromiseResolveBlock resolve, RCTPromiseRejectBlock reject,
+                                int32_t (*importFn)(LoomSession *, const char *, const char *,
+                                                    const unsigned char *, uintptr_t, uint64_t,
+                                                    int32_t, int32_t, unsigned char **,
+                                                    uintptr_t *)) {
+  dispatch_async([owner workQueue], ^{
+    uint64_t rows = 0;
+    if (!loomResolveU64(targetSegmentRows, &rows, reject)) {
+      return;
+    }
+    LoomSession *h = [owner openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [owner loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSUInteger plen = 0;
+    unsigned char *pbuf = loomBytesFromArray(payload, &plen);
+    unsigned char *ptr = NULL;
+    uintptr_t len = 0;
+    int32_t st = [owner authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = importFn(h, ns.UTF8String, name.UTF8String, pbuf, (uintptr_t)plen, rows,
+                    replace ? 1 : 0, dryRun ? 1 : 0, &ptr, &len);
+    }
+    free(pbuf);
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [owner loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    resolve(loomArrayFromOwnedBytes(ptr, len));
+  });
+}
+
+- (void)columnarImportArrow:(NSString *)loomPath
+                  workspace:(NSString *)ns
+                       name:(NSString *)name
+                    payload:(NSArray *)payload
+          targetSegmentRows:(NSString *)targetSegmentRows
+                    replace:(BOOL)replace
+                     dryRun:(BOOL)dryRun
+                 passphrase:(NSString *)passphrase
+                        kek:(NSArray *)kek
+              authPrincipal:(NSString *)authPrincipal
+             authPassphrase:(NSString *)authPassphrase
+                    resolve:(RCTPromiseResolveBlock)resolve
+                     reject:(RCTPromiseRejectBlock)reject {
+  columnarImportBytes(self, loomPath, ns, name, payload, targetSegmentRows, replace, dryRun,
+                      passphrase, kek, authPrincipal, authPassphrase, resolve, reject,
+                      loom_columnar_import_arrow);
+}
+
+- (void)columnarImportParquet:(NSString *)loomPath
+                    workspace:(NSString *)ns
+                         name:(NSString *)name
+                      payload:(NSArray *)payload
+            targetSegmentRows:(NSString *)targetSegmentRows
+                      replace:(BOOL)replace
+                       dryRun:(BOOL)dryRun
+                   passphrase:(NSString *)passphrase
+                          kek:(NSArray *)kek
+                authPrincipal:(NSString *)authPrincipal
+               authPassphrase:(NSString *)authPassphrase
+                      resolve:(RCTPromiseResolveBlock)resolve
+                       reject:(RCTPromiseRejectBlock)reject {
+  columnarImportBytes(self, loomPath, ns, name, payload, targetSegmentRows, replace, dryRun,
+                      passphrase, kek, authPrincipal, authPassphrase, resolve, reject,
+                      loom_columnar_import_parquet);
+}
+
 - (void)columnarScan:(NSString *)loomPath
            workspace:(NSString *)ns
                 name:(NSString *)name

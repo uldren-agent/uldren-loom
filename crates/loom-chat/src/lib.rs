@@ -3,7 +3,8 @@ use std::sync::Mutex;
 
 use loom_core::error::{Code, LoomError};
 use loom_core::workspace::{AclDomain, FacetKind, WorkspaceId};
-use loom_core::{AclRight, Digest, Loom};
+use loom_core::{AclResource, AclResourceScope, AclRight, AclScopeKind, Digest, Loom, ObjectStore};
+#[cfg(test)]
 use loom_store::FileStore;
 use loom_substrate::annotation::{EMOJI_REGISTRY_DIR, EmojiRegistry, emoji_registry_path};
 use loom_substrate::changes::{OperationChangeBatch, OperationChangeCursor};
@@ -19,7 +20,7 @@ use loom_substrate::versioning::{
 };
 use loom_substrate::{ActorKind, OperationEnvelope, OperationEnvelopeInput};
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatMessage {
     pub message_id: String,
     pub thread_id: Option<String>,
@@ -31,20 +32,20 @@ pub struct HostedChatMessage {
     pub reactions: Vec<HostedChatReaction>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatReaction {
     pub kind: String,
     pub principal: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatThread {
     pub thread_id: String,
     pub parent_message_id: String,
     pub created_at_ms: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatChannel {
     pub workspace_id: String,
     pub channel_id: String,
@@ -55,7 +56,7 @@ pub struct HostedChatChannel {
     pub handoffs: Vec<HostedChatHandoff>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatTask {
     pub task_id: String,
     pub message_id: Option<String>,
@@ -65,7 +66,7 @@ pub struct HostedChatTask {
     pub state: HostedChatTaskState,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind")]
 pub enum HostedChatTaskState {
     Open,
@@ -85,7 +86,7 @@ pub enum HostedChatTaskState {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatAgentInvocation {
     pub invocation_id: String,
     pub agent_principal: String,
@@ -96,7 +97,7 @@ pub struct HostedChatAgentInvocation {
     pub reply_message_ids: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatHandoff {
     pub handoff_id: String,
     pub from_agent_principal: String,
@@ -106,7 +107,7 @@ pub struct HostedChatHandoff {
     pub reason: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatWrite {
     pub workspace_id: String,
     pub channel_id: String,
@@ -114,9 +115,10 @@ pub struct HostedChatWrite {
     pub operation_kind: String,
     pub sequence: u64,
     pub root_after: String,
+    pub entity_tag: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatCursor {
     pub workspace_id: String,
     pub channel_id: String,
@@ -124,6 +126,7 @@ pub struct HostedChatCursor {
     pub next_sequence: u64,
     pub head_sequence: u64,
     pub unread_count: u64,
+    pub entity_tag: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -135,18 +138,20 @@ pub struct HostedChatPresence {
     pub expires_at_ms: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatEmojiRegistry {
     pub workspace_id: String,
     pub custom: Vec<String>,
+    pub entity_tag: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct HostedChatChannelSummary {
     pub workspace_id: String,
     pub channel_id: String,
     pub handle: String,
     pub name: String,
+    pub entity_tag: String,
 }
 
 #[derive(Default)]
@@ -221,22 +226,27 @@ impl HostedChatPresenceStore {
     }
 }
 
-pub fn ensure_channel(
-    loom: &mut Loom<FileStore>,
+pub fn ensure_channel<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: WorkspaceId,
     handle: &str,
     name: &str,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatChannelSummary> {
-    loom.authorize_domain(workspace, AclDomain::Chat, AclRight::Write)?;
+    authorize_chat_channel_collection(loom, workspace, workspace_id, AclRight::Write)?;
+    authorize_chat_channel_resource(loom, workspace, workspace_id, &channel_id.to_string())?;
     let mut directory = load_channel_directory(loom, workspace, workspace_id)?;
+    let current_entity_tag = channel_directory_entity_tag(loom, &directory)?;
+    enforce_expected_entity_tag(&current_entity_tag, expected_entity_tag)?;
     if let Some(channel) = directory.resolve(&channel_id.to_string())? {
-        return Ok(channel_summary(workspace_id, channel));
+        return Ok(channel_summary(workspace_id, channel, current_entity_tag));
     }
     match directory.create_channel(channel_id, handle, name) {
         Ok(channel) => {
-            let summary = channel_summary(workspace_id, &channel);
+            let entity_tag = channel_directory_entity_tag(loom, &directory)?;
+            let summary = channel_summary(workspace_id, &channel, entity_tag);
             save_channel_directory(loom, workspace, workspace_id, &directory)?;
             Ok(summary)
         }
@@ -244,58 +254,87 @@ pub fn ensure_channel(
             let channel = directory
                 .resolve(handle)?
                 .ok_or_else(|| LoomError::corrupt("chat channel directory conflict"))?;
-            Ok(channel_summary(workspace_id, channel))
+            let entity_tag = channel_directory_entity_tag(loom, &directory)?;
+            Ok(channel_summary(workspace_id, channel, entity_tag))
         }
         Err(error) => Err(error),
     }
 }
 
-pub fn rename_channel(
-    loom: &mut Loom<FileStore>,
+pub fn ensure_channel_from_request<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    channel_id: &str,
+    handle: &str,
+    name: &str,
+    expected_entity_tag: Option<&str>,
+) -> loom_core::Result<HostedChatChannelSummary> {
+    let channel_id = WorkspaceId::parse(channel_id)?;
+    ensure_channel(
+        loom,
+        workspace,
+        workspace_id,
+        channel_id,
+        handle,
+        name,
+        expected_entity_tag,
+    )
+}
+
+pub fn rename_channel<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     selector: &str,
     handle: &str,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatChannelSummary> {
-    loom.authorize_domain(workspace, AclDomain::Chat, AclRight::Write)?;
+    authorize_chat_channel_collection(loom, workspace, workspace_id, AclRight::Read)?;
     let mut directory = load_channel_directory(loom, workspace, workspace_id)?;
+    let current_entity_tag = channel_directory_entity_tag(loom, &directory)?;
+    enforce_expected_entity_tag(&current_entity_tag, expected_entity_tag)?;
     let id = directory
         .resolve(selector)?
         .ok_or_else(|| LoomError::not_found("chat channel not found"))?
         .id;
+    authorize_chat_channel_resource(loom, workspace, workspace_id, &id.to_string())?;
     directory.rename_channel(id, handle)?;
     let channel = directory
         .resolve(&id.to_string())?
         .ok_or_else(|| LoomError::corrupt("renamed chat channel is missing"))?
         .clone();
+    let entity_tag = channel_directory_entity_tag(loom, &directory)?;
     save_channel_directory(loom, workspace, workspace_id, &directory)?;
-    Ok(channel_summary(workspace_id, &channel))
+    Ok(channel_summary(workspace_id, &channel, entity_tag))
 }
 
-pub fn list_channels(
-    loom: &Loom<FileStore>,
+pub fn list_channels<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
 ) -> loom_core::Result<Vec<HostedChatChannelSummary>> {
     loom.authorize_domain(workspace, AclDomain::Chat, AclRight::Read)?;
     let directory = load_channel_directory(loom, workspace, workspace_id)?;
+    let entity_tag = channel_directory_entity_tag(loom, &directory)?;
     Ok(directory
         .channels()
-        .map(|channel| channel_summary(workspace_id, channel))
+        .map(|channel| channel_summary(workspace_id, channel, entity_tag.clone()))
         .collect())
 }
 
-pub fn post_message(
-    loom: &mut Loom<FileStore>,
+pub fn post_message<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     message_id: &str,
     thread_id: Option<&str>,
     body: Vec<u8>,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    append_payload_authorized(
         loom,
         workspace,
         workspace_id,
@@ -305,19 +344,21 @@ pub fn post_message(
             thread_id: thread_id.map(str::to_string),
             body,
         },
+        expected_entity_tag,
     )
 }
 
-pub fn edit_message(
-    loom: &mut Loom<FileStore>,
+pub fn edit_message<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     message_id: &str,
     body: Vec<u8>,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    append_payload_authorized(
         loom,
         workspace,
         workspace_id,
@@ -326,19 +367,21 @@ pub fn edit_message(
             message_id: message_id.to_string(),
             body,
         },
+        expected_entity_tag,
     )
 }
 
-pub fn redact_message(
-    loom: &mut Loom<FileStore>,
+pub fn redact_message<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     message_id: &str,
     reason: Option<&str>,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    append_payload_authorized(
         loom,
         workspace,
         workspace_id,
@@ -347,19 +390,21 @@ pub fn redact_message(
             message_id: message_id.to_string(),
             reason: reason.map(str::to_string),
         },
+        expected_entity_tag,
     )
 }
 
-pub fn create_thread(
-    loom: &mut Loom<FileStore>,
+pub fn create_thread<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     thread_id: &str,
     parent_message_id: &str,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    append_payload_authorized(
         loom,
         workspace,
         workspace_id,
@@ -368,20 +413,34 @@ pub fn create_thread(
             thread_id: thread_id.to_string(),
             parent_message_id: parent_message_id.to_string(),
         },
+        expected_entity_tag,
     )
 }
 
-pub fn create_task(
-    loom: &mut Loom<FileStore>,
+fn resolve_chat_channel_for_mutation<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    selector: &str,
+) -> loom_core::Result<String> {
+    authorize_chat_channel_collection(loom, workspace, workspace_id, AclRight::Read)?;
+    let channel_id = resolve_channel_id(loom, workspace, workspace_id, selector)?;
+    authorize_chat_channel_resource(loom, workspace, workspace_id, &channel_id)?;
+    Ok(channel_id)
+}
+
+pub fn create_task<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     task_id: &str,
     message_id: Option<&str>,
     title: &str,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    append_payload_authorized(
         loom,
         workspace,
         workspace_id,
@@ -391,21 +450,23 @@ pub fn create_task(
             message_id: message_id.map(str::to_string),
             title: title.to_string(),
         },
+        expected_entity_tag,
     )
 }
 
-pub fn claim_task(
-    loom: &mut Loom<FileStore>,
+pub fn claim_task<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     task_id: &str,
     claim_id: &str,
     lease_token: Option<&str>,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
     let claimant_principal = loom.effective_principal()?.unwrap_or(workspace);
-    append_payload(
+    append_payload_authorized(
         loom,
         workspace,
         workspace_id,
@@ -416,20 +477,22 @@ pub fn claim_task(
             claimant_principal,
             lease_token: lease_token.map(str::to_string),
         },
+        expected_entity_tag,
     )
 }
 
-pub fn complete_task(
-    loom: &mut Loom<FileStore>,
+pub fn complete_task<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     task_id: &str,
     claim_id: &str,
     result_message_id: Option<&str>,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    append_payload_authorized(
         loom,
         workspace,
         workspace_id,
@@ -439,11 +502,12 @@ pub fn complete_task(
             claim_id: claim_id.to_string(),
             result_message_id: result_message_id.map(str::to_string),
         },
+        expected_entity_tag,
     )
 }
 
-pub fn invoke_agent(
-    loom: &mut Loom<FileStore>,
+pub fn invoke_agent<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
@@ -451,32 +515,86 @@ pub fn invoke_agent(
     agent_principal: WorkspaceId,
     source_message_ids: Vec<String>,
     prompt: Vec<u8>,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    invoke_agent_authorized(
         loom,
         workspace,
         workspace_id,
         &channel_id,
+        invocation_id,
+        agent_principal,
+        source_message_ids,
+        prompt,
+        expected_entity_tag,
+    )
+}
+
+pub fn invoke_agent_from_request<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    channel_id: &str,
+    invocation_id: &str,
+    agent_principal: &str,
+    source_message_ids_json: &str,
+    prompt: Vec<u8>,
+    expected_entity_tag: Option<&str>,
+) -> loom_core::Result<HostedChatWrite> {
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    let agent_principal = WorkspaceId::parse(agent_principal)?;
+    let source_message_ids = parse_string_list_json(source_message_ids_json)?;
+    invoke_agent_authorized(
+        loom,
+        workspace,
+        workspace_id,
+        &channel_id,
+        invocation_id,
+        agent_principal,
+        source_message_ids,
+        prompt,
+        expected_entity_tag,
+    )
+}
+
+fn invoke_agent_authorized<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    channel_id: &str,
+    invocation_id: &str,
+    agent_principal: WorkspaceId,
+    source_message_ids: Vec<String>,
+    prompt: Vec<u8>,
+    expected_entity_tag: Option<&str>,
+) -> loom_core::Result<HostedChatWrite> {
+    append_payload_authorized(
+        loom,
+        workspace,
+        workspace_id,
+        channel_id,
         ChatOperationPayload::AgentInvoked {
             invocation_id: invocation_id.to_string(),
             agent_principal,
             source_message_ids,
             prompt,
         },
+        expected_entity_tag,
     )
 }
 
-pub fn agent_reply(
-    loom: &mut Loom<FileStore>,
+pub fn agent_reply<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     invocation_id: &str,
     message_id: &str,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    append_payload_authorized(
         loom,
         workspace,
         workspace_id,
@@ -485,11 +603,12 @@ pub fn agent_reply(
             invocation_id: invocation_id.to_string(),
             message_id: message_id.to_string(),
         },
+        expected_entity_tag,
     )
 }
 
-pub fn request_handoff(
-    loom: &mut Loom<FileStore>,
+pub fn request_handoff<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
@@ -497,33 +616,96 @@ pub fn request_handoff(
     from_agent_principal: WorkspaceId,
     to_principal: Option<WorkspaceId>,
     reason: Option<&str>,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    request_handoff_authorized(
         loom,
         workspace,
         workspace_id,
         &channel_id,
+        handoff_id,
+        from_agent_principal,
+        to_principal,
+        reason,
+        expected_entity_tag,
+    )
+}
+
+pub fn request_handoff_from_request<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    channel_id: &str,
+    handoff_id: &str,
+    from_agent_principal: &str,
+    to_principal: Option<&str>,
+    reason: Option<&str>,
+    expected_entity_tag: Option<&str>,
+) -> loom_core::Result<HostedChatWrite> {
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    let from_agent_principal = WorkspaceId::parse(from_agent_principal)?;
+    let to_principal = to_principal.map(WorkspaceId::parse).transpose()?;
+    request_handoff_authorized(
+        loom,
+        workspace,
+        workspace_id,
+        &channel_id,
+        handoff_id,
+        from_agent_principal,
+        to_principal,
+        reason,
+        expected_entity_tag,
+    )
+}
+
+fn request_handoff_authorized<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    channel_id: &str,
+    handoff_id: &str,
+    from_agent_principal: WorkspaceId,
+    to_principal: Option<WorkspaceId>,
+    reason: Option<&str>,
+    expected_entity_tag: Option<&str>,
+) -> loom_core::Result<HostedChatWrite> {
+    append_payload_authorized(
+        loom,
+        workspace,
+        workspace_id,
+        channel_id,
         ChatOperationPayload::HandoffRequested {
             handoff_id: handoff_id.to_string(),
             from_agent_principal,
             to_principal,
             reason: reason.map(str::to_string),
         },
+        expected_entity_tag,
     )
 }
 
-pub fn add_reaction(
-    loom: &mut Loom<FileStore>,
+fn parse_string_list_json(value: &str) -> loom_core::Result<Vec<String>> {
+    serde_json::from_str(value).map_err(|err| {
+        LoomError::new(
+            Code::InvalidArgument,
+            format!("source_message_ids_json: {err}"),
+        )
+    })
+}
+
+pub fn add_reaction<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     message_id: &str,
     kind: &str,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
     ensure_reaction_kind(loom, workspace, workspace_id, kind)?;
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    append_payload_authorized(
         loom,
         workspace,
         workspace_id,
@@ -532,19 +714,22 @@ pub fn add_reaction(
             message_id: message_id.to_string(),
             kind: kind.to_string(),
         },
+        expected_entity_tag,
     )
 }
 
-pub fn remove_reaction(
-    loom: &mut Loom<FileStore>,
+pub fn remove_reaction<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     message_id: &str,
     kind: &str,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
-    append_payload(
+    let channel_id = resolve_chat_channel_for_mutation(loom, workspace, workspace_id, channel_id)?;
+    ensure_reaction_kind(loom, workspace, workspace_id, kind)?;
+    append_payload_authorized(
         loom,
         workspace,
         workspace_id,
@@ -553,49 +738,83 @@ pub fn remove_reaction(
             message_id: message_id.to_string(),
             kind: kind.to_string(),
         },
+        expected_entity_tag,
     )
 }
 
-pub fn emoji_registry(
-    loom: &Loom<FileStore>,
+pub fn emoji_registry<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
 ) -> loom_core::Result<HostedChatEmojiRegistry> {
     loom.authorize_domain(workspace, AclDomain::Chat, AclRight::Read)?;
     emoji_registry_summary(
+        loom,
         workspace_id,
         &load_emoji_registry(loom, workspace, workspace_id)?,
     )
 }
 
-pub fn register_emoji(
-    loom: &mut Loom<FileStore>,
+pub fn register_emoji<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     kind: &str,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatEmojiRegistry> {
-    loom.authorize_domain(workspace, AclDomain::Chat, AclRight::Admin)?;
-    let mut registry = load_emoji_registry(loom, workspace, workspace_id)?;
-    registry.register(kind)?;
-    save_emoji_registry(loom, workspace, workspace_id, &registry)?;
-    emoji_registry_summary(workspace_id, &registry)
+    register_emoji_with_change(loom, workspace, workspace_id, kind, expected_entity_tag)
+        .map(|(summary, _)| summary)
 }
 
-pub fn unregister_emoji(
-    loom: &mut Loom<FileStore>,
+pub fn register_emoji_with_change<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     kind: &str,
-) -> loom_core::Result<HostedChatEmojiRegistry> {
-    loom.authorize_domain(workspace, AclDomain::Chat, AclRight::Admin)?;
+    expected_entity_tag: Option<&str>,
+) -> loom_core::Result<(HostedChatEmojiRegistry, bool)> {
+    authorize_emoji_registry(loom, workspace, workspace_id)?;
     let mut registry = load_emoji_registry(loom, workspace, workspace_id)?;
-    registry.unregister(kind);
-    save_emoji_registry(loom, workspace, workspace_id, &registry)?;
-    emoji_registry_summary(workspace_id, &registry)
+    let current_tag = emoji_registry_entity_tag(loom, &registry)?;
+    enforce_expected_entity_tag(&current_tag, expected_entity_tag)?;
+    let changed = registry.register(kind)?;
+    if changed {
+        save_emoji_registry(loom, workspace, workspace_id, &registry)?;
+    }
+    emoji_registry_summary(loom, workspace_id, &registry).map(|summary| (summary, changed))
 }
 
-pub fn channel_projection(
-    loom: &Loom<FileStore>,
+pub fn unregister_emoji<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    kind: &str,
+    expected_entity_tag: Option<&str>,
+) -> loom_core::Result<HostedChatEmojiRegistry> {
+    unregister_emoji_with_change(loom, workspace, workspace_id, kind, expected_entity_tag)
+        .map(|(summary, _)| summary)
+}
+
+pub fn unregister_emoji_with_change<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    kind: &str,
+    expected_entity_tag: Option<&str>,
+) -> loom_core::Result<(HostedChatEmojiRegistry, bool)> {
+    authorize_emoji_registry(loom, workspace, workspace_id)?;
+    let mut registry = load_emoji_registry(loom, workspace, workspace_id)?;
+    let current_tag = emoji_registry_entity_tag(loom, &registry)?;
+    enforce_expected_entity_tag(&current_tag, expected_entity_tag)?;
+    let changed = registry.unregister(kind);
+    if changed {
+        save_emoji_registry(loom, workspace, workspace_id, &registry)?;
+    }
+    emoji_registry_summary(loom, workspace_id, &registry).map(|summary| (summary, changed))
+}
+
+pub fn channel_projection<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
@@ -635,8 +854,8 @@ pub fn channel_projection(
     })
 }
 
-pub fn read_cursor(
-    loom: &Loom<FileStore>,
+pub fn read_cursor<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
@@ -650,6 +869,7 @@ pub fn read_cursor(
     Ok(HostedChatCursor {
         workspace_id: workspace_id.to_string(),
         channel_id: channel_id.to_string(),
+        entity_tag: cursor_entity_tag(loom, workspace_id, &channel_id, &principal, next_sequence),
         principal,
         next_sequence,
         head_sequence,
@@ -657,16 +877,46 @@ pub fn read_cursor(
     })
 }
 
-pub fn update_cursor(
-    loom: &mut Loom<FileStore>,
+pub fn update_cursor<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     next_sequence: u64,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatCursor> {
-    loom.authorize_domain(workspace, AclDomain::Chat, AclRight::Advance)?;
-    let channel_id = resolve_channel_id(loom, workspace, workspace_id, channel_id)?;
+    update_cursor_with_change(
+        loom,
+        workspace,
+        workspace_id,
+        channel_id,
+        next_sequence,
+        expected_entity_tag,
+    )
+    .map(|(cursor, _)| cursor)
+}
+
+pub fn update_cursor_with_change<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    channel_id: &str,
+    next_sequence: u64,
+    expected_entity_tag: Option<&str>,
+) -> loom_core::Result<(HostedChatCursor, bool)> {
+    let channel_id = resolve_chat_channel_for_cursor(loom, workspace, workspace_id, channel_id)?;
     let stream = chat_stream_name(workspace_id, &channel_id)?;
+    let principal = chat_consumer_id(loom, workspace)?;
+    authorize_chat_cursor_resource(loom, workspace, workspace_id, &channel_id, &principal)?;
+    let current_sequence = loom.consumer_position_internal(workspace, &stream, &principal)?;
+    let current_tag = cursor_entity_tag(
+        loom,
+        workspace_id,
+        &channel_id,
+        &principal,
+        current_sequence,
+    );
+    enforce_expected_entity_tag(&current_tag, expected_entity_tag)?;
     let head_sequence = stream_len_or_zero(loom, workspace, &stream)? as u64;
     if next_sequence > head_sequence {
         return Err(LoomError::invalid(format!(
@@ -674,14 +924,14 @@ pub fn update_cursor(
         )));
     }
     if head_sequence > 0 || next_sequence > 0 {
-        let principal = chat_consumer_id(loom, workspace)?;
         loom.consumer_advance_internal(workspace, &stream, &principal, next_sequence)?;
     }
     read_cursor(loom, workspace, workspace_id, &channel_id)
+        .map(|cursor| (cursor, next_sequence != current_sequence))
 }
 
-pub fn operation_changes(
-    loom: &Loom<FileStore>,
+pub fn operation_changes<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
@@ -695,8 +945,8 @@ pub fn operation_changes(
     load_log(loom, workspace, workspace_id, &channel_id)?.changes(&cursor, max)
 }
 
-pub fn resolve_channel_id(
-    loom: &Loom<FileStore>,
+pub fn resolve_channel_id<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     selector: &str,
@@ -708,8 +958,8 @@ pub fn resolve_channel_id(
         .ok_or_else(|| LoomError::not_found("chat channel not found"))
 }
 
-fn load_channel_directory(
-    loom: &Loom<FileStore>,
+fn load_channel_directory<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
 ) -> loom_core::Result<ChatChannelDirectory> {
@@ -731,8 +981,69 @@ fn load_channel_directory(
     }
 }
 
-fn save_channel_directory(
-    loom: &mut Loom<FileStore>,
+fn channel_directory_entity_tag<S: ObjectStore>(
+    loom: &Loom<S>,
+    directory: &ChatChannelDirectory,
+) -> loom_core::Result<String> {
+    Ok(loom_core::document_entity_tag_string(
+        loom,
+        &directory.encode()?,
+    ))
+}
+
+fn channel_log_entity_tag<S: ObjectStore>(
+    loom: &Loom<S>,
+    log: &ChannelOperationLog,
+) -> loom_core::Result<String> {
+    Ok(loom_core::document_entity_tag_string(loom, &log.encode()?))
+}
+
+fn emoji_registry_entity_tag<S: ObjectStore>(
+    loom: &Loom<S>,
+    registry: &EmojiRegistry,
+) -> loom_core::Result<String> {
+    Ok(loom_core::document_entity_tag_string(
+        loom,
+        &registry.encode()?,
+    ))
+}
+
+fn cursor_entity_tag<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace_id: &str,
+    channel_id: &str,
+    principal: &str,
+    next_sequence: u64,
+) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"loom.chat.cursor.v1\0");
+    bytes.extend_from_slice(workspace_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(channel_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(principal.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&next_sequence.to_be_bytes());
+    loom_core::document_entity_tag_string(loom, &bytes)
+}
+
+fn enforce_expected_entity_tag(
+    current_entity_tag: &str,
+    expected_entity_tag: Option<&str>,
+) -> loom_core::Result<()> {
+    let Some(expected_entity_tag) = expected_entity_tag else {
+        return Ok(());
+    };
+    loom_core::parse_document_entity_tag(expected_entity_tag)?;
+    if current_entity_tag == expected_entity_tag {
+        Ok(())
+    } else {
+        Err(LoomError::new(Code::Conflict, "expected_tag_mismatch"))
+    }
+}
+
+fn save_channel_directory<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     directory: &ChatChannelDirectory,
@@ -747,17 +1058,113 @@ fn save_channel_directory(
 fn channel_summary(
     workspace_id: &str,
     channel: &loom_substrate::chat::ChatChannel,
+    entity_tag: String,
 ) -> HostedChatChannelSummary {
     HostedChatChannelSummary {
         workspace_id: workspace_id.to_string(),
         channel_id: channel.id.to_string(),
         handle: channel.handle.clone(),
         name: channel.name.clone(),
+        entity_tag,
     }
 }
 
-fn load_log(
-    loom: &Loom<FileStore>,
+fn authorize_chat_channel_collection<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    right: AclRight,
+) -> loom_core::Result<()> {
+    let resource = format!("chat/{workspace_id}/channels/");
+    loom.authorize_resource(
+        AclResource::scoped(
+            workspace,
+            AclDomain::Chat,
+            None,
+            AclResourceScope::Prefix {
+                kind: AclScopeKind::Collection,
+                value: resource.as_bytes(),
+            },
+        ),
+        right,
+    )
+}
+
+fn authorize_chat_channel_resource<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    channel_id: &str,
+) -> loom_core::Result<()> {
+    let resource = format!("chat/{workspace_id}/channels/{channel_id}");
+    loom.authorize_resource(
+        AclResource::scoped(
+            workspace,
+            AclDomain::Chat,
+            None,
+            AclResourceScope::Prefix {
+                kind: AclScopeKind::Collection,
+                value: resource.as_bytes(),
+            },
+        ),
+        AclRight::Write,
+    )
+}
+
+fn authorize_emoji_registry<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+) -> loom_core::Result<()> {
+    let resource = format!("chat/{workspace_id}/emoji-registry");
+    loom.authorize_resource(
+        AclResource::scoped(
+            workspace,
+            AclDomain::Chat,
+            None,
+            AclResourceScope::Prefix {
+                kind: AclScopeKind::Collection,
+                value: resource.as_bytes(),
+            },
+        ),
+        AclRight::Admin,
+    )
+}
+
+fn resolve_chat_channel_for_cursor<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    selector: &str,
+) -> loom_core::Result<String> {
+    authorize_chat_channel_collection(loom, workspace, workspace_id, AclRight::Read)?;
+    resolve_channel_id(loom, workspace, workspace_id, selector)
+}
+
+fn authorize_chat_cursor_resource<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    channel_id: &str,
+    principal: &str,
+) -> loom_core::Result<()> {
+    let resource = format!("chat/{workspace_id}/channels/{channel_id}/cursor/{principal}");
+    loom.authorize_resource(
+        AclResource::scoped(
+            workspace,
+            AclDomain::Chat,
+            None,
+            AclResourceScope::Prefix {
+                kind: AclScopeKind::Collection,
+                value: resource.as_bytes(),
+            },
+        ),
+        AclRight::Advance,
+    )
+}
+
+fn load_log<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
@@ -778,16 +1185,18 @@ fn load_log(
     ChannelOperationLog::new(workspace_id, channel_id, records)
 }
 
-fn append_payload(
-    loom: &mut Loom<FileStore>,
+fn append_payload_authorized<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
     payload: ChatOperationPayload,
+    expected_entity_tag: Option<&str>,
 ) -> loom_core::Result<HostedChatWrite> {
-    loom.authorize_domain(workspace, AclDomain::Chat, AclRight::Write)?;
     let mut log = load_log(loom, workspace, workspace_id, channel_id)?;
     let previous = log.encode()?;
+    let current_entity_tag = loom_core::document_entity_tag_string(loom, &previous);
+    enforce_expected_entity_tag(&current_entity_tag, expected_entity_tag)?;
     let sequence = log
         .records
         .last()
@@ -858,6 +1267,7 @@ fn append_payload(
         }
         _ => {}
     }
+    let entity_tag = channel_log_entity_tag(loom, &log)?;
     Ok(HostedChatWrite {
         workspace_id: projected.workspace_id,
         channel_id: projected.channel_id,
@@ -865,11 +1275,12 @@ fn append_payload(
         operation_kind: record.operation_kind,
         sequence: record.sequence,
         root_after: record.root_after.to_string(),
+        entity_tag,
     })
 }
 
-fn update_message_revision_index(
-    loom: &mut Loom<FileStore>,
+fn update_message_revision_index<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
@@ -925,8 +1336,8 @@ fn update_message_revision_index(
     )
 }
 
-fn append_record(
-    loom: &mut Loom<FileStore>,
+fn append_record<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     channel_id: &str,
@@ -948,8 +1359,8 @@ fn append_record(
     Ok(())
 }
 
-struct MessageRefUpdate<'a> {
-    loom: &'a mut Loom<FileStore>,
+struct MessageRefUpdate<'a, S: ObjectStore> {
+    loom: &'a mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &'a str,
     channel_id: &'a str,
@@ -960,7 +1371,7 @@ struct MessageRefUpdate<'a> {
     now_ms: u64,
 }
 
-fn update_message_refs(update: MessageRefUpdate<'_>) -> loom_core::Result<()> {
+fn update_message_refs<S: ObjectStore>(update: MessageRefUpdate<'_, S>) -> loom_core::Result<()> {
     let workspace = update.workspace;
     let workspace_id = update.workspace_id;
     let source = ReferenceSource::new(
@@ -990,8 +1401,8 @@ fn update_message_refs(update: MessageRefUpdate<'_>) -> loom_core::Result<()> {
     loom_reference::save_index(update.loom, workspace, &index)
 }
 
-fn resolve_reference_candidate(
-    loom: &Loom<FileStore>,
+fn resolve_reference_candidate<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     candidate: &loom_substrate::refs::MarkdownReferenceCandidate,
@@ -1058,12 +1469,15 @@ fn push_hex_segment(output: &mut String, bytes: &[u8]) {
     }
 }
 
-fn chat_consumer_id(loom: &Loom<FileStore>, workspace: WorkspaceId) -> loom_core::Result<String> {
+fn chat_consumer_id<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace: WorkspaceId,
+) -> loom_core::Result<String> {
     Ok(loom.effective_principal()?.unwrap_or(workspace).to_string())
 }
 
-fn stream_len_or_zero(
-    loom: &Loom<FileStore>,
+fn stream_len_or_zero<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     stream: &str,
 ) -> loom_core::Result<usize> {
@@ -1098,8 +1512,8 @@ fn reaction_summary(reaction: ChatReactionSummary) -> HostedChatReaction {
     }
 }
 
-fn ensure_reaction_kind(
-    loom: &Loom<FileStore>,
+fn ensure_reaction_kind<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     kind: &str,
@@ -1115,8 +1529,8 @@ fn ensure_reaction_kind(
     }
 }
 
-fn load_emoji_registry(
-    loom: &Loom<FileStore>,
+fn load_emoji_registry<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
 ) -> loom_core::Result<EmojiRegistry> {
@@ -1128,8 +1542,8 @@ fn load_emoji_registry(
     }
 }
 
-fn save_emoji_registry(
-    loom: &mut Loom<FileStore>,
+fn save_emoji_registry<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     registry: &EmojiRegistry,
@@ -1139,13 +1553,15 @@ fn save_emoji_registry(
     loom.write_file_reserved(workspace, &path, &registry.encode()?, 0o100644)
 }
 
-fn emoji_registry_summary(
+fn emoji_registry_summary<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace_id: &str,
     registry: &EmojiRegistry,
 ) -> loom_core::Result<HostedChatEmojiRegistry> {
     Ok(HostedChatEmojiRegistry {
         workspace_id: workspace_id.to_string(),
         custom: registry.custom().map(str::to_string).collect(),
+        entity_tag: emoji_registry_entity_tag(loom, registry)?,
     })
 }
 
@@ -1234,7 +1650,10 @@ mod tests {
         let workspace = WorkspaceId::v4_from_bytes([5; 16]);
         let channel = WorkspaceId::v4_from_bytes([6; 16]);
         let mut loom = Loom::new(FileStore::create_with_profile(&path, Algo::Blake3).unwrap());
-        ensure_channel(&mut loom, workspace, "chat", channel, "general", "General").unwrap();
+        ensure_channel(
+            &mut loom, workspace, "chat", channel, "general", "General", None,
+        )
+        .unwrap();
         post_message(
             &mut loom,
             workspace,
@@ -1243,6 +1662,7 @@ mod tests {
             "message-1",
             None,
             b"first".to_vec(),
+            None,
         )
         .unwrap();
         edit_message(
@@ -1252,6 +1672,7 @@ mod tests {
             "general",
             "message-1",
             b"second".to_vec(),
+            None,
         )
         .unwrap();
 
@@ -1268,7 +1689,34 @@ mod tests {
     }
 }
 
+#[cfg(feature = "test-clock")]
+thread_local! {
+    static TEST_NOW_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "test-clock")]
+pub struct TestNowMsGuard {
+    prior: Option<u64>,
+}
+
+#[cfg(feature = "test-clock")]
+impl Drop for TestNowMsGuard {
+    fn drop(&mut self) {
+        TEST_NOW_MS.with(|now| now.set(self.prior));
+    }
+}
+
+#[cfg(feature = "test-clock")]
+pub fn set_test_now_ms(value: u64) -> TestNowMsGuard {
+    let prior = TEST_NOW_MS.with(|now| now.replace(Some(value)));
+    TestNowMsGuard { prior }
+}
+
 pub fn now_ms() -> u64 {
+    #[cfg(feature = "test-clock")]
+    if let Some(value) = TEST_NOW_MS.with(|now| now.get()) {
+        return value;
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
         return 0;

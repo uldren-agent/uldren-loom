@@ -549,6 +549,136 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    override fun identityForceDetachAuthorityJson(
+        loomPath: String,
+        principal: String,
+        generation: Double,
+        reason: String,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) {
+        executor.execute {
+            try {
+                promise.resolve(
+                    UldrenLoomNative.nativeIdentityForceDetachAuthorityJson(
+                        loomPath,
+                        principal,
+                        generation,
+                        reason,
+                        passphrase.encodeToByteArray(),
+                        keyBytes(kek),
+                        authPrincipal,
+                        authPassphrase.encodeToByteArray(),
+                    )
+                )
+            } catch (e: Throwable) {
+                promise.reject(e)
+            }
+        }
+    }
+
+    override fun identityReplicateAuthorityJson(
+        loomPath: String,
+        source: String,
+        becomeAuthority: Boolean,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) {
+        executor.execute {
+            try {
+                promise.resolve(
+                    UldrenLoomNative.nativeIdentityReplicateAuthorityJson(
+                        loomPath,
+                        source,
+                        becomeAuthority,
+                        passphrase.encodeToByteArray(),
+                        keyBytes(kek),
+                        authPrincipal,
+                        authPassphrase.encodeToByteArray(),
+                    )
+                )
+            } catch (e: Throwable) {
+                promise.reject(e)
+            }
+        }
+    }
+
+    override fun identityConfigureAuthorityReplicationJson(
+        loomPath: String,
+        id: String,
+        source: String,
+        disabled: Boolean,
+        pullOnStart: Boolean,
+        intervalMs: Double,
+        intervalMsPresent: Boolean,
+        jitterMs: Double,
+        backoffMs: Double,
+        publishWitness: Boolean,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) {
+        executor.execute {
+            try {
+                promise.resolve(
+                    UldrenLoomNative.nativeIdentityConfigureAuthorityReplicationJson(
+                        loomPath,
+                        id,
+                        source,
+                        disabled,
+                        pullOnStart,
+                        intervalMs,
+                        intervalMsPresent,
+                        jitterMs,
+                        backoffMs,
+                        publishWitness,
+                        passphrase.encodeToByteArray(),
+                        keyBytes(kek),
+                        authPrincipal,
+                        authPassphrase.encodeToByteArray(),
+                    )
+                )
+            } catch (e: Throwable) {
+                promise.reject(e)
+            }
+        }
+    }
+
+    override fun identityRemoveAuthorityReplicationJson(
+        loomPath: String,
+        id: String,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) {
+        executor.execute {
+            try {
+                promise.resolve(
+                    UldrenLoomNative.nativeIdentityRemoveAuthorityReplicationJson(
+                        loomPath,
+                        id,
+                        passphrase.encodeToByteArray(),
+                        keyBytes(kek),
+                        authPrincipal,
+                        authPassphrase.encodeToByteArray(),
+                    )
+                )
+            } catch (e: Throwable) {
+                promise.reject(e)
+            }
+        }
+    }
+
     override fun aclListJson(
         loomPath: String,
         passphrase: String,
@@ -1329,6 +1459,33 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    override fun sqlExecResult(
+        loomPath: String,
+        ns: String,
+        db: String,
+        sql: String,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) {
+        executor.execute {
+            try {
+                promise.resolve(
+                    bytesToArray(
+                        UldrenLoomNative.nativeSqlExecResult(
+                            loomPath, ns, db, sql, passphrase.encodeToByteArray(), keyBytes(kek),
+                            authPrincipal, authPassphrase.encodeToByteArray()
+                        )
+                    )
+                )
+            } catch (e: Throwable) {
+                promise.reject(e)
+            }
+        }
+    }
+
     override fun sqlQueryBytes(
         loomPath: String,
         ns: String,
@@ -1414,7 +1571,7 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    override fun execCbor(
+    override fun applyCbor(
         loomPath: String,
         request: ReadableArray,
         passphrase: String,
@@ -1425,7 +1582,7 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
     ) {
         executor.execute {
             try {
-                val bytes = UldrenLoomNative.nativeExecCbor(
+                val bytes = UldrenLoomNative.nativeApplyCbor(
                     loomPath,
                     keyBytes(request),
                     passphrase.encodeToByteArray(),
@@ -1438,6 +1595,203 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
                 promise.reject(e)
             }
         }
+    }
+
+    override fun lifecycleDefineStandardJson(
+        loomPath: String,
+        workspace: String,
+        kind: String,
+        version: String,
+        completionPredicateDigest: String,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) = resolveString(promise) {
+        UldrenLoomNative.nativeLifecycleDefineStandardJson(
+            loomPath, workspace, kind, version, completionPredicateDigest, passphrase.encodeToByteArray(),
+            keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray(),
+        )
+    }
+
+    override fun lifecycleDefineJson(
+        loomPath: String,
+        workspace: String,
+        definition: ReadableArray,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) = resolveString(promise) {
+        UldrenLoomNative.nativeLifecycleDefineJson(
+            loomPath, workspace, keyBytes(definition), passphrase.encodeToByteArray(), keyBytes(kek),
+            authPrincipal, authPassphrase.encodeToByteArray(),
+        )
+    }
+
+    override fun lifecycleInstantiateJson(
+        loomPath: String,
+        workspace: String,
+        instanceId: String,
+        definitionId: String,
+        subjectRefsJson: String,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) = resolveString(promise) {
+        UldrenLoomNative.nativeLifecycleInstantiateJson(
+            loomPath, workspace, instanceId, definitionId, subjectRefsJson, passphrase.encodeToByteArray(),
+            keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray(),
+        )
+    }
+
+    override fun lifecycleTransitionJson(
+        loomPath: String,
+        workspace: String,
+        instanceId: String,
+        transitionId: String,
+        toStageId: String,
+        actorPrincipalId: String?,
+        gateEvaluationsJson: String,
+        snapshotDigest: String?,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) = resolveString(promise) {
+        UldrenLoomNative.nativeLifecycleTransitionJson(
+            loomPath, workspace, instanceId, transitionId, toStageId, actorPrincipalId,
+            gateEvaluationsJson, snapshotDigest, passphrase.encodeToByteArray(), keyBytes(kek),
+            authPrincipal, authPassphrase.encodeToByteArray(),
+        )
+    }
+
+    override fun refsReconcileJson(
+        loomPath: String,
+        workspace: String,
+        max: String,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) = resolveString(promise) {
+        UldrenLoomNative.nativeRefsReconcileJson(
+            loomPath, workspace, max, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal,
+            authPassphrase.encodeToByteArray(),
+        )
+    }
+
+    override fun studioReindexJson(loomPath: String, workspace: String, profile: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeStudioReindexJson(loomPath, workspace, profile, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun studioRevisionsRebuildJson(loomPath: String, workspace: String, profile: String, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeStudioRevisionsRebuildJson(loomPath, workspace, profile, dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun storeBundleImport(loomPath: String, bundle: ReadableArray, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeStoreBundleImport(loomPath, keyBytes(bundle), dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun auditCompact(loomPath: String, throughSeq: Double, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        require(throughSeq >= 0.0 && throughSeq <= 9007199254740991.0 && throughSeq % 1.0 == 0.0) {
+            "throughSeq must be a non-negative safe integer"
+        }
+        UldrenLoomNative.nativeAuditCompact(loomPath, throughSeq.toLong(), passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun storeMaintenanceStatus(loomPath: String, request: ReadableArray, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeStoreMaintenanceStatus(loomPath, keyBytes(request), passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun storeMaintenancePolicySet(loomPath: String, update: ReadableArray, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeStoreMaintenancePolicySet(loomPath, keyBytes(update), passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun storeMaintenanceRun(loomPath: String, request: ReadableArray, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeStoreMaintenanceRun(loomPath, keyBytes(request), passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun importTableCsv(loomPath: String, workspace: String, sourceScope: String, csvPayload: ReadableArray, database: String, table: String, schema: String, primaryKey: String, mode: String, commit: Boolean, author: String?, message: String?, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeImportTableCsv(loomPath, workspace, sourceScope, keyBytes(csvPayload), database, table, schema, primaryKey, mode, commit, author, message, dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun importRedmine(loomPath: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ReadableArray, fieldPolicy: String, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeImportRedmine(loomPath, workspace, profile, sourceScope, keyBytes(snapshotPayload), fieldPolicy, dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun importAsana(loomPath: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ReadableArray, fieldPolicy: String, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeImportAsana(loomPath, workspace, profile, sourceScope, keyBytes(snapshotPayload), fieldPolicy, dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun importJira(loomPath: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ReadableArray, fieldPolicy: String, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeImportJira(loomPath, workspace, profile, sourceScope, keyBytes(snapshotPayload), fieldPolicy, dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun importConfluence(loomPath: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ReadableArray, defaultSpace: String, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeImportConfluence(loomPath, workspace, profile, sourceScope, keyBytes(snapshotPayload), defaultSpace, dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun importSlack(loomPath: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ReadableArray, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeImportSlack(loomPath, workspace, profile, sourceScope, keyBytes(snapshotPayload), dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun importDrive(loomPath: String, workspace: String, profile: String, sourceScope: String, archivePayload: ReadableArray, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeImportDrive(loomPath, workspace, profile, sourceScope, keyBytes(archivePayload), dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun importMarkdown(loomPath: String, workspace: String, profile: String, sourceScope: String, archivePayload: ReadableArray, space: String, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeImportMarkdown(loomPath, workspace, profile, sourceScope, keyBytes(archivePayload), space, dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun importNotion(loomPath: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ReadableArray, defaultSpace: String, dryRun: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveBytes(promise) {
+        UldrenLoomNative.nativeImportNotion(loomPath, workspace, profile, sourceScope, keyBytes(snapshotPayload), defaultSpace, dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun inferenceInstanceCreateJson(loomPath: String, workspace: String, name: String, model: String, kind: String, runtime: String, preset: String?, settingsJson: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeInferenceInstanceCreateJson(loomPath, workspace, name, model, kind, runtime, preset, settingsJson, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun inferenceInstanceUpdateJson(loomPath: String, workspace: String, name: String, preset: String?, settingsJson: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeInferenceInstanceUpdateJson(loomPath, workspace, name, preset, settingsJson, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun inferenceInstanceDeleteJson(loomPath: String, workspace: String, name: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeInferenceInstanceDeleteJson(loomPath, workspace, name, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun serveListenerConfigureJson(loomPath: String, requestJson: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeServeListenerConfigureJson(loomPath, requestJson, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun serveListenerListJson(loomPath: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeServeListenerListJson(loomPath, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun serveListenerSetEnabledJson(loomPath: String, listenerId: String, enabled: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeServeListenerSetEnabledJson(loomPath, listenerId, enabled, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun serveListenerRemoveJson(loomPath: String, listenerId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeServeListenerRemoveJson(loomPath, listenerId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun serveWebRouteListJson(loomPath: String, listenerId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeServeWebRouteListJson(loomPath, listenerId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun serveWebRouteSetJson(loomPath: String, requestJson: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeServeWebRouteSetJson(loomPath, requestJson, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
+    }
+
+    override fun serveWebRouteRemoveJson(loomPath: String, listenerId: String, routeId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) = resolveString(promise) {
+        UldrenLoomNative.nativeServeWebRouteRemoveJson(loomPath, listenerId, routeId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray())
     }
 
     override fun casPut(
@@ -1655,7 +2009,7 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
     override fun driveResolveConflictJson(loomPath: String, workspace: String, driveWorkspaceId: String, conflictId: String, resolution: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeDriveResolveConflictJson(loomPath, workspace, driveWorkspaceId, conflictId, resolution, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun driveGrantShareJson(loomPath: String, workspace: String, driveWorkspaceId: String, grantId: String, targetKind: String, targetId: String, principal: String, role: String, grantedAtMs: String, expiresAtMs: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+    override fun driveGrantShareJson(loomPath: String, workspace: String, driveWorkspaceId: String, grantId: String, targetKind: String, targetId: String, principal: String, role: String, grantedAtMs: String, expiresAtMs: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeDriveGrantShareJson(loomPath, workspace, driveWorkspaceId, grantId, targetKind, targetId, principal, role, grantedAtMs, expiresAtMs, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
     override fun driveRevokeShareJson(loomPath: String, workspace: String, driveWorkspaceId: String, grantId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
@@ -1664,7 +2018,7 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
     override fun driveApplyShareExpiryJson(loomPath: String, workspace: String, driveWorkspaceId: String, nowMs: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeDriveApplyShareExpiryJson(loomPath, workspace, driveWorkspaceId, nowMs, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun drivePinRetentionJson(loomPath: String, workspace: String, driveWorkspaceId: String, pinId: String, kind: String, root: String, targetEntityId: String, addedAtMs: String, expiresAtMs: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+    override fun drivePinRetentionJson(loomPath: String, workspace: String, driveWorkspaceId: String, pinId: String, kind: String, root: String, targetEntityId: String?, addedAtMs: String, expiresAtMs: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeDrivePinRetentionJson(loomPath, workspace, driveWorkspaceId, pinId, kind, root, targetEntityId, addedAtMs, expiresAtMs, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
     override fun driveUnpinRetentionJson(loomPath: String, workspace: String, driveWorkspaceId: String, pinId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
@@ -1679,11 +2033,11 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
     override fun ticketsProjectRekeyJson(loomPath: String, workspace: String, ticketWorkspaceId: String, projectId: String, keyPrefix: String, expectedRoot: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeTicketsProjectRekeyJson(loomPath, workspace, ticketWorkspaceId, projectId, keyPrefix, expectedRoot, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun ticketsProjectSettingsGetJson(loomPath: String, workspace: String, ticketWorkspaceId: String, projectId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeTicketsProjectSettingsGetJson(loomPath, workspace, ticketWorkspaceId, projectId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun ticketsProjectSettingsGetJson(loomPath: String, workspace: String, ticketWorkspaceId: String, projectId: String, includeContracts: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeTicketsProjectSettingsGetJson(loomPath, workspace, ticketWorkspaceId, projectId, includeContracts, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun ticketsProjectSettingsSetJson(loomPath: String, workspace: String, ticketWorkspaceId: String, projectId: String, defaultProjection: String, enableProjectionsJson: String, disableProjectionsJson: String, actorEnforcement: String, projectOwnerPrincipal: String, clearProjectOwnerPrincipal: Boolean, acceptanceAuthoritiesJson: String, expectedRoot: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeTicketsProjectSettingsSetJson(loomPath, workspace, ticketWorkspaceId, projectId, defaultProjection, enableProjectionsJson, disableProjectionsJson, actorEnforcement, projectOwnerPrincipal, clearProjectOwnerPrincipal, acceptanceAuthoritiesJson, expectedRoot, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun ticketsProjectSettingsSetJson(loomPath: String, workspace: String, ticketWorkspaceId: String, projectId: String, defaultProjection: String, enableProjectionsJson: String, disableProjectionsJson: String, actorEnforcement: String, projectOwnerPrincipal: String, clearProjectOwnerPrincipal: Boolean, acceptanceAuthoritiesJson: String, acceptanceEvidenceEnforcement: Boolean, hasAcceptanceEvidenceEnforcement: Boolean, requiredAcceptanceEvidenceKeysJson: String, requiredAcceptanceReviewsJson: String, ownerContractSummary: String, ownerContractDetails: String, workerContractSummary: String, workerContractDetails: String, expectedRoot: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeTicketsProjectSettingsSetJson(loomPath, workspace, ticketWorkspaceId, projectId, defaultProjection, enableProjectionsJson, disableProjectionsJson, actorEnforcement, projectOwnerPrincipal, clearProjectOwnerPrincipal, acceptanceAuthoritiesJson, acceptanceEvidenceEnforcement, hasAcceptanceEvidenceEnforcement, requiredAcceptanceEvidenceKeysJson, requiredAcceptanceReviewsJson, ownerContractSummary, ownerContractDetails, workerContractSummary, workerContractDetails, expectedRoot, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
     override fun ticketsFieldsJson(loomPath: String, workspace: String, ticketWorkspaceId: String, projectId: String, projection: String, operation: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeTicketsFieldsJson(loomPath, workspace, ticketWorkspaceId, projectId, projection, operation, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
@@ -1804,65 +2158,74 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
     override fun lanesUpdate(loomPath: String, workspace: String, laneId: String, title: String?, description: String?, laneStatus: String?, statusReport: String?, reviewerFeedback: String?, updatedBy: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveBytes(promise) { UldrenLoomNative.nativeLanesUpdate(loomPath, workspace, laneId, title, description, laneStatus, statusReport, reviewerFeedback, updatedBy, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun lanesTicketAdd(loomPath: String, workspace: String, laneId: String, ticketId: String, updatedBy: String, placement: String, anchor: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+    override fun lanesTicketAdd(loomPath: String, workspace: String, laneId: String, ticketId: String, updatedBy: String, placement: Double, anchor: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveBytes(promise) { UldrenLoomNative.nativeLanesTicketAdd(loomPath, workspace, laneId, ticketId, updatedBy, placement, anchor, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
     override fun lanesTicketRemove(loomPath: String, workspace: String, laneId: String, ticketId: String, updatedBy: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveBytes(promise) { UldrenLoomNative.nativeLanesTicketRemove(loomPath, workspace, laneId, ticketId, updatedBy, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatCreateChannelJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, channelHandle: String, name: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatCreateChannelJson(loomPath, workspace, chatWorkspaceId, channelId, channelHandle, name, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatCreateChannelJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, channelHandle: String, name: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatCreateChannelJson(loomPath, workspace, chatWorkspaceId, channelId, channelHandle, name, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatRenameChannelJson(loomPath: String, workspace: String, chatWorkspaceId: String, selector: String, channelHandle: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatRenameChannelJson(loomPath, workspace, chatWorkspaceId, selector, channelHandle, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatRenameChannelJson(loomPath: String, workspace: String, chatWorkspaceId: String, selector: String, channelHandle: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatRenameChannelJson(loomPath, workspace, chatWorkspaceId, selector, channelHandle, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
     override fun chatListChannelsJson(loomPath: String, workspace: String, chatWorkspaceId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeChatListChannelsJson(loomPath, workspace, chatWorkspaceId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatPostMessageJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, threadId: String, bodyText: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatPostMessageJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, threadId, bodyText, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatPostMessageJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, threadId: String?, bodyText: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatPostMessageJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, threadId, bodyText, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatEditMessageJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, bodyText: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatEditMessageJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, bodyText, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatPostMessageBytesJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, threadId: String?, body: ReadableArray, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatPostMessageBytesJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, threadId, keyBytes(body), expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatRedactMessageJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, reason: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatRedactMessageJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, reason, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatEditMessageJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, bodyText: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatEditMessageJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, bodyText, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatCreateThreadJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, threadId: String, parentMessageId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatCreateThreadJson(loomPath, workspace, chatWorkspaceId, channelId, threadId, parentMessageId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatEditMessageBytesJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, body: ReadableArray, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatEditMessageBytesJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, keyBytes(body), expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatCreateTaskJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, messageId: String, title: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatCreateTaskJson(loomPath, workspace, chatWorkspaceId, channelId, taskId, messageId, title, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatRedactMessageJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, reason: String?, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatRedactMessageJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, reason, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatClaimTaskJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, claimId: String, leaseToken: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatClaimTaskJson(loomPath, workspace, chatWorkspaceId, channelId, taskId, claimId, leaseToken, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatCreateThreadJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, threadId: String, parentMessageId: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatCreateThreadJson(loomPath, workspace, chatWorkspaceId, channelId, threadId, parentMessageId, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatCompleteTaskJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, claimId: String, resultMessageId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatCompleteTaskJson(loomPath, workspace, chatWorkspaceId, channelId, taskId, claimId, resultMessageId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatCreateTaskJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, messageId: String, title: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatCreateTaskJson(loomPath, workspace, chatWorkspaceId, channelId, taskId, messageId, title, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatInvokeAgentJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, invocationId: String, agentPrincipal: String, sourceMessageIdsJson: String, promptText: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatInvokeAgentJson(loomPath, workspace, chatWorkspaceId, channelId, invocationId, agentPrincipal, sourceMessageIdsJson, promptText, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatClaimTaskJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, claimId: String, leaseToken: String?, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatClaimTaskJson(loomPath, workspace, chatWorkspaceId, channelId, taskId, claimId, leaseToken, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatAgentReplyJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, invocationId: String, messageId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatAgentReplyJson(loomPath, workspace, chatWorkspaceId, channelId, invocationId, messageId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatCompleteTaskJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, claimId: String, resultMessageId: String?, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatCompleteTaskJson(loomPath, workspace, chatWorkspaceId, channelId, taskId, claimId, resultMessageId, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatRequestHandoffJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, handoffId: String, fromAgentPrincipal: String, toPrincipal: String, reason: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatRequestHandoffJson(loomPath, workspace, chatWorkspaceId, channelId, handoffId, fromAgentPrincipal, toPrincipal, reason, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatInvokeAgentJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, invocationId: String, agentPrincipal: String, sourceMessageIdsJson: String, promptText: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatInvokeAgentJson(loomPath, workspace, chatWorkspaceId, channelId, invocationId, agentPrincipal, sourceMessageIdsJson, promptText, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatAddReactionJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, kind: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatAddReactionJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, kind, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatInvokeAgentBytesJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, invocationId: String, agentPrincipal: String, sourceMessageIdsJson: String, prompt: ReadableArray, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatInvokeAgentBytesJson(loomPath, workspace, chatWorkspaceId, channelId, invocationId, agentPrincipal, sourceMessageIdsJson, keyBytes(prompt), expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatRemoveReactionJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, kind: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatRemoveReactionJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, kind, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatAgentReplyJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, invocationId: String, messageId: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatAgentReplyJson(loomPath, workspace, chatWorkspaceId, channelId, invocationId, messageId, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun chatRequestHandoffJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, handoffId: String, fromAgentPrincipal: String, toPrincipal: String?, reason: String?, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatRequestHandoffJson(loomPath, workspace, chatWorkspaceId, channelId, handoffId, fromAgentPrincipal, toPrincipal, reason, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun chatAddReactionJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, kind: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatAddReactionJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, kind, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun chatRemoveReactionJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, kind: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatRemoveReactionJson(loomPath, workspace, chatWorkspaceId, channelId, messageId, kind, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
     override fun chatEmojiListJson(loomPath: String, workspace: String, chatWorkspaceId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeChatEmojiListJson(loomPath, workspace, chatWorkspaceId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatEmojiRegisterJson(loomPath: String, workspace: String, chatWorkspaceId: String, kind: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatEmojiRegisterJson(loomPath, workspace, chatWorkspaceId, kind, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatEmojiRegisterJson(loomPath: String, workspace: String, chatWorkspaceId: String, kind: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatEmojiRegisterJson(loomPath, workspace, chatWorkspaceId, kind, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatEmojiUnregisterJson(loomPath: String, workspace: String, chatWorkspaceId: String, kind: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatEmojiUnregisterJson(loomPath, workspace, chatWorkspaceId, kind, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatEmojiUnregisterJson(loomPath: String, workspace: String, chatWorkspaceId: String, kind: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatEmojiUnregisterJson(loomPath, workspace, chatWorkspaceId, kind, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
     override fun chatMessagesJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeChatMessagesJson(loomPath, workspace, chatWorkspaceId, channelId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
@@ -1870,16 +2233,60 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
     override fun chatCursorJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeChatCursorJson(loomPath, workspace, chatWorkspaceId, channelId, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
-    override fun chatUpdateCursorJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, nextSequence: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
-        resolveString(promise) { UldrenLoomNative.nativeChatUpdateCursorJson(loomPath, workspace, chatWorkspaceId, channelId, nextSequence, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+    override fun chatUpdateCursorJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, nextSequence: String, expectedEntityTag: String?, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeChatUpdateCursorJson(loomPath, workspace, chatWorkspaceId, channelId, nextSequence, expectedEntityTag, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
     override fun chatFetchEventsJson(loomPath: String, workspace: String, chatWorkspaceId: String, channelId: String, fromSequence: String, max: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
         resolveString(promise) { UldrenLoomNative.nativeChatFetchEventsJson(loomPath, workspace, chatWorkspaceId, channelId, fromSequence, max, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun auditConfigShowJson(loomPath: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeAuditConfigShowJson(loomPath, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun auditConfigSetJson(loomPath: String, retentionDays: Double, hasRetentionDays: Boolean, legalHold: Boolean, hasLegalHold: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeAuditConfigSetJson(loomPath, retentionDays, hasRetentionDays, legalHold, hasLegalHold, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun auditListJson(loomPath: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeAuditListJson(loomPath, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun auditViewJson(loomPath: String, record: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeAuditViewJson(loomPath, record, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun certificateListJson(loomPath: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeCertificateListJson(loomPath, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun certificateImportJson(loomPath: String, name: String, certChainPem: ReadableArray, privateKeyPem: ReadableArray, trustBundlePem: ReadableArray, hasTrustBundlePem: Boolean, force: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeCertificateImportJson(loomPath, name, keyBytes(certChainPem), keyBytes(privateKeyPem), keyBytes(trustBundlePem), hasTrustBundlePem, force, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun certificateExport(loomPath: String, name: String, includeCertChain: Boolean, includePrivateKey: Boolean, includeTrustBundle: Boolean, force: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveBytes(promise) { UldrenLoomNative.nativeCertificateExport(loomPath, name, includeCertChain, includePrivateKey, includeTrustBundle, force, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun certificateGenerateSelfSignedJson(loomPath: String, name: String, dnsNamesJson: String, ipAddressesJson: String, cn: String, hasCn: Boolean, days: Double, algorithm: String, force: Boolean, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeCertificateGenerateSelfSignedJson(loomPath, name, dnsNamesJson, ipAddressesJson, cn, hasCn, days, algorithm, force, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun certificateRemoveJson(loomPath: String, name: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeCertificateRemoveJson(loomPath, name, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun certificateAuditJson(loomPath: String, name: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeCertificateAuditJson(loomPath, name, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun networkAccessListJson(loomPath: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeNetworkAccessListJson(loomPath, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun networkAccessSetJson(loomPath: String, name: String, description: String, hasDescription: Boolean, defaultAction: String, rulesJson: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeNetworkAccessSetJson(loomPath, name, description, hasDescription, defaultAction, rulesJson, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun networkAccessRemoveJson(loomPath: String, name: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeNetworkAccessRemoveJson(loomPath, name, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
+
+    override fun networkAccessAuditJson(loomPath: String, name: String, passphrase: String, kek: ReadableArray, authPrincipal: String, authPassphrase: String, promise: Promise) =
+        resolveString(promise) { UldrenLoomNative.nativeNetworkAccessAuditJson(loomPath, name, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()) }
 
     override fun fsImport(
         loomPath: String,
         workspace: String,
         srcPath: String,
+        author: String,
+        message: String,
         commit: Boolean,
         dryRun: Boolean,
         passphrase: String,
@@ -1891,8 +2298,9 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
         executor.execute {
             try {
                 val bytes = UldrenLoomNative.nativeFsImport(
-                    loomPath, workspace, srcPath, commit, dryRun, passphrase.encodeToByteArray(),
-                    keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()
+                    loomPath, workspace, srcPath, author, message, commit, dryRun,
+                    passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal,
+                    authPassphrase.encodeToByteArray()
                 )
                 promise.resolve(bytesToArray(bytes))
             } catch (e: Throwable) {
@@ -1931,6 +2339,10 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
         workspace: String,
         srcPath: String,
         kind: String,
+        gzipOutputPath: String,
+        commit: Boolean,
+        author: String,
+        message: String,
         dryRun: Boolean,
         passphrase: String,
         kek: ReadableArray,
@@ -1941,8 +2353,9 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
         executor.execute {
             try {
                 val bytes = UldrenLoomNative.nativeArchiveImport(
-                    loomPath, workspace, srcPath, kind, dryRun, passphrase.encodeToByteArray(),
-                    keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()
+                    loomPath, workspace, srcPath, kind, gzipOutputPath, commit, author, message,
+                    dryRun, passphrase.encodeToByteArray(), keyBytes(kek), authPrincipal,
+                    authPassphrase.encodeToByteArray()
                 )
                 promise.resolve(bytesToArray(bytes))
             } catch (e: Throwable) {
@@ -4468,6 +4881,55 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    override fun vectorTextUpsert(
+        loomPath: String,
+        request: ReadableArray,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) {
+        executor.execute {
+            try {
+                promise.resolve(
+                    bytesToArray(
+                        UldrenLoomNative.nativeVectorTextUpsert(
+                            loomPath, keyBytes(request), passphrase.encodeToByteArray(), keyBytes(kek),
+                            authPrincipal, authPassphrase.encodeToByteArray()
+                        )
+                    )
+                )
+            } catch (e: Throwable) {
+                promise.reject(e)
+            }
+        }
+    }
+
+    override fun vectorWorkspaceConfigureJson(
+        loomPath: String,
+        workspace: String,
+        requestJson: String,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) {
+        executor.execute {
+            try {
+                promise.resolve(
+                    UldrenLoomNative.nativeVectorWorkspaceConfigureJson(
+                        loomPath, workspace, requestJson, passphrase.encodeToByteArray(), keyBytes(kek),
+                        authPrincipal, authPassphrase.encodeToByteArray()
+                    )
+                )
+            } catch (e: Throwable) {
+                promise.reject(e)
+            }
+        }
+    }
+
     override fun vectorGet(
         loomPath: String,
         workspace: String,
@@ -4781,6 +5243,68 @@ class UldrenLoomModule(reactContext: ReactApplicationContext) :
                     keyBytes(kek), authPrincipal, authPassphrase.encodeToByteArray()
                 )
                 promise.resolve(null)
+            } catch (e: Throwable) {
+                promise.reject(e)
+            }
+        }
+    }
+
+    override fun columnarImportArrow(
+        loomPath: String,
+        workspace: String,
+        name: String,
+        payload: ReadableArray,
+        targetSegmentRows: String,
+        replace: Boolean,
+        dryRun: Boolean,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) {
+        executor.execute {
+            try {
+                promise.resolve(
+                    bytesToArray(
+                        UldrenLoomNative.nativeColumnarImportArrow(
+                            loomPath, workspace, name, keyBytes(payload), targetSegmentRows, replace, dryRun,
+                            passphrase.encodeToByteArray(), keyBytes(kek),
+                            authPrincipal, authPassphrase.encodeToByteArray()
+                        )
+                    )
+                )
+            } catch (e: Throwable) {
+                promise.reject(e)
+            }
+        }
+    }
+
+    override fun columnarImportParquet(
+        loomPath: String,
+        workspace: String,
+        name: String,
+        payload: ReadableArray,
+        targetSegmentRows: String,
+        replace: Boolean,
+        dryRun: Boolean,
+        passphrase: String,
+        kek: ReadableArray,
+        authPrincipal: String,
+        authPassphrase: String,
+        promise: Promise,
+    ) {
+        executor.execute {
+            try {
+                promise.resolve(
+                    bytesToArray(
+                        UldrenLoomNative.nativeColumnarImportParquet(
+                            loomPath, workspace, name, keyBytes(payload), targetSegmentRows, replace, dryRun,
+                            passphrase.encodeToByteArray(), keyBytes(kek),
+                            authPrincipal, authPassphrase.encodeToByteArray()
+                        )
+                    )
+                )
             } catch (e: Throwable) {
                 promise.reject(e)
             }

@@ -56,8 +56,15 @@ pub fn project_settings_get(
     workspace: WorkspaceId,
     workspace_id: &str,
     project_id: &str,
+    include_contracts: bool,
 ) -> Result<Option<TicketProjectSummary>> {
-    loom_tickets::get_project(loom, workspace, workspace_id, project_id)
+    loom_tickets::get_project_with_contract_details(
+        loom,
+        workspace,
+        workspace_id,
+        project_id,
+        include_contracts,
+    )
 }
 
 pub struct HostedTicketProjectSettings<'a> {
@@ -72,6 +79,11 @@ pub struct HostedTicketProjectSettings<'a> {
     pub acceptance_authorities: Option<&'a [String]>,
     pub acceptance_evidence_enforcement: Option<bool>,
     pub required_acceptance_evidence_keys: Option<&'a [loom_tickets::TicketAcceptanceEvidenceKey]>,
+    pub required_acceptance_reviews: Option<&'a [loom_tickets::TicketReviewType]>,
+    pub owner_contract_summary: Option<&'a str>,
+    pub owner_contract_details: Option<&'a str>,
+    pub worker_contract_summary: Option<&'a str>,
+    pub worker_contract_details: Option<&'a str>,
     pub expected_root: Option<&'a str>,
 }
 
@@ -95,10 +107,11 @@ pub fn project_settings_set(
             acceptance_authorities: input.acceptance_authorities,
             acceptance_evidence_enforcement: input.acceptance_evidence_enforcement,
             required_acceptance_evidence_keys: input.required_acceptance_evidence_keys,
-            owner_contract_summary: None,
-            owner_contract_details: None,
-            worker_contract_summary: None,
-            worker_contract_details: None,
+            required_acceptance_reviews: input.required_acceptance_reviews,
+            owner_contract_summary: input.owner_contract_summary,
+            owner_contract_details: input.owner_contract_details,
+            worker_contract_summary: input.worker_contract_summary,
+            worker_contract_details: input.worker_contract_details,
             expected_root: input.expected_root,
         },
     )

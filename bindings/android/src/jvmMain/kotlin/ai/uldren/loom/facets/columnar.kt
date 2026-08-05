@@ -144,3 +144,37 @@ actual fun Loom.columnarAggregateCbor(
         path, workspace, name, aggregates, filter, passphrase?.encodeToByteArray(), kek,
         authPrincipal, authPassphrase?.encodeToByteArray(),
     )
+
+actual fun Loom.columnarImportArrow(
+        path: String,
+        workspace: String,
+        name: String,
+        payload: ByteArray,
+        targetSegmentRows: ULong,
+        replace: Boolean,
+        dryRun: Boolean,
+        passphrase: String?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: String?,
+    ): ByteArray = LoomNative.nativeColumnarImportArrow(
+        path, workspace, name, payload, targetSegmentRows.toString(), replace, dryRun,
+        passphrase?.encodeToByteArray(), kek, authPrincipal, authPassphrase?.encodeToByteArray(),
+    )
+
+actual fun Loom.columnarImportParquet(
+        path: String,
+        workspace: String,
+        name: String,
+        payload: ByteArray,
+        targetSegmentRows: ULong,
+        replace: Boolean,
+        dryRun: Boolean,
+        passphrase: String?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: String?,
+    ): ByteArray = LoomNative.nativeColumnarImportParquet(
+        path, workspace, name, payload, targetSegmentRows.toString(), replace, dryRun,
+        passphrase?.encodeToByteArray(), kek, authPrincipal, authPassphrase?.encodeToByteArray(),
+    )

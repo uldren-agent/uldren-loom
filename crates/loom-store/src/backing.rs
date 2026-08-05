@@ -34,6 +34,170 @@ pub trait BackingIo: std::fmt::Debug + MaybeSend {
     fn grow(&mut self, len: u64) -> std::io::Result<()>;
     /// Flush all writes durably (the commit point depends on this).
     fn fsync(&mut self) -> std::io::Result<()>;
+    fn is_planning(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedBackingOperation {
+    Write { offset: u64, bytes: Vec<u8> },
+    Resize { len: u64 },
+    Fsync,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedBackingTransaction {
+    source_len: u64,
+    final_len: u64,
+    operations: Vec<PreparedBackingOperation>,
+}
+
+impl PreparedBackingTransaction {
+    pub(crate) fn source_len(&self) -> u64 {
+        self.source_len
+    }
+
+    pub(crate) fn final_len(&self) -> u64 {
+        self.final_len
+    }
+
+    pub(crate) fn write_count(&self) -> usize {
+        self.operations
+            .iter()
+            .filter(|operation| matches!(operation, PreparedBackingOperation::Write { .. }))
+            .count()
+    }
+
+    pub(crate) fn apply(
+        &self,
+        backing: &mut dyn BackingIo,
+        mut observe_fsync: impl FnMut(std::time::Duration),
+    ) -> std::io::Result<()> {
+        if backing.size()? != self.source_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "prepared backing source length changed",
+            ));
+        }
+        for operation in &self.operations {
+            match operation {
+                PreparedBackingOperation::Write { offset, bytes } => {
+                    backing.pwrite(*offset, bytes)?;
+                }
+                PreparedBackingOperation::Resize { len } => backing.grow(*len)?,
+                PreparedBackingOperation::Fsync => {
+                    let started = std::time::Instant::now();
+                    backing.fsync()?;
+                    observe_fsync(started.elapsed());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PlanningBacking<'a> {
+    source: &'a mut dyn BackingIo,
+    source_len: u64,
+    len: u64,
+    operations: Vec<PreparedBackingOperation>,
+}
+
+impl<'a> PlanningBacking<'a> {
+    pub(crate) fn new(source: &'a mut dyn BackingIo) -> std::io::Result<Self> {
+        let source_len = source.size()?;
+        Ok(Self {
+            source,
+            source_len,
+            len: source_len,
+            operations: Vec::new(),
+        })
+    }
+
+    pub(crate) fn finish(self) -> PreparedBackingTransaction {
+        PreparedBackingTransaction {
+            source_len: self.source_len,
+            final_len: self.len,
+            operations: self.operations,
+        }
+    }
+
+    fn overlay_write(&mut self, offset: u64, bytes: &[u8]) {
+        self.operations.push(PreparedBackingOperation::Write {
+            offset,
+            bytes: bytes.to_vec(),
+        });
+    }
+}
+
+impl BackingIo for PlanningBacking<'_> {
+    fn pread(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let end = off.checked_add(buf.len() as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "read offset overflow")
+        })?;
+        if end > self.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "read past end of planning backing",
+            ));
+        }
+        buf.fill(0);
+        if off < self.source_len {
+            let source_end = end.min(self.source_len);
+            self.source
+                .pread(off, &mut buf[..(source_end - off) as usize])?;
+        }
+        for operation in &self.operations {
+            let PreparedBackingOperation::Write {
+                offset: write_offset,
+                bytes,
+            } = operation
+            else {
+                continue;
+            };
+            let write_end = write_offset.saturating_add(bytes.len() as u64);
+            let overlap_start = off.max(*write_offset);
+            let overlap_end = end.min(write_end);
+            if overlap_start < overlap_end {
+                let destination = (overlap_start - off) as usize;
+                let source = (overlap_start - *write_offset) as usize;
+                let len = (overlap_end - overlap_start) as usize;
+                buf[destination..destination + len].copy_from_slice(&bytes[source..source + len]);
+            }
+        }
+        Ok(())
+    }
+
+    fn pwrite(&mut self, off: u64, buf: &[u8]) -> std::io::Result<()> {
+        let end = off.checked_add(buf.len() as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "write offset overflow")
+        })?;
+        self.len = self.len.max(end);
+        self.overlay_write(off, buf);
+        Ok(())
+    }
+
+    fn size(&self) -> std::io::Result<u64> {
+        Ok(self.len)
+    }
+
+    fn grow(&mut self, len: u64) -> std::io::Result<()> {
+        self.len = len;
+        self.operations
+            .push(PreparedBackingOperation::Resize { len });
+        Ok(())
+    }
+
+    fn fsync(&mut self) -> std::io::Result<()> {
+        self.operations.push(PreparedBackingOperation::Fsync);
+        Ok(())
+    }
+
+    fn is_planning(&self) -> bool {
+        true
+    }
 }
 
 /// The native backing: a `std::fs::File`. (A local trait on a foreign type, so no wrapper newtype is
@@ -119,6 +283,31 @@ impl BackingIo for MemoryBacking {
     }
     fn fsync(&mut self) -> std::io::Result<()> {
         Ok(()) // in-memory: nothing to flush
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planning_backing_preserves_exact_overlapping_writes_until_apply() {
+        let mut source = MemoryBacking::from_bytes(vec![0; 32]);
+        let prepared = {
+            let mut planning = PlanningBacking::new(&mut source).unwrap();
+            planning.pwrite(4, &[1, 2, 3, 4]).unwrap();
+            planning.pwrite(6, &[9, 8, 7]).unwrap();
+            let mut observed = [0; 7];
+            planning.pread(3, &mut observed).unwrap();
+            assert_eq!(observed, [0, 1, 2, 9, 8, 7, 0]);
+            planning.fsync().unwrap();
+            planning.finish()
+        };
+        assert_eq!(source.to_bytes(), vec![0; 32]);
+        let mut fsyncs = 0;
+        prepared.apply(&mut source, |_| fsyncs += 1).unwrap();
+        assert_eq!(fsyncs, 1);
+        assert_eq!(&source.to_bytes()[4..9], &[1, 2, 9, 8, 7]);
     }
 }
 

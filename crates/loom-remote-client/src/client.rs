@@ -18,6 +18,17 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// A resumable authenticated logical session issued by one coordinator runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalSession {
+    /// Opaque logical session identity.
+    pub session_id: Vec<u8>,
+    /// Opaque coordinator-authenticated resume credential.
+    pub credential: Vec<u8>,
+    /// Wall-clock lease expiry in milliseconds.
+    pub lease_expires_ms: u64,
+}
+
 /// Per-call options carried in the request envelope.
 #[derive(Debug, Clone)]
 pub struct CallOptions {
@@ -76,7 +87,7 @@ impl<T: Transport> RemoteLoomClient<T> {
     /// dedups it), while a fresh application call mints a new key. Callers wanting durable app-level retry
     /// semantics instead pass their own key through [`RemoteLoomClient::call`] with a populated
     /// [`CallOptions::idempotency_key`].
-    pub(crate) fn idempotency_options(&self) -> CallOptions {
+    pub fn idempotency_options(&self) -> CallOptions {
         CallOptions {
             idempotency_key: Some(
                 self.next_idempotency
@@ -118,6 +129,106 @@ impl<T: Transport> RemoteLoomClient<T> {
             }
             SessionOpenReply::Err(err) => Err(err.to_loom_error()),
         }
+    }
+
+    /// Create and bind a resumable logical session.
+    pub async fn create_logical_session(
+        &self,
+        auth: loom_remote_protocol::session::SessionAuth,
+    ) -> Result<LogicalSession, LoomError> {
+        use loom_remote_protocol::session::{SessionOpenReply, open_request_bytes};
+        self.logical_session_request(open_request_bytes(&auth), |reply| match reply {
+            SessionOpenReply::Ok {
+                session_id,
+                lease_expires_ms,
+                credential: Some(credential),
+            } => Ok(LogicalSession {
+                session_id,
+                credential,
+                lease_expires_ms,
+            }),
+            SessionOpenReply::Ok {
+                credential: None, ..
+            } => Err(LoomError::new(
+                Code::CorruptObject,
+                "session coordinator omitted resume credential",
+            )),
+            SessionOpenReply::Err(error) => Err(error.to_loom_error()),
+        })
+        .await
+    }
+
+    /// Resume and bind an existing logical session, rotating its credential.
+    pub async fn resume_logical_session(
+        &self,
+        auth: loom_remote_protocol::session::SessionAuth,
+        credential: &[u8],
+    ) -> Result<LogicalSession, LoomError> {
+        use loom_remote_protocol::session::{SessionOpenReply, resume_request_bytes};
+        self.logical_session_request(
+            resume_request_bytes(&auth, credential),
+            |reply| match reply {
+                SessionOpenReply::Ok {
+                    session_id,
+                    lease_expires_ms,
+                    credential: Some(credential),
+                } => Ok(LogicalSession {
+                    session_id,
+                    credential,
+                    lease_expires_ms,
+                }),
+                SessionOpenReply::Ok {
+                    credential: None, ..
+                } => Err(LoomError::new(
+                    Code::CorruptObject,
+                    "session coordinator omitted rotated credential",
+                )),
+                SessionOpenReply::Err(error) => Err(error.to_loom_error()),
+            },
+        )
+        .await
+    }
+
+    /// Close a logical session and invalidate its credential.
+    pub async fn close_logical_session(
+        &self,
+        auth: loom_remote_protocol::session::SessionAuth,
+        credential: &[u8],
+    ) -> Result<(), LoomError> {
+        use loom_remote_protocol::session::{SessionOpenReply, close_request_bytes};
+        self.logical_session_request(
+            close_request_bytes(&auth, credential),
+            |reply| match reply {
+                SessionOpenReply::Ok { .. } => Ok(()),
+                SessionOpenReply::Err(error) => Err(error.to_loom_error()),
+            },
+        )
+        .await?;
+        self.clear_session();
+        Ok(())
+    }
+
+    async fn logical_session_request<U>(
+        &self,
+        body: Vec<u8>,
+        map: impl FnOnce(loom_remote_protocol::session::SessionOpenReply) -> Result<U, LoomError>,
+    ) -> Result<U, LoomError> {
+        let reply_bytes = self.conn.transport().open_session(body).await?;
+        let reply =
+            loom_remote_protocol::session::parse_open_reply(&reply_bytes).map_err(|error| {
+                LoomError::new(Code::CorruptObject, format!("session reply: {error}"))
+            })?;
+        let session_id = match &reply {
+            loom_remote_protocol::session::SessionOpenReply::Ok { session_id, .. } => {
+                Some(session_id.clone())
+            }
+            loom_remote_protocol::session::SessionOpenReply::Err(_) => None,
+        };
+        let result = map(reply)?;
+        if let Some(session_id) = session_id {
+            self.bind_session(session_id);
+        }
+        Ok(result)
     }
 
     /// Clear the bound session.
@@ -376,8 +487,8 @@ mod tests {
     #[test]
     fn generated_key_methods_auto_attach_an_idempotency_key() {
         // The loopback records, per method, whether the dispatched request carried a non-empty idempotency
-        // key. A §12 `key`-classified method (Exec.exec_cbor) must auto-attach one; a naturally idempotent
-        // method (Kv.put) must not. Each keyed call also mints a distinct key.
+        // key. §12 `key`-classified methods must auto-attach one; a naturally idempotent method
+        // (Kv.put) must not. Each keyed call also mints a distinct key.
         let seen: RecordedIdempotencies = Default::default();
         let sink = seen.clone();
         let transport = Loopback::unary(
@@ -389,7 +500,7 @@ mod tests {
                     request.idempotency_key.clone().filter(|k| !k.is_empty()),
                 ));
                 let value = match request.method.as_str() {
-                    "exec_cbor" => Value::Bytes(Vec::new()),
+                    "exec_cbor" | "apply_cbor" => Value::Bytes(Vec::new()),
                     _ => Value::Null,
                 };
                 Response::ok(request.request_id, request.session_id, value)
@@ -401,6 +512,7 @@ mod tests {
 
         block(client.exec_cbor(handle(), b"req-1".to_vec())).expect("exec 1");
         block(client.exec_cbor(handle(), b"req-2".to_vec())).expect("exec 2");
+        block(client.apply_cbor(handle(), b"apply".to_vec())).expect("apply");
         block(client.put(
             handle(),
             "app".to_string(),
@@ -420,6 +532,15 @@ mod tests {
         assert_ne!(
             exec_keys[0], exec_keys[1],
             "each keyed call mints a fresh key"
+        );
+        let apply_key = recorded
+            .iter()
+            .find(|(m, _)| m == "apply_cbor")
+            .and_then(|(_, k)| k.clone())
+            .expect("apply_cbor carried a key");
+        assert!(
+            exec_keys.iter().all(|key| **key != apply_key),
+            "apply_cbor mints its own fresh key"
         );
 
         let put_key = recorded

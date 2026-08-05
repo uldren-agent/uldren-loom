@@ -53,6 +53,31 @@ pub(crate) fn format_value(v: &GValue) -> String {
     }
 }
 
+#[cfg(test)]
+mod sql_payload_output_tests {
+    use super::*;
+
+    #[test]
+    fn sql_value_formatting_matches_cli_text_output() {
+        assert_eq!(format_value(&GValue::Null), "NULL");
+        assert_eq!(format_value(&GValue::Bool(true)), "true");
+        assert_eq!(format_value(&GValue::I64(7)), "7");
+        assert_eq!(format_value(&GValue::F64(1.5)), "1.5");
+        assert_eq!(format_value(&GValue::Str("cell".to_string())), "cell");
+    }
+
+    #[test]
+    fn sql_payload_printer_accepts_select_and_dml_payloads() {
+        print_payload(&Payload::Select {
+            labels: vec!["id".to_string(), "v".to_string()],
+            rows: vec![vec![GValue::I64(1), GValue::Str("a".to_string())]],
+        });
+        print_payload(&Payload::Insert(1));
+        print_payload(&Payload::Update(2));
+        print_payload(&Payload::Delete(3));
+    }
+}
+
 /// Unlock `fs` when the store is encrypted, acquiring the passphrase from the configured key source
 /// only if needed, so object reads return plaintext and object writes seal under the DEK (an
 /// encrypted store must never be written with a plaintext frame). A no-op on an unencrypted store.
@@ -145,6 +170,14 @@ pub(crate) fn open_loom_from(
     initialize_control: bool,
 ) -> Result<Loom<FileStore>, String> {
     unlock_if_encrypted(&fs, keys)?;
+    open_loom_from_unlocked(fs, keys, initialize_control)
+}
+
+fn open_loom_from_unlocked(
+    fs: FileStore,
+    keys: &KeyOpts,
+    initialize_control: bool,
+) -> Result<Loom<FileStore>, String> {
     if initialize_control {
         ensure_control_state(&fs)?;
     }
@@ -159,19 +192,6 @@ pub(crate) fn open_loom_from(
         .map_err(|e| e.to_string())?;
     *loom.mutable_overlay_mut() =
         loom_core::MutableOverlay::import_entries(&entries).map_err(|e| e.to_string())?;
-    attach_control_state(loom, keys)
-}
-
-pub(crate) fn open_loom_registry_from(
-    fs: FileStore,
-    keys: &KeyOpts,
-) -> Result<Loom<FileStore>, String> {
-    unlock_if_encrypted(&fs, keys)?;
-    let root = fs.reference_root();
-    let mut loom = Loom::new(fs);
-    if let Some(root) = root {
-        loom.load_state_registry(root).map_err(|e| e.to_string())?;
-    }
     attach_control_state(loom, keys)
 }
 
@@ -216,12 +236,68 @@ impl std::ops::DerefMut for CliLoom {
 struct DaemonSessionLease {
     paths: daemon::DaemonPaths,
     session: String,
+    renewal_stop: Option<std::sync::mpsc::Sender<()>>,
+    renewal_worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DaemonSessionLease {
+    fn new(
+        paths: daemon::DaemonPaths,
+        session: String,
+        renewal_interval: std::time::Duration,
+    ) -> DaemonSessionLease {
+        let (renewal_stop, stop_rx) = std::sync::mpsc::channel();
+        let worker_paths = paths.clone();
+        let worker_session = session.clone();
+        let renewal_worker = std::thread::spawn(move || {
+            while stop_rx.recv_timeout(renewal_interval).is_err() {
+                if daemon::lease_renew_auth(
+                    &worker_paths,
+                    &worker_session,
+                    &daemon::DaemonAuth::default(),
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        DaemonSessionLease {
+            paths,
+            session,
+            renewal_stop: Some(renewal_stop),
+            renewal_worker: Some(renewal_worker),
+        }
+    }
 }
 
 impl Drop for DaemonSessionLease {
     fn drop(&mut self) {
+        if let Some(stop) = self.renewal_stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.renewal_worker.take() {
+            let _ = worker.join();
+        }
         let _ = daemon::session_detach(&self.paths, &self.session);
     }
+}
+
+const DEFAULT_DAEMON_SESSION_RENEWAL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+fn daemon_session_renewal_interval() -> std::time::Duration {
+    #[cfg(feature = "mcp-daemon-cli-tests")]
+    {
+        if let Some(value) = std::env::var("ULDREN_LOOM_DAEMON_SESSION_RENEWAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+        {
+            return std::time::Duration::from_millis(value);
+        }
+    }
+    DEFAULT_DAEMON_SESSION_RENEWAL_INTERVAL
 }
 
 fn attach_daemon_session_if_running(store: &str) -> Result<Option<DaemonSessionLease>, String> {
@@ -233,7 +309,27 @@ fn attach_daemon_session_if_running(store: &str) -> Result<Option<DaemonSessionL
     }
     let session = session_id();
     daemon::session_attach(&paths, &session).map_err(|e| e.to_string())?;
-    Ok(Some(DaemonSessionLease { paths, session }))
+    Ok(Some(DaemonSessionLease::new(
+        paths,
+        session,
+        daemon_session_renewal_interval(),
+    )))
+}
+
+#[cfg(feature = "mcp-daemon-cli-tests")]
+pub(crate) fn hold_daemon_session_for_test(
+    store: &str,
+    duration: std::time::Duration,
+) -> Result<(), String> {
+    let paths = daemon::paths(store).map_err(|e| e.to_string())?;
+    daemon::status_response(&paths).map_err(|e| e.to_string())?;
+    let session = session_id();
+    daemon::session_attach(&paths, &session).map_err(|e| e.to_string())?;
+    let _lease = DaemonSessionLease::new(paths, session, daemon_session_renewal_interval());
+    println!("holding");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    std::thread::sleep(duration);
+    Ok(())
 }
 
 pub(crate) fn cli_open_loom(store: &str, keys: &KeyOpts) -> Result<CliLoom, String> {
@@ -340,14 +436,6 @@ pub(crate) fn cli_open_loom_read(store: &str, keys: &KeyOpts) -> Result<Loom<Fil
     open_loom_from(fs, keys, false)
 }
 
-pub(crate) fn cli_open_loom_registry_read(
-    store: &str,
-    keys: &KeyOpts,
-) -> Result<Loom<FileStore>, String> {
-    let fs = FileStore::open_read(store).map_err(|e| e.to_string())?;
-    open_loom_registry_from(fs, keys)
-}
-
 /// Milliseconds since the Unix epoch (commit timestamp); 0 if the clock is before the epoch.
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -380,53 +468,6 @@ pub(crate) fn load_drive_policy_registry(store: &FileStore) -> Result<DrivePolic
         .map(|registry| registry.unwrap_or_else(DrivePolicyRegistry::empty))
 }
 
-pub(crate) fn save_drive_policy_registry_audited(
-    store: &FileStore,
-    registry: &DrivePolicyRegistry,
-    actor: Option<WorkspaceId>,
-    target: &str,
-) -> Result<u64, String> {
-    store
-        .control_set_audited(
-            &drive_policy_registry_key(),
-            registry.encode().map_err(|e| e.to_string())?,
-            actor,
-            "drive.policy_registry.configure",
-            Some(target),
-        )
-        .map_err(|e| e.to_string())
-}
-
-pub(crate) fn register_drive_policy_target(
-    loom: &Loom<FileStore>,
-    actor: Option<WorkspaceId>,
-    workspace: WorkspaceId,
-    workspace_id: &str,
-) -> Result<u64, String> {
-    let mut registry = load_drive_policy_registry(loom.store())?;
-    registry
-        .upsert_enabled(
-            DrivePolicyTarget::new(workspace, workspace_id, true).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-    save_drive_policy_registry_audited(
-        loom.store(),
-        &registry,
-        actor,
-        &format!("workspace={workspace};profile={workspace_id};enabled=true"),
-    )
-}
-
-pub(crate) fn optional_workspace_arg(
-    loom: &Loom<FileStore>,
-    value: Option<&str>,
-) -> Result<Option<WorkspaceId>, String> {
-    match value {
-        Some(v) if !v.is_empty() => Ok(Some(resolve_ns(loom, v)?)),
-        _ => Ok(None),
-    }
-}
-
 pub(crate) fn optional_acl_domain_arg(value: Option<&str>) -> Result<Option<AclDomain>, String> {
     match value {
         Some(v) if !v.is_empty() => Ok(Some(AclDomain::parse(v).map_err(|e| e.to_string())?)),
@@ -450,6 +491,7 @@ pub(crate) fn require_global_admin(loom: &Loom<FileStore>) -> Result<(), String>
         .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn require_global_admin_actor(loom: &Loom<FileStore>) -> Result<WorkspaceId, String> {
     require_global_admin(loom)?;
     loom.effective_principal()
@@ -486,18 +528,6 @@ pub(crate) fn acl_effect_str(effect: AclEffect) -> &'static str {
     match effect {
         AclEffect::Allow => "allow",
         AclEffect::Deny => "deny",
-    }
-}
-
-pub(crate) fn parse_acl_subject(value: &str) -> Result<AclSubject, String> {
-    match value {
-        "*" | "everyone" => Ok(AclSubject::Everyone),
-        role if role.starts_with("role:") => Ok(AclSubject::Role(
-            WorkspaceId::parse(&role[5..]).map_err(|e| e.to_string())?,
-        )),
-        other => Ok(AclSubject::Principal(
-            WorkspaceId::parse(other).map_err(|e| e.to_string())?,
-        )),
     }
 }
 
@@ -552,37 +582,6 @@ pub(crate) struct AclGrantArgs<'a> {
     pub ref_glob: Option<&'a str>,
     pub scopes: &'a [String],
     pub predicate_cel: Option<&'a str>,
-}
-
-pub(crate) fn acl_grant_from_args(
-    loom: &Loom<FileStore>,
-    args: AclGrantArgs<'_>,
-) -> Result<AclGrant, String> {
-    let scopes = if args.scopes.is_empty() {
-        vec![AclScope::All]
-    } else {
-        args.scopes
-            .iter()
-            .map(|scope| parse_acl_scope(scope))
-            .collect::<Result<_, _>>()?
-    };
-    Ok(AclGrant {
-        subject: parse_acl_subject(args.subject)?,
-        workspace: optional_workspace_arg(loom, args.workspace)?,
-        domain: optional_acl_domain_arg(args.domain)?,
-        ref_glob: args
-            .ref_glob
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        scopes,
-        rights: args
-            .rights
-            .iter()
-            .map(|right| parse_acl_right(right))
-            .collect::<Result<_, _>>()?,
-        effect: parse_acl_effect(args.effect)?,
-        predicate: optional_acl_predicate(args.predicate_cel)?,
-    })
 }
 
 pub(crate) fn optional_acl_predicate(value: Option<&str>) -> Result<Option<AclPredicate>, String> {
@@ -906,27 +905,6 @@ pub(crate) fn identity_authority_witness_json(
     out
 }
 
-pub(crate) fn identity_authority_sync_report_json(
-    report: &loom_core::IdentityAuthoritySyncReport,
-    algo: loom_core::Algo,
-    seq: u64,
-) -> String {
-    let mut out = String::new();
-    out.push('{');
-    out.push_str("\"seq\":");
-    out.push_str(&seq.to_string());
-    out.push_str(",\"from_generation\":");
-    out.push_str(&report.from_generation.to_string());
-    out.push_str(",\"to_generation\":");
-    out.push_str(&report.to_generation.to_string());
-    out.push_str(",\"applied\":");
-    out.push_str(if report.applied { "true" } else { "false" });
-    out.push_str(",\"witness\":");
-    out.push_str(&identity_authority_witness_json(&report.witness, algo));
-    out.push('}');
-    out
-}
-
 pub(crate) fn authority_replication_policy_json(
     policy: &loom_store::AuthorityReplicationPolicy,
 ) -> String {
@@ -1203,27 +1181,6 @@ pub(crate) fn kv_map_config_json(config: KvMapConfig) -> String {
     out
 }
 
-pub(crate) fn ensure_kv_workspace(
-    loom: &mut Loom<FileStore>,
-    workspace: &str,
-) -> Result<WorkspaceId, String> {
-    let selector = match WorkspaceId::parse(workspace) {
-        Ok(id) => WsSelector::Id(id),
-        Err(_) => WsSelector::Typed {
-            ty: FacetKind::Kv,
-            name: workspace.to_string(),
-        },
-    };
-    let ns = loom
-        .registry_mut()
-        .ensure_for_write(&selector, random_workspace_id()?)
-        .map_err(|e| e.to_string())?;
-    loom.registry_mut()
-        .add_facet(ns, FacetKind::Kv)
-        .map_err(|e| e.to_string())?;
-    Ok(ns)
-}
-
 #[cfg(any(feature = "mcp", feature = "fuse", feature = "nfs"))]
 pub(crate) fn mount_open_auth(store: &str, keys: &KeyOpts) -> Result<LocalOpenAuth, String> {
     let fs = FileStore::open_read(store).map_err(|e| e.to_string())?;
@@ -1487,6 +1444,81 @@ pub(crate) fn write_output(out: Option<&str>, bytes: &[u8]) -> std::io::Result<(
     }
 }
 
+#[cfg(test)]
+mod daemon_session_lease_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn temp_store(tag: &str) -> String {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "uldren-loom-{tag}-{}-{}.loom",
+            std::process::id(),
+            now_ms()
+        ));
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn daemon_session_lease_renews_until_drop_then_detaches() {
+        let store = temp_store("daemon-lease-renewal");
+        std::fs::write(&store, b"store").unwrap();
+        let paths = daemon::paths(&store).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(&paths.addr_file, listener.local_addr().unwrap().to_string()).unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                stream.read_to_string(&mut request).unwrap();
+                let response = match request
+                    .trim_end()
+                    .split('\t')
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    ["lease-renew", session] => format!("renewed\t{session}\tsessions=1\n"),
+                    ["session-detach", session] => {
+                        format!("detached\t{session}\tsessions=0\n")
+                    }
+                    other => panic!("unexpected daemon request {other:?}"),
+                };
+                requests.push(request.clone());
+                request_tx.send(request.clone()).unwrap();
+                write!(stream, "{response}").unwrap();
+                if request.starts_with("session-detach\t") {
+                    break;
+                }
+            }
+            requests
+        });
+
+        let lease = DaemonSessionLease::new(
+            paths.clone(),
+            "cli-session".to_string(),
+            std::time::Duration::from_millis(10),
+        );
+        let first = request_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(first, "lease-renew\tcli-session\n");
+        drop(lease);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.last().unwrap(), "session-detach\tcli-session\n");
+        assert!(
+            requests[..requests.len() - 1]
+                .iter()
+                .all(|request| request == "lease-renew\tcli-session\n")
+        );
+        let _ = std::fs::remove_file(&paths.addr_file);
+        let _ = std::fs::remove_file(&paths.pid_file);
+        let _ = std::fs::remove_file(&paths.lock_file);
+        let _ = std::fs::remove_file(&store);
+    }
+}
+
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
@@ -1579,9 +1611,9 @@ mod tests {
                 bind: bind.into(),
                 transport: None,
                 profile: None,
+                mode: None,
                 disabled: false,
                 tls_certificate_bundle: None,
-                tls_mode: None,
                 auth_mode: None,
                 exposure: None,
                 audit_mode: None,
@@ -1841,6 +1873,9 @@ mod tests {
             action: StoreCmd::Policy {
                 store: store.clone(),
                 fips_required: Some(true),
+                default_durability: None,
+                facet_durability: Vec::new(),
+                clear_facet_durability: Vec::new(),
             },
         })
         .unwrap();
@@ -1856,6 +1891,9 @@ mod tests {
             action: StoreCmd::Policy {
                 store: store.clone(),
                 fips_required: None,
+                default_durability: None,
+                facet_durability: Vec::new(),
+                clear_facet_durability: Vec::new(),
             },
         })
         .unwrap();
@@ -2359,7 +2397,7 @@ mod tests {
             .unwrap();
         assert!(acl.grants().iter().any(|grant| {
             grant.subject == AclSubject::Principal(alice)
-                && grant.facet == Some(FacetKind::Kv)
+                && grant.domain == Some(AclDomain::Kv)
                 && grant.ref_glob.as_deref() == Some("branch/main")
                 && grant.scopes
                     == vec![
@@ -2762,9 +2800,9 @@ mod tests {
                 bind: "127.0.0.1:8011".into(),
                 transport: Some("rest".into()),
                 profile: Some("qdrant".into()),
+                mode: None,
                 disabled: false,
                 tls_certificate_bundle: None,
-                tls_mode: None,
                 auth_mode: None,
                 exposure: None,
                 audit_mode: None,
@@ -2800,9 +2838,9 @@ mod tests {
                 bind: "127.0.0.1:8012".into(),
                 transport: Some("rest".into()),
                 profile: None,
+                mode: None,
                 disabled: false,
                 tls_certificate_bundle: None,
-                tls_mode: None,
                 auth_mode: None,
                 exposure: None,
                 audit_mode: None,
@@ -2830,9 +2868,9 @@ mod tests {
                 bind: "127.0.0.1:8013".into(),
                 transport: Some("qdrant_rest".into()),
                 profile: Some("qdrant".into()),
+                mode: None,
                 disabled: false,
                 tls_certificate_bundle: None,
-                tls_mode: None,
                 auth_mode: None,
                 exposure: None,
                 audit_mode: None,
@@ -2881,9 +2919,9 @@ mod tests {
                 bind: "127.0.0.1:8003".into(),
                 transport: Some("rest".into()),
                 profile: None,
+                mode: None,
                 disabled: true,
                 tls_certificate_bundle: Some("admin".into()),
-                tls_mode: None,
                 auth_mode: Some("passphrase".into()),
                 exposure: Some("read-only".into()),
                 audit_mode: Some("all".into()),
@@ -2948,9 +2986,9 @@ mod tests {
                 bind: "127.0.0.1:8025".into(),
                 transport: Some("smtp".into()),
                 profile: None,
+                mode: Some("starttls".into()),
                 disabled: false,
                 tls_certificate_bundle: Some("smtp".into()),
-                tls_mode: Some("starttls".into()),
                 auth_mode: Some("passphrase".into()),
                 exposure: Some("read-write".into()),
                 audit_mode: Some("all".into()),

@@ -25,7 +25,7 @@ public final class LanesOps {
     private static final MethodHandle TICKET_ADD = down("loom_lanes_ticket_add_cbor",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS));
     private static final MethodHandle TICKET_REMOVE = down("loom_lanes_ticket_remove_cbor",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
@@ -35,6 +35,19 @@ public final class LanesOps {
 
     LanesOps(LoomSession session) {
         this.session = session;
+    }
+
+    public enum LaneTicketPlacement {
+        FIRST(1),
+        LAST(2),
+        BEFORE(3),
+        AFTER(4);
+
+        final int abiValue;
+
+        LaneTicketPlacement(int abiValue) {
+            this.abiValue = abiValue;
+        }
     }
 
     private static MethodHandle down(String symbol, FunctionDescriptor descriptor) {
@@ -88,13 +101,14 @@ public final class LanesOps {
     }
 
     public byte[] ticketAdd(String workspace, String laneId, String ticketId, String updatedBy,
-            String placement, String anchor) {
+            LaneTicketPlacement placement, String anchor) {
         return session.onHandle("loom_lanes_ticket_add_cbor", (arena, handle) -> {
             MemorySegment outPtr = arena.allocate(ValueLayout.ADDRESS);
             MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+            int placementValue = placement == null ? LaneTicketPlacement.LAST.abiValue : placement.abiValue;
             int status = (int) TICKET_ADD.invokeExact(handle, arena.allocateFrom(workspace),
                     arena.allocateFrom(laneId), arena.allocateFrom(ticketId),
-                    arena.allocateFrom(updatedBy), nullable(arena, placement),
+                    arena.allocateFrom(updatedBy), placementValue,
                     nullable(arena, anchor), outPtr, outLen);
             return takeBytes("loom_lanes_ticket_add_cbor", status, outPtr, outLen);
         });

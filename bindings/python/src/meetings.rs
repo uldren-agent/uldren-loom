@@ -2,27 +2,39 @@
 
 use super::*;
 
-use loom_interchange_io::{
-    import_meetings_bytes, import_report_json, meetings_source_payload_path,
-    parse_meetings_input_profile, validate_meetings_source_payload_leaf,
-};
+use futures::executor::block_on;
+use loom_client::generated_api::Meetings as GeneratedMeetings;
+use loom_interchange_io::{meetings_source_payload_path, validate_meetings_source_payload_leaf};
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, input_profile, snapshot, dry_run, passphrase=None))]
+#[pyo3(signature = (path, workspace, input_profile, snapshot, dry_run, store_passphrase=None, auth_principal=None, auth_passphrase=None))]
 pub(crate) fn meetings_import_snapshot(
     path: &str,
     workspace: &str,
     input_profile: &str,
     snapshot: &[u8],
     dry_run: bool,
-    passphrase: Option<&str>,
+    store_passphrase: Option<&str>,
+    auth_principal: Option<&str>,
+    auth_passphrase: Option<&str>,
 ) -> PyResult<String> {
-    let mut loom = open_loom_unlocked(path, key_spec(passphrase).as_ref()).map_err(py_err)?;
-    let workspace_id = resolve_workspace_arg(&loom, workspace)?;
-    let profile = parse_meetings_input_profile(input_profile).map_err(py_err)?;
-    let result = import_meetings_bytes(&mut loom, workspace_id, profile, snapshot, dry_run)
-        .map_err(py_err)?;
-    import_report_json(&result.report).map_err(py_err)
+    let generated = generated_session::open_generated_session(
+        path,
+        store_passphrase,
+        auth_principal,
+        auth_passphrase,
+    )?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedMeetings>::meetings_import_snapshot(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            input_profile.to_string(),
+            snapshot.to_vec(),
+            dry_run,
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]

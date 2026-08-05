@@ -4941,7 +4941,8 @@ mod tests {
     use std::fs;
 
     use loom_core::{
-        FieldMapping, FieldValue, Mapping, Metric, Query, QueryRequest, Value, error::Code, graph,
+        DeliveryProduceRequest, Digest, FieldMapping, FieldValue, Mapping, Metric, Object, Query,
+        QueryRequest, Value, cas::cas_has, delivery_produce, delivery_replay, error::Code, graph,
         kv,
     };
 
@@ -4951,6 +4952,32 @@ mod tests {
     };
     use crate::test_support::{init, nid, temp_path};
     use crate::{HostedAuth, HostedKernel};
+
+    fn payload_object_digest(kernel: &HostedKernel, payload: &[u8]) -> Digest {
+        kernel
+            .read(
+                &HostedAuth::passphrase(nid(1), "root-pass", "digest-helper"),
+                |loom| {
+                    Ok(Digest::hash(
+                        loom.store().digest_algo(),
+                        &Object::Blob(payload.to_vec()).canonical(),
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    fn live_contains(kernel: &HostedKernel, auth: &HostedAuth, digest: Digest) -> bool {
+        kernel
+            .read(auth, |loom| {
+                let mut state = loom.begin_live_object_mark([])?;
+                while !state.completed {
+                    loom.step_live_object_mark(&mut state, 64)?;
+                }
+                Ok(state.marked.contains(&digest))
+            })
+            .unwrap()
+    }
 
     #[test]
     fn hosted_data_adapter_covers_core_tier_one_facets() {
@@ -5320,6 +5347,94 @@ mod tests {
                 .unwrap()
                 .count,
             0
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn kafka_topic_delete_releases_delivery_payload_liveness_after_reopen() {
+        let path = temp_path("data-kafka-delivery-liveness");
+        let ns = init(&path, None);
+        let auth = HostedAuth::passphrase(nid(1), "root-pass", "kafka-delivery-liveness");
+        let kernel = HostedKernel::new(&path);
+        let data = kernel.data();
+        let payload = b"kafka-delivery-payload";
+        let payload_object = payload_object_digest(&kernel, payload);
+
+        assert!(
+            data.kafka_topic_create(&auth, "main", "events", 1)
+                .unwrap()
+                .is_some()
+        );
+        let envelope = kernel
+            .write(&auth, |loom| {
+                delivery_produce(
+                    loom,
+                    ns,
+                    DeliveryProduceRequest {
+                        stream_id: "events",
+                        producer: "watch",
+                        subject: "client",
+                        payload,
+                        created_at_ms: 10,
+                        expires_at_ms: None,
+                        source_cursor: Some(b"kafka-cursor"),
+                    },
+                )
+            })
+            .unwrap();
+
+        let replay = kernel
+            .read(&auth, |loom| {
+                delivery_replay(loom, ns, "events", "client", Some(0), false, 10)
+            })
+            .unwrap();
+        assert_eq!(replay.messages.len(), 1);
+        assert_eq!(replay.messages[0].payload, payload);
+        assert_eq!(replay.messages[0].envelope.id, envelope.id);
+        assert!(live_contains(&kernel, &auth, payload_object));
+        assert!(
+            !kernel
+                .read(&auth, |loom| cas_has(loom, ns, &envelope.payload_digest))
+                .unwrap()
+        );
+
+        assert!(data.kafka_topic_delete(&auth, "main", "events").unwrap());
+        assert_eq!(
+            data.kafka_topic_metadata(&auth, "main", "events")
+                .unwrap_err()
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            kernel
+                .read(&auth, |loom| loom_core::log::len(loom, ns, "events"))
+                .unwrap_err()
+                .code,
+            Code::NotFound
+        );
+        assert!(
+            !data
+                .queue_streams(&auth, "main")
+                .unwrap()
+                .contains(&"events".to_string())
+        );
+
+        drop(kernel);
+        let reopened = HostedKernel::new(&path);
+        assert_eq!(
+            reopened
+                .data()
+                .kafka_topic_metadata(&auth, "main", "events")
+                .unwrap_err()
+                .code,
+            Code::NotFound
+        );
+        assert!(!live_contains(&reopened, &auth, payload_object));
+        assert!(
+            !reopened
+                .read(&auth, |loom| cas_has(loom, ns, &envelope.payload_digest))
+                .unwrap()
         );
         fs::remove_file(path).unwrap();
     }

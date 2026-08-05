@@ -15,6 +15,51 @@ use loom_types::LoomError;
 pub type LoomStream<T> =
     core::pin::Pin<Box<dyn futures_core::Stream<Item = Result<T, LoomError>> + Send>>;
 
+/// Public placement value for inserting a ticket into a Lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneTicketPlacement {
+    First,
+    Last,
+    Before,
+    After,
+}
+
+impl LaneTicketPlacement {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::First => "FIRST",
+            Self::Last => "LAST",
+            Self::Before => "BEFORE",
+            Self::After => "AFTER",
+        }
+    }
+}
+
+impl ToValue for LaneTicketPlacement {
+    fn to_value(&self) -> Value {
+        Value::Text(self.as_str().to_string())
+    }
+}
+
+impl FromValue for LaneTicketPlacement {
+    fn from_value(value: &Value) -> Result<Self, ArgError> {
+        match value {
+            Value::Text(text) => match text.as_str() {
+                "FIRST" => Ok(Self::First),
+                "LAST" => Ok(Self::Last),
+                "BEFORE" => Ok(Self::Before),
+                "AFTER" => Ok(Self::After),
+                _ => Err(ArgError::TypeMismatch {
+                    expected: "LaneTicketPlacement",
+                }),
+            },
+            _ => Err(ArgError::TypeMismatch {
+                expected: "LaneTicketPlacement",
+            }),
+        }
+    }
+}
+
 /// The canonical opaque handle id shared by the whole surface. This is the wire
 /// handle [`RemoteHandleId`]: a kind label, the server-minted id bytes, a generation counter, and the
 /// owning session id. Every typed handle newtype below wraps one, so a handle a client receives from the
@@ -147,5 +192,53 @@ mod tests {
             Digest("blake3:af".to_string())
         );
         assert_eq!(Uuid::from_value(&decoded[2]).unwrap(), Uuid([3; 16]));
+    }
+
+    #[test]
+    fn lane_ticket_placement_round_trips() {
+        let value = LaneTicketPlacement::Before.to_value();
+        assert_eq!(
+            LaneTicketPlacement::from_value(&value).unwrap(),
+            LaneTicketPlacement::Before
+        );
+        assert!(LaneTicketPlacement::from_value(&Value::Text("APPEND".to_string())).is_err());
+    }
+
+    #[test]
+    fn ticket_project_settings_generated_shape_exposes_full_contract() {
+        let get = crate::generated::METHODS
+            .iter()
+            .find(|method| {
+                method.interface == "Tickets"
+                    && method.method == "tickets_project_settings_get_json"
+            })
+            .expect("generated get method exists");
+        assert_eq!(
+            get.args,
+            &[
+                ("LoomSession", "handle"),
+                ("string", "workspace"),
+                ("string", "ticket_workspace_id"),
+                ("string", "project_id"),
+                ("bool", "include_contracts"),
+            ]
+        );
+        let set = crate::generated::METHODS
+            .iter()
+            .find(|method| {
+                method.interface == "Tickets"
+                    && method.method == "tickets_project_settings_set_json"
+            })
+            .expect("generated set method exists");
+        assert_eq!(
+            set.args,
+            &[
+                ("LoomSession", "handle"),
+                ("string", "workspace"),
+                ("string", "ticket_workspace_id"),
+                ("string", "project_id"),
+                ("TicketProjectSettingsPatch", "patch"),
+            ]
+        );
     }
 }

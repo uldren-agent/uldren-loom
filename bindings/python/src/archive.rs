@@ -25,12 +25,14 @@ fn parse_archive_kind(kind: &str) -> PyResult<ArchiveKind> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, src_path, commit=false, dry_run=false, passphrase=None))]
+#[pyo3(signature = (path, workspace, src_path, author=None, message=None, commit=false, dry_run=false, passphrase=None))]
 pub(crate) fn fs_import<'py>(
     py: Python<'py>,
     path: &str,
     workspace: &str,
     src_path: &str,
+    author: Option<String>,
+    message: Option<String>,
     commit: bool,
     dry_run: bool,
     passphrase: Option<&str>,
@@ -38,6 +40,12 @@ pub(crate) fn fs_import<'py>(
     let mut loom = open_loom_unlocked(path, key_spec(passphrase).as_ref()).map_err(py_err)?;
     let ns = resolve_workspace_arg(&loom, workspace)?;
     let mut options = FsImportOptions::new(src_path);
+    if let Some(author) = author {
+        options.author = author;
+    }
+    if let Some(message) = message {
+        options.message = message;
+    }
     options.commit = commit;
     options.dry_run = dry_run;
     let report = import_fs(&mut loom, ns, Path::new(src_path), &options).map_err(py_err)?;
@@ -70,13 +78,17 @@ pub(crate) fn fs_export<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, src_path, kind, dry_run=false, passphrase=None))]
+#[pyo3(signature = (path, workspace, src_path, kind, gzip_output_path=None, commit=false, author=None, message=None, dry_run=false, passphrase=None))]
 pub(crate) fn archive_import<'py>(
     py: Python<'py>,
     path: &str,
     workspace: &str,
     src_path: &str,
     kind: &str,
+    gzip_output_path: Option<String>,
+    commit: bool,
+    author: Option<String>,
+    message: Option<String>,
     dry_run: bool,
     passphrase: Option<&str>,
 ) -> PyResult<Bound<'py, PyBytes>> {
@@ -84,13 +96,21 @@ pub(crate) fn archive_import<'py>(
     let ns = resolve_workspace_arg(&loom, workspace)?;
     let archive_kind = parse_archive_kind(kind)?;
     let mut options = ArchiveImportOptions::new(src_path);
+    options.gzip_output_path = gzip_output_path;
+    options.commit = commit;
+    if let Some(author) = author {
+        options.author = author;
+    }
+    if let Some(message) = message {
+        options.message = message;
+    }
     options.dry_run = dry_run;
     let result = import_archive(&mut loom, ns, Path::new(src_path), archive_kind, &options)
         .map_err(py_err)?;
     if !dry_run {
         save_loom(&mut loom).map_err(py_err)?;
     }
-    let bytes = result.report.encode().map_err(py_err)?;
+    let bytes = result.encode().map_err(py_err)?;
     Ok(PyBytes::new(py, &bytes))
 }
 

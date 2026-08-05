@@ -102,7 +102,7 @@ pub(crate) fn value_to_tabular(v: &GValue) -> Result<Value> {
 /// A tabular [`Value`] back as the equivalent GlueSQL [`GValue`] (inverse of [`value_to_tabular`]).
 /// A zero interval round-trips as `Microsecond(0)` (`Month(0)` and `Microsecond(0)` denote the same
 /// interval).
-pub(crate) fn value_from_tabular(v: &Value) -> Result<GValue> {
+pub fn value_from_tabular(v: &Value) -> Result<GValue> {
     Ok(match v {
         Value::Null => GValue::Null,
         Value::Bool(b) => GValue::Bool(*b),

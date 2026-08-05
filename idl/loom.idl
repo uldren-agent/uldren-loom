@@ -43,6 +43,7 @@ enum FacetKind {
     METRICS,
     LOGS,
     TRACES,
+    INFERENCE,
 }
 
 enum AclDomain {
@@ -72,6 +73,7 @@ enum AclDomain {
     CHAT,
     LIFECYCLE,
     MEETINGS,
+    INFERENCE,
 }
 
 struct Workspace {
@@ -348,6 +350,15 @@ struct IdentityAuthorityDetach {
     string reason;
 }
 
+struct IdentityAuthorityWitnessRecord {
+    Uuid authority;
+    IdentityAuthorityMode mode;
+    u64 generation;
+    optional Digest head;
+    Digest snapshot_digest;
+    optional Digest latest_handoff_digest;
+}
+
 struct IdentitySnapshot {
     bool authenticated_mode;
     optional Uuid root;
@@ -380,6 +391,22 @@ struct AppCredentialCreateResult {
     string label;
     bool enabled;
     string secret_token;
+}
+
+struct AuthorityReplicationPolicyRecord {
+    string id;
+    u32 schema_version;
+    string source;
+    bool enabled;
+    bool pull_on_start;
+    optional u64 interval_ms;
+    u64 jitter_ms;
+    u64 backoff_ms;
+    bool publish_witness;
+    optional u64 last_success_ms;
+    optional u64 last_failure_ms;
+    optional string last_error;
+    optional u64 last_modified_audit_seq;
 }
 
 // An opaque, session-scoped transfer handle minted by transfer_import_open. Carried back on each
@@ -526,23 +553,34 @@ struct CapabilitySet {
 // profile default. A non-empty `passphrase`, or a 32-byte `kek`, encrypts the store; both empty is an
 // unencrypted store. `open_keyed`/`open_with_kek` unlock an encrypted store. `close` frees a handle.
 interface Store {
+    @effect(read)
     string version();
     // Canonical-CBOR CapabilitySet with independent proof_status and operational_state.
+    @effect(read)
     bytes capabilities();
     // Runtime provider/profile report as canonical CBOR: binary_channel, runtime_policy,
     // default_identity_profile, crypto_provider, tls_provider, fips_capable, fips_tls_claim.
+    @effect(read)
     bytes runtime_profile();
+    @effect(read)
     Digest blob_digest(bytes data);
     // The store's digest algorithm as a stable lowercase string (e.g. "blake3", "sha256"): the algo
     // component of every content address this store produces. A property of the open store, so hosts
     // that reassemble content-addressed results (e.g. the MCP document_query composite) can reproduce
     // `Digest::hash(algo, bytes)` over a remote store instead of assuming a fixed algorithm.
+    @effect(read)
     string digest_algo();
+    @effect(control)
     void create(string loom_path, string profile, optional string suite, optional bytes passphrase);
+    @effect(control)
     void create_with_kek(string loom_path, string profile, optional string suite, bytes kek);
+    @effect(control)
     LoomSession open(string loom_path);
+    @effect(control)
     LoomSession open_keyed(string loom_path, bytes passphrase);
+    @effect(control)
     LoomSession open_with_kek(string loom_path, bytes kek);
+    @effect(control)
     void close(LoomSession handle);
 }
 
@@ -553,8 +591,11 @@ interface Store {
 // recovery wrap. A `kek` is 32 bytes. Provider acquisition (keychain, TPM, KMS) and callback providers
 // are outside this interface.
 interface KeySource {
+    @effect(mutation)
     void key_add_wrap_keyed(LoomSession handle, bytes new_passphrase, bool allow_no_recovery);
+    @effect(mutation)
     void key_add_wrap_with_kek(LoomSession handle, bytes kek, bool allow_no_recovery);
+    @effect(mutation)
     void key_remove_wrap(LoomSession handle, u64 index, bool allow_no_recovery);
 }
 
@@ -562,9 +603,13 @@ interface KeySource {
 // `workspace` selects by UUID or name. `workspace_create` returns the new workspace UUID. The C ABI and
 // bindings return `workspace_list` as JSON records carrying the same fields.
 interface Workspaces {
+    @effect(mutation)
     Uuid workspace_create(LoomSession handle, optional string name, optional FacetKind facet);
+    @effect(read)
     list<Workspace> workspace_list(LoomSession handle);
+    @effect(mutation)
     void workspace_rename(LoomSession handle, string workspace, string new_name);
+    @effect(mutation)
     void workspace_delete(LoomSession handle, string workspace);
 }
 
@@ -574,7 +619,10 @@ interface Workspaces {
 // context grant upper bound, execution mode, per-step manifests, WASM bodies, inputs, fuel, and commit
 // metadata.
 interface Exec {
+    @effect(mutation)
     bytes exec_cbor(LoomSession handle, bytes request);
+    @effect(mutation)
+    bytes apply_cbor(LoomSession handle, bytes request);
 }
 
 // ---- program lifecycle ----
@@ -582,10 +630,15 @@ interface Exec {
 // manifest]`. `program_get` returns `[record, body]`. `manifest` is the canonical
 // `loom_compute::Manifest` byte form.
 interface Program {
+    @effect(mutation)
     bytes program_put(LoomSession handle, string workspace, string name, bytes manifest, bytes body);
+    @effect(read)
     optional bytes program_inspect(LoomSession handle, string workspace, string name);
+    @effect(read)
     optional bytes program_get(LoomSession handle, string workspace, string name);
+    @effect(read)
     bytes program_list(LoomSession handle, string workspace);
+    @effect(mutation)
     bool program_remove(LoomSession handle, string workspace, string name);
 }
 
@@ -599,37 +652,74 @@ interface Program {
 // structured scopes, an optional `{language, expression}` predicate, and a non-empty rights list.
 // `acl_revoke` returns whether a matching direct grant was removed.
 interface Sessions {
+    @effect(control)
     void authenticate_passphrase(LoomSession handle, Uuid principal, bytes passphrase);
+    @effect(control)
     void clear_authentication(LoomSession handle);
 }
 
 interface Identity {
+    @effect(read)
     IdentitySnapshot identity_list(LoomSession handle);
+    @effect(read)
+    IdentityAuthorityWitnessRecord identity_authority_witness(LoomSession handle);
+    @effect(read)
+    list<AuthorityReplicationPolicyRecord> identity_list_authority_replication(LoomSession handle);
+    @effect(mutation)
     Uuid identity_add_principal(LoomSession handle, string principal_handle, string name,
                                 PrincipalKind kind);
+    @effect(mutation)
     void identity_rename_principal_handle(LoomSession handle, Uuid principal,
                                           string principal_handle);
+    @effect(mutation)
     void identity_set_passphrase(LoomSession handle, Uuid principal, bytes passphrase);
+    @effect(mutation)
     void identity_remove_principal(LoomSession handle, Uuid principal);
+    @effect(mutation)
     void identity_assign_role(LoomSession handle, Uuid principal, Uuid role);
+    @effect(mutation)
     bool identity_revoke_role(LoomSession handle, Uuid principal, Uuid role);
+    @effect(mutation)
     IdentityAuditResult identity_create_external_credential(LoomSession handle, Uuid principal,
                                              ExternalCredentialSpec credential);
+    @effect(mutation)
     IdentityAuditResult identity_revoke_external_credential(LoomSession handle, Uuid credential);
+    @effect(mutation)
     IdentityAuditResult identity_add_public_key(LoomSession handle, Uuid principal, string label,
                                  string algorithm, bytes public_key);
+    @effect(mutation)
     IdentityAuditResult identity_revoke_public_key(LoomSession handle, Uuid key);
+    @effect(mutation)
     AppCredentialCreateResult identity_create_app_credential(LoomSession handle, Uuid principal,
                                              string label);
+    @effect(mutation)
     IdentityAuditResult identity_revoke_app_credential(LoomSession handle, Uuid credential);
+    @effect(mutation)
+    string identity_force_detach_authority_json(LoomSession handle, Uuid principal,
+                                                u64 generation, string reason);
+    @effect(mutation)
+    string identity_replicate_authority_json(LoomSession handle, string source,
+                                             bool become_authority);
+    @effect(mutation)
+    string identity_configure_authority_replication_json(LoomSession handle, string id,
+                                                         string source, bool disabled,
+                                                         bool pull_on_start,
+                                                         optional u64 interval_ms,
+                                                         u64 jitter_ms, u64 backoff_ms,
+                                                         bool publish_witness);
+    @effect(mutation)
+    string identity_remove_authority_replication_json(LoomSession handle, string id);
 }
 
 interface Acl {
+    @effect(read)
     list<AclGrantRecord> acl_list(LoomSession handle);
+    @effect(mutation)
     void acl_grant(LoomSession handle, AclEffect effect, string subject, optional string workspace,
                    optional AclDomain domain, optional string ref_glob,
                    optional list<AclScopeRecord> scopes, optional list<AclRight> rights,
                    optional AclPredicateRecord predicate);
+    @effect(mutation)
     bool acl_revoke(LoomSession handle, AclEffect effect, string subject, optional string workspace,
                     optional AclDomain domain, optional string ref_glob,
                     optional list<AclScopeRecord> scopes, optional list<AclRight> rights,
@@ -637,14 +727,111 @@ interface Acl {
 }
 
 interface ProtectedRefs {
+    @effect(read)
     list<ProtectedRefPolicyRecord> protected_ref_list(LoomSession handle, string workspace);
+    @effect(read)
     optional ProtectedRefPolicyRecord protected_ref_get(LoomSession handle, string workspace,
                                                         string ref_name);
+    @effect(mutation)
     void protected_ref_set(LoomSession handle, string workspace, string ref_name,
                            bool fast_forward_only, bool signed_commits_required,
                            bool signed_ref_advance_required, u32 required_review_count,
                            bool retention_lock, bool governance_lock);
+    @effect(mutation)
     bool protected_ref_remove(LoomSession handle, string workspace, string ref_name);
+}
+
+interface Lifecycle {
+    @effect(mutation)
+    string lifecycle_define_standard_json(LoomSession handle, string workspace, string kind,
+                                          string version,
+                                          string completion_predicate_digest);
+    @effect(mutation)
+    string lifecycle_define_json(LoomSession handle, string workspace, bytes definition);
+    @effect(mutation)
+    string lifecycle_instantiate_json(LoomSession handle, string workspace, string instance_id,
+                                      string definition_id, list<string> subject_refs);
+    @effect(mutation)
+    string lifecycle_transition_json(LoomSession handle, string workspace, string instance_id,
+                                     string transition_id, string to_stage_id,
+                                     optional string actor_principal_id,
+                                     string gate_evaluations_json,
+                                     optional string snapshot_digest);
+}
+
+interface Refs {
+    @effect(mutation)
+    string refs_reconcile_json(LoomSession handle, string workspace, u64 max);
+}
+
+// ---- security administration ----
+// Audit, certificate, and network-access administration are persisted Loom mutations because even
+// read-shaped administration commands append durable audit records. Certificate import carries local
+// PEM bytes over the generated contract; certificate export returns canonical CBOR
+// `[seq, name, cert_chain?, private_key?, trust_bundle?]` so remote callers can write local files
+// without exposing host paths to the server.
+interface Audit {
+    @effect(mutation)
+    string audit_config_show_json(LoomSession handle);
+    @effect(mutation)
+    string audit_config_set_json(LoomSession handle, optional u32 retention_days,
+                                 optional bool legal_hold);
+    @effect(mutation)
+    string audit_list_json(LoomSession handle);
+    @effect(mutation)
+    string audit_view_json(LoomSession handle, string record);
+    @effect(mutation)
+    AuditCompactResult audit_compact(LoomSession handle, u64 through_seq);
+}
+
+interface Certificate {
+    @effect(mutation)
+    string certificate_list_json(LoomSession handle);
+    @effect(mutation)
+    string certificate_import_json(LoomSession handle, string name, bytes cert_chain_pem,
+                                   bytes private_key_pem, optional bytes trust_bundle_pem,
+                                   bool force);
+    @effect(mutation)
+    bytes certificate_export(LoomSession handle, string name, bool include_cert_chain,
+                             bool include_private_key, bool include_trust_bundle, bool force);
+    @effect(mutation)
+    string certificate_generate_self_signed_json(LoomSession handle, string name,
+                                                 list<string> dns_names,
+                                                 list<string> ip_addresses, optional string cn,
+                                                 u32 days, string algorithm, bool force);
+    @effect(mutation)
+    string certificate_remove_json(LoomSession handle, string name);
+    @effect(mutation)
+    string certificate_audit_json(LoomSession handle, string name);
+}
+
+interface NetworkAccess {
+    @effect(mutation)
+    string network_access_list_json(LoomSession handle);
+    @effect(mutation)
+    string network_access_set_json(LoomSession handle, string name, optional string description,
+                                   string default_action, string rules_json);
+    @effect(mutation)
+    string network_access_remove_json(LoomSession handle, string name);
+    @effect(mutation)
+    string network_access_audit_json(LoomSession handle, string name);
+}
+
+interface ServeConfig {
+    @effect(mutation)
+    string serve_listener_configure_json(LoomSession handle, string request_json);
+    @effect(read)
+    string serve_listener_list_json(LoomSession handle);
+    @effect(mutation)
+    string serve_listener_set_enabled_json(LoomSession handle, string listener_id, bool enabled);
+    @effect(mutation)
+    string serve_listener_remove_json(LoomSession handle, string listener_id);
+    @effect(read)
+    string serve_web_route_list_json(LoomSession handle, string listener_id);
+    @effect(mutation)
+    string serve_web_route_set_json(LoomSession handle, string request_json);
+    @effect(mutation)
+    string serve_web_route_remove_json(LoomSession handle, string listener_id, string route_id);
 }
 
 // ---- daemon lifecycle and locks ----
@@ -657,25 +844,34 @@ interface ProtectedRefs {
 // leased, and fenced; a true stateless caller that cannot attach to the daemon must reject these
 // methods.
 interface Daemon {
+    @effect(control)
     void daemon_start(string loom_path);
+    @effect(control)
     void daemon_stop(string loom_path);
+    @effect(control)
     void daemon_restart(string loom_path);
+    @effect(control)
     DaemonStatus daemon_status(string loom_path);
+    @effect(control)
     DaemonStatus daemon_doctor(string loom_path);
+    @effect(control)
     void daemon_session_attach(string loom_path, string session);
+    @effect(control)
     void daemon_session_detach(string loom_path, string session);
+    @effect(control)
     void daemon_pin_add(string loom_path, string pin);
+    @effect(control)
     void daemon_pin_remove(string loom_path, string pin);
 }
 
 interface Locks {
-    LockToken lock_acquire(string loom_path, string key, string principal, string session,
-                           LockMode mode, u32 permits, u32 capacity, u64 lease_ms, u64 wait_ms);
-    LockToken lock_refresh(string loom_path, string key, string principal, string session,
-                           LockMode mode, u32 permits, u32 capacity, u64 fence_low,
-                           u64 fence_high, u64 lease_ms);
-    void lock_release(string loom_path, string key, string principal, string session, LockMode mode,
-                      u32 permits, u32 capacity, u64 fence_low, u64 fence_high);
+    @effect(control)
+    LockToken lock_acquire(LoomSession handle, string key, LockMode mode, u32 permits,
+                           u32 capacity, u64 lease_ms, u64 wait_ms);
+    @effect(control)
+    LockToken lock_refresh(LoomSession handle, LockToken token, u64 lease_ms);
+    @effect(control)
+    void lock_release(LoomSession handle, LockToken token);
 }
 
 // How merge_resolve settles one conflicted path of an in-progress merge: keep the current branch slot
@@ -773,27 +969,42 @@ struct WatchBatch {
 // two-parent merge commit once every path is resolved. The in-progress state is operational metadata,
 // excluded from commits, reachability, clone, push, bundle, and ordinary sync.
 interface VersionControl {
+    @effect(mutation)
     Digest commit(LoomSession handle, string workspace, string author, string message, u64 timestamp_ms);
+    @effect(mutation)
     void branch(LoomSession handle, string workspace, string branch);
+    @effect(mutation)
     void checkout(LoomSession handle, string workspace, string branch);
+    @effect(read)
     list<Digest> log(LoomSession handle, string workspace, string branch);
     // The current HEAD branch name for `workspace` (what `vcs log` resolves locally).
+    @effect(read)
     string head_branch(LoomSession handle, string workspace);
+    @effect(mutation)
     MergeResult merge(LoomSession handle, string workspace, string from_branch,
                       string author, bool cell_level, u64 timestamp_ms);
+    @effect(read)
     bool merge_in_progress(LoomSession handle, string workspace);
+    @effect(read)
     list<string> merge_conflicts(LoomSession handle, string workspace);
+    @effect(mutation)
     void merge_resolve(LoomSession handle, string workspace, string path,
                        ConflictResolution resolution);
+    @effect(mutation)
     void merge_abort(LoomSession handle, string workspace);
+    @effect(mutation)
     Digest merge_continue(LoomSession handle, string workspace, string author, u64 timestamp_ms);
     // Workspace history. `diff` is the cross-facet structural `LMDIFF` envelope between two commits;
     // `blame` pairs each current path on `branch` with the commit that last set it. All return
     // canonical CBOR.
+    @effect(read)
     bytes diff(LoomSession handle, string workspace, string from_commit, string to_commit);
+    @effect(read)
     bytes blame(LoomSession handle, string workspace, string branch);
     // Async (Task-returning) forms of the version-control history queries.
+    @effect(read)
     Task log_async(LoomSession handle, string workspace, string branch);
+    @effect(mutation)
     Task merge_async(LoomSession handle, string workspace, string from_branch,
                      string author, bool cell_level);
 
@@ -801,10 +1012,15 @@ interface VersionControl {
     // working tree (staged plus unstaged); `commit_staged` records only the index. `stage`/`stage_all`
     // move working-tree changes into the index, `unstage` reverts an index entry to HEAD, and `status`
     // reports the working state.
+    @effect(read)
     Status status(LoomSession handle, string workspace);
+    @effect(mutation)
     void stage(LoomSession handle, string workspace, string path);
+    @effect(mutation)
     void stage_all(LoomSession handle, string workspace);
+    @effect(mutation)
     void unstage(LoomSession handle, string workspace, string path);
+    @effect(mutation)
     Digest commit_staged(LoomSession handle, string workspace, string author,
                          string message, u64 timestamp_ms);
 
@@ -814,11 +1030,16 @@ interface VersionControl {
     // the ref target digest. `tag_target` reads the raw ref (the commit, or the tag object) and is
     // absent for an unknown tag. `tag_delete` is NOT_FOUND if absent; `tag_rename` is NOT_FOUND on a
     // missing source and ALREADY_EXISTS on a taken destination.
+    @effect(mutation)
     Digest tag_create(LoomSession handle, string workspace, string name, string rev,
                       string tagger, string message, u64 timestamp_ms);
+    @effect(read)
     list<string> tag_list(LoomSession handle, string workspace);
+    @effect(read)
     Digest? tag_target(LoomSession handle, string workspace, string name);
+    @effect(mutation)
     void tag_delete(LoomSession handle, string workspace, string name);
+    @effect(mutation)
     void tag_rename(LoomSession handle, string workspace, string old_name,
                     string new_name);
 
@@ -826,7 +1047,9 @@ interface VersionControl {
     // snapshot `rev` resolves to (HEAD, a branch name, or a digest), removing it if absent there;
     // `restore_path` resets the subtree under `prefix` (a `""` prefix restores the whole tree). Both
     // touch the working tree only - HEAD, the branch, and the staging index are unchanged.
+    @effect(mutation)
     void restore_file(LoomSession handle, string workspace, string rev, string path);
+    @effect(mutation)
     void restore_path(LoomSession handle, string workspace, string rev, string prefix);
 
     // History replay (cherry-pick / revert / rebase). These are workspace-level and cross-facet (a
@@ -835,16 +1058,20 @@ interface VersionControl {
     // outcome reports whether the replay applied (with the new tip), was clean (dry run), hit conflicts
     // (with the unresolved paths), or had nothing to do. Multi-commit ops are atomic: the first conflict
     // makes no change.
+    @effect(mutation)
     ReplayOutcome cherry_pick(LoomSession handle, string workspace,
                               list<Digest> commits, bool dry_run, u64 timestamp_ms);
+    @effect(mutation)
     ReplayOutcome revert(LoomSession handle, string workspace, list<Digest> commits,
                          string author, bool dry_run, u64 timestamp_ms);
+    @effect(mutation)
     ReplayOutcome rebase(LoomSession handle, string workspace, string onto,
                          bool dry_run, u64 timestamp_ms);
 
     // Squash the commits after `onto` up to the tip into one commit (parent `onto`, the tip's tree,
     // `author`/`message`); returns the new commit. `onto` must be an ancestor of the tip and not the tip
     // itself (INVALID_ARGUMENT).
+    @effect(mutation)
     Digest squash(LoomSession handle, string workspace, string onto, string author,
                   string message, u64 timestamp_ms);
 }
@@ -854,8 +1081,11 @@ interface VersionControl {
 // The current source-backed v1 profile is first-parent and commit-level for one exact branch; selector
 // narrowing may return UNSUPPORTED until promoted by the implementation.
 interface Watch {
+    @effect(read)
     WatchSubscription subscribe(LoomSession handle, WatchSelector selector, optional Digest from);
+    @effect(read)
     WatchBatch poll(LoomSession handle, string cursor, u32 max);
+    @effect(read)
     stream<DataChange> stream(LoomSession handle, WatchSelector selector, optional Digest from);
 }
 
@@ -874,10 +1104,14 @@ struct ReplayOutcome {
 // parent; `read_file` returns the staged bytes; `remove_file` stages a deletion. Appending to a path
 // that is a directory is ALREADY_EXISTS; a missing parent is NOT_FOUND.
 interface FileSystem {
+    @effect(mutation)
     void write_file(LoomSession handle, string workspace, string path, bytes content,
                     u32 mode);
+    @effect(read)
     bytes read_file(LoomSession handle, string workspace, string path);
+    @effect(mutation)
     void append_file(LoomSession handle, string workspace, string path, bytes content);
+    @effect(mutation)
     void remove_file(LoomSession handle, string workspace, string path);
 
     // ---- byte-range I/O (path form) ----
@@ -887,16 +1121,21 @@ interface FileSystem {
     // (POSIX pwrite); only the affected chunks are re-stored. `truncate` resizes to `size`, zero-extending
     // or dropping bytes, creating a missing file zero-filled (POSIX truncate). A missing parent is
     // NOT_FOUND; a directory path is ALREADY_EXISTS. A handle open on the path sees these changes.
+    @effect(read)
     bytes read_at(LoomSession handle, string workspace, string path, u64 offset, u64 len);
+    @effect(mutation)
     void write_at(LoomSession handle, string workspace, string path, u64 offset,
                   bytes content);
+    @effect(mutation)
     void truncate(LoomSession handle, string workspace, string path, u64 size);
 
     // Symbolic links (git-style: a file slot with the S_IFLNK mode whose content is the target). The
     // target is opaque and may be dangling; symlinks are not followed by other fs operations. `symlink`
     // requires an existing parent (`NOT_FOUND`) and a free `link_path` (`ALREADY_EXISTS`). `read_link`
     // is `NOT_FOUND` if absent and `INVALID_ARGUMENT` if the path is not a symlink.
+    @effect(mutation)
     void symlink(LoomSession handle, string workspace, string target, string link_path);
+    @effect(read)
     string read_link(LoomSession handle, string workspace, string path);
 
     // ---- directories and metadata ----
@@ -907,19 +1146,28 @@ interface FileSystem {
     // (`[path, kind, size, mode]`, `kind` = 0 file / 1 directory / 2 symlink); a path resolving to neither
     // file nor directory is `NOT_FOUND`. `list_directory` returns canonical-CBOR `loom.fs.dir-listing.v1`
     // (an array of `[name, kind]` sorted by name; root is `""` or `"/"`); a non-directory path is `NOT_FOUND`.
+    @effect(mutation)
     void create_directory(LoomSession handle, string workspace, string path, bool recursive);
+    @effect(mutation)
     void remove_directory(LoomSession handle, string workspace, string path, bool recursive);
+    @effect(read)
     bytes stat(LoomSession handle, string workspace, string path);
+    @effect(read)
     bytes list_directory(LoomSession handle, string workspace, string path);
 
     // Host filesystem import/export over a workspace file tree. Return values are canonical-CBOR
     // `loom.interchange.import-report.v1` or `loom.interchange.export-report.v1` records.
-    bytes import_fs(LoomSession handle, string workspace, string src_path, bool commit,
-                    bool dry_run);
+    @effect(mutation)
+    bytes import_fs(LoomSession handle, string workspace, string src_path, optional string author,
+                    optional string message, bool commit, bool dry_run);
+    @effect(read)
     bytes export_fs(LoomSession handle, string workspace, string dst_path,
                     optional string revision, bool dry_run);
-    Task import_fs_async(LoomSession handle, string workspace, string src_path, bool commit,
+    @effect(mutation)
+    Task import_fs_async(LoomSession handle, string workspace, string src_path,
+                         optional string author, optional string message, bool commit,
                          bool dry_run);
+    @effect(read)
     Task export_fs_async(LoomSession handle, string workspace, string dst_path,
                          optional string revision, bool dry_run);
 }
@@ -927,27 +1175,74 @@ interface FileSystem {
 // ---- archive interchange ----
 // Host archive import/export over a workspace file tree. `kind` is one of `tar-zstd`, `tar`,
 // `tar-gzip`, `zip`, or `gzip` for import; export supports `tar-zstd`, `tar`, `tar-gzip`, or `zip`.
-// Return values are canonical-CBOR `loom.interchange.import-report.v1` or
-// `loom.interchange.export-report.v1` records. `revision` is absent for the current working tree or a
+// `archive_import` returns canonical CBOR `[manifest, import_report]` where `manifest` carries
+// archive id, archive kind, root digest, and detailed archive entries. `archive_export` returns
+// canonical CBOR `[manifest, export_report]`. `revision` is absent for the current working tree or a
 // supported revision selector.
 interface Archive {
+    @effect(mutation)
     bytes archive_import(LoomSession handle, string workspace, string src_path, string kind,
-                         bool dry_run);
+                         optional string gzip_output_path, bool commit, optional string author,
+                         optional string message, bool dry_run);
+    @effect(read)
     bytes archive_export(LoomSession handle, string workspace, string dst_path, string kind,
                          optional string revision, bool dry_run);
+    @effect(mutation)
     Task archive_import_async(LoomSession handle, string workspace, string src_path, string kind,
-                              bool dry_run);
+                              optional string gzip_output_path, bool commit, optional string author,
+                              optional string message, bool dry_run);
+    @effect(read)
     Task archive_export_async(LoomSession handle, string workspace, string dst_path, string kind,
                               optional string revision, bool dry_run);
+}
+
+// ---- profile imports ----
+// Byte-payload profile imports that preserve existing CLI semantics without exposing host paths over
+// hosted/remote boundaries. Return values are canonical-CBOR `loom.interchange.import-report.v1`
+// records. `source_scope` is the caller-visible source identity, not a server filesystem path.
+interface InterchangeProfiles {
+    @effect(mutation)
+    bytes import_table_csv(LoomSession handle, string workspace, string source_scope,
+                           bytes csv_payload, string database, string table, string schema,
+                           string primary_key, string mode, bool commit,
+                           optional string author, optional string message, bool dry_run);
+    @effect(mutation)
+    bytes import_redmine(LoomSession handle, string workspace, string profile, string source_scope,
+                         bytes snapshot_payload, string field_policy, bool dry_run);
+    @effect(mutation)
+    bytes import_asana(LoomSession handle, string workspace, string profile, string source_scope,
+                       bytes snapshot_payload, string field_policy, bool dry_run);
+    @effect(mutation)
+    bytes import_jira(LoomSession handle, string workspace, string profile, string source_scope,
+                      bytes snapshot_payload, string field_policy, bool dry_run);
+    @effect(mutation)
+    bytes import_confluence(LoomSession handle, string workspace, string profile, string source_scope,
+                            bytes snapshot_payload, string default_space, bool dry_run);
+    @effect(mutation)
+    bytes import_slack(LoomSession handle, string workspace, string profile, string source_scope,
+                       bytes snapshot_payload, bool dry_run);
+    @effect(mutation)
+    bytes import_drive(LoomSession handle, string workspace, string profile, string source_scope,
+                       bytes archive_payload, bool dry_run);
+    @effect(mutation)
+    bytes import_markdown(LoomSession handle, string workspace, string profile, string source_scope,
+                          bytes archive_payload, string space, bool dry_run);
+    @effect(mutation)
+    bytes import_notion(LoomSession handle, string workspace, string profile, string source_scope,
+                        bytes snapshot_payload, string default_space, bool dry_run);
 }
 
 // ---- CAR interchange ----
 // Deterministic Loom CAR import/export for a workspace object graph. Return values are canonical-CBOR
 // `loom.interchange.import-report.v1` or `loom.interchange.export-report.v1` records.
 interface Car {
+    @effect(mutation)
     bytes car_import(LoomSession handle, string src_path, bool dry_run);
+    @effect(read)
     bytes car_export(LoomSession handle, string workspace, string dst_path, bool dry_run);
+    @effect(mutation)
     Task car_import_async(LoomSession handle, string src_path, bool dry_run);
+    @effect(read)
     Task car_export_async(LoomSession handle, string workspace, string dst_path, bool dry_run);
 }
 
@@ -978,14 +1273,23 @@ struct FileStat {
 // an unlinked inode closes, reclaims its bytes. The open-file table is operational metadata: excluded
 // from commits, reachability, clone, push, bundle, and ordinary sync.
 interface FileHandle {
+    @effect(control)
     u64 open(LoomSession handle, string workspace, string path, OpenMode mode);
+    @effect(read)
     bytes read(LoomSession handle, u64 file, u64 len);
+    @effect(read)
     bytes read_at(LoomSession handle, u64 file, u64 offset, u64 len);
+    @effect(mutation)
     u64 write(LoomSession handle, u64 file, bytes content);
+    @effect(mutation)
     u64 write_at(LoomSession handle, u64 file, u64 offset, bytes content);
+    @effect(mutation)
     void truncate(LoomSession handle, u64 file, u64 size);
+    @effect(control)
     void flush(LoomSession handle, u64 file);
+    @effect(read)
     FileStat stat(LoomSession handle, u64 file);
+    @effect(control)
     void close(LoomSession handle, u64 file);
 }
 
@@ -994,13 +1298,18 @@ interface FileHandle {
 // the workspace working tree, not a global inventory. An absent `get` returns no value; a content or
 // digest mismatch is INTEGRITY_FAILURE.
 interface Cas {
+    @effect(mutation)
     Digest put(LoomSession handle, string workspace, bytes content);
+    @effect(read)
     optional bytes get(LoomSession handle, string workspace, Digest digest);
+    @effect(read)
     bool has(LoomSession handle, string workspace, Digest digest);
     // `delete` unlinks the blob from the workspace's current working tree (making it unreachable going
     // forward) and returns whether it was present. CAS stays immutable: the bytes are reclaimed by GC
     // once unreferenced, and an earlier commit that held the blob still restores it.
+    @effect(mutation)
     bool delete(LoomSession handle, string workspace, Digest digest);
+    @effect(read)
     list<Digest> list(LoomSession handle, string workspace);
 }
 
@@ -1011,12 +1320,18 @@ interface Cas {
 // return the canonical CBOR array of `[key, value]` pairs in key order; `range` is half-open [lo, hi).
 // An absent key or map reads as absent (no value / empty list), not an error.
 interface Kv {
+    @effect(mutation)
     void put(LoomSession handle, string workspace, string collection, bytes key, bytes value);
+    @effect(read)
     optional bytes get(LoomSession handle, string workspace, string collection, bytes key);
+    @effect(mutation)
     bool delete(LoomSession handle, string workspace, string collection, bytes key);
+    @effect(read)
     bytes list(LoomSession handle, string workspace, string collection);
+    @effect(read)
     bytes range(LoomSession handle, string workspace, string collection, bytes lo, bytes hi);
     // The collection (map) names present in the workspace, canonical CBOR array of strings.
+    @effect(read)
     bytes list_collections(LoomSession handle, string workspace);
 }
 
@@ -1025,20 +1340,35 @@ interface Kv {
 // CBOR array of node-id text; out-/in-edge results cross as a CBOR array of [edge_id, edge]. For
 // `reachable`, max_depth < 0 is no limit; `via_label` empty follows every edge, else only that label.
 interface Graph {
+    @effect(mutation)
     void upsert_node(LoomSession handle, string workspace, string name, string id, bytes props);
+    @effect(read)
     optional bytes get_node(LoomSession handle, string workspace, string name, string id);
+    @effect(mutation)
     void remove_node(LoomSession handle, string workspace, string name, string id, bool cascade);
+    @effect(mutation)
     void upsert_edge(LoomSession handle, string workspace, string name, string id, string src, string dst, string label, bytes props);
+    @effect(mutation)
     void upsert_edge_indexed(LoomSession handle, string workspace, string name, string id, string src, string dst, string label, bytes props);
+    @effect(read)
     optional bytes get_edge(LoomSession handle, string workspace, string name, string id);
+    @effect(mutation)
     bool remove_edge(LoomSession handle, string workspace, string name, string id);
+    @effect(mutation)
     bool remove_edge_indexed(LoomSession handle, string workspace, string name, string id);
+    @effect(read)
     bytes neighbors(LoomSession handle, string workspace, string name, string id);
+    @effect(read)
     bytes out_edges(LoomSession handle, string workspace, string name, string id);
+    @effect(read)
     bytes in_edges(LoomSession handle, string workspace, string name, string id);
+    @effect(read)
     bytes reachable(LoomSession handle, string workspace, string name, string start, i64 max_depth, string via_label);
+    @effect(read)
     optional bytes shortest_path(LoomSession handle, string workspace, string name, string from, string to, string via_label);
+    @effect(read)
     bytes query(LoomSession handle, string workspace, string name, string query);
+    @effect(read)
     bytes explain_query(LoomSession handle, string workspace, string name, string query);
 }
 
@@ -1048,24 +1378,56 @@ interface Graph {
 // `filter` is a recursive CBOR array: [0] all, [1,key,value] eq, [2,a,b] and, [3,a,b] or,
 // [4,a] not, [5,key] exists, [6,key,value] ne, [7,key,value] lt, [8,key,value] le,
 // [9,key,value] gt, [10,key,value] ge, [11,key,[values...]] in. Empty bytes mean all.
+struct VectorTextUpsertRequest {
+    string workspace;
+    string name;
+    string id;
+    bytes vector;
+    bytes metadata;
+    bytes source_text;
+    optional string model_id;
+    optional string weights_digest;
+    bool create;
+    i32 metric;
+    optional bytes expected_token;
+    bool expect_absent;
+}
+
 interface Vector {
+    @effect(mutation)
     void create(LoomSession handle, string workspace, string name, u64 dim, i32 metric);
+    @effect(mutation)
     void upsert(LoomSession handle, string workspace, string name, string id, bytes vector, bytes metadata);
+    @effect(mutation)
     void upsert_source(LoomSession handle, string workspace, string name, string id, bytes vector,
                        bytes metadata, bytes source_text, optional string model_id,
                        optional string weights_digest);
+    @effect(read)
     optional bytes get(LoomSession handle, string workspace, string name, string id);
+    @effect(read)
     optional bytes source_text(LoomSession handle, string workspace, string name, string id);
+    @effect(read)
     optional bytes embedding_model(LoomSession handle, string workspace, string name);
+    @effect(read)
     bytes ids(LoomSession handle, string workspace, string name, optional string prefix);
+    @effect(read)
     bytes metadata_index_keys(LoomSession handle, string workspace, string name);
+    @effect(mutation)
     bool create_metadata_index(LoomSession handle, string workspace, string name, string key);
+    @effect(mutation)
     bool drop_metadata_index(LoomSession handle, string workspace, string name, string key);
+    @effect(mutation)
     bool delete(LoomSession handle, string workspace, string name, string id);
+    @effect(read)
     bytes search(LoomSession handle, string workspace, string name, bytes query, u64 k, bytes filter);
+    @effect(read)
     bytes search_policy(LoomSession handle, string workspace, string name, bytes query, u64 k,
                         bytes filter, i32 policy, u64 threshold, u64 ef, u64 pq_m, u64 pq_k,
                         u64 pq_iters);
+    @effect(mutation)
+    bytes vector_text_upsert(LoomSession handle, VectorTextUpsertRequest request);
+    @effect(mutation)
+    string vector_workspace_configure_json(LoomSession handle, string workspace, string request_json);
 }
 
 // Columnar dataset (Columnar facet). `columns` crosses as a CBOR array of [name, type_tag]; a row
@@ -1074,27 +1436,49 @@ interface Vector {
 // Aggregate expressions cross as [[op, column?] ...] where op is 0 count, 1 count-non-null, 2 min,
 // 3 max, 4 sum. Aggregate results cross as a CBOR cell array.
 interface Columnar {
+    @effect(mutation)
     void create(LoomSession handle, string workspace, string name, bytes columns, u64 target_segment_rows);
+    @effect(mutation)
     void append(LoomSession handle, string workspace, string name, bytes row);
+    @effect(mutation)
     void compact(LoomSession handle, string workspace, string name);
+    @effect(read)
     bytes inspect(LoomSession handle, string workspace, string name);
+    @effect(read)
     bytes source_digest(LoomSession handle, string workspace, string name);
+    @effect(read)
     bytes scan(LoomSession handle, string workspace, string name);
+    @effect(read)
     bytes columns(LoomSession handle, string workspace, string name);
+    @effect(read)
     u64 rows(LoomSession handle, string workspace, string name);
+    @effect(read)
     bytes select(LoomSession handle, string workspace, string name, bytes columns, bytes filter);
+    @effect(read)
     bytes aggregate(LoomSession handle, string workspace, string name, bytes aggregates, bytes filter);
+    @effect(mutation)
+    bytes columnar_import_arrow(LoomSession handle, string workspace, string name, bytes payload,
+                                u64 target_segment_rows, bool replace, bool dry_run);
+    @effect(mutation)
+    bytes columnar_import_parquet(LoomSession handle, string workspace, string name, bytes payload,
+                                  u64 target_segment_rows, bool replace, bool dry_run);
 }
 
 // Dataframe frame (Dataframe facet). A plan crosses as canonical `DataframePlan` CBOR. Collect and
 // preview return `[columns, rows]` canonical CBOR, where `columns` is `[name, type_tag, nullable]`
 // and each row is a CBOR cell array. Source digests are the explicit digests pinned in the plan.
 interface Dataframe {
+    @effect(mutation)
     void create(LoomSession handle, string workspace, string name, bytes plan);
+    @effect(read)
     bytes collect(LoomSession handle, string workspace, string name);
+    @effect(read)
     bytes preview(LoomSession handle, string workspace, string name, u64 rows);
+    @effect(mutation)
     optional Digest materialize(LoomSession handle, string workspace, string name);
+    @effect(read)
     Digest plan_digest(LoomSession handle, string workspace, string name);
+    @effect(read)
     bytes source_digests(LoomSession handle, string workspace, string name);
 }
 
@@ -1105,17 +1489,26 @@ interface Dataframe {
 // phrase / [3, field, lower, upper, incl_lower, incl_upper] range / [4, [must], [should], [must_not]]
 // bool); the response is [reduced, [[id, score_cell] ...]]. For `ids`, has_prefix false lists every id.
 interface Search {
+    @effect(mutation)
     void create(LoomSession handle, string workspace, string name, bytes mapping);
+    @effect(mutation)
     void index(LoomSession handle, string workspace, string name, bytes id, bytes doc);
+    @effect(read)
     optional bytes get(LoomSession handle, string workspace, string name, bytes id);
+    @effect(mutation)
     bool delete(LoomSession handle, string workspace, string name, bytes id);
+    @effect(read)
     bytes ids(LoomSession handle, string workspace, string name, bytes prefix, bool has_prefix);
+    @effect(mutation)
     void remap(LoomSession handle, string workspace, string name, bytes mapping);
+    @effect(read)
     bytes query(LoomSession handle, string workspace, string name, bytes request);
     // Derived source digest of index `name` (status/introspection), over the served store's algorithm.
+    @effect(read)
     Digest source_digest(LoomSession handle, string workspace, string name);
     // Full index status for `name` at `engine_version`: canonical CBOR/bytes of `[source_digest,
     // DerivedArtifactStatus]` about the served store's derived tantivy artifact.
+    @effect(read)
     bytes status(LoomSession handle, string workspace, string name, string engine_version);
 }
 
@@ -1171,7 +1564,9 @@ struct KvMapConfig {
 // Map config changes durability and sync behavior for a named KV map. It is public control-plane
 // surface, not KV data-plane surface.
 interface ManagementKv {
+    @effect(mutation)
     void set_config(LoomSession handle, string workspace, string collection, KvMapConfig config);
+    @effect(read)
     KvMapConfig get_config(LoomSession handle, string workspace, string collection);
 }
 
@@ -1206,25 +1601,44 @@ struct DocumentBinaryResult {
     string entity_tag;
 }
 interface Document {
+    @effect(mutation)
     DocumentPutResult put_text(LoomSession handle, string workspace, string collection, string id, string text, optional string expected_entity_tag);
+    @effect(read)
     optional DocumentTextResult get_text(LoomSession handle, string workspace, string collection, string id);
+    @effect(mutation)
     DocumentPutResult put_binary(LoomSession handle, string workspace, string collection, string id, bytes bytes, optional string expected_entity_tag);
+    @effect(read)
     optional DocumentBinaryResult get_binary(LoomSession handle, string workspace, string collection, string id);
+    @effect(read)
     bytes list_binary(LoomSession handle, string workspace, string collection);
+    @effect(mutation)
     void put_binary_indexed(LoomSession handle, string workspace, string collection, string id, bytes bytes);
+    @effect(mutation)
     bool delete(LoomSession handle, string workspace, string collection, string id);
+    @effect(mutation)
     bool delete_collection(LoomSession handle, string workspace, string collection);
+    @effect(mutation)
     bool delete_indexed(LoomSession handle, string workspace, string collection, string id);
+    @effect(mutation)
     DocumentReplaceTextResult replace_text_indexed(LoomSession handle, string workspace, string collection, string id, string find, string replace, bool replace_all, Digest base_digest);
     // The collection names present in the workspace, canonical CBOR array of strings.
+    @effect(read)
     bytes list_collections(LoomSession handle, string workspace);
+    @effect(mutation)
     void index_create(LoomSession handle, string workspace, string collection, string name, string path, bool unique);
+    @effect(mutation)
     void index_create_json(LoomSession handle, string workspace, string collection, bytes declaration_json);
+    @effect(mutation)
     bool index_drop(LoomSession handle, string workspace, string collection, string name);
+    @effect(mutation)
     void index_rebuild(LoomSession handle, string workspace, string collection, string name);
+    @effect(read)
     bytes index_list_json(LoomSession handle, string workspace, string collection);
+    @effect(read)
     bytes index_status_json(LoomSession handle, string workspace, string collection);
+    @effect(read)
     bytes find_json(LoomSession handle, string workspace, string collection, string index, bytes value_json);
+    @effect(read)
     bytes query_json(LoomSession handle, string workspace, string collection, bytes query_json);
 }
 
@@ -1242,25 +1656,37 @@ interface Document {
 // is the on-demand iCalendar projection of one entry, used by the mount and CalDAV surfaces. An absent
 // uid or collection reads as absent.
 interface Calendar {
+    @effect(mutation)
     void create_collection(LoomSession handle, string workspace, string principal, string collection,
                            bytes meta);
+    @effect(read)
     optional bytes get_collection(LoomSession handle, string workspace, string principal,
                                   string collection);
+    @effect(read)
     bytes list_collections(LoomSession handle, string workspace, string principal);
+    @effect(mutation)
     bool delete_collection(LoomSession handle, string workspace, string principal, string collection);
     // Import an iCalendar (.ics) document into `collection`, ensuring the collection; returns the etag Digest.
+    @effect(mutation)
     Digest put_ics(LoomSession handle, string workspace, string principal, string collection, string ics);
+    @effect(mutation)
     Digest put_entry(LoomSession handle, string workspace, string principal, string collection,
                      bytes entry);
+    @effect(read)
     optional bytes get_entry(LoomSession handle, string workspace, string principal, string collection,
                              string uid);
+    @effect(mutation)
     bool delete_entry(LoomSession handle, string workspace, string principal, string collection,
                       string uid);
+    @effect(read)
     bytes list_entries(LoomSession handle, string workspace, string principal, string collection);
+    @effect(read)
     bytes range(LoomSession handle, string workspace, string principal, string collection,
                 string from, string to);
+    @effect(read)
     bytes search(LoomSession handle, string workspace, string principal, string collection,
                  string component, string text);
+    @effect(read)
     optional bytes to_ics(LoomSession handle, string workspace, string principal, string collection,
                           string uid);
 }
@@ -1275,18 +1701,29 @@ interface Calendar {
 // their items; `search` is a case-insensitive substring over name/org/email. `to_vcard` is the on-demand
 // vCard projection of one contact. An absent uid or book reads as absent.
 interface Contacts {
+    @effect(mutation)
     void create_book(LoomSession handle, string workspace, string principal, string book, bytes meta);
+    @effect(read)
     optional bytes get_book(LoomSession handle, string workspace, string principal, string book);
+    @effect(read)
     bytes list_books(LoomSession handle, string workspace, string principal);
+    @effect(mutation)
     bool delete_book(LoomSession handle, string workspace, string principal, string book);
     // Import a vCard (.vcf) document into `book`, ensuring the book; returns the etag Digest.
+    @effect(mutation)
     Digest put_vcard(LoomSession handle, string workspace, string principal, string book, string vcard);
+    @effect(mutation)
     Digest put_entry(LoomSession handle, string workspace, string principal, string book, bytes entry);
+    @effect(read)
     optional bytes get_entry(LoomSession handle, string workspace, string principal, string book,
                              string uid);
+    @effect(mutation)
     bool delete_entry(LoomSession handle, string workspace, string principal, string book, string uid);
+    @effect(read)
     bytes list_entries(LoomSession handle, string workspace, string principal, string book);
+    @effect(read)
     bytes search(LoomSession handle, string workspace, string principal, string book, string text);
+    @effect(read)
     optional bytes to_vcard(LoomSession handle, string workspace, string principal, string book,
                             string uid);
 }
@@ -1302,23 +1739,35 @@ interface Contacts {
 // `get_flags`/`set_flags` carry the CBOR array of flag strings (sorted, deduplicated). `ingest_message`
 // or `set_flags` against a missing mailbox/message is NOT_FOUND. There is no SMTP.
 interface Mail {
+    @effect(mutation)
     void create_mailbox(LoomSession handle, string workspace, string principal, string mailbox,
                         bytes meta);
+    @effect(read)
     optional bytes get_mailbox(LoomSession handle, string workspace, string principal, string mailbox);
+    @effect(read)
     bytes list_mailboxes(LoomSession handle, string workspace, string principal);
+    @effect(mutation)
     bool delete_mailbox(LoomSession handle, string workspace, string principal, string mailbox);
+    @effect(mutation)
     Digest ingest_message(LoomSession handle, string workspace, string principal, string mailbox,
                           string uid, bytes raw);
+    @effect(read)
     optional bytes get_message(LoomSession handle, string workspace, string principal, string mailbox,
                                string uid);
+    @effect(read)
     optional bytes to_eml(LoomSession handle, string workspace, string principal, string mailbox,
                           string uid);
+    @effect(mutation)
     bool delete_message(LoomSession handle, string workspace, string principal, string mailbox,
                         string uid);
+    @effect(read)
     bytes list_messages(LoomSession handle, string workspace, string principal, string mailbox);
+    @effect(read)
     bytes get_flags(LoomSession handle, string workspace, string principal, string mailbox, string uid);
+    @effect(mutation)
     void set_flags(LoomSession handle, string workspace, string principal, string mailbox, string uid,
                    bytes flags);
+    @effect(read)
     bytes search(LoomSession handle, string workspace, string principal, string mailbox, string text);
 }
 
@@ -1358,22 +1807,39 @@ struct MutationReceipt {
     optional string root_after;
     list<MutationChange> changes;
 }
+
+enum LaneTicketPlacement {
+    FIRST,
+    LAST,
+    BEFORE,
+    AFTER,
+}
+
 interface Lanes {
+    @effect(mutation)
     Lane create(LoomSession handle, string workspace, Lane lane);
+    @effect(read)
     optional Lane get(LoomSession handle, string workspace, string lane_id);
+    @effect(read)
     list<Lane> list(LoomSession handle, string workspace);
     // Atomically update one or more first-class Lane fields. At least one optional field must be
     // present; an absent optional leaves that field unchanged while an empty string clears text.
+    @effect(mutation)
     Lane update(LoomSession handle, string workspace, string lane_id,
                 optional string title, optional string description, optional string lane_status,
                 optional string status_report, optional string reviewer_feedback, string updated_by);
+    @effect(mutation)
     Lane ticket_add(LoomSession handle, string workspace, string lane_id, string ticket_id,
-                    optional string placement, optional string anchor, string updated_by);
+                    optional LaneTicketPlacement placement, optional string anchor, string updated_by);
+    @effect(mutation)
     Lane ticket_remove(LoomSession handle, string workspace, string lane_id, string ticket_id,
                        string updated_by);
+    @effect(mutation)
     Lane ticket_transfer(LoomSession handle, string workspace, string source_lane_id,
                          string target_lane_id, string ticket_id, string updated_by);
+    @effect(mutation)
     Lane delete(LoomSession handle, string workspace, string lane_id, string updated_by);
+    @effect(mutation)
     Lane closeout(LoomSession handle, string workspace, string lane_id, string ticket_workspace_id,
                   string ticket_id, string comment_type, string comment_body,
                   optional string evidence_json, string status_report, string updated_by,
@@ -1384,61 +1850,82 @@ interface Lanes {
     // display status, and ordered ticket ids only. `get_view_json` returns the JSON literal null when
     // the lane is absent; `list_views_json` returns a JSON array. Ticket descriptions, comments, and
     // history are excluded.
+    @effect(read)
     string get_view_json(LoomSession handle, string workspace, string ticket_workspace_id,
                          string lane_id, bool detailed);
+    @effect(read)
     string list_views_json(LoomSession handle, string workspace, string ticket_workspace_id,
                            bool detailed);
+    @effect(mutation)
     string cleanup_json(LoomSession handle, string workspace, optional string lane_id, bool apply,
                         string updated_by);
 }
 
 // ---- pages ----
 interface Pages {
+    @effect(mutation)
     string spaces_create_json(LoomSession handle, string workspace, string page_workspace_id,
                               string space_id, string title, optional string expected_root);
+    @effect(read)
     string spaces_list_json(LoomSession handle, string workspace, string page_workspace_id);
+    @effect(read)
     string spaces_get_json(LoomSession handle, string workspace, string page_workspace_id,
                            string space_id);
+    @effect(mutation)
     string pages_create_json(LoomSession handle, string workspace, string page_workspace_id,
                              string page_id, string space_id, optional string parent_page_id,
                              string title, optional string expected_root);
+    @effect(mutation)
     string pages_update_json(LoomSession handle, string workspace, string page_workspace_id,
                              string page_id, string body_text, optional string expected_root);
+    @effect(mutation)
     string pages_publish_json(LoomSession handle, string workspace, string page_workspace_id,
                               string page_id, optional string expected_root);
+    @effect(read)
     string pages_get_json(LoomSession handle, string workspace, string page_workspace_id,
                           string page_id);
+    @effect(read)
     string pages_list_json(LoomSession handle, string workspace, string page_workspace_id);
+    @effect(read)
     string pages_history_json(LoomSession handle, string workspace, string page_workspace_id,
                               string page_id);
+    @effect(mutation)
     string structures_create_json(LoomSession handle, string workspace, string page_workspace_id,
                                   string structure_id, string space_id, string kind, string title,
                                   optional string expected_root);
+    @effect(mutation)
     string structures_add_node_json(LoomSession handle, string workspace,
                                     string page_workspace_id, string structure_id, string node_id,
                                     string kind, string label, optional string body_digest,
                                     optional string entity_ref, optional string expected_root);
+    @effect(mutation)
     string structures_update_node_json(LoomSession handle, string workspace,
                                        string page_workspace_id, string structure_id,
                                        string node_id, string kind, string label,
                                        optional string body_digest, optional string entity_ref,
                                        optional string expected_root);
+    @effect(mutation)
     string structures_bind_json(LoomSession handle, string workspace, string page_workspace_id,
                                 string structure_id, string node_id, optional string entity_ref,
                                 optional string expected_root);
+    @effect(mutation)
     string structures_move_node_json(LoomSession handle, string workspace, string page_workspace_id,
                                      string structure_id, string node_id,
                                      optional string parent_node_id, optional string label,
                                      optional string expected_root);
+    @effect(mutation)
     string structures_link_node_json(LoomSession handle, string workspace, string page_workspace_id,
                                      string structure_id, string edge_id, string src_node_id,
                                      string dst_node_id, string label, optional string target_ref,
                                      optional string expected_root);
+    @effect(mutation)
     string structures_decompose_to_tickets_json(LoomSession handle, string workspace,
                                                 string page_workspace_id, string structure_id,
                                                 string items_json);
+    @effect(read)
     string structures_get_json(LoomSession handle, string workspace, string page_workspace_id,
                                string structure_id);
+    @effect(read)
     string structures_list_json(LoomSession handle, string workspace, string page_workspace_id);
 }
 
@@ -1449,11 +1936,16 @@ interface Pages {
 // returns the most recent point as a single canonical `[ts, value]` CBOR pair (carrying both the
 // timestamp and the value), or none. An absent timestamp or series reads as absent.
 interface TimeSeries {
+    @effect(mutation)
     void put(LoomSession handle, string workspace, string collection, i64 ts, bytes value);
+    @effect(read)
     optional bytes get(LoomSession handle, string workspace, string collection, i64 ts);
+    @effect(read)
     bytes range(LoomSession handle, string workspace, string collection, i64 from, i64 to);
+    @effect(read)
     optional bytes latest(LoomSession handle, string workspace, string collection);
     // The collection (series-set) names present in the workspace, canonical CBOR array of strings.
+    @effect(read)
     bytes list_collections(LoomSession handle, string workspace);
 }
 
@@ -1464,10 +1956,14 @@ interface TimeSeries {
 // output bytes, and returns canonical CBOR `[observations, partial, stale]`, where `observations` is
 // an array of canonical observation record bytes.
 interface Metrics {
+    @effect(mutation)
     void put_descriptor(LoomSession handle, string workspace, bytes descriptor);
+    @effect(read)
     optional bytes get_descriptor(LoomSession handle, string workspace, string name);
+    @effect(mutation)
     void put_observation(LoomSession handle, string workspace, string descriptor_name,
                          bytes observation);
+    @effect(read)
     bytes query(LoomSession handle, string workspace, string descriptor_name,
                 u64 from_timestamp_ms, u64 to_timestamp_ms,
                 u32 max_series, u32 max_groups, u32 max_samples,
@@ -1480,8 +1976,11 @@ interface Metrics {
 // [from_time_unix_nano, to_time_unix_nano), bounded by returned records and output bytes, and returns
 // canonical CBOR `[records, partial]`, where `records` is an array of canonical log record bytes.
 interface Logs {
+    @effect(mutation)
     string put_record(LoomSession handle, string workspace, bytes record);
+    @effect(read)
     optional bytes get_record(LoomSession handle, string workspace, string record_id);
+    @effect(read)
     bytes query(LoomSession handle, string workspace, u64 from_time_unix_nano,
                 u64 to_time_unix_nano, u32 max_records, u64 max_output_bytes);
 }
@@ -1491,10 +1990,14 @@ interface Logs {
 // writes by name ensure a Traces-facet workspace. Trace listing and `query` return canonical CBOR
 // `[spans, partial]`, where `spans` is an array of canonical span record bytes.
 interface Traces {
+    @effect(mutation)
     void put_span(LoomSession handle, string workspace, bytes span);
+    @effect(read)
     optional bytes get_span(LoomSession handle, string workspace, string trace_id, string span_id);
+    @effect(read)
     bytes trace_spans(LoomSession handle, string workspace, string trace_id, u32 max_spans,
                       u64 max_output_bytes);
+    @effect(read)
     bytes query(LoomSession handle, string workspace, u64 from_start_time_ns,
                 u64 to_start_time_ns, u32 max_spans, u64 max_output_bytes);
 }
@@ -1507,12 +2010,18 @@ interface Traces {
 // INTEGRITY_FAILURE on any altered payload or broken link. The chain is fast-forward-only; divergence
 // is reconciled by replay, never a silent interleave.
 interface Ledger {
+    @effect(mutation)
     u64 append(LoomSession handle, string workspace, string collection, bytes payload);
+    @effect(read)
     optional bytes get(LoomSession handle, string workspace, string collection, u64 seq);
+    @effect(read)
     optional Digest head(LoomSession handle, string workspace, string collection);
+    @effect(read)
     u64 len(LoomSession handle, string workspace, string collection);
+    @effect(read)
     void verify(LoomSession handle, string workspace, string collection);
     // The collection (log) names present in the workspace, canonical CBOR array of strings.
+    @effect(read)
     bytes list_collections(LoomSession handle, string workspace);
 }
 
@@ -1521,11 +2030,16 @@ interface Ledger {
 // returns the assigned zero-based sequence. `range` is half-open [lo, hi) and ordered by sequence. An
 // absent `get` returns no value.
 interface Queue {
+    @effect(mutation)
     u64 append(LoomSession handle, string workspace, string stream, bytes entry);
+    @effect(read)
     optional bytes get(LoomSession handle, string workspace, string stream, u64 seq);
+    @effect(read)
     list<bytes> range(LoomSession handle, string workspace, string stream, u64 lo, u64 hi);
+    @effect(read)
     u64 len(LoomSession handle, string workspace, string stream);
     // The stream (collection) names present in the workspace, canonical CBOR array of strings.
+    @effect(read)
     bytes list_streams(LoomSession handle, string workspace);
 }
 
@@ -1536,11 +2050,15 @@ interface Queue {
 // backward) while `consumer_reset` may move backward. `consumer_id` is non-empty and free of `/`, NUL,
 // and control characters.
 interface QueueConsumers {
+    @effect(read)
     u64 consumer_position(LoomSession handle, string workspace, string stream, string consumer_id);
+    @effect(read)
     list<bytes> consumer_read(LoomSession handle, string workspace, string stream, string consumer_id,
                               u32 max);
+    @effect(mutation)
     void consumer_advance(LoomSession handle, string workspace, string stream, string consumer_id,
                           u64 next_seq);
+    @effect(mutation)
     void consumer_reset(LoomSession handle, string workspace, string stream, string consumer_id,
                         u64 next_seq);
 }
@@ -1555,38 +2073,62 @@ interface QueueConsumers {
 // version-control commit and returns its address. `sql_batch_abort` discards un-persisted changes, and
 // closing without a commit discards them too. Encrypted stores open with a passphrase or a 32-byte kek.
 interface Sql {
+    @effect(control)
     SqlSession sql_open(string loom_path, string workspace, string db);
+    @effect(control)
     SqlSession sql_open_keyed(string loom_path, string workspace, string db, bytes passphrase);
+    @effect(control)
     SqlSession sql_open_with_kek(string loom_path, string workspace, string db, bytes kek);
+    @effect(control)
     SqlSession sql_open_authenticated(string loom_path, string workspace, string db,
                                       Uuid auth_principal, bytes auth_passphrase);
+    @effect(control)
     SqlSession sql_open_keyed_authenticated(string loom_path, string workspace, string db,
                                             bytes passphrase, Uuid auth_principal,
                                             bytes auth_passphrase);
+    @effect(control)
     SqlSession sql_open_with_kek_authenticated(string loom_path, string workspace, string db,
                                                bytes kek, Uuid auth_principal,
                                                bytes auth_passphrase);
+    @effect(control)
     void sql_authenticate_passphrase(SqlSession session, Uuid principal, bytes passphrase);
+    @effect(mutation)
+    bytes sql_exec_result(LoomSession handle, string workspace, string db, string sql);
+    @effect(mutation)
     bytes sql_exec(SqlSession session, string sql);
+    @effect(read)
     stream<bytes> sql_query(SqlSession session, string sql);
+    @effect(mutation)
     Digest sql_commit(SqlSession session, string message, string author, u64 timestamp_ms);
+    @effect(control)
     void sql_close(SqlSession session);
 
+    @effect(control)
     SqlBatch sql_batch_begin(string loom_path, string workspace, string db);
+    @effect(control)
     SqlBatch sql_batch_begin_keyed(string loom_path, string workspace, string db, bytes passphrase);
+    @effect(control)
     SqlBatch sql_batch_begin_with_kek(string loom_path, string workspace, string db, bytes kek);
+    @effect(control)
     SqlBatch sql_batch_begin_authenticated(string loom_path, string workspace, string db,
                                            Uuid auth_principal, bytes auth_passphrase);
+    @effect(control)
     SqlBatch sql_batch_begin_keyed_authenticated(string loom_path, string workspace, string db,
                                                  bytes passphrase, Uuid auth_principal,
                                                  bytes auth_passphrase);
+    @effect(control)
     SqlBatch sql_batch_begin_with_kek_authenticated(string loom_path, string workspace, string db,
                                                     bytes kek, Uuid auth_principal,
                                                     bytes auth_passphrase);
+    @effect(mutation)
     bytes sql_batch_exec(SqlBatch batch, string sql);
+    @effect(mutation)
     void sql_batch_commit(SqlBatch batch);
+    @effect(mutation)
     Digest sql_batch_commit_vcs(SqlBatch batch, string message, string author);
+    @effect(control)
     void sql_batch_abort(SqlBatch batch);
+    @effect(control)
     void sql_batch_close(SqlBatch batch);
 
     // Handle-based direct/version-aware readers over the SQL facet's staged tables (bound to the sql
@@ -1597,21 +2139,33 @@ interface Sql {
     // of `table` between two commits; `sql_table_diff` returns schema-aware table records. The `_at`
     // readers read from a commit without changing the working tree. The current reader set has async
     // forms returning a Task.
+    @effect(read)
     bytes sql_read_table(LoomSession handle, string workspace, string table);
+    @effect(read)
     bytes sql_read_table_at(LoomSession handle, string workspace, string table, string commit);
+    @effect(read)
     bytes sql_index_scan(LoomSession handle, string workspace, string table, string index, bytes prefix);
+    @effect(read)
     bytes sql_index_scan_at(LoomSession handle, string workspace, string table, string index,
                             bytes prefix, string commit);
+    @effect(read)
     bytes sql_blame(LoomSession handle, string workspace, string branch, string table);
+    @effect(read)
     bytes sql_diff(LoomSession handle, string workspace, string table, string from_commit, string to_commit);
+    @effect(read)
     bytes sql_table_diff(LoomSession handle, string workspace, string table, string from_commit,
                          string to_commit);
+    @effect(read)
     Task sql_read_table_async(LoomSession handle, string workspace, string table);
+    @effect(read)
     Task sql_index_scan_async(LoomSession handle, string workspace, string table, string index, bytes prefix);
+    @effect(read)
     Task sql_blame_async(LoomSession handle, string workspace, string branch, string table);
+    @effect(read)
     Task sql_diff_async(LoomSession handle, string workspace, string table, string from_commit,
                         string to_commit);
     // The database (collection) names present in the workspace, canonical CBOR array of strings.
+    @effect(read)
     bytes sql_list_databases(LoomSession handle, string workspace);
     // Run a read-only query against database `db` and return the FULL result payload (the same canonical
     // CBOR `sql_exec` produces: an array of per-statement payloads carrying column labels and rows). Unlike
@@ -1619,14 +2173,40 @@ interface Sql {
     // returns the complete `exec_cbor` shape, and unlike `sql_exec` it never persists: a statement that
     // dirties the store is rejected, so the read-only contract is preserved. This backs the MCP
     // `sql_query` tool over remote at full parity.
+    @effect(read)
     bytes sql_query_result(LoomSession handle, string workspace, string db, string sql);
 }
 
 interface StudioSurfaces {
+    @effect(read)
     string studio_surface_catalog_json(string workspace, string set);
 }
 
+interface StudioMaintenance {
+    @effect(mutation)
+    string studio_reindex_json(LoomSession handle, string workspace, string profile);
+    @effect(mutation)
+    string studio_revisions_rebuild_json(LoomSession handle, string workspace, string profile, bool dry_run);
+}
+
+interface InferenceInstance {
+    @effect(read)
+    string inference_instance_list_json(LoomSession handle, string workspace, optional string kind);
+    @effect(read)
+    string inference_instance_get_json(LoomSession handle, string workspace, string name);
+    @effect(mutation)
+    string inference_instance_create_json(LoomSession handle, string workspace, string name,
+                                          string model, string kind, string runtime,
+                                          optional string preset, string settings_json);
+    @effect(mutation)
+    string inference_instance_update_json(LoomSession handle, string workspace, string name,
+                                          optional string preset, string settings_json);
+    @effect(mutation)
+    string inference_instance_delete_json(LoomSession handle, string workspace, string name);
+}
+
 interface Meetings {
+    @effect(mutation)
     string meetings_import_snapshot(
         LoomSession handle,
         string workspace,
@@ -1634,53 +2214,75 @@ interface Meetings {
         bytes snapshot,
         bool dry_run
     );
+    @effect(read)
     bytes meetings_source_read(LoomSession handle, string workspace, string source_id, string leaf);
 }
 
 interface Drive {
+    @effect(read)
     string drive_list_json(LoomSession handle, string workspace, string drive_workspace_id, string folder_id);
+    @effect(read)
     string drive_stat_json(LoomSession handle, string workspace, string drive_workspace_id,
                            string folder_id, string name);
+    @effect(read)
     bytes drive_read_file(LoomSession handle, string workspace, string drive_workspace_id, string file_id);
+    @effect(read)
     string drive_list_versions_json(LoomSession handle, string workspace, string drive_workspace_id,
                                     string file_id);
+    @effect(read)
     string drive_list_conflicts_json(LoomSession handle, string workspace, string drive_workspace_id);
+    @effect(read)
     string drive_list_shares_json(LoomSession handle, string workspace, string drive_workspace_id);
+    @effect(read)
     string drive_list_retention_json(LoomSession handle, string workspace, string drive_workspace_id);
+    @effect(mutation)
     string drive_create_folder_json(LoomSession handle, string workspace, string drive_workspace_id,
                                     string parent_folder_id, string folder_id, string name,
                                     string expected_root);
+    @effect(mutation)
     string drive_create_upload_json(LoomSession handle, string workspace, string drive_workspace_id,
                                     string upload_id, string parent_folder_id, string name,
                                     string file_id, string expected_root, u64 created_at_ms,
                                     bool replace_file);
+    @effect(mutation)
     string drive_upload_chunk_json(LoomSession handle, string workspace, string drive_workspace_id,
                                    string upload_id, bytes chunk);
+    @effect(mutation)
     string drive_commit_upload_json(LoomSession handle, string workspace, string drive_workspace_id,
                                     string upload_id);
+    @effect(mutation)
     string drive_rename_json(LoomSession handle, string workspace, string drive_workspace_id,
                              string folder_id, string node_id, string new_name, string expected_root);
+    @effect(mutation)
     string drive_move_json(LoomSession handle, string workspace, string drive_workspace_id,
                            string source_folder_id, string target_folder_id, string node_id,
                            string expected_root);
+    @effect(mutation)
     string drive_delete_json(LoomSession handle, string workspace, string drive_workspace_id,
                              string folder_id, string node_id, string expected_root);
+    @effect(mutation)
     string drive_resolve_conflict_json(LoomSession handle, string workspace, string drive_workspace_id,
                                        string conflict_id, string resolution);
+    @effect(mutation)
     string drive_grant_share_json(LoomSession handle, string workspace, string drive_workspace_id,
                                   string grant_id, string target_kind, string target_id,
                                   string principal, string role, u64 granted_at_ms,
                                   optional u64 expires_at_ms);
+    @effect(mutation)
     string drive_revoke_share_json(LoomSession handle, string workspace, string drive_workspace_id,
                                    string grant_id);
+    @effect(mutation)
     string drive_apply_share_expiry_json(LoomSession handle, string workspace,
                                          string drive_workspace_id, u64 now_ms);
+    @effect(mutation)
     string drive_pin_retention_json(LoomSession handle, string workspace, string drive_workspace_id,
                                     string pin_id, string kind, string root,
                                     optional string target_entity_id, u64 added_at_ms,
                                     optional u64 expires_at_ms);
+    @effect(mutation)
     string drive_unpin_retention_json(LoomSession handle, string workspace, string drive_workspace_id,
                                       string pin_id);
+    @effect(mutation)
     string drive_apply_retention_json(LoomSession handle, string workspace,
                                       string drive_workspace_id, u64 now_ms);
 }
@@ -1710,6 +2312,11 @@ enum TicketAcceptanceEvidenceKey {
     RISK_NOTES,
 }
 
+enum TicketReviewType {
+    DESIGN_REVIEW,
+    CODE_REVIEW,
+}
+
 struct TicketProjectSettingsPatch {
     optional TicketProjectionProfile default_projection;
     list<TicketProjectionProfile> enable_projections;
@@ -1720,6 +2327,7 @@ struct TicketProjectSettingsPatch {
     optional list<string> acceptance_authorities;
     optional bool acceptance_evidence_enforcement;
     optional list<TicketAcceptanceEvidenceKey> required_acceptance_evidence_keys;
+    optional list<TicketReviewType> required_acceptance_reviews;
     optional string owner_contract_summary;
     optional string owner_contract_details;
     optional string worker_contract_summary;
@@ -1728,22 +2336,29 @@ struct TicketProjectSettingsPatch {
 }
 
 interface Tickets {
+    @effect(mutation)
     string tickets_project_create_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                        string project_id, string key_prefix, string name,
                                        optional string expected_root);
+    @effect(mutation)
     string tickets_project_rekey_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                       string project_id, string key_prefix,
                                       optional string expected_root);
+    @effect(read)
     string tickets_projects_json(LoomSession handle, string workspace, string ticket_workspace_id);
+    @effect(read)
     string tickets_project_settings_get_json(LoomSession handle, string workspace,
                                              string ticket_workspace_id, string project_id,
                                              bool include_contracts);
+    @effect(mutation)
     string tickets_project_settings_set_json(LoomSession handle, string workspace,
                                              string ticket_workspace_id, string project_id,
                                              TicketProjectSettingsPatch patch);
+    @effect(read)
     string tickets_fields_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                optional string project_id, optional string projection,
                                optional string operation);
+    @effect(mutation)
     string tickets_field_put_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                   string project_id, string field_id, string key, string name,
                                   optional string description, string field_type,
@@ -1751,15 +2366,18 @@ interface Tickets {
                                   bool required, bool searchable, bool orderable,
                                   string cardinality, string applicable_type_ids_json,
                                   optional string expected_root);
+    @effect(mutation)
     string tickets_field_retire_json(LoomSession handle, string workspace,
                                      string ticket_workspace_id, string project_id,
                                      string field_id, optional string expected_root);
     // Ticket mutation JSON methods return `{ "resource": ..., "receipt": MutationReceipt }`.
+    @effect(mutation)
     string tickets_create_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                string project_id, string ticket_type,
                                optional string external_source, optional string external_id,
                                string fields_json, string policy_labels_json,
                                optional string expected_root);
+    @effect(mutation)
     string tickets_update_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                string ticket_id, optional string set_fields_json,
                                string delete_fields_json, optional string action,
@@ -1770,45 +2388,61 @@ interface Tickets {
                                optional string expected_root,
                                optional string comments_json, optional string relation_sets_json,
                                optional string relation_removes_json);
+    @effect(mutation)
     string tickets_delete_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                string ticket_id, optional string expected_root);
+    @effect(read)
     string tickets_comments_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                  string ticket_id);
+    @effect(mutation)
     string tickets_comment_add_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                     string ticket_id, optional string comment_id,
                                     optional string comment_type, string body,
                                     optional string evidence_json, optional string expected_root);
+    @effect(mutation)
     string tickets_comment_update_json(LoomSession handle, string workspace,
                                        string ticket_workspace_id, string ticket_id,
                                        string comment_id, optional string comment_type,
                                        optional string body, optional string evidence_json,
                                        optional string expected_root);
+    @effect(mutation)
     string tickets_comment_delete_json(LoomSession handle, string workspace,
                                        string ticket_workspace_id, string ticket_id,
                                        string comment_id, optional string expected_root);
+    @effect(mutation)
     string tickets_relation_set_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                      string ticket_id, optional string relation_id, string kind,
                                      string target_id, optional string expected_root);
+    @effect(mutation)
     string tickets_relation_remove_json(LoomSession handle, string workspace,
                                         string ticket_workspace_id, string ticket_id,
                                         string relation_id, optional string expected_root);
+    @effect(read)
     string tickets_relation_list_json(LoomSession handle, string workspace,
                                       string ticket_workspace_id, string ticket_id);
+    @effect(read)
     string tickets_get_json(LoomSession handle, string workspace, string ticket_workspace_id,
                             string ticket_id, optional string projection);
+    @effect(mutation)
     string boards_create_json(LoomSession handle, string workspace, string ticket_workspace_id,
                               string request_json);
+    @effect(read)
     string boards_get_json(LoomSession handle, string workspace, string ticket_workspace_id,
                            string board_id);
+    @effect(read)
     string boards_list_json(LoomSession handle, string workspace, string ticket_workspace_id,
                             bool include_deleted);
+    @effect(mutation)
     string boards_update_json(LoomSession handle, string workspace, string ticket_workspace_id,
                               string board_id, string request_json);
+    @effect(mutation)
     string boards_delete_json(LoomSession handle, string workspace, string ticket_workspace_id,
                               string board_id, string updated_by, optional string expected_root);
+    @effect(mutation)
     string boards_configure_columns_json(LoomSession handle, string workspace,
                                          string ticket_workspace_id, string board_id,
                                          string request_json);
+    @effect(mutation)
     string boards_move_card_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                  string board_id, string request_json);
     // Bounded, filtered, ordered, paginated ticket listing. `request` is an optional JSON object:
@@ -1816,60 +2450,111 @@ interface Tickets {
     // lane, board, ready, include_completed, limit, cursor}. Returns a JSON page {items[], total,
     // next_cursor}. Default 25, hard cap 100. Board-scoped lists use Board card order; Lane plus
     // Board intersects membership and uses Lane order; `next_cursor` is opaque.
+    @effect(read)
     string tickets_list_json(LoomSession handle, string workspace, string ticket_workspace_id,
                              optional string request);
+    @effect(read)
     string tickets_history_json(LoomSession handle, string workspace, string ticket_workspace_id,
                                 optional string ticket_id);
 }
 
 interface Chat {
+    @effect(mutation)
     string chat_create_channel_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                    string channel_id, string channel_handle, string name);
+                                    string channel_id, string channel_handle, string name,
+                                    optional string expected_entity_tag);
+    @effect(mutation)
     string chat_rename_channel_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                    string selector, string channel_handle);
+                                    string selector, string channel_handle,
+                                    optional string expected_entity_tag);
+    @effect(read)
     string chat_list_channels_json(LoomSession handle, string workspace, string chat_workspace_id);
+    @effect(mutation)
     string chat_post_message_json(LoomSession handle, string workspace, string chat_workspace_id,
                                   string channel_id, string message_id, optional string thread_id,
-                                  string body_text);
+                                  string body_text, optional string expected_entity_tag);
+    @effect(mutation)
+    string chat_post_message_bytes_json(LoomSession handle, string workspace,
+                                        string chat_workspace_id, string channel_id,
+                                        string message_id, optional string thread_id,
+                                        bytes body, optional string expected_entity_tag);
+    @effect(mutation)
     string chat_edit_message_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                  string channel_id, string message_id, string body_text);
+                                  string channel_id, string message_id, string body_text,
+                                  optional string expected_entity_tag);
+    @effect(mutation)
+    string chat_edit_message_bytes_json(LoomSession handle, string workspace,
+                                        string chat_workspace_id, string channel_id,
+                                        string message_id, bytes body,
+                                        optional string expected_entity_tag);
+    @effect(mutation)
     string chat_redact_message_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                    string channel_id, string message_id, optional string reason);
+                                    string channel_id, string message_id, optional string reason,
+                                    optional string expected_entity_tag);
+    @effect(mutation)
     string chat_create_thread_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                   string channel_id, string thread_id, string parent_message_id);
+                                   string channel_id, string thread_id, string parent_message_id,
+                                   optional string expected_entity_tag);
+    @effect(mutation)
     string chat_create_task_json(LoomSession handle, string workspace, string chat_workspace_id,
                                  string channel_id, string task_id, optional string message_id,
-                                 string title);
+                                 string title, optional string expected_entity_tag);
+    @effect(mutation)
     string chat_claim_task_json(LoomSession handle, string workspace, string chat_workspace_id,
                                 string channel_id, string task_id, string claim_id,
-                                optional string lease_token);
+                                optional string lease_token, optional string expected_entity_tag);
+    @effect(mutation)
     string chat_complete_task_json(LoomSession handle, string workspace, string chat_workspace_id,
                                    string channel_id, string task_id, string claim_id,
-                                   optional string result_message_id);
+                                   optional string result_message_id,
+                                   optional string expected_entity_tag);
+    @effect(mutation)
     string chat_invoke_agent_json(LoomSession handle, string workspace, string chat_workspace_id,
                                   string channel_id, string invocation_id, string agent_principal,
-                                  string source_message_ids_json, string prompt_text);
+                                  string source_message_ids_json, string prompt_text,
+                                  optional string expected_entity_tag);
+    @effect(mutation)
+    string chat_invoke_agent_bytes_json(LoomSession handle, string workspace,
+                                        string chat_workspace_id, string channel_id,
+                                        string invocation_id, string agent_principal,
+                                        string source_message_ids_json, bytes prompt,
+                                        optional string expected_entity_tag);
+    @effect(mutation)
     string chat_agent_reply_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                 string channel_id, string invocation_id, string message_id);
+                                 string channel_id, string invocation_id, string message_id,
+                                 optional string expected_entity_tag);
+    @effect(mutation)
     string chat_request_handoff_json(LoomSession handle, string workspace, string chat_workspace_id,
                                      string channel_id, string handoff_id,
                                      string from_agent_principal, optional string to_principal,
-                                     optional string reason);
+                                     optional string reason, optional string expected_entity_tag);
+    @effect(mutation)
     string chat_add_reaction_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                  string channel_id, string message_id, string kind);
+                                  string channel_id, string message_id, string kind,
+                                  optional string expected_entity_tag);
+    @effect(mutation)
     string chat_remove_reaction_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                     string channel_id, string message_id, string kind);
+                                     string channel_id, string message_id, string kind,
+                                     optional string expected_entity_tag);
+    @effect(read)
     string chat_emoji_list_json(LoomSession handle, string workspace, string chat_workspace_id);
+    @effect(mutation)
     string chat_emoji_register_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                    string kind);
+                                    string kind, optional string expected_entity_tag);
+    @effect(mutation)
     string chat_emoji_unregister_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                      string kind);
+                                      string kind, optional string expected_entity_tag);
+    @effect(read)
     string chat_messages_json(LoomSession handle, string workspace, string chat_workspace_id,
                               string channel_id);
+    @effect(read)
     string chat_cursor_json(LoomSession handle, string workspace, string chat_workspace_id,
                             string channel_id);
+    @effect(mutation)
     string chat_update_cursor_json(LoomSession handle, string workspace, string chat_workspace_id,
-                                   string channel_id, u64 next_sequence);
+                                   string channel_id, u64 next_sequence,
+                                   optional string expected_entity_tag);
+    @effect(read)
     string chat_fetch_events_json(LoomSession handle, string workspace, string chat_workspace_id,
                                   string channel_id, u64 from_sequence, u64 max);
 }
@@ -1881,8 +2566,11 @@ interface Chat {
 // normative wire form and not the general typed binding API. `last_error` returns this thread's most
 // recent error.
 interface Diagnostics {
+    @effect(read)
     string result_to_json(bytes result);
+    @effect(read)
     string result_to_bridge_json(bytes result);
+    @effect(read)
     LastError last_error();
 }
 
@@ -1896,14 +2584,23 @@ interface Diagnostics {
 // owned result buffer, leaving the task TAKEN; `task_wait` polls to completion and takes the result in
 // one call; `task_cancel` cancels a still-pending task; `task_free` releases the handle.
 interface Tasks {
+    @effect(control)
     optional bytes iter_next(RowIter iter);
+    @effect(control)
     void iter_free(RowIter iter);
+    @effect(mutation)
     Task sql_exec_async(SqlSession session, string sql);
+    @effect(control)
     bool task_poll(Task task);
+    @effect(control)
     optional TaskStatus task_status(Task task);
+    @effect(control)
     bytes task_result(Task task);
+    @effect(control)
     void task_cancel(Task task);
+    @effect(control)
     void task_free(Task task);
+    @effect(control)
     bytes task_wait(Task task);
 }
 
@@ -1923,29 +2620,53 @@ interface Tasks {
 // `result_diff_change`, and, over a DiffSide, `result_diff_len` and `result_diff_cell`. SelectMap rows
 // expose `result_map_len` and `result_map_entry`. Cells decode as LoomValue.
 interface ResultViews {
+    @effect(control)
     ResultView result_open(bytes result);
+    @effect(control)
     ResultView row_open(bytes row);
+    @effect(control)
     void result_close(ResultView view);
+    @effect(read)
     u64 result_len(ResultView view);
+    @effect(read)
     optional bool result_is_statements(ResultView view);
+    @effect(read)
     optional ResultKind result_item_kind(ResultView view, u64 item);
+    @effect(read)
     u64 result_column_count(ResultView view, u64 item);
+    @effect(read)
     string result_column_name(ResultView view, u64 item, u64 col);
+    @effect(read)
     string result_column_type(ResultView view, u64 item, u64 col);
+    @effect(read)
     u64 result_row_count(ResultView view, u64 item);
+    @effect(read)
     u64 result_row_len(ResultView view, u64 item, u64 row);
+    @effect(read)
     LoomValue result_cell(ResultView view, u64 item, u64 row, u64 col);
+    @effect(read)
     string result_row_commit(ResultView view, u64 item, u64 row);
+    @effect(read)
     u64 result_count(ResultView view, u64 item);
+    @effect(read)
     u64 result_string_count(ResultView view, u64 item);
+    @effect(read)
     string result_string(ResultView view, u64 item, u64 i);
+    @effect(read)
     VariableKind result_variable_kind(ResultView view, u64 item);
+    @effect(read)
     MergeOutcome result_merge_outcome(ResultView view, u64 item);
+    @effect(read)
     u64 result_diff_count(ResultView view, u64 item);
+    @effect(read)
     DiffChange result_diff_change(ResultView view, u64 item, u64 entry);
+    @effect(read)
     u64 result_diff_len(ResultView view, u64 item, u64 entry, DiffSide side);
+    @effect(read)
     LoomValue result_diff_cell(ResultView view, u64 item, u64 entry, DiffSide side, u64 col);
+    @effect(read)
     u64 result_map_len(ResultView view, u64 item, u64 row);
+    @effect(read)
     MapEntry result_map_entry(ResultView view, u64 item, u64 row, u64 idx);
 }
 
@@ -1966,11 +2687,17 @@ interface ResultViews {
 // facets. Keeper due-evaluation and fire-record append are owned by the serving runtime and are not
 // client-callable methods.
 interface Triggers {
+    @effect(mutation)
     void trigger_put(LoomSession handle, string workspace, bytes binding);
+    @effect(read)
     bytes trigger_get(LoomSession handle, string workspace, Uuid id);
+    @effect(read)
     bytes trigger_list(LoomSession handle, string workspace);
+    @effect(mutation)
     bytes trigger_enable(LoomSession handle, string workspace, Uuid id, bool enabled);
+    @effect(mutation)
     bool trigger_remove(LoomSession handle, string workspace, Uuid id);
+    @effect(read)
     bytes trigger_history(LoomSession handle, string workspace, Uuid id, u64 from_seq, u64 limit);
 }
 
@@ -1978,10 +2705,15 @@ interface Triggers {
 // filesystem paths; the server sees only opaque bytes, the target workspace, the payload kind, and
 // integrity digests. Path-shaped import/export stays a local/admin surface (see FileSystem/Archive).
 interface Transfer {
+    @effect(control)
     TransferId transfer_import_open(LoomSession handle, string workspace, string kind, bytes opts);
+    @effect(control)
     TransferAccept transfer_import_write(LoomSession handle, TransferId transfer, bytes chunk, u64 seq, optional Digest digest);
+    @effect(mutation)
     bytes transfer_import_finish(LoomSession handle, TransferId transfer, bool commit, bool dry_run, Digest final_digest);
+    @effect(control)
     void transfer_import_cancel(LoomSession handle, TransferId transfer);
+    @effect(read)
     stream<bytes> transfer_export(LoomSession handle, string workspace, string kind, optional string revision, bytes opts);
 }
 
@@ -2005,7 +2737,44 @@ struct StoreStat {
 
 struct StorePolicyResult {
     bool fips_required;
+    StoreDurabilityPolicy default_durability;
+    list<StoreFacetDurabilityAssignment> facet_durability_overrides;
     optional u64 audit_seq;
+}
+
+enum StoreDurabilityPolicy {
+    STRICT,
+    NORMAL,
+    RELAXED,
+    EPHEMERAL
+}
+
+struct StoreFacetDurabilityAssignment {
+    FacetKind facet;
+    StoreDurabilityPolicy durability;
+}
+
+struct StorePolicyUpdate {
+    optional bool fips_required;
+    optional StoreDurabilityPolicy default_durability;
+    list<StoreFacetDurabilityAssignment> facet_durability_assignments;
+    list<FacetKind> clear_facet_durability;
+}
+
+enum StoreRekeyCredentialKind {
+    PASSPHRASE,
+    RAW_KEK
+}
+
+struct StoreRekeyCredential {
+    StoreRekeyCredentialKind kind;
+    bytes secret;
+}
+
+struct StoreRekeyRequest {
+    StoreRekeyCredential credential;
+    bool reseal;
+    optional string suite;
 }
 
 struct StoreRekeyResult {
@@ -2016,9 +2785,250 @@ struct StoreRekeyResult {
     optional u64 bytes_after;
 }
 
+struct AuditCompactResult {
+    u64 pruned;
+    optional u64 checkpoint_seq;
+    optional Digest checkpoint_hash;
+    u64 audit_seq;
+}
+
+struct StoreMaintenancePolicyRecord {
+    u64 min_candidate_pages;
+    u64 min_reusable_pages;
+    u64 interval_ms;
+    u64 backoff_ms;
+    u64 max_segments;
+    u64 max_pages;
+    bool full_compaction_enabled;
+    bool tail_trim_enabled;
+    bool tail_compaction_enabled;
+    u64 tail_compaction_max_pages;
+    u64 tail_compaction_max_objects;
+    u64 tail_compaction_max_bytes;
+    u64 tail_compaction_interval_ms;
+    u64 tail_compaction_backoff_ms;
+}
+
+struct StoreMaintenanceRunStateRecord {
+    optional u64 last_run_ms;
+    u64 next_eligible_ms;
+    optional string last_skip_reason;
+    optional string last_error;
+    bool last_tail_trim_attempted;
+    u64 last_tail_trim_pages;
+    u64 last_tail_trim_bytes;
+    bool last_tail_compaction_attempted;
+    u64 last_tail_compaction_relocated_objects;
+    u64 last_tail_compaction_relocated_pages;
+    u64 last_tail_compaction_relocated_bytes;
+    u64 last_tail_compaction_truncated_pages;
+    u64 last_tail_compaction_conflicts;
+    optional string last_shrink_skip_reason;
+    u64 last_progress_steps;
+    u64 last_yield_count;
+    u64 last_overrun_count;
+}
+
+struct StoreGroupCommitDiagnosticsRecord {
+    u64 group_commit_batches_total;
+    u64 group_commit_transactions_total;
+    u64 group_commit_records_total;
+    u64 fsync_total_micros;
+    u64 fsync_count;
+    u64 write_lock_wait_total_micros;
+    u64 write_lock_wait_count;
+    u64 pending_durable_window_transactions;
+    u64 pending_durable_window_records;
+    optional u64 pinned_reader_blockers;
+}
+
+struct StoreMaintenanceStatusRecord {
+    u64 generation;
+    u64 object_count;
+    u64 physical_page_count;
+    u64 physical_bytes;
+    u64 reusable_free_pages;
+    u64 candidate_dead_pages;
+    u64 tail_free_pages;
+    u64 tail_free_bytes;
+    u64 last_validated_mark_epoch;
+    list<u64> touched_segments;
+    list<u64> candidate_segments;
+    bool segment_overflow;
+    StoreGroupCommitDiagnosticsRecord group_commit;
+}
+
+struct StoreMutableOverlayHealthRecord {
+    u64 current_generation;
+    u64 current_record_count;
+    u64 tombstone_count;
+    u64 live_checkpoint_references;
+    u64 reclaimable_overlay_pages;
+    list<string> blocked_reclamation_reasons;
+    u64 hot_write_count;
+    u64 active_writer_contention_indicators;
+}
+
+struct StoreMvccSnapshotIdentityRecord {
+    u64 overlay_generation;
+    optional Digest immutable_base_root;
+}
+
+struct StoreMvccSnapshotPinRecord {
+    u64 pin_id;
+    StoreMvccSnapshotIdentityRecord identity;
+    optional string owner;
+}
+
+struct StoreMvccSnapshotDiagnosticsRecord {
+    u64 active_snapshot_count;
+    optional u64 oldest_pinned_overlay_generation;
+    list<StoreMvccSnapshotPinRecord> pins;
+}
+
+struct StoreGrowthDomainRecord {
+    string domain;
+    u64 current_records;
+    u64 obsolete_records;
+    u64 payload_bytes;
+}
+
+struct StoreLiveRootExampleRecord {
+    string id;
+    Digest digest;
+}
+
+struct StoreLiveRootClassDiagnosticsRecord {
+    string class;
+    u64 count;
+    list<StoreLiveRootExampleRecord> examples;
+    bool truncated;
+}
+
+struct StoreLiveRootDiagnosticsRecord {
+    u64 sample_limit;
+    list<StoreLiveRootClassDiagnosticsRecord> classes;
+}
+
+struct StoreMaintenanceReportRecord {
+    StoreMaintenanceStatusRecord status;
+    StoreMutableOverlayHealthRecord overlay_health;
+    StoreMvccSnapshotDiagnosticsRecord mvcc_snapshots;
+    StoreMaintenancePolicyRecord policy;
+    StoreMaintenanceRunStateRecord run_state;
+    optional u64 mark_epoch;
+    bool mark_completed;
+    u64 marked_live_objects;
+    u64 marked_live_bytes;
+    u64 live_bytes;
+    u64 candidate_reclaimable_bytes;
+    u64 reusable_free_bytes;
+    u64 overlay_obsolete_record_count;
+    u64 overlay_obsolete_page_count;
+    u64 tail_free_pages;
+    u64 tail_free_bytes;
+    bool tail_trim_eligible;
+    bool tail_blocked_by_live_objects;
+    bool tail_compaction_eligible;
+    bool full_compaction_required_for_shrink;
+    bool tail_trim_attempted;
+    u64 tail_trim_pages;
+    u64 tail_trim_bytes;
+    bool tail_compaction_attempted;
+    u64 tail_compaction_relocated_objects;
+    u64 tail_compaction_relocated_pages;
+    u64 tail_compaction_relocated_bytes;
+    u64 tail_compaction_truncated_pages;
+    u64 tail_compaction_conflicts;
+    optional string last_shrink_skip_reason;
+    u64 retained_control_roots;
+    u64 derived_payload_count;
+    list<StoreGrowthDomainRecord> growth_domains;
+    bool eligible;
+    string reason;
+}
+
+struct StoreMaintenanceStatusRequest {
+    bool include_live_root_diagnostics;
+}
+
+struct StoreMaintenanceStatusResult {
+    StoreMaintenanceReportRecord report;
+    optional StoreLiveRootDiagnosticsRecord live_root_diagnostics;
+}
+
+struct StoreMaintenancePolicyUpdate {
+    optional u64 min_candidate_pages;
+    optional u64 min_reusable_pages;
+    optional u64 interval_ms;
+    optional u64 backoff_ms;
+    optional u64 max_segments;
+    optional u64 max_pages;
+    optional bool full_compaction_enabled;
+    optional bool tail_trim_enabled;
+    optional bool tail_compaction_enabled;
+    optional u64 tail_compaction_max_pages;
+    optional u64 tail_compaction_max_objects;
+    optional u64 tail_compaction_max_bytes;
+    optional u64 tail_compaction_interval_ms;
+    optional u64 tail_compaction_backoff_ms;
+}
+
+enum StoreMaintenanceRunKind {
+    SKIPPED,
+    MARKED,
+    COMPACTED,
+    RECLAIMED
+}
+
+struct StoreMaintenanceRunRequest {
+    optional u64 max_segments;
+    optional u64 max_pages;
+}
+
+struct StoreMaintenanceRunResult {
+    StoreMaintenanceRunKind kind;
+    optional string reason;
+    optional u64 visited;
+    optional u64 pending;
+    optional u64 before;
+    optional u64 after;
+    optional u64 reclaimed;
+    optional u64 required_temp_bytes;
+    optional u64 available_temp_bytes;
+    optional u64 segments_reclaimed;
+    optional u64 pages_freed;
+    optional u64 tail_trim_pages;
+    optional u64 tail_trim_bytes;
+    optional bool tail_compaction_attempted;
+    optional u64 tail_compaction_relocated_objects;
+    optional u64 tail_compaction_relocated_pages;
+    optional u64 tail_compaction_truncated_pages;
+    optional u64 objects_relocated;
+    optional u64 objects_dropped;
+    optional u64 elapsed_ms;
+    StoreMaintenanceRunStateRecord run_state;
+    StoreMaintenanceReportRecord report;
+}
+
 interface StoreAdmin {
+    @effect(read)
     bytes store_stat(LoomSession handle);
+    @effect(read)
     bytes store_policy_get(LoomSession handle);
-    bytes store_policy_set(LoomSession handle, bool fips_required);
-    bytes store_rekey(LoomSession handle, bytes new_passphrase, bool reseal, optional string suite);
+    @effect(mutation)
+    bytes store_policy_set(LoomSession handle, StorePolicyUpdate update);
+    @effect(mutation)
+    bytes store_rekey(LoomSession handle, StoreRekeyRequest request);
+    @effect(mutation)
+    bytes store_bundle_import(LoomSession handle, bytes bundle, bool dry_run);
+    @effect(read)
+    StoreMaintenanceStatusResult store_maintenance_status(LoomSession handle,
+                                                          StoreMaintenanceStatusRequest request);
+    @effect(mutation)
+    StoreMaintenanceStatusResult store_maintenance_policy_set(LoomSession handle,
+                                                              StoreMaintenancePolicyUpdate update);
+    @effect(mutation)
+    StoreMaintenanceRunResult store_maintenance_run(LoomSession handle,
+                                                    StoreMaintenanceRunRequest request);
 }

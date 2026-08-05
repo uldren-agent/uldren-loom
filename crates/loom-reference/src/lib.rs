@@ -79,7 +79,7 @@ impl ReferenceTarget {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ReconciliationSummary {
     pub pending: u64,
     pub resolved: u64,
@@ -781,14 +781,14 @@ pub struct MarkdownReferenceUpdate<'a> {
     pub relation: &'a str,
 }
 
-pub fn update_markdown_references<F>(
-    loom: &mut Loom<FileStore>,
+pub fn update_markdown_references<S: ObjectStore, F>(
+    loom: &mut Loom<S>,
     mut index: ReferenceIndex,
     update: MarkdownReferenceUpdate<'_>,
     mut resolve: F,
 ) -> Result<ReferenceIndex>
 where
-    F: FnMut(&Loom<FileStore>, &MarkdownReferenceCandidate) -> Result<Option<EntityRef>>,
+    F: FnMut(&Loom<S>, &MarkdownReferenceCandidate) -> Result<Option<EntityRef>>,
 {
     remove_source_candidates(loom, update.workspace, &update.source)?;
     index.remove_source(&update.source);
@@ -827,8 +827,8 @@ where
     Ok(index)
 }
 
-pub fn enqueue(
-    loom: &mut Loom<FileStore>,
+pub fn enqueue<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     candidate: &UnresolvedReference,
 ) -> Result<()> {
@@ -854,8 +854,8 @@ pub fn enqueue(
     save_target(loom, workspace, &target)
 }
 
-pub fn remove_source_candidates(
-    loom: &mut Loom<FileStore>,
+pub fn remove_source_candidates<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     source: &loom_substrate::refs::ReferenceSource,
 ) -> Result<usize> {
@@ -977,7 +977,7 @@ pub fn summary(loom: &Loom<FileStore>, workspace: WorkspaceId) -> Result<Reconci
     })
 }
 
-fn ensure_shared_tables(loom: &mut Loom<FileStore>, workspace: WorkspaceId) -> Result<()> {
+fn ensure_shared_tables<S: ObjectStore>(loom: &mut Loom<S>, workspace: WorkspaceId) -> Result<()> {
     if loom.staged_table_root(workspace, TARGETS_TABLE).is_none() {
         loom.stage_table_reserved(workspace, TARGETS_TABLE, &Table::new(target_schema()?))?;
     }
@@ -994,7 +994,7 @@ fn ensure_shared_tables(loom: &mut Loom<FileStore>, workspace: WorkspaceId) -> R
 }
 
 fn ensure_candidate_table(
-    loom: &mut Loom<FileStore>,
+    loom: &mut Loom<impl ObjectStore>,
     workspace: WorkspaceId,
     table: &str,
 ) -> Result<()> {
@@ -1038,7 +1038,7 @@ fn record_schema() -> Result<Schema> {
 }
 
 fn insert_candidate(
-    loom: &mut Loom<FileStore>,
+    loom: &mut Loom<impl ObjectStore>,
     workspace: WorkspaceId,
     table: &str,
     candidate: &UnresolvedReference,
@@ -1055,7 +1055,7 @@ fn insert_candidate(
 }
 
 fn delete_candidate(
-    loom: &mut Loom<FileStore>,
+    loom: &mut Loom<impl ObjectStore>,
     workspace: WorkspaceId,
     table: &str,
     candidate: &UnresolvedReference,
@@ -1110,7 +1110,7 @@ fn reschedule_or_fail(
 }
 
 fn refresh_target(
-    loom: &mut Loom<FileStore>,
+    loom: &mut Loom<impl ObjectStore>,
     workspace: WorkspaceId,
     target: &ReferenceTarget,
     pending: u64,
@@ -1142,7 +1142,7 @@ fn refresh_target(
 }
 
 fn save_target(
-    loom: &mut Loom<FileStore>,
+    loom: &mut Loom<impl ObjectStore>,
     workspace: WorkspaceId,
     target: &ReferenceTarget,
 ) -> Result<()> {
@@ -1159,7 +1159,7 @@ fn save_target(
 }
 
 fn target_for(
-    loom: &Loom<FileStore>,
+    loom: &Loom<impl ObjectStore>,
     workspace: WorkspaceId,
     source_profile: &str,
     source_scope: &str,
@@ -1169,7 +1169,10 @@ fn target_for(
     }))
 }
 
-fn target_rows(loom: &Loom<FileStore>, workspace: WorkspaceId) -> Result<Vec<ReferenceTarget>> {
+fn target_rows(
+    loom: &Loom<impl ObjectStore>,
+    workspace: WorkspaceId,
+) -> Result<Vec<ReferenceTarget>> {
     let table = match loom.read_table_reserved(workspace, TARGETS_TABLE) {
         Ok(table) => table,
         Err(error) if error.code == Code::NotFound => return Ok(Vec::new()),
@@ -1221,7 +1224,7 @@ fn due_from_table(
 }
 
 fn candidates_from_table(
-    loom: &Loom<FileStore>,
+    loom: &Loom<impl ObjectStore>,
     workspace: WorkspaceId,
     table: &str,
 ) -> Result<Vec<UnresolvedReference>> {
@@ -1241,7 +1244,7 @@ fn candidates_from_table(
 }
 
 fn first_candidate_due(
-    loom: &Loom<FileStore>,
+    loom: &Loom<impl ObjectStore>,
     workspace: WorkspaceId,
     table: &str,
 ) -> Result<Option<u64>> {
@@ -1339,7 +1342,7 @@ fn next_retry_ms(now_ms: u64, attempts: u32) -> u64 {
 }
 
 fn authorize_table(
-    loom: &Loom<FileStore>,
+    loom: &Loom<impl ObjectStore>,
     workspace: WorkspaceId,
     table: &str,
     right: AclRight,

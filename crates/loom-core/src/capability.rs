@@ -193,6 +193,13 @@ const FACET_CAPABILITIES: &[CapabilityInfo] = &[
     cap_facet("metrics", "0046", Executable, Supported),
     cap_facet("logs", "0047", Executable, Supported),
     cap_facet("traces", "0048", Executable, Supported),
+    cap_named_facet(
+        "inference-facet",
+        "inference",
+        "0062",
+        SourceBacked,
+        Supported,
+    ),
     cap_facet("columnar", "0023", Executable, Supported),
     cap_facet("search", "0033", Executable, Supported),
     cap_facet("calendar", "0037", Executable, Supported),
@@ -294,6 +301,12 @@ const POLICY_CAPABILITIES: &[CapabilityInfo] = &[
     cap_policy("acl", "0027", ProofTarget, OpTarget),
     cap_policy("acl-fine", "0028", ProofTarget, OpTarget),
     cap_policy("audit", "0009", ProofTarget, OpTarget),
+    cap_policy(
+        "certificate-generate-self-signed",
+        "0009",
+        SourceBacked,
+        OpTarget,
+    ),
     cap_policy("retention", "0009", ProofTarget, OpTarget),
     cap_policy("redact", "0009", ProofTarget, OpTarget),
     cap_policy("digest-migration", "0002", ProofTarget, OpTarget),
@@ -346,11 +359,21 @@ const fn cap_facet(
     proof: CapabilityProof,
     operational_state: CapabilityOperationalState,
 ) -> CapabilityInfo {
+    cap_named_facet(name, name, owning_spec, proof, operational_state)
+}
+
+const fn cap_named_facet(
+    name: &'static str,
+    facet: &'static str,
+    owning_spec: &'static str,
+    proof: CapabilityProof,
+    operational_state: CapabilityOperationalState,
+) -> CapabilityInfo {
     cap_with_dimensions(
         name,
         owning_spec,
         CapabilityDimensions {
-            facet: Some(name),
+            facet: Some(facet),
             facade: None,
             engine: None,
             transport: None,

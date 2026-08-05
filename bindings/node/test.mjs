@@ -16,9 +16,99 @@ const fixture = JSON.parse(
   readFileSync(join(here, "..", "conformance", "result-vectors.json"), "utf8"),
 );
 
+function cborText(value) {
+  const bytes = Buffer.from(value, "utf8");
+  assert.ok(bytes.length < 24, "test helper supports short CBOR text values");
+  return Buffer.concat([Buffer.from([0x60 + bytes.length]), bytes]);
+}
+
+function cborUint(value) {
+  if (value < 24) {
+    return Buffer.from([value]);
+  }
+  if (value < 256) {
+    return Buffer.from([0x18, value]);
+  }
+  assert.ok(value < 65536, "test helper supports uint16 values");
+  return Buffer.from([0x19, (value >> 8) & 0xff, value & 0xff]);
+}
+
+function execApplyRequest(workspace, base, fork) {
+  return Buffer.concat([
+    Buffer.from([0xa5]),
+    cborText("base"),
+    cborText(base),
+    cborText("fork"),
+    cborText(fork),
+    cborText("author"),
+    cborText("agent"),
+    cborText("workspace"),
+    cborText(workspace),
+    cborText("timestamp_ms"),
+    cborUint(3000),
+  ]);
+}
+
 // Smoke: version + blob digest shape.
 assert.notEqual(loom.version(), "");
 assert.match(loom.blobDigest(Buffer.from("abc")), /^blake3:[0-9a-f]{64}$/);
+assert.equal(typeof loom.applyCbor, "function", "applyCbor is exported");
+assert.equal(typeof loom.sqlExecResult, "function", "sqlExecResult is exported");
+assert.equal(typeof loom.auditCompact, "function", "auditCompact is exported");
+assert.equal(typeof loom.storeMaintenanceStatus, "function", "storeMaintenanceStatus is exported");
+assert.equal(typeof loom.storeMaintenancePolicySet, "function", "storeMaintenancePolicySet is exported");
+assert.equal(typeof loom.storeMaintenanceRun, "function", "storeMaintenanceRun is exported");
+
+function freshAdminStore(name) {
+  const path = join(mkdtempSync(join(tmpdir(), "loom-mu6i-d7-")), `${name}.loom`);
+  loom.createLoom(path, "default", null, null);
+  return path;
+}
+
+function assertCanonicalArrayBytes(value, label) {
+  const bytes = Buffer.from(value);
+  assert.ok(bytes.length > 0, `${label} returned empty bytes`);
+  assert.equal(bytes[0] & 0xe0, 0x80, `${label} did not return a canonical CBOR array`);
+}
+
+const mu6iD7AuditPath = freshAdminStore("audit");
+assertCanonicalArrayBytes(loom.auditCompact(mu6iD7AuditPath, 0n, null, null, null), "auditCompact");
+assert.throws(
+  () => loom.auditCompact(mu6iD7AuditPath, -1n, null, null, null),
+  /throughSeq must be a non-negative u64/,
+);
+assert.throws(
+  () => loom.auditCompact(mu6iD7AuditPath, 1n << 65n, null, null, null),
+  /throughSeq must be a non-negative u64/,
+);
+
+const mu6iD7StatusPath = freshAdminStore("status");
+assertCanonicalArrayBytes(
+  loom.storeMaintenanceStatus(mu6iD7StatusPath, Buffer.from([0x81, 0xf4]), null, null, null),
+  "storeMaintenanceStatus",
+);
+assert.throws(
+  () => loom.storeMaintenanceStatus(mu6iD7StatusPath, Buffer.from([0xff]), null, null, null),
+  /INVALID_ARGUMENT|invalid|break|CBOR/i,
+);
+
+const mu6iD7PolicyPath = freshAdminStore("policy");
+assertCanonicalArrayBytes(
+  loom.storeMaintenancePolicySet(
+    mu6iD7PolicyPath,
+    Buffer.from([0x8e, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6]),
+    null,
+    null,
+    null,
+  ),
+  "storeMaintenancePolicySet",
+);
+
+const mu6iD7RunPath = freshAdminStore("run");
+assertCanonicalArrayBytes(
+  loom.storeMaintenanceRun(mu6iD7RunPath, Buffer.from([0x82, 0x01, 0x01]), null, null, null),
+  "storeMaintenanceRun",
+);
 
 // Smoke: capability report is a non-empty canonical-CBOR buffer (decoded shape is covered by the
 // core and FFI tests). The CBOR text strings appear verbatim in the buffer, so check a couple.
@@ -31,8 +121,7 @@ for (const name of [
   "lanesCreate",
   "lanesGet",
   "lanesList",
-  "lanesStatusReportUpdate",
-  "lanesReviewerFeedbackUpdate",
+  "lanesUpdate",
   "lanesTicketAdd",
   "lanesTicketRemove",
 ]) {
@@ -47,6 +136,131 @@ assert.equal(surfaceCatalog.workspace, "studio");
 assert.equal(surfaceCatalog.set, "core");
 assert.ok(surfaceCatalog.apps.some((app) => app.app_id === "ticket-details"));
 assert.throws(() => loom.studioSurfaceCatalogJson("studio", "bogus"), /unsupported Studio surface catalog set/);
+
+for (const name of [
+  "lifecycleDefineStandardJson",
+  "lifecycleDefineJson",
+  "lifecycleInstantiateJson",
+  "lifecycleTransitionJson",
+  "refsReconcileJson",
+]) {
+  assert.equal(typeof loom[name], "function", `${name} is exported`);
+}
+const lifecyclePath = join(mkdtempSync(join(tmpdir(), "loom-")), "lifecycle.loom");
+loom.createLoom(lifecyclePath, "default", null, null);
+const completionDigest = `blake3:${"0".repeat(64)}`;
+const customLifecycleDefinition = Buffer.from(
+  "8278236c6f6f6d2e73747564696f2e6c6966656379636c652e646566696e6974696f6e2e7631846b637573746f6d2d666c6f776a323032362d30372d3238828766717565756564665175657565648080008080876772756e6e696e676752756e6e696e67808000808066717565756564",
+  "hex",
+);
+const definition = JSON.parse(
+  loom.lifecycleDefineStandardJson(lifecyclePath, "lifecycle", "feature", "1", completionDigest),
+);
+assert.equal(definition.definition_id, "feature");
+const customDefinition = JSON.parse(loom.lifecycleDefineJson(lifecyclePath, "lifecycle", customLifecycleDefinition));
+assert.equal(customDefinition.definition_id, "custom-flow");
+assert.equal(customDefinition.initial_stage_id, "queued");
+const instance = JSON.parse(
+  loom.lifecycleInstantiateJson(lifecyclePath, "lifecycle", "feature-1", "feature", ["ticket:MX-1"]),
+);
+assert.equal(instance.current_stage_id, "ideate");
+const transition = JSON.parse(
+  loom.lifecycleTransitionJson(
+    lifecyclePath,
+    "lifecycle",
+    "feature-1",
+    "transition-1",
+    "draft",
+    null,
+    JSON.stringify([{ gate_id: "enter-draft", passed: true }]),
+    null,
+  ),
+);
+assert.equal(transition.instance.current_stage_id, "draft");
+assert.throws(
+  () =>
+    loom.lifecycleInstantiateJson(lifecyclePath, "lifecycle", "feature-1", "feature", []),
+  /already exists|AlreadyExists/i,
+);
+loom.lifecycleInstantiateJson(lifecyclePath, "lifecycle", "feature-gate", "feature", []);
+assert.throws(
+  () =>
+    loom.lifecycleTransitionJson(
+      lifecyclePath,
+      "lifecycle",
+      "feature-gate",
+      "transition-gate",
+      "draft",
+      null,
+      "[]",
+      null,
+    ),
+  /CONFLICT|missing required gate|did not pass/i,
+);
+assert.throws(
+  () => loom.lifecycleDefineJson(lifecyclePath, "lifecycle", Buffer.from("bad"), null, "root-only", null),
+  /authPrincipal and authPassphrase must be provided together/,
+);
+assert.throws(
+  () =>
+    loom.lifecycleDefineJson(
+      lifecyclePath,
+      "lifecycle",
+      Buffer.from("bad"),
+      null,
+      "00000000-0000-4000-8000-000000000001",
+      "bad-pass",
+    ),
+  /unauthenticated-root mode|not found|authentication/i,
+);
+const refs = JSON.parse(loom.refsReconcileJson(lifecyclePath, "lifecycle", 0n));
+assert.equal(refs.processed, 0);
+assert.equal(refs.pending, 0);
+assert.equal(refs.resolved, 0);
+assert.equal(refs.failed, 0);
+assert.throws(() => loom.refsReconcileJson(lifecyclePath, "lifecycle", -1n), /max must be a non-negative u64/);
+
+const refsPath = join(mkdtempSync(join(tmpdir(), "loom-")), "refs.loom");
+loom.createLoom(refsPath, "default", null, null);
+const refsWorkspaceId = loom.workspaceCreate(refsPath, "refs", "vcs", null);
+loom.ticketsProjectCreateJson(refsPath, "refs", refsWorkspaceId, "project", "MX", "Project", null, null);
+loom.ticketsCreateJson(
+  refsPath,
+  "refs",
+  refsWorkspaceId,
+  "project",
+  "task",
+  null,
+  null,
+  JSON.stringify({ description: "Related !ticket:MX-2" }),
+  "[]",
+  null,
+  null,
+);
+loom.ticketsCreateJson(refsPath, "refs", refsWorkspaceId, "project", "task", null, null, "{}", "[]", null, null);
+const refsPending = JSON.parse(loom.refsReconcileJson(refsPath, "refs", 0n));
+assert.equal(refsPending.processed, 0);
+assert.equal(refsPending.pending, 1);
+assert.equal(refsPending.resolved, 0);
+assert.equal(refsPending.failed, 0);
+const refsProcessed = JSON.parse(loom.refsReconcileJson(refsPath, "refs", 1n));
+assert.equal(refsProcessed.processed, 1);
+assert.equal(refsProcessed.pending, 0);
+assert.equal(refsProcessed.resolved, 1);
+assert.equal(refsProcessed.failed, 0);
+const refsReopened = JSON.parse(loom.refsReconcileJson(refsPath, "refs", 1n));
+assert.equal(refsReopened.processed, 0);
+assert.equal(refsReopened.pending, 0);
+assert.equal(refsReopened.resolved, 1);
+assert.equal(refsReopened.failed, 0);
+const refsAudits = JSON.parse(loom.auditListJson(refsPath, null, null, null)).records.filter(
+  (record) => record.action === "refs.reconcile",
+);
+assert.equal(refsAudits.length, 1);
+assert.equal(
+  refsAudits[0].target,
+  `workspace=${refsWorkspaceId};processed=1;resolved=1;failed=0;pending=0`,
+);
 
 const meetingsPath = join(mkdtempSync(join(tmpdir(), "loom-")), "meetings.loom");
 loom.createLoom(meetingsPath, "default", null, null);
@@ -72,12 +286,94 @@ const meetingsSnapshot = Buffer.from(
     ],
   }),
 );
+const meetingsDryPath = join(mkdtempSync(join(tmpdir(), "loom-")), "meetings-dry.loom");
+loom.createLoom(meetingsDryPath, "default", null, null);
+loom.workspaceCreate(meetingsDryPath, "studio", "vcs");
+const meetingsDryReport = JSON.parse(
+  loom.meetingsImportSnapshot(meetingsDryPath, "studio", "granola-app", meetingsSnapshot, true),
+);
+assert.equal(meetingsDryReport.profile, "meetings");
+assert.equal(meetingsDryReport.rows_imported, 1);
+assert.throws(
+  () => loom.meetingsSourceRead(meetingsDryPath, "studio", "note-1", "summary.txt"),
+  /not found|NOT_FOUND/i,
+);
 const meetingsReport = JSON.parse(
   loom.meetingsImportSnapshot(meetingsPath, "studio", "granola-app", meetingsSnapshot, false),
 );
 assert.equal(meetingsReport.profile, "meetings");
 assert.equal(meetingsReport.rows_imported, 1);
 assert.equal(Buffer.from(loom.meetingsSourceRead(meetingsPath, "studio", "note-1", "summary.txt")).toString(), "Planning summary");
+assert.throws(
+  () =>
+    loom.meetingsImportSnapshot(
+      meetingsPath,
+      "studio",
+      "unknown-profile",
+      Buffer.from("not-json"),
+      false,
+      null,
+      "00000000-0000-4000-8000-000000000001",
+      "bad-passphrase",
+    ),
+  /authentication|not found|unauthenticated/i,
+);
+
+const applyPath = join(mkdtempSync(join(tmpdir(), "loom-")), "apply.loom");
+loom.createLoom(applyPath, "default", null, null);
+loom.workspaceCreate(applyPath, "repo", "files");
+loom.writeFile(applyPath, "files", "repo", "base.txt", Buffer.from("base"));
+loom.stageAll(applyPath, "files", "repo");
+loom.commitStaged(applyPath, "files", "repo", "agent", "base");
+const applyResult = Buffer.from(loom.applyCbor(applyPath, execApplyRequest("repo", "main", "main")));
+assert.ok(applyResult.includes(Buffer.from("loom.exec.apply.result.v1")), "generated Exec returns result bytes");
+assert.ok(applyResult.includes(Buffer.from("up_to_date")), "generated Exec preserves result semantics");
+assert.throws(() => loom.applyCbor(applyPath, Buffer.from("not-cbor")), /decode|invalid|cbor/i);
+assert.throws(
+  () =>
+    loom.applyCbor(
+      applyPath,
+      Buffer.from("not-cbor"),
+      null,
+      "00000000-0000-4000-8000-000000000001",
+      "bad-passphrase",
+    ),
+  /authentication|not found|unauthenticated/i,
+);
+
+const generatedSqlPath = join(mkdtempSync(join(tmpdir(), "loom-")), "generated-sql.loom");
+loom.createLoom(generatedSqlPath, "default", null, null);
+loom.workspaceCreate(generatedSqlPath, "repo", null);
+const sqlCreate = Buffer.from(
+  loom.sqlExecResult(
+    generatedSqlPath,
+    "repo",
+    "db",
+    "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'a')",
+  ),
+);
+assert.ok(sqlCreate.length > 0, "sqlExecResult returns canonical result bytes");
+assert.throws(
+  () => loom.sqlExecResult(generatedSqlPath, "repo", "db", "THIS IS NOT SQL"),
+  /sql|parse|syntax|invalid/i,
+);
+assert.throws(
+  () =>
+    loom.sqlExecResult(
+      generatedSqlPath,
+      "repo",
+      "db",
+      "THIS IS NOT SQL",
+      null,
+      "00000000-0000-4000-8000-000000000001",
+      "bad-passphrase",
+    ),
+  /authentication|not found|unauthenticated/i,
+);
+const sqlSelect = Buffer.from(
+  loom.sqlExecResult(generatedSqlPath, "repo", "db", "SELECT id, v FROM t ORDER BY id"),
+);
+assert.ok(sqlSelect.includes(Buffer.from("a")), "sqlExecResult persisted SQL state across wrapper reopen");
 
 const drivePath = join(mkdtempSync(join(tmpdir(), "loom-")), "drive.loom");
 loom.createLoom(drivePath, "default", null, null);
@@ -126,7 +422,7 @@ loom.drivePinRetentionJson(
   "pin-1",
   "legal_hold",
   committed.profile_root,
-  "file-1",
+  "file:file-1",
   3000n,
   null,
 );
@@ -184,22 +480,26 @@ assert.deepEqual(collected, [
 // Document binding parity: text uses strings and binary uses explicit byte APIs.
 const docPath = join(mkdtempSync(join(tmpdir(), "loom-")), "docs.loom");
 loom.createLoom(docPath, "default", null, null);
-const textDigest = loom.docPutText(docPath, "docs", "notes", "a", "hello text", null, null);
-assert.match(textDigest, /^blake3:[0-9a-f]{64}$/);
+const textPut = loom.docPutText(docPath, "docs", "notes", "a", "hello text", null, null);
+assert.match(textPut.digest, /^blake3:[0-9a-f]{64}$/);
+assert.match(textPut.entityTag, /^entity-tag:/);
 const textDoc = loom.docGetText(docPath, "docs", "notes", "a", null);
-assert.deepEqual(textDoc, { text: "hello text", digest: textDigest });
+assert.deepEqual(textDoc, { text: "hello text", digest: textPut.digest, entityTag: textPut.entityTag });
 assert.equal(loom.docGetText(docPath, "docs", "notes", "missing", null), null);
+const staleTag = loom.docPutText(docPath, "docs", "notes", "stale-tag", "other text", null, null).entityTag;
 assert.throws(
-  () => loom.docPutText(docPath, "docs", "notes", "a", "stale", loom.blobDigest(Buffer.from("stale")), null),
-  /CAS_MISMATCH/,
+  () => loom.docPutText(docPath, "docs", "notes", "a", "stale", staleTag, null),
+  /CONFLICT: expected_tag_mismatch/,
 );
-const updatedDigest = loom.docPutText(docPath, "docs", "notes", "a", "updated text", textDigest, null);
-assert.notEqual(updatedDigest, textDigest);
-const binaryDigest = loom.docPutBinary(docPath, "docs", "notes", "raw", Uint8Array.from([0xff, 0x00]), null, null);
-assert.match(binaryDigest, /^blake3:[0-9a-f]{64}$/);
+const updatedPut = loom.docPutText(docPath, "docs", "notes", "a", "updated text", textPut.entityTag, null);
+assert.notEqual(updatedPut.digest, textPut.digest);
+const binaryPut = loom.docPutBinary(docPath, "docs", "notes", "raw", Uint8Array.from([0xff, 0x00]), null, null);
+assert.match(binaryPut.digest, /^blake3:[0-9a-f]{64}$/);
+assert.match(binaryPut.entityTag, /^entity-tag:/);
 const binaryDoc = loom.docGetBinary(docPath, "docs", "notes", "raw", null);
 assert.deepEqual(Array.from(binaryDoc.bytes), [0xff, 0x00]);
-assert.equal(binaryDoc.digest, binaryDigest);
+assert.equal(binaryDoc.digest, binaryPut.digest);
+assert.equal(binaryDoc.entityTag, binaryPut.entityTag);
 assert.ok(Buffer.from(loom.docListBinary(docPath, "docs", "notes", null)).length > 0);
 assert.throws(
   () => loom.docGetText(docPath, "docs", "notes", "raw", null),
@@ -335,14 +635,14 @@ loom.aclGrantScoped(
   "principal == 'alice'",
 );
 const grants = JSON.parse(loom.aclListJson(authPath, null, rootId, "root-pass"));
-assert.ok(grants.some((g) => g.subject === aliceId && g.facet === "files" && g.rights.includes("read")));
-assert.ok(grants.some((g) => g.subject === `role:${adminRoleId}` && g.subject_kind === "role" && g.facet === "kv"));
-assert.ok(grants.some((g) => g.subject === aliceId && g.facet === "kv" && g.ref_glob === "branch/main" && g.scopes.length === 2));
+assert.ok(grants.some((g) => g.subject === aliceId && g.domain === "files" && g.rights.includes("read")));
+assert.ok(grants.some((g) => g.subject === `role:${adminRoleId}` && g.subject_kind === "role" && g.domain === "kv"));
+assert.ok(grants.some((g) => g.subject === aliceId && g.domain === "kv" && g.ref_glob === "branch/main" && g.scopes.length === 2));
 assert.ok(
   grants.some(
     (g) =>
       g.subject === aliceId &&
-      g.facet === "files" &&
+      g.domain === "files" &&
       g.ref_glob === "branch/main" &&
       g.predicate?.language === "cel" &&
       g.predicate?.expression === "principal == 'alice'",

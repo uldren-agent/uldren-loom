@@ -11,7 +11,8 @@
 use crate::client::{CallOptions, RemoteLoomClient};
 use crate::transport::Transport;
 use loom_remote_protocol::api_types::{
-    Digest, LoomSession, LoomStream, ResultView, RowIter, SqlBatch, SqlSession, Task, Uuid,
+    Digest, LaneTicketPlacement, LoomSession, LoomStream, ResultView, RowIter, SqlBatch,
+    SqlSession, Task, Uuid,
 };
 use loom_remote_protocol::generated_api::*;
 use loom_types::LoomError;
@@ -380,6 +381,25 @@ impl<T: Transport + Send + Sync> Exec for RemoteLoomClient<T> {
             }
         }
     }
+    fn apply_cbor(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_codec::Value::Bytes(request),
+        ];
+        async move {
+            let value = self
+                .call("Exec", "apply_cbor", args, &self.idempotency_options())
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
 }
 
 impl<T: Transport + Send + Sync> Program for RemoteLoomClient<T> {
@@ -559,6 +579,54 @@ impl<T: Transport + Send + Sync> Identity for RemoteLoomClient<T> {
             match value {
                 ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
                 _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn identity_authority_witness(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> =
+            vec![::loom_remote_protocol::codec::ToValue::to_value(&handle)];
+        async move {
+            let value = self
+                .call(
+                    "Identity",
+                    "identity_authority_witness",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn identity_list_authority_replication(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<Vec<Vec<u8>>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> =
+            vec![::loom_remote_protocol::codec::ToValue::to_value(&handle)];
+        async move {
+            let value = self
+                .call(
+                    "Identity",
+                    "identity_list_authority_replication",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Array(items) => items
+                    .into_iter()
+                    .map(|item| match item {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                        _ => Err(crate::wire::shape("bytes")),
+                    })
+                    .collect::<::core::result::Result<Vec<_>, _>>(),
+                _ => Err(crate::wire::shape("list")),
             }
         }
     }
@@ -866,6 +934,113 @@ impl<T: Transport + Send + Sync> Identity for RemoteLoomClient<T> {
             }
         }
     }
+    fn identity_force_detach_authority_json(
+        &self,
+        handle: LoomSession,
+        principal: Uuid,
+        generation: u64,
+        reason: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&principal),
+            ::loom_remote_protocol::codec::ToValue::to_value(&generation),
+            ::loom_remote_protocol::codec::ToValue::to_value(&reason),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Identity",
+                    "identity_force_detach_authority_json",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn identity_replicate_authority_json(
+        &self,
+        handle: LoomSession,
+        source: String,
+        become_authority: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source),
+            ::loom_remote_protocol::codec::ToValue::to_value(&become_authority),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Identity",
+                    "identity_replicate_authority_json",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn identity_configure_authority_replication_json(
+        &self,
+        handle: LoomSession,
+        id: String,
+        source: String,
+        disabled: bool,
+        pull_on_start: bool,
+        interval_ms: Option<u64>,
+        jitter_ms: u64,
+        backoff_ms: u64,
+        publish_witness: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source),
+            ::loom_remote_protocol::codec::ToValue::to_value(&disabled),
+            ::loom_remote_protocol::codec::ToValue::to_value(&pull_on_start),
+            match interval_ms {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&jitter_ms),
+            ::loom_remote_protocol::codec::ToValue::to_value(&backoff_ms),
+            ::loom_remote_protocol::codec::ToValue::to_value(&publish_witness),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Identity",
+                    "identity_configure_authority_replication_json",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn identity_remove_authority_replication_json(
+        &self,
+        handle: LoomSession,
+        id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&id),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Identity",
+                    "identity_remove_authority_replication_json",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
 }
 
 impl<T: Transport + Send + Sync> Acl for RemoteLoomClient<T> {
@@ -1135,6 +1310,671 @@ impl<T: Transport + Send + Sync> ProtectedRefs for RemoteLoomClient<T> {
     }
 }
 
+impl<T: Transport + Send + Sync> Lifecycle for RemoteLoomClient<T> {
+    fn lifecycle_define_standard_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        kind: String,
+        version: String,
+        completion_predicate_digest: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&kind),
+            ::loom_remote_protocol::codec::ToValue::to_value(&version),
+            ::loom_remote_protocol::codec::ToValue::to_value(&completion_predicate_digest),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Lifecycle",
+                    "lifecycle_define_standard_json",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn lifecycle_define_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        definition: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_codec::Value::Bytes(definition),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Lifecycle",
+                    "lifecycle_define_json",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn lifecycle_instantiate_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        instance_id: String,
+        definition_id: String,
+        subject_refs: Vec<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&instance_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&definition_id),
+            ::loom_codec::Value::Array(
+                subject_refs
+                    .into_iter()
+                    .map(|item| ::loom_remote_protocol::codec::ToValue::to_value(&item))
+                    .collect(),
+            ),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Lifecycle",
+                    "lifecycle_instantiate_json",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn lifecycle_transition_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        instance_id: String,
+        transition_id: String,
+        to_stage_id: String,
+        actor_principal_id: Option<String>,
+        gate_evaluations_json: String,
+        snapshot_digest: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&instance_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&transition_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&to_stage_id),
+            match actor_principal_id {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&gate_evaluations_json),
+            match snapshot_digest {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Lifecycle",
+                    "lifecycle_transition_json",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+}
+
+impl<T: Transport + Send + Sync> Refs for RemoteLoomClient<T> {
+    fn refs_reconcile_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        max: u64,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&max),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Refs",
+                    "refs_reconcile_json",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+}
+
+impl<T: Transport + Send + Sync> Audit for RemoteLoomClient<T> {
+    fn audit_config_show_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> =
+            vec![::loom_remote_protocol::codec::ToValue::to_value(&handle)];
+        async move {
+            let value = self
+                .call(
+                    "Audit",
+                    "audit_config_show_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn audit_config_set_json(
+        &self,
+        handle: LoomSession,
+        retention_days: Option<u32>,
+        legal_hold: Option<bool>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            match retention_days {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            match legal_hold {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Audit",
+                    "audit_config_set_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn audit_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> =
+            vec![::loom_remote_protocol::codec::ToValue::to_value(&handle)];
+        async move {
+            let value = self
+                .call("Audit", "audit_list_json", args, &CallOptions::default())
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn audit_view_json(
+        &self,
+        handle: LoomSession,
+        record: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&record),
+        ];
+        async move {
+            let value = self
+                .call("Audit", "audit_view_json", args, &CallOptions::default())
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn audit_compact(
+        &self,
+        handle: LoomSession,
+        through_seq: u64,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&through_seq),
+        ];
+        async move {
+            let value = self
+                .call("Audit", "audit_compact", args, &self.idempotency_options())
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+}
+
+impl<T: Transport + Send + Sync> Certificate for RemoteLoomClient<T> {
+    fn certificate_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> =
+            vec![::loom_remote_protocol::codec::ToValue::to_value(&handle)];
+        async move {
+            let value = self
+                .call(
+                    "Certificate",
+                    "certificate_list_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn certificate_import_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+        cert_chain_pem: Vec<u8>,
+        private_key_pem: Vec<u8>,
+        trust_bundle_pem: Option<Vec<u8>>,
+        force: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+            ::loom_codec::Value::Bytes(cert_chain_pem),
+            ::loom_codec::Value::Bytes(private_key_pem),
+            match trust_bundle_pem {
+                Some(inner) => ::loom_codec::Value::Bytes(inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&force),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Certificate",
+                    "certificate_import_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn certificate_export(
+        &self,
+        handle: LoomSession,
+        name: String,
+        include_cert_chain: bool,
+        include_private_key: bool,
+        include_trust_bundle: bool,
+        force: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+            ::loom_remote_protocol::codec::ToValue::to_value(&include_cert_chain),
+            ::loom_remote_protocol::codec::ToValue::to_value(&include_private_key),
+            ::loom_remote_protocol::codec::ToValue::to_value(&include_trust_bundle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&force),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Certificate",
+                    "certificate_export",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn certificate_generate_self_signed_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+        dns_names: Vec<String>,
+        ip_addresses: Vec<String>,
+        cn: Option<String>,
+        days: u32,
+        algorithm: String,
+        force: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+            ::loom_codec::Value::Array(
+                dns_names
+                    .into_iter()
+                    .map(|item| ::loom_remote_protocol::codec::ToValue::to_value(&item))
+                    .collect(),
+            ),
+            ::loom_codec::Value::Array(
+                ip_addresses
+                    .into_iter()
+                    .map(|item| ::loom_remote_protocol::codec::ToValue::to_value(&item))
+                    .collect(),
+            ),
+            match cn {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&days),
+            ::loom_remote_protocol::codec::ToValue::to_value(&algorithm),
+            ::loom_remote_protocol::codec::ToValue::to_value(&force),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Certificate",
+                    "certificate_generate_self_signed_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn certificate_remove_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Certificate",
+                    "certificate_remove_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn certificate_audit_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Certificate",
+                    "certificate_audit_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+}
+
+impl<T: Transport + Send + Sync> NetworkAccess for RemoteLoomClient<T> {
+    fn network_access_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> =
+            vec![::loom_remote_protocol::codec::ToValue::to_value(&handle)];
+        async move {
+            let value = self
+                .call(
+                    "NetworkAccess",
+                    "network_access_list_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn network_access_set_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+        description: Option<String>,
+        default_action: String,
+        rules_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+            match description {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&default_action),
+            ::loom_remote_protocol::codec::ToValue::to_value(&rules_json),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "NetworkAccess",
+                    "network_access_set_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn network_access_remove_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "NetworkAccess",
+                    "network_access_remove_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn network_access_audit_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "NetworkAccess",
+                    "network_access_audit_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+}
+
+impl<T: Transport + Send + Sync> ServeConfig for RemoteLoomClient<T> {
+    fn serve_listener_configure_json(
+        &self,
+        handle: LoomSession,
+        request_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&request_json),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "ServeConfig",
+                    "serve_listener_configure_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn serve_listener_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> =
+            vec![::loom_remote_protocol::codec::ToValue::to_value(&handle)];
+        async move {
+            let value = self
+                .call(
+                    "ServeConfig",
+                    "serve_listener_list_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn serve_listener_set_enabled_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+        enabled: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&listener_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&enabled),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "ServeConfig",
+                    "serve_listener_set_enabled_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn serve_listener_remove_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&listener_id),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "ServeConfig",
+                    "serve_listener_remove_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn serve_web_route_list_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&listener_id),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "ServeConfig",
+                    "serve_web_route_list_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn serve_web_route_set_json(
+        &self,
+        handle: LoomSession,
+        request_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&request_json),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "ServeConfig",
+                    "serve_web_route_set_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn serve_web_route_remove_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+        route_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&listener_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&route_id),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "ServeConfig",
+                    "serve_web_route_remove_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+}
+
 impl<T: Transport + Send + Sync> Daemon for RemoteLoomClient<T> {
     fn daemon_start(&self) -> impl ::core::future::Future<Output = Result<(), LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![];
@@ -1279,9 +2119,8 @@ impl<T: Transport + Send + Sync> Daemon for RemoteLoomClient<T> {
 impl<T: Transport + Send + Sync> Locks for RemoteLoomClient<T> {
     fn lock_acquire(
         &self,
+        handle: LoomSession,
         key: String,
-        principal: String,
-        session: String,
         mode: Vec<u8>,
         permits: u32,
         capacity: u32,
@@ -1289,9 +2128,8 @@ impl<T: Transport + Send + Sync> Locks for RemoteLoomClient<T> {
         wait_ms: u64,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
             ::loom_remote_protocol::codec::ToValue::to_value(&key),
-            ::loom_remote_protocol::codec::ToValue::to_value(&principal),
-            ::loom_remote_protocol::codec::ToValue::to_value(&session),
             ::loom_codec::Value::Bytes(mode),
             ::loom_remote_protocol::codec::ToValue::to_value(&permits),
             ::loom_remote_protocol::codec::ToValue::to_value(&capacity),
@@ -1310,25 +2148,13 @@ impl<T: Transport + Send + Sync> Locks for RemoteLoomClient<T> {
     }
     fn lock_refresh(
         &self,
-        key: String,
-        principal: String,
-        session: String,
-        mode: Vec<u8>,
-        permits: u32,
-        capacity: u32,
-        fence_low: u64,
-        fence_high: u64,
+        handle: LoomSession,
+        token: Vec<u8>,
         lease_ms: u64,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
-            ::loom_remote_protocol::codec::ToValue::to_value(&key),
-            ::loom_remote_protocol::codec::ToValue::to_value(&principal),
-            ::loom_remote_protocol::codec::ToValue::to_value(&session),
-            ::loom_codec::Value::Bytes(mode),
-            ::loom_remote_protocol::codec::ToValue::to_value(&permits),
-            ::loom_remote_protocol::codec::ToValue::to_value(&capacity),
-            ::loom_remote_protocol::codec::ToValue::to_value(&fence_low),
-            ::loom_remote_protocol::codec::ToValue::to_value(&fence_high),
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_codec::Value::Bytes(token),
             ::loom_remote_protocol::codec::ToValue::to_value(&lease_ms),
         ];
         async move {
@@ -1343,24 +2169,12 @@ impl<T: Transport + Send + Sync> Locks for RemoteLoomClient<T> {
     }
     fn lock_release(
         &self,
-        key: String,
-        principal: String,
-        session: String,
-        mode: Vec<u8>,
-        permits: u32,
-        capacity: u32,
-        fence_low: u64,
-        fence_high: u64,
+        handle: LoomSession,
+        token: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<(), LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
-            ::loom_remote_protocol::codec::ToValue::to_value(&key),
-            ::loom_remote_protocol::codec::ToValue::to_value(&principal),
-            ::loom_remote_protocol::codec::ToValue::to_value(&session),
-            ::loom_codec::Value::Bytes(mode),
-            ::loom_remote_protocol::codec::ToValue::to_value(&permits),
-            ::loom_remote_protocol::codec::ToValue::to_value(&capacity),
-            ::loom_remote_protocol::codec::ToValue::to_value(&fence_low),
-            ::loom_remote_protocol::codec::ToValue::to_value(&fence_high),
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_codec::Value::Bytes(token),
         ];
         async move {
             let value = self
@@ -2529,6 +3343,8 @@ impl<T: Transport + Send + Sync> FileSystem for RemoteLoomClient<T> {
         handle: LoomSession,
         workspace: String,
         src_path: String,
+        author: Option<String>,
+        message: Option<String>,
         commit: bool,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
@@ -2536,6 +3352,14 @@ impl<T: Transport + Send + Sync> FileSystem for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
             ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
             ::loom_remote_protocol::codec::ToValue::to_value(&src_path),
+            match author {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            match message {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
             ::loom_remote_protocol::codec::ToValue::to_value(&commit),
             ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
         ];
@@ -2582,6 +3406,8 @@ impl<T: Transport + Send + Sync> FileSystem for RemoteLoomClient<T> {
         handle: LoomSession,
         workspace: String,
         src_path: String,
+        author: Option<String>,
+        message: Option<String>,
         commit: bool,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Task, LoomError>> + Send {
@@ -2589,6 +3415,14 @@ impl<T: Transport + Send + Sync> FileSystem for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
             ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
             ::loom_remote_protocol::codec::ToValue::to_value(&src_path),
+            match author {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            match message {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
             ::loom_remote_protocol::codec::ToValue::to_value(&commit),
             ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
         ];
@@ -2643,6 +3477,10 @@ impl<T: Transport + Send + Sync> Archive for RemoteLoomClient<T> {
         workspace: String,
         src_path: String,
         kind: String,
+        gzip_output_path: Option<String>,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
@@ -2650,6 +3488,19 @@ impl<T: Transport + Send + Sync> Archive for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
             ::loom_remote_protocol::codec::ToValue::to_value(&src_path),
             ::loom_remote_protocol::codec::ToValue::to_value(&kind),
+            match gzip_output_path {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&commit),
+            match author {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            match message {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
             ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
         ];
         async move {
@@ -2698,6 +3549,10 @@ impl<T: Transport + Send + Sync> Archive for RemoteLoomClient<T> {
         workspace: String,
         src_path: String,
         kind: String,
+        gzip_output_path: Option<String>,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Task, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
@@ -2705,6 +3560,19 @@ impl<T: Transport + Send + Sync> Archive for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
             ::loom_remote_protocol::codec::ToValue::to_value(&src_path),
             ::loom_remote_protocol::codec::ToValue::to_value(&kind),
+            match gzip_output_path {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&commit),
+            match author {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            match message {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
             ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
         ];
         async move {
@@ -2749,6 +3617,329 @@ impl<T: Transport + Send + Sync> Archive for RemoteLoomClient<T> {
                 )
                 .await?;
             crate::wire::from_wire::<Task>(&value)
+        }
+    }
+}
+
+impl<T: Transport + Send + Sync> InterchangeProfiles for RemoteLoomClient<T> {
+    fn import_table_csv(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        source_scope: String,
+        csv_payload: Vec<u8>,
+        database: String,
+        table: String,
+        schema: String,
+        primary_key: String,
+        mode: String,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source_scope),
+            ::loom_codec::Value::Bytes(csv_payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&database),
+            ::loom_remote_protocol::codec::ToValue::to_value(&table),
+            ::loom_remote_protocol::codec::ToValue::to_value(&schema),
+            ::loom_remote_protocol::codec::ToValue::to_value(&primary_key),
+            ::loom_remote_protocol::codec::ToValue::to_value(&mode),
+            ::loom_remote_protocol::codec::ToValue::to_value(&commit),
+            match author {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            match message {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InterchangeProfiles",
+                    "import_table_csv",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn import_redmine(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        field_policy: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&profile),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source_scope),
+            ::loom_codec::Value::Bytes(snapshot_payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&field_policy),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InterchangeProfiles",
+                    "import_redmine",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn import_asana(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        field_policy: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&profile),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source_scope),
+            ::loom_codec::Value::Bytes(snapshot_payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&field_policy),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InterchangeProfiles",
+                    "import_asana",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn import_jira(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        field_policy: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&profile),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source_scope),
+            ::loom_codec::Value::Bytes(snapshot_payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&field_policy),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InterchangeProfiles",
+                    "import_jira",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn import_confluence(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        default_space: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&profile),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source_scope),
+            ::loom_codec::Value::Bytes(snapshot_payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&default_space),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InterchangeProfiles",
+                    "import_confluence",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn import_slack(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&profile),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source_scope),
+            ::loom_codec::Value::Bytes(snapshot_payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InterchangeProfiles",
+                    "import_slack",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn import_drive(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        archive_payload: Vec<u8>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&profile),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source_scope),
+            ::loom_codec::Value::Bytes(archive_payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InterchangeProfiles",
+                    "import_drive",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn import_markdown(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        archive_payload: Vec<u8>,
+        space: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&profile),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source_scope),
+            ::loom_codec::Value::Bytes(archive_payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&space),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InterchangeProfiles",
+                    "import_markdown",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn import_notion(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        default_space: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&profile),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source_scope),
+            ::loom_codec::Value::Bytes(snapshot_payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&default_space),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InterchangeProfiles",
+                    "import_notion",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
         }
     }
 }
@@ -4008,6 +5199,53 @@ impl<T: Transport + Send + Sync> Vector for RemoteLoomClient<T> {
             }
         }
     }
+    fn vector_text_upsert(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_codec::Value::Bytes(request),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Vector",
+                    "vector_text_upsert",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn vector_workspace_configure_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        request_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&request_json),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Vector",
+                    "vector_workspace_configure_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
 }
 
 impl<T: Transport + Send + Sync> Columnar for RemoteLoomClient<T> {
@@ -4225,6 +5463,74 @@ impl<T: Transport + Send + Sync> Columnar for RemoteLoomClient<T> {
         async move {
             let value = self
                 .call("Columnar", "aggregate", args, &CallOptions::default())
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn columnar_import_arrow(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        payload: Vec<u8>,
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+            ::loom_codec::Value::Bytes(payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&target_segment_rows),
+            ::loom_remote_protocol::codec::ToValue::to_value(&replace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Columnar",
+                    "columnar_import_arrow",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn columnar_import_parquet(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        payload: Vec<u8>,
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+            ::loom_codec::Value::Bytes(payload),
+            ::loom_remote_protocol::codec::ToValue::to_value(&target_segment_rows),
+            ::loom_remote_protocol::codec::ToValue::to_value(&replace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Columnar",
+                    "columnar_import_parquet",
+                    args,
+                    &CallOptions::default(),
+                )
                 .await?;
             match value {
                 ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
@@ -6098,7 +7404,7 @@ impl<T: Transport + Send + Sync> Lanes for RemoteLoomClient<T> {
         workspace: String,
         lane_id: String,
         ticket_id: String,
-        placement: Option<String>,
+        placement: Option<LaneTicketPlacement>,
         anchor: Option<String>,
         updated_by: String,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
@@ -7785,6 +9091,29 @@ impl<T: Transport + Send + Sync> Sql for RemoteLoomClient<T> {
             }
         }
     }
+    fn sql_exec_result(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        db: String,
+        sql: String,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&db),
+            ::loom_remote_protocol::codec::ToValue::to_value(&sql),
+        ];
+        async move {
+            let value = self
+                .call("Sql", "sql_exec_result", args, &self.idempotency_options())
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
     fn sql_exec(
         &self,
         session: SqlSession,
@@ -8395,6 +9724,198 @@ impl<T: Transport + Send + Sync> StudioSurfaces for RemoteLoomClient<T> {
                 .call(
                     "StudioSurfaces",
                     "studio_surface_catalog_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+}
+
+impl<T: Transport + Send + Sync> StudioMaintenance for RemoteLoomClient<T> {
+    fn studio_reindex_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&profile),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "StudioMaintenance",
+                    "studio_reindex_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn studio_revisions_rebuild_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&profile),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "StudioMaintenance",
+                    "studio_revisions_rebuild_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+}
+
+impl<T: Transport + Send + Sync> InferenceInstance for RemoteLoomClient<T> {
+    fn inference_instance_list_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        kind: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            match kind {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InferenceInstance",
+                    "inference_instance_list_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn inference_instance_get_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InferenceInstance",
+                    "inference_instance_get_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn inference_instance_create_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        model: String,
+        kind: String,
+        runtime: String,
+        preset: Option<String>,
+        settings_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+            ::loom_remote_protocol::codec::ToValue::to_value(&model),
+            ::loom_remote_protocol::codec::ToValue::to_value(&kind),
+            ::loom_remote_protocol::codec::ToValue::to_value(&runtime),
+            match preset {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&settings_json),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InferenceInstance",
+                    "inference_instance_create_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn inference_instance_update_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        preset: Option<String>,
+        settings_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+            match preset {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_remote_protocol::codec::ToValue::to_value(&settings_json),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InferenceInstance",
+                    "inference_instance_update_json",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn inference_instance_delete_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&name),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "InferenceInstance",
+                    "inference_instance_delete_json",
                     args,
                     &CallOptions::default(),
                 )
@@ -9994,6 +11515,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         channel_id: String,
         channel_handle: String,
         name: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10002,6 +11524,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&channel_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&channel_handle),
             ::loom_remote_protocol::codec::ToValue::to_value(&name),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10009,7 +11535,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_create_channel_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10022,6 +11548,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         chat_workspace_id: String,
         selector: String,
         channel_handle: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10029,6 +11556,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&chat_workspace_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&selector),
             ::loom_remote_protocol::codec::ToValue::to_value(&channel_handle),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10036,7 +11567,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_rename_channel_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10074,6 +11605,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         message_id: String,
         thread_id: Option<String>,
         body_text: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10086,6 +11618,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                 None => ::loom_codec::Value::Null,
             },
             ::loom_remote_protocol::codec::ToValue::to_value(&body_text),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10093,7 +11629,46 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_post_message_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn chat_post_message_bytes_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        message_id: String,
+        thread_id: Option<String>,
+        body: Vec<u8>,
+        expected_entity_tag: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&chat_workspace_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&channel_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&message_id),
+            match thread_id {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+            ::loom_codec::Value::Bytes(body),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Chat",
+                    "chat_post_message_bytes_json",
+                    args,
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10107,6 +11682,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         channel_id: String,
         message_id: String,
         body_text: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10115,6 +11691,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&channel_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&message_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&body_text),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10122,7 +11702,41 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_edit_message_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn chat_edit_message_bytes_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        message_id: String,
+        body: Vec<u8>,
+        expected_entity_tag: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&chat_workspace_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&channel_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&message_id),
+            ::loom_codec::Value::Bytes(body),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Chat",
+                    "chat_edit_message_bytes_json",
+                    args,
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10136,6 +11750,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         channel_id: String,
         message_id: String,
         reason: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10147,6 +11762,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                 Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
                 None => ::loom_codec::Value::Null,
             },
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10154,7 +11773,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_redact_message_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10168,6 +11787,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         channel_id: String,
         thread_id: String,
         parent_message_id: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10176,6 +11796,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&channel_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&thread_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&parent_message_id),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10183,7 +11807,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_create_thread_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10198,6 +11822,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         task_id: String,
         message_id: Option<String>,
         title: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10210,6 +11835,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                 None => ::loom_codec::Value::Null,
             },
             ::loom_remote_protocol::codec::ToValue::to_value(&title),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10217,7 +11846,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_create_task_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10232,6 +11861,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         task_id: String,
         claim_id: String,
         lease_token: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10244,6 +11874,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                 Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
                 None => ::loom_codec::Value::Null,
             },
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10251,7 +11885,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_claim_task_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10266,6 +11900,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         task_id: String,
         claim_id: String,
         result_message_id: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10278,6 +11913,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                 Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
                 None => ::loom_codec::Value::Null,
             },
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10285,7 +11924,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_complete_task_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10301,6 +11940,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         agent_principal: String,
         source_message_ids_json: String,
         prompt_text: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10311,6 +11951,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&agent_principal),
             ::loom_remote_protocol::codec::ToValue::to_value(&source_message_ids_json),
             ::loom_remote_protocol::codec::ToValue::to_value(&prompt_text),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10318,7 +11962,45 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_invoke_agent_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
+                )
+                .await?;
+            crate::wire::from_wire::<String>(&value)
+        }
+    }
+    fn chat_invoke_agent_bytes_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        invocation_id: String,
+        agent_principal: String,
+        source_message_ids_json: String,
+        prompt: Vec<u8>,
+        expected_entity_tag: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
+            ::loom_remote_protocol::codec::ToValue::to_value(&chat_workspace_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&channel_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&invocation_id),
+            ::loom_remote_protocol::codec::ToValue::to_value(&agent_principal),
+            ::loom_remote_protocol::codec::ToValue::to_value(&source_message_ids_json),
+            ::loom_codec::Value::Bytes(prompt),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
+        ];
+        async move {
+            let value = self
+                .call(
+                    "Chat",
+                    "chat_invoke_agent_bytes_json",
+                    args,
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10332,6 +12014,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         channel_id: String,
         invocation_id: String,
         message_id: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10340,6 +12023,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&channel_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&invocation_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&message_id),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10347,7 +12034,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_agent_reply_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10363,6 +12050,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         from_agent_principal: String,
         to_principal: Option<String>,
         reason: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10379,6 +12067,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                 Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
                 None => ::loom_codec::Value::Null,
             },
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10386,7 +12078,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_request_handoff_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10400,6 +12092,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         channel_id: String,
         message_id: String,
         kind: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10408,6 +12101,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&channel_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&message_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&kind),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10415,7 +12112,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_add_reaction_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10429,6 +12126,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         channel_id: String,
         message_id: String,
         kind: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10437,6 +12135,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&channel_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&message_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&kind),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10444,7 +12146,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_remove_reaction_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10479,12 +12181,17 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         workspace: String,
         chat_workspace_id: String,
         kind: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
             ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
             ::loom_remote_protocol::codec::ToValue::to_value(&chat_workspace_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&kind),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10492,7 +12199,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_emoji_register_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10504,12 +12211,17 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         workspace: String,
         chat_workspace_id: String,
         kind: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
             ::loom_remote_protocol::codec::ToValue::to_value(&workspace),
             ::loom_remote_protocol::codec::ToValue::to_value(&chat_workspace_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&kind),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10517,7 +12229,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_emoji_unregister_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -10570,6 +12282,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
         chat_workspace_id: String,
         channel_id: String,
         next_sequence: u64,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
@@ -10577,6 +12290,10 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
             ::loom_remote_protocol::codec::ToValue::to_value(&chat_workspace_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&channel_id),
             ::loom_remote_protocol::codec::ToValue::to_value(&next_sequence),
+            match expected_entity_tag {
+                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
+                None => ::loom_codec::Value::Null,
+            },
         ];
         async move {
             let value = self
@@ -10584,7 +12301,7 @@ impl<T: Transport + Send + Sync> Chat for RemoteLoomClient<T> {
                     "Chat",
                     "chat_update_cursor_json",
                     args,
-                    &CallOptions::default(),
+                    &self.idempotency_options(),
                 )
                 .await?;
             crate::wire::from_wire::<String>(&value)
@@ -11191,11 +12908,11 @@ impl<T: Transport + Send + Sync> StoreAdmin for RemoteLoomClient<T> {
     fn store_policy_set(
         &self,
         handle: LoomSession,
-        fips_required: bool,
+        update: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
-            ::loom_remote_protocol::codec::ToValue::to_value(&fips_required),
+            ::loom_codec::Value::Bytes(update),
         ];
         async move {
             let value = self
@@ -11215,24 +12932,115 @@ impl<T: Transport + Send + Sync> StoreAdmin for RemoteLoomClient<T> {
     fn store_rekey(
         &self,
         handle: LoomSession,
-        new_passphrase: Vec<u8>,
-        reseal: bool,
-        suite: Option<String>,
+        request: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
         let args: Vec<::loom_codec::Value> = vec![
             ::loom_remote_protocol::codec::ToValue::to_value(&handle),
-            ::loom_codec::Value::Bytes(new_passphrase),
-            ::loom_remote_protocol::codec::ToValue::to_value(&reseal),
-            match suite {
-                Some(inner) => ::loom_remote_protocol::codec::ToValue::to_value(&inner),
-                None => ::loom_codec::Value::Null,
-            },
+            ::loom_codec::Value::Bytes(request),
         ];
         async move {
             let value = self
                 .call(
                     "StoreAdmin",
                     "store_rekey",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn store_bundle_import(
+        &self,
+        handle: LoomSession,
+        bundle: Vec<u8>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_codec::Value::Bytes(bundle),
+            ::loom_remote_protocol::codec::ToValue::to_value(&dry_run),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "StoreAdmin",
+                    "store_bundle_import",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn store_maintenance_status(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_codec::Value::Bytes(request),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "StoreAdmin",
+                    "store_maintenance_status",
+                    args,
+                    &CallOptions::default(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn store_maintenance_policy_set(
+        &self,
+        handle: LoomSession,
+        update: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_codec::Value::Bytes(update),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "StoreAdmin",
+                    "store_maintenance_policy_set",
+                    args,
+                    &self.idempotency_options(),
+                )
+                .await?;
+            match value {
+                ::loom_codec::Value::Bytes(bytes) => Ok(bytes),
+                _ => Err(crate::wire::shape("bytes")),
+            }
+        }
+    }
+    fn store_maintenance_run(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let args: Vec<::loom_codec::Value> = vec![
+            ::loom_remote_protocol::codec::ToValue::to_value(&handle),
+            ::loom_codec::Value::Bytes(request),
+        ];
+        async move {
+            let value = self
+                .call(
+                    "StoreAdmin",
+                    "store_maintenance_run",
                     args,
                     &self.idempotency_options(),
                 )

@@ -4,21 +4,23 @@ use crate::{
     TicketProfileState, TicketProject, TicketRelation, ticket_profile_state_key,
 };
 use loom_core::acl::{AclResource, AclResourceScope, AclScopeKind};
+use loom_core::delivery::PlannedDeliveryProduce;
 use loom_core::graph::{
     GraphValue, Props, graph_remove_edge, graph_upsert_edge, graph_upsert_node,
 };
 use loom_core::tabular::{ColumnType, Predicate, Row, Schema, Table, Value};
 use loom_core::workspace::{FacetKind, WorkspaceId};
 use loom_core::{
-    AtomicityBoundary, AuditIntent, Code, CompareToken, Digest, FacetSideEffects, FacetWrite,
-    FacetWriteOp, IdentityStore, Loom, LoomError, OverlayDurabilityPolicy, Result,
+    AtomicityBoundary, AuditIntent, Code, CommitReceipt, CompareToken, Digest, FacetSideEffects,
+    FacetWrite, FacetWriteOp, IdentityStore, Loom, LoomError, ObjectStore, OverlayDurabilityPolicy,
+    PreparedDeliveryIntent, PreparedOperation, PreparedRevisionMetadata, Result,
     SecondaryIndexWrite, WorkflowTransaction,
 };
 use loom_store::FileStore;
 use loom_substrate::OperationEnvelope;
 use loom_substrate::versioning::{
-    BodyRef, Checkpoint, EntityRevision, RevisionIndexAppend, load_latest_entity_revision,
-    persist_revision_index_append_with_owner_state_and_writes,
+    BodyRef, Checkpoint, EntityRevision, RevisionIndexAppend, current_revision_index_append_writes,
+    load_latest_entity_revision,
 };
 
 const STORAGE_ROOT: &str = ".loom/substrate/tickets/v2";
@@ -35,6 +37,41 @@ const RANKS_TABLE: &str = "ranks";
 const BOARDS_TABLE: &str = "boards";
 const BOARD_CARDS_TABLE: &str = "board-cards";
 const TICKET_RELATION_GRAPH: &str = "ticket-relations";
+
+#[cfg(test)]
+static FAIL_AFTER_DELIVERY_PLANNING_BEFORE_TICKET_COMMIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub struct TicketDeliveryPlanningFailureGuard;
+
+#[cfg(test)]
+impl Drop for TicketDeliveryPlanningFailureGuard {
+    fn drop(&mut self) {
+        FAIL_AFTER_DELIVERY_PLANNING_BEFORE_TICKET_COMMIT
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub fn install_ticket_delivery_planning_failure() -> TicketDeliveryPlanningFailureGuard {
+    FAIL_AFTER_DELIVERY_PLANNING_BEFORE_TICKET_COMMIT
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    TicketDeliveryPlanningFailureGuard
+}
+
+fn fail_after_delivery_planning_before_ticket_commit() -> Result<()> {
+    #[cfg(test)]
+    if FAIL_AFTER_DELIVERY_PLANNING_BEFORE_TICKET_COMMIT
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(LoomError::new(
+            Code::Internal,
+            "injected ticket delivery planning failure",
+        ));
+    }
+    Ok(())
+}
 
 pub fn profile_table_prefix(workspace_id: &str) -> Result<String> {
     ticket_profile_state_key(workspace_id)?;
@@ -85,8 +122,8 @@ pub fn reconcile_reference_candidates(
     )
 }
 
-pub struct IndexedTicketProfile<'a> {
-    loom: &'a mut Loom<FileStore>,
+pub struct IndexedTicketProfile<'a, S: ObjectStore = FileStore> {
+    loom: &'a mut Loom<S>,
     namespace: WorkspaceId,
     workspace_id: String,
     state: TicketProfileState,
@@ -94,16 +131,16 @@ pub struct IndexedTicketProfile<'a> {
     pending_workflow_idempotency: Option<loom_core::IdempotencyKey>,
 }
 
-pub struct TicketProfileReader<'a> {
-    loom: &'a Loom<FileStore>,
+pub struct TicketProfileReader<'a, S: ObjectStore = FileStore> {
+    loom: &'a Loom<S>,
     namespace: WorkspaceId,
     workspace_id: String,
     state: TicketProfileState,
 }
 
-impl<'a> TicketProfileReader<'a> {
+impl<'a, S: ObjectStore> TicketProfileReader<'a, S> {
     pub fn open(
-        loom: &'a Loom<FileStore>,
+        loom: &'a Loom<S>,
         namespace: WorkspaceId,
         workspace_id: &str,
     ) -> Result<Option<Self>> {
@@ -148,6 +185,16 @@ impl<'a> TicketProfileReader<'a> {
         ))
     }
 
+    pub fn resolve_ticket_key(&self, value: &str) -> Result<Option<TicketKeyResolution>> {
+        resolve_ticket_key(self.loom, self.namespace, &self.workspace_id, value)
+    }
+
+    pub fn prefix_exists(&self, prefix: &str) -> Result<bool> {
+        prefix_exists(self.loom, self.namespace, &self.workspace_id, prefix)
+    }
+}
+
+impl<'a> TicketProfileReader<'a, FileStore> {
     pub fn project(&self, project_id: &str) -> Result<Option<TicketProject>> {
         get_project(self.loom, self.namespace, &self.workspace_id, project_id)
     }
@@ -189,14 +236,6 @@ impl<'a> TicketProfileReader<'a> {
         get_ticket_by_external_identity(self.loom, self.namespace, &self.workspace_id, identity)
     }
 
-    pub fn resolve_ticket_key(&self, value: &str) -> Result<Option<TicketKeyResolution>> {
-        resolve_ticket_key(self.loom, self.namespace, &self.workspace_id, value)
-    }
-
-    pub fn prefix_exists(&self, prefix: &str) -> Result<bool> {
-        prefix_exists(self.loom, self.namespace, &self.workspace_id, prefix)
-    }
-
     pub fn tickets(&self) -> Result<Vec<Ticket>> {
         list_tickets(self.loom, self.namespace, &self.workspace_id)
     }
@@ -222,12 +261,8 @@ impl<'a> TicketProfileReader<'a> {
     }
 }
 
-impl<'a> IndexedTicketProfile<'a> {
-    pub fn open(
-        loom: &'a mut Loom<FileStore>,
-        namespace: WorkspaceId,
-        workspace_id: &str,
-    ) -> Result<Self> {
+impl<'a, S: ObjectStore> IndexedTicketProfile<'a, S> {
+    pub fn open(loom: &'a mut Loom<S>, namespace: WorkspaceId, workspace_id: &str) -> Result<Self> {
         let state = match loom
             .store()
             .control_get(&ticket_profile_state_key(workspace_id)?)?
@@ -242,12 +277,33 @@ impl<'a> IndexedTicketProfile<'a> {
                 // observe a stored state without its indexed tables.
                 stage_empty_tables(loom, namespace, workspace_id)?;
                 let state = state_from_tables(loom, namespace, workspace_id, 1)?;
-                let reference_root = loom.save_state()?;
-                loom.store().control_set_with_reference(
-                    &ticket_profile_state_key(workspace_id)?,
-                    state.encode()?,
-                    Some(reference_root),
-                )?;
+                let (reference_root, objects) = loom.save_state_objects()?;
+                let expected_generation = loom.store().mutable_overlay_generation()?;
+                loom.store()
+                    .commit_workflow_transaction(WorkflowTransaction {
+                        workspace: namespace,
+                        actor: loom.effective_principal()?.unwrap_or(namespace),
+                        expected_generation: Some(expected_generation),
+                        writes: Vec::new(),
+                        prepared_operations: Vec::new(),
+                        revision_metadata: Vec::new(),
+                        delivery_intents: Vec::new(),
+                        durability: OverlayDurabilityPolicy::Normal,
+                        boundary: AtomicityBoundary::Single,
+                        idempotency: None,
+                        owner_state: loom_core::WorkflowOwnerState {
+                            objects,
+                            reference: loom_core::WorkflowReferenceUpdate::Set(Some(
+                                reference_root,
+                            )),
+                            controls: vec![loom_core::WorkflowControlWrite::Put {
+                                key: ticket_profile_state_key(workspace_id)?,
+                                payload: state.encode()?,
+                            }],
+                            audits: Vec::new(),
+                        },
+                        post_commit_delta: None,
+                    })?;
                 state
             }
         };
@@ -274,7 +330,7 @@ impl<'a> IndexedTicketProfile<'a> {
         ))
     }
 
-    pub(crate) fn loom_mut(&mut self) -> &mut Loom<FileStore> {
+    pub(crate) fn loom_mut(&mut self) -> &mut Loom<S> {
         self.loom
     }
 
@@ -816,13 +872,17 @@ impl<'a> IndexedTicketProfile<'a> {
             .unwrap_or_default();
         let expected_generation = snapshot.expected_generation();
         snapshot.release()?;
-        self.loom
+        let receipt = self
+            .loom
             .store()
             .commit_workflow_transaction(WorkflowTransaction {
                 workspace: self.namespace,
                 actor: self.loom.effective_principal()?.unwrap_or(self.namespace),
                 expected_generation: Some(expected_generation),
                 writes: std::mem::take(&mut self.pending_workflow_writes),
+                prepared_operations: Vec::new(),
+                revision_metadata: Vec::new(),
+                delivery_intents: Vec::new(),
                 durability: OverlayDurabilityPolicy::Normal,
                 boundary: AtomicityBoundary::Single,
                 idempotency: self.pending_workflow_idempotency.take(),
@@ -835,8 +895,9 @@ impl<'a> IndexedTicketProfile<'a> {
                     }],
                     audits,
                 },
+                post_commit_delta: None,
             })?;
-        self.refresh_mutable_overlay()?;
+        synchronize_ticket_workflow_receipt(self.loom, &receipt)?;
         self.profile_root()
     }
 
@@ -846,19 +907,45 @@ impl<'a> IndexedTicketProfile<'a> {
         ticket_id: &str,
         payload: &[u8],
     ) -> Result<Digest> {
-        let (root, index, owner_state) =
+        let (root, _) =
+            self.finish_ticket_operation_with_delivery(record, ticket_id, payload, Vec::new())?;
+        Ok(root)
+    }
+
+    pub fn finish_ticket_operation_with_delivery(
+        &mut self,
+        record: &TicketOperationRecord,
+        ticket_id: &str,
+        payload: &[u8],
+        planned_deliveries: Vec<PlannedDeliveryProduce>,
+    ) -> Result<(Digest, CommitReceipt)> {
+        for delivery in &planned_deliveries {
+            loom_core::delivery::apply_planned_delivery_candidate(self.loom, delivery)?;
+        }
+        let (root, index, owner_state, post_commit_delta) =
             self.prepare_ticket_operation(record, ticket_id, payload)?;
-        persist_revision_index_append_with_owner_state_and_writes(
+        let delivery_intents = planned_deliveries
+            .iter()
+            .map(|delivery| delivery.prepared_intent.clone())
+            .collect::<Vec<_>>();
+        fail_after_delivery_planning_before_ticket_commit()?;
+        let receipt = commit_ticket_workflow_transaction(
             self.loom,
             self.namespace,
             &self.workspace_id,
-            FacetKind::Queue,
             &index,
             std::mem::take(&mut self.pending_workflow_writes),
             self.pending_workflow_idempotency.take(),
             owner_state,
+            vec![PreparedOperation {
+                operation_id: record.operation_id.clone(),
+                payload: record.envelope.clone(),
+            }],
+            ticket_revision_metadata(&index)?,
+            delivery_intents,
+            Some(post_commit_delta),
         )?;
-        Ok(root)
+        Ok((root, receipt))
     }
 
     pub fn prepare_ticket_operation(
@@ -866,7 +953,12 @@ impl<'a> IndexedTicketProfile<'a> {
         record: &TicketOperationRecord,
         ticket_id: &str,
         payload: &[u8],
-    ) -> Result<(Digest, RevisionIndexAppend, loom_core::WorkflowOwnerState)> {
+    ) -> Result<(
+        Digest,
+        RevisionIndexAppend,
+        loom_core::WorkflowOwnerState,
+        loom_core::EngineStateDelta,
+    )> {
         self.state = state_from_tables(
             self.loom,
             self.namespace,
@@ -882,12 +974,15 @@ impl<'a> IndexedTicketProfile<'a> {
             self.loom.store(),
             Some("tickets.operation.prepare"),
         )?;
-        let (reference_root, objects) = match snapshot.immutable_base_root() {
-            Some(base_root) => self
-                .loom
-                .prepare_current_facet_state_reference(self.namespace, base_root)?,
-            None => self.loom.save_state_objects()?,
-        };
+        let base_root = snapshot.immutable_base_root().ok_or_else(|| {
+            LoomError::new(
+                Code::Conflict,
+                "ticket operation requires a durable engine-state base",
+            )
+        })?;
+        let (post_commit_delta, (reference_root, objects)) = self
+            .loom
+            .prepare_current_facet_state_delta_reference(self.namespace, base_root)?;
         let index = next_ticket_revision_index(
             self.loom,
             self.namespace,
@@ -909,6 +1004,7 @@ impl<'a> IndexedTicketProfile<'a> {
                 }],
                 audits: Vec::new(),
             },
+            post_commit_delta,
         ))
     }
 
@@ -919,23 +1015,23 @@ impl<'a> IndexedTicketProfile<'a> {
         idempotency: Option<loom_core::IdempotencyKey>,
         owner_state: loom_core::WorkflowOwnerState,
     ) -> Result<()> {
-        persist_revision_index_append_with_owner_state_and_writes(
+        commit_ticket_workflow_transaction(
             self.loom,
             self.namespace,
             &self.workspace_id,
-            FacetKind::Queue,
             index,
             writes,
             idempotency,
             owner_state,
-        )
-    }
-
-    fn refresh_mutable_overlay(&mut self) -> Result<()> {
-        let current = self.loom.store().mutable_overlay_entries()?;
-        if !current.is_empty() {
-            *self.loom.mutable_overlay_mut() = loom_core::MutableOverlay::import_entries(&current)?;
-        }
+            Vec::new(),
+            ticket_revision_metadata(index)?,
+            Vec::new(),
+            Some(loom_core::EngineStateDelta::summary(
+                self.namespace,
+                [format!("{STORAGE_ROOT}/{}", self.workspace_id)],
+                0,
+            )),
+        )?;
         Ok(())
     }
 
@@ -956,8 +1052,89 @@ impl<'a> IndexedTicketProfile<'a> {
     }
 }
 
-fn next_ticket_revision_index(
-    loom: &Loom<FileStore>,
+pub fn commit_ticket_workflow_transaction(
+    loom: &mut Loom<impl ObjectStore>,
+    workspace: WorkspaceId,
+    scope_id: &str,
+    additions: &RevisionIndexAppend,
+    mut writes: Vec<FacetWrite>,
+    idempotency: Option<loom_core::IdempotencyKey>,
+    mut owner_state: loom_core::WorkflowOwnerState,
+    prepared_operations: Vec<PreparedOperation>,
+    revision_metadata: Vec<PreparedRevisionMetadata>,
+    delivery_intents: Vec<PreparedDeliveryIntent>,
+    post_commit_delta: Option<loom_core::EngineStateDelta>,
+) -> Result<CommitReceipt> {
+    let expected_generation = if loom.store().uses_mutable_overlay_current_records() {
+        loom.store().mutable_overlay_generation()?
+    } else {
+        loom.mutable_overlay_snapshot().generation()
+    };
+    let (mut revision_writes, controls) = current_revision_index_append_writes(
+        loom,
+        workspace,
+        scope_id,
+        FacetKind::Queue,
+        additions,
+    )?;
+    writes.append(&mut revision_writes);
+    owner_state.controls.extend(controls);
+    let receipt = loom
+        .store()
+        .commit_workflow_transaction(WorkflowTransaction {
+            workspace,
+            actor: loom.effective_principal()?.unwrap_or(workspace),
+            expected_generation: Some(expected_generation),
+            writes,
+            prepared_operations,
+            revision_metadata,
+            delivery_intents,
+            durability: OverlayDurabilityPolicy::Normal,
+            boundary: AtomicityBoundary::Single,
+            idempotency,
+            owner_state,
+            post_commit_delta,
+        })?;
+    synchronize_ticket_workflow_receipt(loom, &receipt)?;
+    Ok(receipt)
+}
+
+pub(crate) fn synchronize_ticket_workflow_receipt<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    receipt: &CommitReceipt,
+) -> Result<()> {
+    for outcome in &receipt.writes {
+        let current = loom
+            .store()
+            .mutable_overlay_current_entry(&outcome.target)?
+            .ok_or_else(|| {
+                LoomError::corrupt("workflow transaction omitted committed current record")
+            })?;
+        loom.mutable_overlay_mut()
+            .synchronize_current_entry(current)?;
+    }
+    Ok(())
+}
+
+pub fn ticket_revision_metadata(
+    index: &RevisionIndexAppend,
+) -> Result<Vec<PreparedRevisionMetadata>> {
+    index
+        .revisions
+        .iter()
+        .map(|revision| {
+            Ok(PreparedRevisionMetadata {
+                entity_id: revision.entity_id.clone(),
+                revision_id: revision.revision.to_string(),
+                payload: loom_codec::encode(&revision.to_value())
+                    .map_err(loom_substrate::codec_error)?,
+            })
+        })
+        .collect()
+}
+
+fn next_ticket_revision_index<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     ticket_id: &str,
@@ -1049,8 +1226,8 @@ fn relation_edge_props(source_ticket_id: &str, relation: &TicketRelation) -> Pro
     ])
 }
 
-fn resolve_ticket_key(
-    loom: &Loom<FileStore>,
+fn resolve_ticket_key<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     value: &str,
@@ -1096,8 +1273,8 @@ fn resolve_ticket_key(
     }))
 }
 
-fn prefix_exists(
-    loom: &Loom<FileStore>,
+fn prefix_exists<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     prefix: &str,
@@ -1115,8 +1292,8 @@ fn table_path(workspace_id: &str, table: &str) -> String {
     format!("{STORAGE_ROOT}/{workspace_id}/{table}")
 }
 
-fn stage_empty_tables(
-    loom: &mut Loom<FileStore>,
+fn stage_empty_tables<S: ObjectStore>(
+    loom: &mut Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
 ) -> Result<()> {
@@ -1286,8 +1463,8 @@ fn schemas() -> Vec<(&'static str, Schema)> {
     ]
 }
 
-fn state_from_tables(
-    loom: &Loom<FileStore>,
+fn state_from_tables<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     next_sequence: u64,
@@ -1334,8 +1511,8 @@ fn mismatched_state_tables(
     mismatches
 }
 
-fn verify_state_roots(
-    loom: &Loom<FileStore>,
+fn verify_state_roots<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     state: &TicketProfileState,
@@ -1351,8 +1528,8 @@ fn verify_state_roots(
     Ok(())
 }
 
-fn table_root(
-    loom: &Loom<FileStore>,
+fn table_root<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     table: &str,
@@ -1361,8 +1538,8 @@ fn table_root(
         .ok_or_else(|| LoomError::corrupt("ticket indexed table is missing"))
 }
 
-fn point_row(
-    loom: &Loom<FileStore>,
+fn point_row<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     table: &str,
     key: &[Value],
@@ -1373,8 +1550,8 @@ fn point_row(
     Table::get_row(loom.store(), &schema, &root, key)
 }
 
-fn get_project(
-    loom: &Loom<FileStore>,
+fn get_project<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     project_id: &str,
@@ -1391,8 +1568,8 @@ fn get_project(
     TicketProject::decode(row_bytes(&row, 1, "ticket project")?).map(Some)
 }
 
-fn get_ticket(
-    loom: &Loom<FileStore>,
+fn get_ticket<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     ticket_id: &str,
@@ -1409,8 +1586,8 @@ fn get_ticket(
     Ticket::decode(row_bytes(&row, 1, "ticket")?).map(Some)
 }
 
-fn get_board(
-    loom: &Loom<FileStore>,
+fn get_board<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     board_id: &str,
@@ -1427,8 +1604,8 @@ fn get_board(
     TicketBoard::decode(row_bytes(&row, 2, "ticket board")?).map(Some)
 }
 
-fn get_ticket_by_external_identity(
-    loom: &Loom<FileStore>,
+fn get_ticket_by_external_identity<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     identity: &ExternalTicketIdentity,
@@ -1451,8 +1628,8 @@ fn get_ticket_by_external_identity(
         .ok_or_else(|| LoomError::corrupt("ticket external identity resolved to a missing ticket"))
 }
 
-fn list_tickets(
-    loom: &Loom<FileStore>,
+fn list_tickets<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
 ) -> Result<Vec<Ticket>> {
@@ -1462,8 +1639,8 @@ fn list_tickets(
         .collect()
 }
 
-fn list_projects(
-    loom: &Loom<FileStore>,
+fn list_projects<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
 ) -> Result<Vec<TicketProject>> {
@@ -1473,8 +1650,8 @@ fn list_projects(
         .collect()
 }
 
-fn list_operations(
-    loom: &Loom<FileStore>,
+fn list_operations<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
 ) -> Result<Vec<TicketOperationRecord>> {
@@ -1484,8 +1661,8 @@ fn list_operations(
         .collect()
 }
 
-fn list_boards(
-    loom: &Loom<FileStore>,
+fn list_boards<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
 ) -> Result<Vec<TicketBoard>> {
@@ -1495,8 +1672,8 @@ fn list_boards(
         .collect()
 }
 
-fn list_board_cards(
-    loom: &Loom<FileStore>,
+fn list_board_cards<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     board_id: &str,
@@ -1512,8 +1689,8 @@ fn list_board_cards(
     .collect()
 }
 
-fn list_comments(
-    loom: &Loom<FileStore>,
+fn list_comments<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     ticket_id: &str,
@@ -1525,8 +1702,8 @@ fn list_comments(
         .collect()
 }
 
-fn get_comment(
-    loom: &Loom<FileStore>,
+fn get_comment<S: ObjectStore>(
+    loom: &Loom<S>,
     namespace: WorkspaceId,
     workspace_id: &str,
     ticket_id: &str,
@@ -1593,14 +1770,18 @@ fn rank_token(
     row_text(&row, 1, "ticket rank token").map(Some)
 }
 
-fn optional_rows(loom: &Loom<FileStore>, namespace: WorkspaceId, table: &str) -> Result<Vec<Row>> {
+fn optional_rows<S: ObjectStore>(
+    loom: &Loom<S>,
+    namespace: WorkspaceId,
+    table: &str,
+) -> Result<Vec<Row>> {
     if loom.table_reader_reserved(namespace, table)?.is_none() {
         return Ok(Vec::new());
     }
     rows(loom, namespace, table)
 }
 
-fn rows(loom: &Loom<FileStore>, namespace: WorkspaceId, table: &str) -> Result<Vec<Row>> {
+fn rows<S: ObjectStore>(loom: &Loom<S>, namespace: WorkspaceId, table: &str) -> Result<Vec<Row>> {
     Ok(loom
         .read_table_reserved(namespace, table)?
         .scan(&Predicate::All)

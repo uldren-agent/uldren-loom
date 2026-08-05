@@ -193,6 +193,67 @@ public final class IdentityOps {
                 });
     }
 
+    public String forceDetachAuthorityJson(String principal, long generation, String reason) {
+        return session.onHandle("loom_identity_force_detach_authority_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) Loom.LOOM_IDENTITY_FORCE_DETACH_AUTHORITY_JSON.invokeExact(
+                            handle, arena.allocateFrom(principal), generation,
+                            arena.allocateFrom(reason), out);
+                    if (status != 0) {
+                        throw Loom.lastError("loom_identity_force_detach_authority_json");
+                    }
+                    return Loom.takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public String replicateAuthorityJson(String source, boolean becomeAuthority) {
+        return session.onHandle("loom_identity_replicate_authority_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) Loom.LOOM_IDENTITY_REPLICATE_AUTHORITY_JSON.invokeExact(
+                            handle, arena.allocateFrom(source), becomeAuthority ? 1 : 0, out);
+                    if (status != 0) {
+                        throw Loom.lastError("loom_identity_replicate_authority_json");
+                    }
+                    return Loom.takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public String configureAuthorityReplicationJson(
+            String id,
+            String source,
+            boolean disabled,
+            boolean pullOnStart,
+            Long intervalMs,
+            long jitterMs,
+            long backoffMs,
+            boolean publishWitness) {
+        return session.onHandle("loom_identity_configure_authority_replication_json",
+                (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) Loom.LOOM_IDENTITY_CONFIGURE_AUTHORITY_REPLICATION_JSON.invokeExact(
+                            handle, arena.allocateFrom(id), arena.allocateFrom(source),
+                            disabled ? 1 : 0, pullOnStart ? 1 : 0,
+                            intervalMs != null ? intervalMs : 0L, intervalMs != null ? 1 : 0,
+                            jitterMs, backoffMs, publishWitness ? 1 : 0, out);
+                    if (status != 0) {
+                        throw Loom.lastError("loom_identity_configure_authority_replication_json");
+                    }
+                    return Loom.takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public String removeAuthorityReplicationJson(String id) {
+        return session.onHandle("loom_identity_remove_authority_replication_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) Loom.LOOM_IDENTITY_REMOVE_AUTHORITY_REPLICATION_JSON.invokeExact(
+                            handle, arena.allocateFrom(id), out);
+                    if (status != 0) {
+                        throw Loom.lastError("loom_identity_remove_authority_replication_json");
+                    }
+                    return Loom.takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
     public String aclListJson() {
         return session.onHandle("loom_acl_list_json",
                 (arena, handle) -> {

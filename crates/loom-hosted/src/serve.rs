@@ -12119,6 +12119,10 @@ async fn tickets_project_settings_get(
         Ok(value) => value,
         Err(response) => return response.into_response(),
     };
+    let include_contracts = match optional_bool(&value, "include_contracts") {
+        Ok(value) => value.unwrap_or(false),
+        Err(response) => return response.into_response(),
+    };
     let workspace = match hosted_workspace_id(&state.kernel, &auth, &state.workspace) {
         Ok(value) => value,
         Err(response) => return response.into_response(),
@@ -12128,6 +12132,7 @@ async fn tickets_project_settings_get(
         workspace,
         &state.collection,
         project_id,
+        include_contracts,
     ) {
         Ok(response) => json_response(
             StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK),
@@ -12183,6 +12188,27 @@ async fn tickets_project_settings_set(
             Ok(value) => value,
             Err(response) => return response.into_response(),
         };
+    let required_acceptance_reviews =
+        match optional_acceptance_review_types_http(&value, "required_acceptance_reviews") {
+            Ok(value) => value,
+            Err(response) => return response.into_response(),
+        };
+    let owner_contract_summary = match optional_str_ref(&value, "owner_contract_summary") {
+        Ok(value) => value,
+        Err(response) => return response.into_response(),
+    };
+    let owner_contract_details = match optional_str_ref(&value, "owner_contract_details") {
+        Ok(value) => value,
+        Err(response) => return response.into_response(),
+    };
+    let worker_contract_summary = match optional_str_ref(&value, "worker_contract_summary") {
+        Ok(value) => value,
+        Err(response) => return response.into_response(),
+    };
+    let worker_contract_details = match optional_str_ref(&value, "worker_contract_details") {
+        Ok(value) => value,
+        Err(response) => return response.into_response(),
+    };
     let expected_root = match optional_str_ref(&value, "expected_root") {
         Ok(value) => value,
         Err(response) => return response.into_response(),
@@ -12206,6 +12232,11 @@ async fn tickets_project_settings_set(
             acceptance_authorities: acceptance_authorities.as_deref(),
             acceptance_evidence_enforcement,
             required_acceptance_evidence_keys: required_acceptance_evidence_keys.as_deref(),
+            required_acceptance_reviews: required_acceptance_reviews.as_deref(),
+            owner_contract_summary,
+            owner_contract_details,
+            worker_contract_summary,
+            worker_contract_details,
             expected_root,
         },
     ) {
@@ -13003,7 +13034,7 @@ async fn lanes_ticket_add(
         Ok(value) => value,
         Err(response) => return response.into_response(),
     };
-    let placement_verb = match optional_str_ref(&value, "placement") {
+    let placement = match optional_str_ref(&value, "placement") {
         Ok(value) => value,
         Err(response) => return response.into_response(),
     };
@@ -13011,7 +13042,7 @@ async fn lanes_ticket_add(
         Ok(value) => value,
         Err(response) => return response.into_response(),
     };
-    let placement = match hosted_lane_placement(placement_verb, anchor) {
+    let placement = match hosted_lane_placement(placement, anchor) {
         Ok(placement) => placement,
         Err(err) => return loom_error_response(StatusCode::BAD_REQUEST, err),
     };
@@ -14796,11 +14827,14 @@ fn data_jsonrpc_result(
         ("tickets", "tickets.project_settings_get") | ("tickets", "tickets.projectSettingsGet") => {
             let workspace = drive_workspace_id_jsonrpc(state, auth)?;
             let project_id = required_string_jsonrpc(params, "project_id")?;
+            let include_contracts =
+                optional_bool_jsonrpc(params, "include_contracts")?.unwrap_or(false);
             drive_jsonrpc_body(state.kernel.jsonrpc().tickets_project_settings_get(
                 auth,
                 workspace,
                 &state.collection,
                 &project_id,
+                include_contracts,
             ))
         }
         ("tickets", "tickets.project_settings_set") | ("tickets", "tickets.projectSettingsSet") => {
@@ -14829,6 +14863,14 @@ fn data_jsonrpc_result(
                 params,
                 "required_acceptance_evidence_keys",
             )?;
+            let required_acceptance_reviews =
+                optional_acceptance_review_types_jsonrpc(params, "required_acceptance_reviews")?;
+            let owner_contract_summary = optional_string_jsonrpc(params, "owner_contract_summary")?;
+            let owner_contract_details = optional_string_jsonrpc(params, "owner_contract_details")?;
+            let worker_contract_summary =
+                optional_string_jsonrpc(params, "worker_contract_summary")?;
+            let worker_contract_details =
+                optional_string_jsonrpc(params, "worker_contract_details")?;
             let expected_root = optional_string_jsonrpc(params, "expected_root")?;
             drive_jsonrpc_body(state.kernel.jsonrpc().tickets_project_settings_set(
                 auth,
@@ -14845,6 +14887,11 @@ fn data_jsonrpc_result(
                     acceptance_authorities: acceptance_authorities.as_deref(),
                     acceptance_evidence_enforcement,
                     required_acceptance_evidence_keys: required_acceptance_evidence_keys.as_deref(),
+                    required_acceptance_reviews: required_acceptance_reviews.as_deref(),
+                    owner_contract_summary: owner_contract_summary.as_deref(),
+                    owner_contract_details: owner_contract_details.as_deref(),
+                    worker_contract_summary: worker_contract_summary.as_deref(),
+                    worker_contract_details: worker_contract_details.as_deref(),
                     expected_root: expected_root.as_deref(),
                 },
             ))
@@ -15133,9 +15180,9 @@ fn data_jsonrpc_result(
             let lane_id = required_string_jsonrpc(params, "lane_id")?;
             let ticket_id = required_string_jsonrpc(params, "ticket_id")?;
             let updated_by = required_string_jsonrpc(params, "updated_by")?;
-            let placement_verb = optional_string_jsonrpc(params, "placement")?;
+            let placement = optional_string_jsonrpc(params, "placement")?;
             let anchor = optional_string_jsonrpc(params, "anchor")?;
-            let placement = hosted_lane_placement(placement_verb.as_deref(), anchor.as_deref())
+            let placement = hosted_lane_placement(placement.as_deref(), anchor.as_deref())
                 .map_err(|err| DataJsonRpcFailure::Protocol(err.to_string()))?;
             drive_jsonrpc_body(state.kernel.jsonrpc().lanes_ticket_add(
                 auth,
@@ -22071,13 +22118,38 @@ fn required_str<'a>(value: &'a Value, name: &str) -> HostedHttpResult<&'a str> {
     })
 }
 
-/// Build a lane ticket placement from the wire placement verb and optional anchor. Defaults to
-/// LAST. BEFORE and AFTER require an anchor; unknown verbs are rejected.
+/// Build a lane ticket placement from the public enum symbol and optional anchor.
 fn hosted_lane_placement<'a>(
     placement: Option<&str>,
     anchor: Option<&'a str>,
 ) -> Result<loom_lanes::LaneTicketPlacement<'a>, LoomError> {
-    loom_lanes::LaneTicketPlacement::parse(placement.unwrap_or("LAST"), anchor)
+    match placement.unwrap_or("LAST") {
+        "LAST" => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(LoomError::invalid(
+                    "placement 'LAST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::Last)
+        }
+        "FIRST" => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(LoomError::invalid(
+                    "placement 'FIRST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::First)
+        }
+        "BEFORE" => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::Before)
+            .ok_or_else(|| LoomError::invalid("placement 'BEFORE' requires an anchor ticket id")),
+        "AFTER" => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::After)
+            .ok_or_else(|| LoomError::invalid("placement 'AFTER' requires an anchor ticket id")),
+        _ => Err(LoomError::invalid("unknown lane ticket placement")),
+    }
 }
 
 fn document_index_value_from_json(value: &Value) -> HostedHttpResult<DataValue> {
@@ -22524,6 +22596,21 @@ fn optional_acceptance_evidence_keys_http(
         .map(|keys| {
             keys.iter()
                 .map(|key| loom_tickets::TicketAcceptanceEvidenceKey::parse(key))
+                .collect::<loom_core::error::Result<Vec<_>>>()
+        })
+        .transpose()
+        .map_err(loom_error_bad_request)
+}
+
+fn optional_acceptance_review_types_http(
+    value: &Value,
+    name: &str,
+) -> HostedHttpResult<Option<Vec<loom_tickets::TicketReviewType>>> {
+    optional_string_array_patch_field(value, name)?
+        .map(|reviews| {
+            reviews
+                .iter()
+                .map(|review| loom_tickets::TicketReviewType::parse(review))
                 .collect::<loom_core::error::Result<Vec<_>>>()
         })
         .transpose()
@@ -23146,6 +23233,21 @@ fn optional_acceptance_evidence_keys_jsonrpc(
         .map(|keys| {
             keys.iter()
                 .map(|key| loom_tickets::TicketAcceptanceEvidenceKey::parse(key))
+                .collect::<loom_core::error::Result<Vec<_>>>()
+        })
+        .transpose()
+        .map_err(|err| DataJsonRpcFailure::Protocol(err.to_string()))
+}
+
+fn optional_acceptance_review_types_jsonrpc(
+    params: &Value,
+    name: &str,
+) -> Result<Option<Vec<loom_tickets::TicketReviewType>>, DataJsonRpcFailure> {
+    optional_string_array_jsonrpc(params, name)?
+        .map(|reviews| {
+            reviews
+                .iter()
+                .map(|review| loom_tickets::TicketReviewType::parse(review))
                 .collect::<loom_core::error::Result<Vec<_>>>()
         })
         .transpose()

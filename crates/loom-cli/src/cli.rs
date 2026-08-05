@@ -212,12 +212,14 @@ pub(crate) enum Command {
         action: ProtectedRefCmd,
     },
     /// Serve a Loom store as an MCP host over stdio or Streamable HTTP. A local locator serves the full
-    /// tool surface. A remote locator (URL or selected context) serves the KV, CAS, Queue, Ledger,
+    /// tool surface through the daemon-owned generated boundary. A remote locator (URL or selected
+    /// context) serves the KV, CAS, Queue, Ledger,
     /// TimeSeries, full-text search, columnar, calendar, contacts, mail, filesystem, and vector tool
     /// families (plus document reads, the VCS reads + non-timestamped writes, and the graph reads +
     /// node writes) over the remote Loom; document/graph ref-index (edge) writes and the timestamped VCS
     /// writes (commit/tag_create/merge/... whose caller timestamp has no remote IDL parameter) and other
-    /// tools return a clear not-yet/local-only error, and `--stateless` is rejected.
+    /// tools return a clear not-yet/local-only error. Local MCP rejects `--stateless`; remote endpoint
+    /// statefulness is owned by that endpoint.
     #[cfg(feature = "mcp")]
     Mcp {
         /// Local `.loom` path, `context`, or a remote URL.
@@ -233,10 +235,17 @@ pub(crate) enum Command {
         /// Network access policy name for the Streamable HTTP listener.
         #[arg(long)]
         network_access: Option<String>,
-        /// With `--http`, use MCP stateless mode: POST-only, a fresh server per request, no session -
-        /// so no subscription push or progress streams. Ignored without `--http`.
+        /// With `--http`, request MCP stateless HTTP mode. Local MCP rejects this because it uses the
+        /// daemon-owned generated boundary; remote MCP statefulness is owned by the remote endpoint.
         #[arg(long)]
         stateless: bool,
+    },
+    #[cfg(feature = "mcp-daemon-cli-tests")]
+    #[command(hide = true)]
+    McpDaemonCliTestHoldSession {
+        store: String,
+        #[arg(long)]
+        millis: u64,
     },
     /// Mount workspace projections through FUSE or NFS.
     #[cfg(any(feature = "fuse", feature = "nfs"))]
@@ -532,6 +541,9 @@ pub(crate) enum ChatCmd {
         /// Message body file, or `-` for standard input.
         #[arg(long, default_value = "-")]
         input: String,
+        /// Entity tag that must match the current message state.
+        #[arg(long)]
+        expected_entity_tag: Option<String>,
         /// Output format: text or json.
         #[arg(long, default_value = "text")]
         format: String,
@@ -1550,9 +1562,6 @@ pub(crate) struct ServeConfigureArgs {
     /// Stored certificate bundle name for TLS.
     #[arg(long)]
     pub tls_certificate_bundle: Option<String>,
-    /// TLS mode: `direct` or `starttls`.
-    #[arg(long)]
-    pub tls_mode: Option<String>,
     /// Authentication mode: `owner-or-passphrase` or `passphrase`.
     #[arg(long)]
     pub auth_mode: Option<String>,
@@ -2302,6 +2311,12 @@ pub(crate) enum TicketsCmd {
         /// Replace required acceptance evidence keys with the provided list.
         #[arg(long)]
         replace_required_acceptance_evidence_keys: bool,
+        /// Required acceptance review type. Repeat for multiple types: design_review or code_review.
+        #[arg(long = "required-acceptance-review")]
+        required_acceptance_reviews: Vec<String>,
+        /// Replace required acceptance reviews with the provided list.
+        #[arg(long)]
+        replace_required_acceptance_reviews: bool,
         /// Project owner contract summary. Accepts `@path` to load from a file (`@@` escapes a literal @).
         #[arg(long)]
         owner_contract_summary: Option<String>,
@@ -3468,6 +3483,7 @@ pub(crate) enum LifecycleCmd {
         /// Standard lifecycle kind: feature, bug, incident, or design.
         kind: String,
         /// Definition version string.
+        #[arg(id = "definition_version")]
         version: String,
         /// Completion predicate digest.
         completion_predicate_digest: String,
@@ -5414,6 +5430,12 @@ pub(crate) enum VectorTextCmd {
         /// Create the vector set first when it does not already exist.
         #[arg(long)]
         create: bool,
+        /// Opaque hex token that must match the current vector entry before replacement.
+        #[arg(long, conflicts_with = "expect_absent")]
+        expected_token: Option<String>,
+        /// Apply only when the vector entry is currently absent.
+        #[arg(long)]
+        expect_absent: bool,
         /// Metric for `--create`: cosine, l2, or dot.
         #[arg(long, default_value = "cosine")]
         metric: String,
@@ -6212,11 +6234,31 @@ pub(crate) enum DaemonCmd {
         lock_file: String,
         #[arg(long, default_value = "native")]
         transport: String,
+        #[arg(long, default_value = "persistent")]
+        startup_mode: String,
+        #[arg(long, default_value = "cli.daemon.start")]
+        startup_initiator: String,
     },
 }
 
 #[derive(Subcommand)]
 pub(crate) enum DaemonSessionCmd {
+    /// Create an authenticated logical session credential.
+    Open {
+        /// Path to the `.loom` file.
+        store: String,
+        /// New owner-only credential file.
+        #[arg(long)]
+        out: String,
+    },
+    /// Close an authenticated logical session.
+    Close {
+        /// Path to the `.loom` file.
+        store: String,
+        /// Owner-only credential file reference (`@path`).
+        #[arg(long)]
+        session: String,
+    },
     /// Attach a named session to the local coordinator daemon.
     Attach {
         /// Path to the `.loom` file.
@@ -6338,12 +6380,12 @@ pub(crate) enum LockCmd {
         store: String,
         /// Lock key.
         key: String,
-        /// Principal id or name for the lock owner.
-        #[arg(long, default_value = "cli")]
-        principal: String,
-        /// Session id for the lock owner.
-        #[arg(long, default_value = "cli")]
+        /// Owner-only logical-session credential file reference (`@path`).
+        #[arg(long)]
         session: String,
+        /// New non-secret lock-token file.
+        #[arg(long)]
+        out: String,
         /// Mode: exclusive, shared, or semaphore.
         #[arg(long, default_value = "exclusive")]
         mode: String,
@@ -6367,26 +6409,15 @@ pub(crate) enum LockCmd {
     Refresh {
         /// Path to the `.loom` file.
         store: String,
-        /// Lock key.
-        key: String,
-        /// Principal id or name for the lock owner.
-        #[arg(long)]
-        principal: String,
-        /// Session id for the lock owner.
+        /// Owner-only logical-session credential file reference (`@path`).
         #[arg(long)]
         session: String,
-        /// Mode: exclusive, shared, or semaphore.
-        #[arg(long, default_value = "exclusive")]
-        mode: String,
-        /// Semaphore permits when `--mode semaphore`.
-        #[arg(long, default_value_t = 1)]
-        permits: u32,
-        /// Semaphore capacity when `--mode semaphore`.
-        #[arg(long, default_value_t = 1)]
-        capacity: u32,
-        /// Fence token returned by acquire.
+        /// Non-secret lock-token file reference (`@path`).
         #[arg(long)]
-        fence: u64,
+        token: String,
+        /// Replacement non-secret lock-token file.
+        #[arg(long)]
+        out: String,
         /// Lease duration in milliseconds.
         #[arg(long, default_value_t = 30000)]
         lease_ms: u64,
@@ -6395,26 +6426,12 @@ pub(crate) enum LockCmd {
     Release {
         /// Path to the `.loom` file.
         store: String,
-        /// Lock key.
-        key: String,
-        /// Principal id or name for the lock owner.
-        #[arg(long)]
-        principal: String,
-        /// Session id for the lock owner.
+        /// Owner-only logical-session credential file reference (`@path`).
         #[arg(long)]
         session: String,
-        /// Mode: exclusive, shared, or semaphore.
-        #[arg(long, default_value = "exclusive")]
-        mode: String,
-        /// Semaphore permits when `--mode semaphore`.
-        #[arg(long, default_value_t = 1)]
-        permits: u32,
-        /// Semaphore capacity when `--mode semaphore`.
-        #[arg(long, default_value_t = 1)]
-        capacity: u32,
-        /// Fence token returned by acquire.
+        /// Non-secret lock-token file reference (`@path`).
         #[arg(long)]
-        fence: u64,
+        token: String,
     },
 }
 

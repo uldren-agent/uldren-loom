@@ -146,9 +146,90 @@ fn store_maintenance_tools_update_status_and_run_tail_compaction() {
 }
 
 #[test]
+fn store_maintenance_slice_resumes_captured_epoch_after_current_state_advances() {
+    use loom_core::{Algo, Loom, Object, OverlayKey, ReachabilityMarkState, content_address};
+    use loom_store::FileStore;
+    use std::collections::VecDeque;
+
+    let path = std::env::temp_dir().join(format!(
+        "loom-mcp-store-maintenance-snapshot-{}.loom",
+        std::process::id()
+    ));
+    let mut loom = Loom::new(FileStore::create_with_profile(&path, Algo::Blake3).unwrap());
+    let payload = b"captured maintenance content";
+    let object = Object::Blob(payload.to_vec());
+    let root = loom.ingest_object(&object.canonical()).unwrap();
+    loom.store().set_reference_root(Some(root)).unwrap();
+    let content_root = content_address(payload);
+    let state = ReachabilityMarkState {
+        pinned: BTreeSet::from([root]),
+        marked: BTreeSet::new(),
+        queue: VecDeque::new(),
+        stream_roots: VecDeque::new(),
+        // One item beyond the scheduler slice proves that its persisted cursor is resumed.
+        content_roots: std::iter::repeat_n(content_root, 1025).collect(),
+        prolly_cursors: VecDeque::new(),
+        completed: false,
+    };
+    let captured = loom
+        .store()
+        .begin_reachability_mark_epoch(Some(root), BTreeSet::new(), state)
+        .unwrap();
+    let current_key = OverlayKey::from_segments([
+        b"mcp",
+        b"maintenance",
+        b"snapshot",
+        b"current",
+        b"advance",
+        b"test",
+    ])
+    .unwrap();
+    loom.store()
+        .put_mutable_overlay_value(current_key.clone(), b"advanced".to_vec())
+        .unwrap();
+
+    let outcome = run_mcp_store_maintenance_once(&mut loom, 1, true, None, None).unwrap();
+
+    assert_eq!(outcome["outcome"], "marked");
+    let resumed = loom
+        .store()
+        .active_reachability_mark_epoch()
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.epoch, captured.epoch);
+    assert_eq!(resumed.base_generation, captured.base_generation);
+    assert_eq!(resumed.captured_root_vector, captured.captured_root_vector);
+    assert_eq!(
+        resumed.canonical_roots_fingerprint,
+        captured.canonical_roots_fingerprint
+    );
+    assert!(
+        resumed.state.content_roots.len() < captured.state.content_roots.len()
+            && !resumed.state.content_roots.is_empty()
+    );
+    assert!(resumed.state.marked.contains(&root));
+    assert_eq!(
+        loom.store()
+            .mutable_overlay_current_entry(&current_key)
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"advanced"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn store_policy_tools_read_and_update_durability() {
     use loom_core::{Algo, Loom};
     use loom_store::FileStore;
+
+    assert!(
+        crate::tools::tool("store_policy_set")
+            .expect("store_policy_set tool")
+            .generated_projection
+            .is_none()
+    );
 
     let path =
         std::env::temp_dir().join(format!("loom-mcp-store-policy-{}.loom", std::process::id()));
@@ -229,17 +310,17 @@ fn mcp_surface_baseline_is_reproducible() {
     let prompts = server.prompt_router.list_all();
     let app_launchers = server.list_app_launcher_tools().expect("app launchers");
 
-    assert_eq!(tools.len(), 407);
+    assert_eq!(tools.len(), 416);
     assert_eq!(
         serde_json::to_vec(&tools).expect("tools json").len(),
-        531_193
+        540_403
     );
     assert_eq!(read_only_tools.len(), 215);
     assert_eq!(
         serde_json::to_vec(&read_only_tools)
             .expect("read-only tools json")
             .len(),
-        232_537
+        232_601
     );
     assert_eq!(resources.len(), 31);
     assert_eq!(
@@ -6336,6 +6417,70 @@ fn gate_lane(lane_id: &str) -> loom_lanes::Lane {
 }
 
 impl crate::RemoteMcpBackend for GateTestBackend {
+    fn execute_generated_operation(
+        &self,
+        call: crate::GeneratedMcpCall,
+    ) -> crate::GeneratedMcpFuture<'_> {
+        Box::pin(async move {
+            match call.operation {
+                loom_remote_protocol::generated::GeneratedOperationId::StoreVersion => {
+                    assert!(call.args_without_handle.is_empty());
+                    Ok(loom_codec::Value::Text("gate-version".to_string()))
+                }
+                loom_remote_protocol::generated::GeneratedOperationId::GraphRemoveEdge => {
+                    if call.args_without_handle
+                        == vec![
+                            loom_codec::Value::Text("repo".to_string()),
+                            loom_codec::Value::Text("graph".to_string()),
+                            loom_codec::Value::Text("permission-denied".to_string()),
+                        ]
+                    {
+                        return Err(LoomError::new(
+                            loom_core::error::Code::PermissionDenied,
+                            "generated permission denied",
+                        )
+                        .with_detail(
+                            loom_core::error::ErrorDetail::invalid_field(
+                                "operation",
+                                Some("graph_remove_edge"),
+                                ["authorized"],
+                            ),
+                        ));
+                    }
+                    assert_eq!(
+                        call.args_without_handle,
+                        vec![
+                            loom_codec::Value::Text("repo".to_string()),
+                            loom_codec::Value::Text("graph".to_string()),
+                            loom_codec::Value::Text("edge-1".to_string()),
+                        ]
+                    );
+                    Ok(loom_codec::Value::Bool(true))
+                }
+                _ => gate_backend_unexpected("execute_generated_operation"),
+            }
+        })
+    }
+
+    fn store_bundle_import(
+        &self,
+        bundle: &[u8],
+        dry_run: bool,
+    ) -> std::result::Result<Vec<u8>, LoomError> {
+        assert_eq!(bundle, b"remote-bundle");
+        Ok(loom_wire::store_admin::store_bundle_import_result_to_cbor(
+            &loom_wire::store_admin::StoreBundleImportResult {
+                workspace_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                workspace_name: "remote".to_string(),
+                facets: vec!["document".to_string()],
+                objects_transferred: 0,
+                objects_skipped: 0,
+                new_tips: Vec::new(),
+                dry_run,
+            },
+        ))
+    }
+
     fn workspace_create(
         &self,
         _: Option<&str>,
@@ -6368,6 +6513,16 @@ impl crate::RemoteMcpBackend for GateTestBackend {
         lane: loom_lanes::Lane,
     ) -> std::result::Result<loom_lanes::Lane, LoomError> {
         Ok(lane)
+    }
+
+    fn lanes_get_view(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: bool,
+    ) -> std::result::Result<Option<loom_lanes::LaneView>, LoomError> {
+        gate_backend_unexpected("lanes_get_view")
     }
 
     fn lanes_get(
@@ -6412,13 +6567,10 @@ impl crate::RemoteMcpBackend for GateTestBackend {
         _: &str,
         lane_id: &str,
         ticket_id: &str,
-        placement: Option<&str>,
-        anchor: Option<&str>,
+        placement: loom_lanes::LaneTicketPlacement<'_>,
         updated_by: &str,
     ) -> std::result::Result<loom_lanes::Lane, LoomError> {
         let mut lane = gate_lane(lane_id);
-        let placement =
-            loom_lanes::LaneTicketPlacement::parse(placement.unwrap_or("LAST"), anchor)?;
         loom_lanes::place_lane_ticket(&mut lane, ticket_id, placement)?;
         lane.updated_by = updated_by.to_string();
         Ok(lane)
@@ -6436,6 +6588,71 @@ impl crate::RemoteMcpBackend for GateTestBackend {
             .retain(|lane_ticket| lane_ticket.ticket_id != ticket_id);
         lane.updated_by = updated_by.to_string();
         Ok(lane)
+    }
+
+    fn tickets_create_json(
+        &self,
+        _: &str,
+        _: loom_tickets::TicketCreateRequest<'_>,
+    ) -> std::result::Result<String, LoomError> {
+        gate_backend_unexpected("tickets_create_json")
+    }
+
+    fn tickets_update_json(
+        &self,
+        _: &str,
+        _: loom_tickets::TicketUpdateRequest<'_>,
+    ) -> std::result::Result<String, LoomError> {
+        gate_backend_unexpected("tickets_update_json")
+    }
+
+    fn tickets_get_json(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> std::result::Result<String, LoomError> {
+        gate_backend_unexpected("tickets_get_json")
+    }
+
+    fn spaces_create(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> std::result::Result<loom_pages::SpaceSummary, LoomError> {
+        gate_backend_unexpected("spaces_create")
+    }
+
+    fn pages_create(
+        &self,
+        _: &str,
+        _: loom_pages::PageCreateRequest<'_>,
+    ) -> std::result::Result<loom_pages::PageSummary, LoomError> {
+        gate_backend_unexpected("pages_create")
+    }
+
+    fn pages_update_text(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> std::result::Result<loom_pages::PageUpdateSummary, LoomError> {
+        gate_backend_unexpected("pages_update_text")
+    }
+
+    fn pages_get(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> std::result::Result<Option<loom_pages::PageSummary>, LoomError> {
+        gate_backend_unexpected("pages_get")
     }
 
     fn list_collections(
@@ -7126,6 +7343,26 @@ impl crate::RemoteMcpBackend for GateTestBackend {
     ) -> std::result::Result<Vec<u8>, LoomError> {
         gate_backend_unexpected("vector_search_policy")
     }
+    fn vector_text_upsert(&self, request: &[u8]) -> std::result::Result<Vec<u8>, LoomError> {
+        assert_eq!(request, b"remote-vector-request");
+        Ok(loom_wire::vector::text_upsert_report_with_token_to_cbor(
+            "remote-id",
+            "remote-collection",
+            b"remote-token",
+        ))
+    }
+    fn vector_workspace_configure_json(
+        &self,
+        workspace: &str,
+        request_json: &str,
+    ) -> std::result::Result<String, LoomError> {
+        let request: serde_json::Value = serde_json::from_str(request_json).unwrap();
+        Ok(serde_json::json!({
+            "workspace": workspace,
+            "embedding_instance": request["embedding-instance"],
+        })
+        .to_string())
+    }
     fn metrics_put_descriptor(&self, _: &str, _: &[u8]) -> std::result::Result<(), LoomError> {
         gate_backend_unexpected("metrics_put_descriptor")
     }
@@ -7672,11 +7909,25 @@ fn remote_tool_route_classifies_by_execution_target() {
             "{tool} is unary in the surface and forwards"
         );
     }
-    assert_eq!(
-        remote_tool_route("lanes_create"),
-        RemoteToolRoute::UnaryForward,
-        "Lane tools are IDL-backed and forward over remote"
-    );
+    for tool in [
+        "tickets_create",
+        "tickets_update",
+        "tickets_get",
+        "lanes_create",
+        "lanes_get",
+        "spaces_create",
+        "pages_create",
+        "pages_update",
+        "pages_get",
+        "document_put_text",
+        "document_get_text",
+    ] {
+        assert_eq!(
+            remote_tool_route(tool),
+            RemoteToolRoute::UnaryForward,
+            "{tool} is IDL-backed and forwards over generated remote dispatch"
+        );
+    }
     assert_eq!(
         remote_tool_route("apps_list"),
         RemoteToolRoute::ServerExecute,
@@ -8011,6 +8262,58 @@ fn server_side_execute_promoted_chat_tool_is_routed() {
         ),
     }
 
+    execute_promoted_tool(
+        &mcp,
+        "chat_create_channel",
+        &serde_json::to_vec(
+            &json!({ "workspace": "repo", "handle": "general", "name": "General" }),
+        )
+        .unwrap(),
+    )
+    .expect("chat_create_channel server-side");
+    for (name, args) in [
+        (
+            "chat_post_message_bytes",
+            json!({
+                "workspace": "repo",
+                "channel_id": "general",
+                "message_id": "m1",
+                "body": [255, 0, 1]
+            }),
+        ),
+        (
+            "chat_edit_message_bytes",
+            json!({
+                "workspace": "repo",
+                "channel_id": "general",
+                "message_id": "m1",
+                "body": [254, 2, 3]
+            }),
+        ),
+        (
+            "chat_invoke_agent_bytes",
+            json!({
+                "workspace": "repo",
+                "channel_id": "general",
+                "invocation_id": "inv1",
+                "agent_principal": WorkspaceId::v4_from_bytes([0x11; 16]).to_string(),
+                "source_message_ids": ["m1"],
+                "prompt": [253, 4, 5]
+            }),
+        ),
+    ] {
+        match execute_promoted_tool(&mcp, name, &serde_json::to_vec(&args).unwrap()) {
+            Ok(out) => {
+                let val: serde_json::Value = serde_json::from_slice(&out).unwrap();
+                assert!(val.get("value").is_some(), "{name}: {val}");
+            }
+            Err(e) => assert!(
+                !e.to_string().contains("not server-promoted"),
+                "{name} must be routed to server-side execution, got: {e}"
+            ),
+        }
+    }
+
     // Ephemeral presence stays host-local: the server-side executor declines it precisely.
     let presence_err = execute_promoted_tool(
         &mcp,
@@ -8328,6 +8631,53 @@ fn server_side_execute_promoted_tickets_tools_are_routed() {
         .expect("ticket_id")
         .to_string();
 
+    let dependency_out = execute_promoted_tool(
+        &mcp,
+        "tickets_create",
+        &serde_json::to_vec(&json!({
+            "workspace": "repo",
+            "project_id": "eng",
+            "ticket_type": "task",
+            "fields": { "title": "Dependency ticket" }
+        }))
+        .unwrap(),
+    )
+    .expect("dependency tickets_create executes server-side");
+    let dependency: serde_json::Value = serde_json::from_slice(&dependency_out).unwrap();
+    let dependency_id = dependency["value"]["resource"]["ticket_id"]
+        .as_str()
+        .expect("dependency ticket id")
+        .to_string();
+
+    execute_promoted_tool(
+        &mcp,
+        "tickets_update",
+        &serde_json::to_vec(&json!({
+            "workspace": "repo",
+            "ticket_id": &ticket_id,
+            "set_fields": { "description": "Updated with real dependency and comment" },
+            "comments": [{
+                "comment_id": "comment-1",
+                "comment_type": "review_feedback",
+                "body": "real review comment"
+            }],
+            "relation_sets": [{
+                "relation_id": "rel-dep-1",
+                "kind": "depends_on",
+                "target_id": &dependency_id
+            }]
+        }))
+        .unwrap(),
+    )
+    .expect("tickets_update seeds real comments, relations, and history");
+
+    assert!(
+        crate::tools::tool("tickets_get")
+            .expect("tickets_get tool")
+            .generated_projection
+            .is_none()
+    );
+
     let got = execute_promoted_tool(
         &mcp,
         "tickets_get",
@@ -8343,12 +8693,19 @@ fn server_side_execute_promoted_tickets_tools_are_routed() {
         .expect("readable ticket object");
     assert!(got_obj.contains_key("status"));
     assert!(got_obj.contains_key("description"));
-    assert_eq!(got_val["value"]["dependencies"]["depends_on"], json!([]));
+    assert_eq!(
+        got_val["value"]["dependencies"]["depends_on"],
+        json!([dependency_id])
+    );
     assert_eq!(got_val["value"]["dependencies"]["blocks"], json!([]));
-    assert_eq!(got_val["value"]["comment_count"], json!(0));
+    assert_eq!(got_val["value"]["comment_count"], json!(1));
+    assert_eq!(
+        got_val["value"]["comments"][0]["body"],
+        json!("real review comment")
+    );
     assert_eq!(
         got_val["value"]["latest_update"]["operation_kind"],
-        json!("ticket.created")
+        json!("ticket.comment_added")
     );
 
     let got_detailed = execute_promoted_tool(
@@ -8391,10 +8748,10 @@ fn server_side_execute_promoted_tickets_tools_are_routed() {
         .expect("compact ticket object");
     assert_eq!(got_compact_val["value"]["primary_key"], json!("ENG-1"));
     assert_eq!(got_compact_val["value"]["title"], json!("Build tickets"));
-    assert_eq!(got_compact_val["value"]["comment_count"], json!(0));
+    assert_eq!(got_compact_val["value"]["comment_count"], json!(1));
     assert_eq!(
         got_compact_val["value"]["dependencies"]["depends_on"],
-        json!([])
+        got_val["value"]["dependencies"]["depends_on"]
     );
     assert_eq!(
         got_compact_val["value"]["dependencies"]["blocks"],
@@ -8402,7 +8759,7 @@ fn server_side_execute_promoted_tickets_tools_are_routed() {
     );
     assert_eq!(
         got_compact_val["value"]["latest_update"]["operation_kind"],
-        json!("ticket.created")
+        json!("ticket.comment_added")
     );
     // The heavy fields MUST be absent from the compact shape.
     assert!(!compact_obj.contains_key("description"));
@@ -8455,10 +8812,13 @@ fn server_side_execute_promoted_tickets_tools_are_routed() {
     .expect("tickets_list executes server-side");
     let listed_val: serde_json::Value = serde_json::from_slice(&listed).unwrap();
     assert_schema_accepts(&ticket_schema(), &listed_val["value"]["items"][0]);
-    assert_eq!(listed_val["value"]["items"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        listed_val["value"]["items"][0]["primary_key"],
-        json!("ENG-1")
+    assert_eq!(listed_val["value"]["items"].as_array().unwrap().len(), 2);
+    assert!(
+        listed_val["value"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["primary_key"] == json!("ENG-1"))
     );
 
     execute_promoted_tool(
@@ -9142,20 +9502,7 @@ fn tickets_project_settings_get_pins_enabled_projections() {
     std::fs::remove_dir_all(&path).ok();
 }
 
-/// MX-464 drift, tracked for owner (do NOT delete the assertions). `store_capabilities_json` and
-/// `store_maintenance_status` return structured JSON objects, but their advertised output schema is
-/// `bytes_schema()` (an array of u8) via the shared arm in `output_value_schema` (server.rs, the
-/// arm beginning at `"store_capabilities" | "store_capabilities_json" | .. | "store_maintenance_status"`).
-/// The correct fix is to move the object-returning store tools (store_capabilities_json,
-/// store_policy_get/set, store_maintenance_status/policy_set/run) out of the `bytes_schema()` arm to
-/// a proper object schema. That changes the serialized tool surface, so it must be landed together
-/// with regenerated byte baselines in `mcp_surface_baseline_is_reproducible` — which requires a
-/// toolchain build this ticket cannot run. Ignored (not deleted) so the drift is preserved and the
-/// owner can land schema + baseline atomically.
 #[test]
-#[ignore = "MX-464 drift: store_capabilities_json / store_maintenance_status advertise bytes_schema \
-(array) but return structured objects; fix must regenerate mcp_surface_baseline byte counts under a \
-toolchain build. Tracked for owner."]
 fn mcp_store_object_tools_output_schema_drift_mx464() {
     let (path, mcp) = declared_output_schema_fixture("store-object-drift");
     let server = LoomServer::new(mcp.clone());
@@ -9177,6 +9524,564 @@ fn check_store_object_drift(server: &LoomServer) {
 
     let status = server.store_maintenance_status().unwrap().0;
     assert_declared_value_ok(server, "store_maintenance_status", &status["value"]);
+}
+
+#[test]
+fn mu_7f_d_local_persistent_store_bundle_and_vector_generated_tools_execute() {
+    let (path, mcp) = declared_output_schema_fixture("mu-7f-d-local");
+    let server = LoomServer::new(mcp.clone());
+
+    let source_path = std::env::temp_dir().join(format!(
+        "loom-mcp-mu-7f-d-source-{}-{}.loom",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut source = loom_core::Loom::new(
+        loom_store::FileStore::create_with_profile(&source_path, loom_core::Algo::Blake3).unwrap(),
+    );
+    let imported_ns = source
+        .registry_mut()
+        .create(
+            loom_core::FacetKind::Files,
+            Some("bundle-ws"),
+            loom_core::WorkspaceId::v4_from_bytes([0x7d; 16]),
+        )
+        .unwrap();
+    source
+        .write_file(imported_ns, "bundle.txt", b"bundle payload", 0o100644)
+        .unwrap();
+    let imported_tip = source
+        .commit(imported_ns, "agent", "bundle commit", 1)
+        .unwrap();
+    let bundle = loom_core::bundle_export(&source, imported_ns).unwrap();
+    let bundle_result = server
+        .store_bundle_import(Parameters(PStoreBundleImport {
+            bundle: bundle.encode(),
+            dry_run: false,
+        }))
+        .expect("store_bundle_import executes through local persistent MCP")
+        .0;
+    let bundle_bytes = bundle_result["value"]
+        .as_array()
+        .expect("store_bundle_import returns generated CBOR bytes")
+        .iter()
+        .map(|value| value.as_u64().expect("byte") as u8)
+        .collect::<Vec<_>>();
+    let bundle_report = loom_wire::store_admin::store_bundle_import_result_from_cbor(&bundle_bytes)
+        .expect("local bundle import report decodes");
+    assert_eq!(bundle_report.workspace_id, imported_ns.to_string());
+    assert_eq!(bundle_report.workspace_name, "bundle-ws");
+    assert!(!bundle_report.dry_run);
+    assert!(bundle_report.objects_transferred > 0);
+
+    let request = loom_wire::vector::TextUpsertRequest {
+        workspace: "vectors".to_string(),
+        name: "docs".to_string(),
+        id: "doc-1".to_string(),
+        vector: loom_wire::vector::floats_to_bytes(&[1.0, 0.0]),
+        metadata: Vec::new(),
+        source_text: b"hello".to_vec(),
+        model_id: None,
+        weights_digest: None,
+        create: true,
+        metric: 1,
+        expected_token: None,
+        expect_absent: false,
+    };
+    let result = server
+        .vector_text_upsert(Parameters(PVectorTextUpsert {
+            request: loom_wire::vector::text_upsert_request_to_cbor(&request),
+        }))
+        .expect("vector_text_upsert executes through local persistent MCP")
+        .0;
+    let bytes = result["value"]
+        .as_array()
+        .expect("vector_text_upsert returns generated CBOR bytes")
+        .iter()
+        .map(|value| value.as_u64().expect("byte") as u8)
+        .collect::<Vec<_>>();
+    let report = loom_wire::vector::text_upsert_report_from_cbor(&bytes)
+        .expect("generated vector report decodes");
+    assert_eq!(report.id, "doc-1");
+    assert_eq!(report.collection, "docs");
+
+    let repo_id = mcp
+        .store()
+        .write_without_persist(|loom| {
+            let repo_id = loom
+                .registry()
+                .open(&loom_core::WsSelector::Name("repo".to_string()))?;
+            loom.registry_mut()
+                .add_facet(repo_id, loom_core::FacetKind::Inference)?;
+            let mut state = loom_inference::InferenceInstanceState::default();
+            let instance = loom_inference::build_instance_descriptor(
+                "embedder",
+                loom_types::InferenceModelKind::TextEmbedding,
+                loom_types::ModelRef::new(
+                    loom_types::InferenceModelKind::TextEmbedding,
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                ),
+                loom_types::RuntimeKind::CandleSafetensors,
+                Some("deterministic".to_string()),
+                BTreeMap::new(),
+            )?;
+            state.upsert_instance(instance);
+            loom_core::put_inference_instance_state(loom, repo_id, &state)?;
+            loom_store::save_loom(loom)?;
+            Ok(repo_id)
+        })
+        .expect("seed text-embedding instance");
+    let configured = server
+        .vector_workspace_configure_json(Parameters(PVectorWorkspaceConfigure {
+            workspace: "repo".to_string(),
+            request_json: serde_json::json!({ "embedding-instance": "embedder" }).to_string(),
+        }))
+        .expect("vector_workspace_configure_json executes through local persistent MCP")
+        .0;
+    assert_eq!(configured["value"]["workspace"], repo_id.to_string());
+    assert_eq!(configured["value"]["embedding-instance"], "embedder");
+
+    drop(server);
+    drop(mcp);
+
+    let reopened = loom_store::open_loom(&path).unwrap();
+    assert_eq!(
+        reopened
+            .registry()
+            .open(&loom_core::WsSelector::Name("bundle-ws".to_string()))
+            .unwrap(),
+        imported_ns
+    );
+    assert_eq!(
+        reopened.registry().facets(imported_ns).unwrap(),
+        vec![loom_core::FacetKind::Files]
+    );
+    assert_eq!(
+        reopened
+            .registry()
+            .branch_tip(imported_ns, loom_core::workspace::DEFAULT_BRANCH)
+            .unwrap(),
+        Some(imported_tip)
+    );
+    let state = loom_core::inference_instance_state(&reopened, repo_id).unwrap();
+    assert_eq!(state.vector_bindings.len(), 1);
+    assert_eq!(state.vector_bindings[0].workspace, repo_id.to_string());
+    assert_eq!(state.vector_bindings[0].embedding_instance, "embedder");
+
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&source_path).ok();
+    std::fs::remove_dir_all(&path).ok();
+    std::fs::remove_dir_all(&source_path).ok();
+}
+
+#[test]
+fn generated_remote_mcp_target_executes_read_and_mutation_through_generated_backend() {
+    let server = LoomServer::new(Arc::new(crate::LoomMcp::new(StoreAccess::remote(
+        std::sync::Arc::new(GateTestBackend),
+    ))));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    let read = rt
+        .block_on(
+            server.execute_generated_tool_remote(&CallToolRequestParams::new("store_version")),
+        )
+        .expect("generated read forwards")
+        .structured_content
+        .expect("structured read");
+    assert_eq!(read["value"], json!("gate-version"));
+
+    let mut args = JsonObject::new();
+    args.insert("workspace".to_string(), json!("repo"));
+    args.insert("collection".to_string(), json!("graph"));
+    args.insert("id".to_string(), json!("edge-1"));
+    let mutation = rt
+        .block_on(server.execute_generated_tool_remote(
+            &CallToolRequestParams::new("graph_remove_edge").with_arguments(args),
+        ))
+        .expect("generated mutation forwards")
+        .structured_content
+        .expect("structured mutation");
+    assert_eq!(mutation["value"], json!(true));
+}
+
+#[test]
+fn generated_projection_canonical_eligibility_gate_is_source_backed() {
+    let server = LoomServer::new(Arc::new(crate::LoomMcp::new(StoreAccess::remote(
+        std::sync::Arc::new(GateTestBackend),
+    ))));
+
+    assert!(
+        canonical_projection_eligibility(&server, "store_version", &[]).is_ok(),
+        "store_version is the canonical generated read representative"
+    );
+    assert!(
+        canonical_projection_eligibility(&server, "graph_remove_edge", &[("name", "collection")])
+            .is_ok(),
+        "graph_remove_edge has only the declared IDL name-to-MCP collection transform"
+    );
+
+    let store_policy =
+        canonical_projection_eligibility(&server, "store_policy_set", &[]).unwrap_err();
+    assert!(
+        store_policy.contains("requiredness mismatch for fips_required")
+            && store_policy.contains("extra MCP parameter default_durability"),
+        "{store_policy}"
+    );
+
+    let tickets = canonical_projection_eligibility(&server, "tickets_get", &[]).unwrap_err();
+    assert!(
+        tickets.contains("missing MCP parameter ticket_workspace_id")
+            && tickets.contains("extra MCP parameter detailed")
+            && tickets.contains("output schema mismatch"),
+        "{tickets}"
+    );
+
+    assert_eq!(
+        crate::tools::tool("store_version")
+            .expect("store_version tool")
+            .generated_projection,
+        Some(crate::tools::GeneratedMcpProjection::Canonical)
+    );
+    assert_eq!(
+        crate::tools::tool("graph_remove_edge")
+            .expect("graph_remove_edge tool")
+            .generated_projection,
+        Some(crate::tools::GeneratedMcpProjection::GraphRemoveEdge)
+    );
+    assert!(
+        crate::tools::tool("store_policy_set")
+            .expect("store_policy_set tool")
+            .generated_projection
+            .is_none()
+    );
+    assert!(
+        crate::tools::tool("tickets_get")
+            .expect("tickets_get tool")
+            .generated_projection
+            .is_none()
+    );
+}
+
+#[test]
+fn mu17_generated_mcp_boundary_preserves_runtime_visibility_and_schema_authority() {
+    let server = LoomServer::new(Arc::new(crate::LoomMcp::new(StoreAccess::remote(
+        std::sync::Arc::new(GateTestBackend),
+    ))));
+
+    for (tool_name, projection, transforms) in [
+        (
+            "store_version",
+            crate::tools::GeneratedMcpProjection::Canonical,
+            Vec::<(&str, &str)>::new(),
+        ),
+        (
+            "graph_remove_edge",
+            crate::tools::GeneratedMcpProjection::GraphRemoveEdge,
+            vec![("name", "collection")],
+        ),
+    ] {
+        let tool = crate::tools::tool(tool_name).unwrap_or_else(|| panic!("{tool_name} tool"));
+        assert_eq!(tool.generated_projection, Some(projection));
+        assert!(
+            server.generated_execution_target(tool_name).is_some(),
+            "{tool_name} must have a generated target against a remote backend"
+        );
+        canonical_projection_eligibility(&server, tool_name, &transforms)
+            .unwrap_or_else(|err| panic!("{tool_name} schema authority: {err}"));
+    }
+
+    let listed = server.tool_router.list_all();
+    let by_name = |name: &str| {
+        listed
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} registered"))
+    };
+    assert!(by_name("store_version").output_schema.is_some());
+    assert!(by_name("graph_remove_edge").output_schema.is_some());
+}
+
+#[test]
+fn mu17_unmigrated_ticket_lane_page_and_document_tools_stay_on_existing_handlers() {
+    let server = LoomServer::new(Arc::new(crate::LoomMcp::new(StoreAccess::remote(
+        std::sync::Arc::new(GateTestBackend),
+    ))));
+
+    for tool_name in [
+        "tickets_create",
+        "tickets_get",
+        "lanes_create",
+        "lanes_get",
+        "spaces_create",
+        "spaces_get",
+        "pages_create",
+        "pages_get",
+        "document_put_text",
+        "document_get_text",
+    ] {
+        let tool = crate::tools::tool(tool_name).unwrap_or_else(|| panic!("{tool_name} tool"));
+        assert!(
+            matches!(tool.target, crate::tools::ExecutionTarget::Generated(_)),
+            "{tool_name} remains a generated catalog entry"
+        );
+        assert!(
+            tool.generated_projection.is_none(),
+            "{tool_name} must not silently migrate to the MU-16 opt-in generated adapter"
+        );
+        assert!(
+            server.generated_execution_target(tool_name).is_none(),
+            "{tool_name} must remain on its established handler until a typed projection is accepted"
+        );
+    }
+}
+
+#[test]
+fn mu17_generated_mcp_stable_errors_preserve_structured_details() {
+    let server = LoomServer::new(Arc::new(crate::LoomMcp::new(StoreAccess::remote(
+        std::sync::Arc::new(GateTestBackend),
+    ))));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let mut args = JsonObject::new();
+    args.insert("workspace".to_string(), json!("repo"));
+    args.insert("collection".to_string(), json!("graph"));
+    args.insert("id".to_string(), json!("permission-denied"));
+
+    let error = rt
+        .block_on(server.execute_generated_tool_remote(
+            &CallToolRequestParams::new("graph_remove_edge").with_arguments(args),
+        ))
+        .expect_err("generated permission error");
+
+    assert!(
+        error.message.contains("generated permission denied"),
+        "{}",
+        error.message
+    );
+    let data = error.data.expect("structured error data");
+    assert_eq!(data["details"][0]["kind"], "invalid_field");
+    assert_eq!(data["details"][0]["field"], "operation");
+    assert_eq!(data["details"][0]["rejected"], "graph_remove_edge");
+}
+
+#[test]
+fn mu17d_schema_authority_matrix_keeps_generated_and_manual_sources_distinct() {
+    let server = LoomServer::new(Arc::new(crate::LoomMcp::new(StoreAccess::remote(
+        std::sync::Arc::new(GateTestBackend),
+    ))));
+
+    for (tool_name, transforms) in [
+        ("store_version", Vec::<(&str, &str)>::new()),
+        ("graph_remove_edge", vec![("name", "collection")]),
+    ] {
+        let tool = crate::tools::tool(tool_name).unwrap_or_else(|| panic!("{tool_name} tool"));
+        assert!(
+            tool.generated_projection.is_some(),
+            "{tool_name} must declare generated schema ownership"
+        );
+        canonical_projection_eligibility(&server, tool_name, &transforms)
+            .unwrap_or_else(|err| panic!("{tool_name} generated schema authority: {err}"));
+    }
+
+    for tool_name in ["chat_set_presence", "apps_call_tool"] {
+        let tool = crate::tools::tool(tool_name).unwrap_or_else(|| panic!("{tool_name} tool"));
+        assert!(
+            tool.generated_projection.is_none(),
+            "{tool_name} must retain manual schema ownership"
+        );
+        assert!(
+            matches!(
+                tool.target,
+                crate::tools::ExecutionTarget::Composite(_)
+                    | crate::tools::ExecutionTarget::OwningAdapter(_)
+            ),
+            "{tool_name} must stay on an owning adapter target"
+        );
+        let registered = server
+            .tool_router
+            .get(tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} registered"));
+        let input_schema = Value::Object((*registered.input_schema).clone());
+        assert_object_schema(&input_schema, tool_name);
+    }
+}
+
+fn canonical_projection_eligibility(
+    server: &LoomServer,
+    tool_name: &str,
+    name_transforms: &[(&str, &str)],
+) -> Result<(), String> {
+    let tool = crate::tools::tool(tool_name).ok_or_else(|| format!("unknown tool {tool_name}"))?;
+    let crate::tools::ExecutionTarget::Generated(operation) = tool.target else {
+        return Err(format!("{tool_name} is not a generated tool"));
+    };
+    let sig = crate::tools::generated_operation_signature(operation)
+        .ok_or_else(|| format!("{tool_name} references absent generated operation"))?;
+    let mcp_input_schema = Value::Object(
+        (*server
+            .tool_router
+            .get(tool_name)
+            .ok_or_else(|| format!("{tool_name} is not registered"))?
+            .input_schema)
+            .clone(),
+    );
+    let mcp_properties = mcp_input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{tool_name} input schema has no properties"))?;
+    let mcp_required = mcp_input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let transforms = name_transforms.iter().copied().collect::<BTreeMap<_, _>>();
+    let mut expected_mcp_names = BTreeSet::new();
+    let mut errors = Vec::new();
+    for (idl_type, idl_name) in sig.args_without_handle {
+        let mcp_name = transforms.get(idl_name).copied().unwrap_or(idl_name);
+        expected_mcp_names.insert(mcp_name);
+        let Some(mcp_schema) = mcp_properties.get(mcp_name) else {
+            errors.push(format!(
+                "missing MCP parameter {mcp_name} for IDL argument {idl_name}"
+            ));
+            continue;
+        };
+        let idl_required = !idl_type.trim_start().starts_with("optional ");
+        if mcp_required.contains(mcp_name) != idl_required {
+            errors.push(format!(
+                "requiredness mismatch for {mcp_name}: MCP={}, IDL={idl_required}",
+                mcp_required.contains(mcp_name)
+            ));
+        }
+        let expected_kind = idl_json_schema_kind_for_gate(idl_type);
+        let actual_kind = json_schema_kind_for_gate(mcp_schema);
+        if actual_kind.as_deref() != Some(expected_kind) {
+            errors.push(format!(
+                "JSON type mismatch for {mcp_name}: MCP={actual_kind:?}, IDL={expected_kind}"
+            ));
+        }
+    }
+    for mcp_name in mcp_properties.keys() {
+        if !expected_mcp_names.contains(mcp_name.as_str()) {
+            errors.push(format!(
+                "extra MCP parameter {mcp_name} without declared transform"
+            ));
+        }
+    }
+
+    let mcp_output = advertised_value_schema(server, tool_name);
+    let idl_output: Value = serde_json::from_str(sig.response_json_schema)
+        .map_err(|err| format!("invalid generated response schema: {err}"))?;
+    let mcp_output_kind = json_schema_kind_for_gate(&mcp_output);
+    let idl_output_kind = json_schema_kind_for_gate(&idl_output);
+    if mcp_output_kind != idl_output_kind {
+        errors.push(format!(
+            "output schema mismatch: MCP={mcp_output_kind:?}, IDL={idl_output_kind:?}"
+        ));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn idl_json_schema_kind_for_gate(idl_type: &str) -> &'static str {
+    match idl_type
+        .trim()
+        .strip_prefix("optional ")
+        .unwrap_or(idl_type.trim())
+    {
+        "bool" => "boolean",
+        "bytes" => "string:base64",
+        "u8" | "u32" | "u64" | "i32" | "i64" => "integer",
+        "f32" | "f64" => "number",
+        "string" | "Uuid" | "Digest" => "string",
+        _ => "object",
+    }
+}
+
+fn json_schema_kind_for_gate(schema: &Value) -> Option<String> {
+    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+        let mut non_null = any_of
+            .iter()
+            .filter(|branch| branch.get("type").and_then(Value::as_str) != Some("null"))
+            .filter_map(json_schema_kind_for_gate)
+            .collect::<Vec<_>>();
+        non_null.sort();
+        non_null.dedup();
+        return match non_null.len() {
+            1 => non_null.pop(),
+            _ => Some(non_null.join("|")),
+        };
+    }
+    let ty = schema.get("type").and_then(Value::as_str)?;
+    if ty == "string" && schema.get("contentEncoding").and_then(Value::as_str) == Some("base64") {
+        return Some("string:base64".to_string());
+    }
+    Some(ty.to_string())
+}
+
+#[test]
+fn mu_7f_d_remote_store_bundle_and_vector_generated_tools_execute() {
+    let server = LoomServer::new(Arc::new(crate::LoomMcp::new(StoreAccess::remote(
+        std::sync::Arc::new(GateTestBackend),
+    ))));
+
+    let bundle = server
+        .store_bundle_import(Parameters(PStoreBundleImport {
+            bundle: b"remote-bundle".to_vec(),
+            dry_run: true,
+        }))
+        .expect("store_bundle_import forwards through remote MCP")
+        .0;
+    let bundle_bytes = bundle["value"]
+        .as_array()
+        .expect("store bundle import returns bytes")
+        .iter()
+        .map(|value| value.as_u64().expect("byte") as u8)
+        .collect::<Vec<_>>();
+    let bundle_report = loom_wire::store_admin::store_bundle_import_result_from_cbor(&bundle_bytes)
+        .expect("remote bundle import report decodes");
+    assert_eq!(bundle_report.workspace_name, "remote");
+    assert!(bundle_report.dry_run);
+
+    let vector = server
+        .vector_text_upsert(Parameters(PVectorTextUpsert {
+            request: b"remote-vector-request".to_vec(),
+        }))
+        .expect("vector_text_upsert forwards through remote MCP")
+        .0;
+    let vector_bytes = vector["value"]
+        .as_array()
+        .expect("vector text upsert returns bytes")
+        .iter()
+        .map(|value| value.as_u64().expect("byte") as u8)
+        .collect::<Vec<_>>();
+    let vector_report = loom_wire::vector::text_upsert_report_from_cbor(&vector_bytes)
+        .expect("remote vector report decodes");
+    assert_eq!(vector_report.id, "remote-id");
+
+    let configured = server
+        .vector_workspace_configure_json(Parameters(PVectorWorkspaceConfigure {
+            workspace: "remote-workspace".to_string(),
+            request_json: serde_json::json!({ "embedding-instance": "remote-embed" }).to_string(),
+        }))
+        .expect("vector_workspace_configure_json forwards through remote MCP")
+        .0;
+    assert_eq!(configured["value"]["workspace"], "remote-workspace");
+    assert_eq!(configured["value"]["embedding_instance"], "remote-embed");
 }
 
 // The non-SQL `*_list_collections` tools forward over a remote store via

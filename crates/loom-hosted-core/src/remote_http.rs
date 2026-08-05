@@ -110,20 +110,41 @@ impl RemoteHttpService {
     /// rides the reply envelope at `200`, like the call route's application errors.
     fn open_session_route(&self, body: &[u8]) -> HttpResponse {
         use loom_remote_protocol::session::{
-            SessionOpenReply, open_reply_bytes, parse_open_request,
+            SessionOpenReply, SessionRequest, open_reply_bytes, parse_session_request,
         };
-        let auth = match parse_open_request(body) {
-            Ok(auth) => auth,
+        let request = match parse_session_request(body) {
+            Ok(request) => request,
             Err(_) => return HttpResponse::status_only(400),
         };
-        let connection = self.runtime.register_connection("remote-http-session");
-        let reply = match self
-            .runtime
-            .open_session(connection, map_session_auth(auth))
-        {
-            Ok(session) => SessionOpenReply::Ok {
+        let result = match request {
+            SessionRequest::Create(auth) => {
+                let connection = self.runtime.register_connection("remote-http-session");
+                self.runtime
+                    .create_logical_session(connection, map_session_auth(auth))
+            }
+            SessionRequest::Resume { auth, credential } => {
+                let connection = self.runtime.register_connection("remote-http-session");
+                self.runtime
+                    .resume_logical_session(connection, map_session_auth(auth), &credential)
+            }
+            SessionRequest::Close { auth, credential } => self
+                .runtime
+                .close_logical_session(map_session_auth(auth), &credential)
+                .map(|session_id| {
+                    (
+                        super::remote::RemoteSession {
+                            id: session_id,
+                            lease_expires_ms: 0,
+                        },
+                        Vec::new(),
+                    )
+                }),
+        };
+        let reply = match result {
+            Ok((session, credential)) => SessionOpenReply::Ok {
                 session_id: session.id,
                 lease_expires_ms: session.lease_expires_ms,
+                credential: (!credential.is_empty()).then_some(credential),
             },
             Err(err) => {
                 SessionOpenReply::Err(loom_remote_protocol::RemoteError::from_loom_error(&err))

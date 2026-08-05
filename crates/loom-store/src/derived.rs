@@ -821,7 +821,7 @@ impl FileStore {
             payload_digest,
             payload_len: payload.len() as u64,
         };
-        let mut map = self.control_map()?;
+        let mut map = self.control_root_map()?;
         map.insert(derived_control_key(key)?, encode_record(&record)?);
         map.remove(&derived_rebuild_key(key)?);
         self.write_control_map(map)?;

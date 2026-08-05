@@ -68,6 +68,26 @@ fn parse_projection_list(
         .collect()
 }
 
+fn parse_acceptance_evidence_key_list(
+    value: &str,
+    what: &str,
+) -> Result<Vec<loom_tickets::TicketAcceptanceEvidenceKey>, JsError> {
+    parse_string_list(value, what)?
+        .into_iter()
+        .map(|key| loom_tickets::TicketAcceptanceEvidenceKey::parse(&key).map_err(le))
+        .collect()
+}
+
+fn parse_review_type_list(
+    value: &str,
+    what: &str,
+) -> Result<Vec<loom_tickets::TicketReviewType>, JsError> {
+    parse_string_list(value, what)?
+        .into_iter()
+        .map(|review| loom_tickets::TicketReviewType::parse(&review).map_err(le))
+        .collect()
+}
+
 fn parse_cardinality(value: &str) -> Result<loom_tickets::TicketFieldCardinality, JsError> {
     match value {
         "single" => Ok(loom_tickets::TicketFieldCardinality::Single),
@@ -164,13 +184,15 @@ impl LoomStore {
         workspace: String,
         ticket_workspace_id: String,
         project_id: String,
+        include_contracts: bool,
     ) -> Result<String, JsError> {
         let ns = resolve_workspace_arg(&self.loom, &workspace)?;
-        to_json(loom_tickets::get_project(
+        to_json(loom_tickets::get_project_with_contract_details(
             &self.loom,
             ns,
             &ticket_workspace_id,
             &project_id,
+            include_contracts,
         ))
     }
 
@@ -186,6 +208,13 @@ impl LoomStore {
         project_owner_principal: Option<String>,
         clear_project_owner_principal: bool,
         acceptance_authorities_json: Option<String>,
+        acceptance_evidence_enforcement: Option<bool>,
+        required_acceptance_evidence_keys_json: Option<String>,
+        required_acceptance_reviews_json: Option<String>,
+        owner_contract_summary: Option<String>,
+        owner_contract_details: Option<String>,
+        worker_contract_summary: Option<String>,
+        worker_contract_details: Option<String>,
         expected_root: Option<String>,
     ) -> Result<String, JsError> {
         let default_projection = default_projection
@@ -206,6 +235,19 @@ impl LoomStore {
             .as_deref()
             .map(|value| parse_string_list(value, "ticket acceptance authorities json"))
             .transpose()?;
+        let required_acceptance_evidence_keys = required_acceptance_evidence_keys_json
+            .as_deref()
+            .map(|value| {
+                parse_acceptance_evidence_key_list(
+                    value,
+                    "ticket required acceptance evidence keys json",
+                )
+            })
+            .transpose()?;
+        let required_acceptance_reviews = required_acceptance_reviews_json
+            .as_deref()
+            .map(|value| parse_review_type_list(value, "ticket required acceptance reviews json"))
+            .transpose()?;
         let ns = resolve_workspace_arg(&self.loom, &workspace)?;
         let out = to_json(loom_tickets::set_project_settings(
             &mut self.loom,
@@ -220,6 +262,13 @@ impl LoomStore {
                 project_owner_principal: project_owner_principal.as_deref(),
                 clear_project_owner_principal,
                 acceptance_authorities: acceptance_authorities.as_deref(),
+                acceptance_evidence_enforcement,
+                required_acceptance_evidence_keys: required_acceptance_evidence_keys.as_deref(),
+                required_acceptance_reviews: required_acceptance_reviews.as_deref(),
+                owner_contract_summary: owner_contract_summary.as_deref(),
+                owner_contract_details: owner_contract_details.as_deref(),
+                worker_contract_summary: worker_contract_summary.as_deref(),
+                worker_contract_details: worker_contract_details.as_deref(),
                 expected_root: expected_root.as_deref(),
             },
         ))?;
@@ -419,6 +468,7 @@ impl LoomStore {
                 comment_id: comment_id.as_deref(),
                 comment_type: comment_type.as_deref(),
                 body,
+                evidence: None,
             });
         let comments = comments_input
             .iter()
@@ -426,6 +476,7 @@ impl LoomStore {
                 comment_id: comment.comment_id.as_deref(),
                 comment_type: comment.comment_type.as_deref(),
                 body: &comment.body,
+                evidence: None,
             })
             .collect::<Vec<_>>();
         let relation_sets = relation_sets_input
@@ -532,6 +583,7 @@ impl LoomStore {
                 comment_id: comment_id.as_deref(),
                 comment_type: comment_type.as_deref(),
                 body: &body,
+                evidence: None,
                 expected_root: expected_root.as_deref(),
             },
         )
@@ -563,6 +615,7 @@ impl LoomStore {
                 comment_id: &comment_id,
                 comment_type: comment_type.as_deref(),
                 body: body.as_deref(),
+                evidence: None,
                 expected_root: expected_root.as_deref(),
             },
         )

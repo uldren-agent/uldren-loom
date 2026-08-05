@@ -8,8 +8,7 @@ if ! [[ "$iterations" =~ ^[0-9]+$ ]] || [[ "$iterations" -le 0 ]]; then
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
-loom_bin="${LOOM_BIN:-$repo_root/target/debug/loom}"
+loom_bin="${LOOM_BIN:-$script_dir/loop/loom}"
 store="${LOOP_STORE:-random.loom}"
 daemon_transport="${LOOP_DAEMON_TRANSPORT:-native}"
 workspace="${LOOP_WORKSPACE:-random}"
@@ -19,7 +18,7 @@ document_collection="random-documents"
 
 if [[ ! -x "$loom_bin" ]]; then
   echo "loom binary is not executable: $loom_bin" >&2
-  echo "set LOOM_BIN=/path/to/loom or build ./target/debug/loom" >&2
+  echo "copy the Loom binary to $script_dir/loop/loom or set LOOM_BIN=/path/to/loom" >&2
   exit 1
 fi
 
@@ -128,5 +127,9 @@ echo "before_bytes=$before_bytes"
 echo "after_bytes=$after_bytes"
 echo "growth_bytes=$growth_bytes"
 echo "approx_payload_bytes=$payload_bytes"
+if [[ "$daemon_started" -eq 1 ]]; then
+  "$loom_bin" daemon stop "$store"
+  daemon_started=0
+fi
 "$loom_bin" store stat "$store"
 "$loom_bin" store attribution "$store" "$workspace" --format text --examples 6

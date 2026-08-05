@@ -125,6 +125,75 @@
   });
 }
 
+- (void)vectorTextUpsert:(NSString *)loomPath
+                 request:(NSArray *)request
+              passphrase:(NSString *)passphrase
+                     kek:(NSArray *)kek
+           authPrincipal:(NSString *)authPrincipal
+          authPassphrase:(NSString *)authPassphrase
+                 resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSUInteger rlen = 0;
+    unsigned char *rbuf = loomBytesFromArray(request, &rlen);
+    unsigned char *ptr = NULL;
+    uintptr_t len = 0;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_vector_text_upsert(h, rbuf, (uintptr_t)rlen, &ptr, &len);
+    }
+    free(rbuf);
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    resolve(loomArrayFromOwnedBytes(ptr, len));
+  });
+}
+
+- (void)vectorWorkspaceConfigureJson:(NSString *)loomPath
+                            workspace:(NSString *)ns
+                          requestJson:(NSString *)requestJson
+                           passphrase:(NSString *)passphrase
+                                  kek:(NSArray *)kek
+                        authPrincipal:(NSString *)authPrincipal
+                       authPassphrase:(NSString *)authPassphrase
+                              resolve:(RCTPromiseResolveBlock)resolve
+                               reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    char *out = NULL;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_vector_workspace_configure_json(h, ns.UTF8String, requestJson.UTF8String, &out);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSString *result = out ? [NSString stringWithUTF8String:out] : @"";
+    if (out) {
+      loom_string_free(out);
+    }
+    resolve(result);
+  });
+}
+
 - (void)vectorGet:(NSString *)loomPath
         workspace:(NSString *)ns
              name:(NSString *)name

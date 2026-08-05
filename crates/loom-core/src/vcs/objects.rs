@@ -16,16 +16,23 @@ pub struct ReachabilityMarkState {
     pub pinned: BTreeSet<Digest>,
     pub marked: BTreeSet<Digest>,
     pub queue: VecDeque<Digest>,
-    pub stream_roots: VecDeque<Digest>,
+    pub stream_roots: VecDeque<ReachabilityStreamRoot>,
     pub content_roots: VecDeque<Digest>,
     pub prolly_cursors: VecDeque<ReachabilityProllyCursor>,
     pub completed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReachabilityStreamRoot {
+    pub root: Digest,
+    pub retained_low_water: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReachabilityProllyCursor {
     pub cursor: crate::prolly::ProllyReachCursor,
     pub collect_stream_payloads: bool,
+    pub retained_low_water: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,9 +173,9 @@ impl<S: ObjectStore> Loom<S> {
         // Keep the persisted working trees' content alive too: a staged-but-uncommitted file is only
         // reachable through the content map, not from any ref, but it survives a reload (it is in the
         // engine state), so GC must not drop it.
-        let mut stream_roots: Vec<Digest> = Vec::new();
-        for wt in self.work.values() {
-            for staged in wt.values() {
+        let mut stream_roots: Vec<ReachabilityStreamRoot> = Vec::new();
+        for (ns, wt) in &self.work {
+            for (path, staged) in wt {
                 match staged {
                     StagedEntry::File(f) => {
                         if let Some(obj) = self.content.get(&f.content_addr) {
@@ -181,7 +188,10 @@ impl<S: ObjectStore> Loom<S> {
                     | StagedEntry::Ledger(tree)
                     | StagedEntry::Columnar(tree)
                     | StagedEntry::Document(tree) => tips.push(*tree),
-                    StagedEntry::Stream(root) => stream_roots.push(*root),
+                    StagedEntry::Stream(root) => stream_roots.push(ReachabilityStreamRoot {
+                        root: *root,
+                        retained_low_water: self.retained_low_water_for_stream_path(*ns, path),
+                    }),
                     StagedEntry::TimeSeries(root) => tips.push(*root),
                 }
             }
@@ -195,8 +205,12 @@ impl<S: ObjectStore> Loom<S> {
             }
         }
         let mut live = self.reachable(&tips, &BTreeSet::new())?;
-        for root in stream_roots {
-            for d in self.stream_reachable(root, &BTreeSet::new())? {
+        for stream in stream_roots {
+            for d in self.stream_reachable_from_low_water(
+                stream.root,
+                &BTreeSet::new(),
+                stream.retained_low_water,
+            )? {
                 live.insert(d);
             }
         }
@@ -335,8 +349,8 @@ impl<S: ObjectStore> Loom<S> {
                 }
             }
         }
-        for wt in self.work.values() {
-            for staged in wt.values() {
+        for (ns, wt) in &self.work {
+            for (path, staged) in wt {
                 match staged {
                     StagedEntry::File(f) => {
                         if let Some(obj) = self.content.get(&f.content_addr) {
@@ -348,7 +362,10 @@ impl<S: ObjectStore> Loom<S> {
                     | StagedEntry::Ledger(tree)
                     | StagedEntry::Columnar(tree)
                     | StagedEntry::Document(tree) => queue.push_back(*tree),
-                    StagedEntry::Stream(root) => stream_roots.push_back(*root),
+                    StagedEntry::Stream(root) => stream_roots.push_back(ReachabilityStreamRoot {
+                        root: *root,
+                        retained_low_water: self.retained_low_water_for_stream_path(*ns, path),
+                    }),
                     StagedEntry::TimeSeries(root) => queue.push_back(*root),
                 }
             }
@@ -428,6 +445,8 @@ impl<S: ObjectStore> Loom<S> {
                 continue;
             }
             if let Some(prolly) = state.prolly_cursors.front_mut() {
+                let collect_stream_payloads = prolly.collect_stream_payloads;
+                let retained_low_water = prolly.retained_low_water;
                 let step = crate::prolly::step_reachable_with_leaves(
                     &self.store,
                     &mut prolly.cursor,
@@ -438,11 +457,16 @@ impl<S: ObjectStore> Loom<S> {
                 for node in step.nodes {
                     state.marked.insert(node);
                 }
-                if prolly.collect_stream_payloads {
-                    for value in step.leaf_values {
-                        let payload_addr = stream_payload_address_from_record(&value)?;
-                        state.content_roots.push_back(payload_addr);
+                if collect_stream_payloads {
+                    let mut payload_roots = Vec::new();
+                    for (key, value) in step.leaf_entries {
+                        let seq = stream_sequence_from_key(&key)?;
+                        if seq < retained_low_water {
+                            continue;
+                        }
+                        payload_roots.extend(self.stream_entry_payload_roots(&value)?);
                     }
+                    state.content_roots.extend(payload_roots);
                 }
                 visited = visited.saturating_add(step.visited);
                 if step.completed {
@@ -452,8 +476,8 @@ impl<S: ObjectStore> Loom<S> {
                 }
                 continue;
             }
-            if let Some(root) = state.stream_roots.pop_front() {
-                self.enqueue_stream_root_mark(root, state)?;
+            if let Some(stream) = state.stream_roots.pop_front() {
+                self.enqueue_stream_root_mark(stream, state)?;
                 visited += 1;
                 continue;
             }
@@ -881,9 +905,13 @@ impl<S: ObjectStore> Loom<S> {
                 state.prolly_cursors.push_back(ReachabilityProllyCursor {
                     cursor: crate::prolly::ProllyReachCursor::new(entry.target),
                     collect_stream_payloads: false,
+                    retained_low_water: 0,
                 });
             }
-            EntryKind::Stream => state.stream_roots.push_back(entry.target),
+            EntryKind::Stream => state.stream_roots.push_back(ReachabilityStreamRoot {
+                root: entry.target,
+                retained_low_water: 0,
+            }),
         }
         Ok(())
     }
@@ -907,9 +935,10 @@ impl<S: ObjectStore> Loom<S> {
 
     fn enqueue_stream_root_mark(
         &self,
-        root: Digest,
+        stream: ReachabilityStreamRoot,
         state: &mut ReachabilityMarkState,
     ) -> Result<()> {
+        let root = stream.root;
         if !state.marked.insert(root) {
             return Ok(());
         }
@@ -922,15 +951,36 @@ impl<S: ObjectStore> Loom<S> {
                 "entries" => state.prolly_cursors.push_back(ReachabilityProllyCursor {
                     cursor: crate::prolly::ProllyReachCursor::new(entry.target),
                     collect_stream_payloads: true,
+                    retained_low_water: stream.retained_low_water,
                 }),
                 "consumers" => state.prolly_cursors.push_back(ReachabilityProllyCursor {
                     cursor: crate::prolly::ProllyReachCursor::new(entry.target),
                     collect_stream_payloads: false,
+                    retained_low_water: 0,
                 }),
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    fn stream_entry_payload_roots(&self, record: &[u8]) -> Result<Vec<Digest>> {
+        let payload_addr = stream_payload_address_from_record(record)?;
+        let mut roots = vec![payload_addr];
+        let payload = self.load_content(payload_addr)?;
+        if let Ok(envelope) = loom_delivery::decode_envelope(&payload) {
+            roots.push(envelope.payload_digest);
+        }
+        Ok(roots)
+    }
+
+    fn retained_low_water_for_stream_path(&self, ns: WorkspaceId, path: &str) -> u64 {
+        let root = crate::workspace::facet_root(crate::workspace::FacetKind::Queue);
+        let prefix = format!("{root}/");
+        path.strip_prefix(&prefix)
+            .and_then(|name| self.stream_low_water_marks.get(&(ns, name.to_string())))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn flatten_commit(&self, commit: Digest) -> Result<(FileMap, BTreeSet<String>)> {
@@ -1359,4 +1409,11 @@ fn stream_payload_address_from_record(value: &[u8]) -> Result<Digest> {
     let _len = f.uint()?;
     f.end()?;
     Ok(payload_addr)
+}
+
+fn stream_sequence_from_key(key: &[u8]) -> Result<u64> {
+    let bytes: [u8; 8] = key
+        .try_into()
+        .map_err(|_| LoomError::corrupt("stream entry key has invalid length"))?;
+    Ok(u64::from_be_bytes(bytes))
 }

@@ -8,6 +8,8 @@ function args(key?: LoomKey, auth?: LoomAuth): [string, number[], string, string
   return [passphrase, kek, authPrincipal, authPassphrase];
 }
 
+export type TicketReviewType = 'design_review' | 'code_review';
+
 export function ticketsProjectCreateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, keyPrefix: string, name: string, expectedRoot: string, key?: LoomKey, auth?: LoomAuth): Promise<string> {
   return UldrenLoom.ticketsProjectCreateJson(loomPath, workspace, ticketWorkspaceId, projectId, keyPrefix, name, expectedRoot, ...args(key, auth));
 }
@@ -16,12 +18,12 @@ export function ticketsProjectRekeyJson(loomPath: string, workspace: string, tic
   return UldrenLoom.ticketsProjectRekeyJson(loomPath, workspace, ticketWorkspaceId, projectId, keyPrefix, expectedRoot, ...args(key, auth));
 }
 
-export function ticketsProjectSettingsGetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, key?: LoomKey, auth?: LoomAuth): Promise<string> {
-  return UldrenLoom.ticketsProjectSettingsGetJson(loomPath, workspace, ticketWorkspaceId, projectId, ...args(key, auth));
+export function ticketsProjectSettingsGetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, includeContracts = false, key?: LoomKey, auth?: LoomAuth): Promise<string> {
+  return UldrenLoom.ticketsProjectSettingsGetJson(loomPath, workspace, ticketWorkspaceId, projectId, includeContracts, ...args(key, auth));
 }
 
-export function ticketsProjectSettingsSetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, defaultProjection: string | null | undefined, enableProjectionsJson: string, disableProjectionsJson: string, actorEnforcement: string | null | undefined, projectOwnerPrincipal: string | null | undefined, clearProjectOwnerPrincipal: boolean, acceptanceAuthoritiesJson: string | null | undefined, expectedRoot: string, key?: LoomKey, auth?: LoomAuth): Promise<string> {
-  return UldrenLoom.ticketsProjectSettingsSetJson(loomPath, workspace, ticketWorkspaceId, projectId, defaultProjection ?? '', enableProjectionsJson, disableProjectionsJson, actorEnforcement ?? '', projectOwnerPrincipal ?? '', clearProjectOwnerPrincipal, acceptanceAuthoritiesJson ?? '', expectedRoot, ...args(key, auth));
+export function ticketsProjectSettingsSetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, defaultProjection: string | null | undefined, enableProjectionsJson: string, disableProjectionsJson: string, actorEnforcement: string | null | undefined, projectOwnerPrincipal: string | null | undefined, clearProjectOwnerPrincipal: boolean, acceptanceAuthoritiesJson: string | null | undefined, expectedRoot: string, key?: LoomKey, auth?: LoomAuth, acceptanceEvidenceEnforcement?: boolean | null, requiredAcceptanceEvidenceKeysJson?: string | null, requiredAcceptanceReviews?: TicketReviewType[] | null, ownerContractSummary?: string | null, ownerContractDetails?: string | null, workerContractSummary?: string | null, workerContractDetails?: string | null): Promise<string> {
+  return UldrenLoom.ticketsProjectSettingsSetJson(loomPath, workspace, ticketWorkspaceId, projectId, defaultProjection ?? '', enableProjectionsJson, disableProjectionsJson, actorEnforcement ?? '', projectOwnerPrincipal ?? '', clearProjectOwnerPrincipal, acceptanceAuthoritiesJson ?? '', acceptanceEvidenceEnforcement ?? false, acceptanceEvidenceEnforcement != null, requiredAcceptanceEvidenceKeysJson ?? '', requiredAcceptanceReviews == null ? '' : JSON.stringify(requiredAcceptanceReviews), ownerContractSummary ?? '', ownerContractDetails ?? '', workerContractSummary ?? '', workerContractDetails ?? '', expectedRoot, ...args(key, auth));
 }
 
 export function ticketsFieldsJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, projection = 'native', operation = 'create', key?: LoomKey, auth?: LoomAuth): Promise<string> {

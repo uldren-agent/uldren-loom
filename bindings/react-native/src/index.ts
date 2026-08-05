@@ -24,6 +24,8 @@ export * from './facets/tickets';
 export * from './facets/pages';
 export * from './facets/lanes';
 export * from './facets/chat';
+export * from './facets/security_admin';
+export * from './facets/operational';
 export * from './facets/graph';
 export * from './facets/vector';
 export * from './facets/columnar';

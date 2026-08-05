@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 
 const KEY_SCHEMA: &[u8] = b"loom.mutable-overlay.key.v1";
 const TOKEN_SCHEMA: &[u8] = b"loom.mutable-overlay.owner-token.v1";
+const OVERLAY_KEY_SEGMENT_COUNT: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OverlayDurabilityPolicy {
@@ -87,13 +88,11 @@ pub struct OverlayKey(Vec<u8>);
 
 impl OverlayKey {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        if !bytes.starts_with(KEY_SCHEMA) {
-            return Err(LoomError::corrupt("overlay key schema mismatch"));
-        }
+        validate_overlay_key_framing(&bytes)?;
         Ok(Self(bytes))
     }
 
-    pub fn from_segments(segments: [&[u8]; 6]) -> Result<Self> {
+    pub fn from_segments(segments: [&[u8]; OVERLAY_KEY_SEGMENT_COUNT as usize]) -> Result<Self> {
         let mut out = Vec::new();
         out.extend_from_slice(KEY_SCHEMA);
         out.push(segments.len() as u8);
@@ -105,6 +104,28 @@ impl OverlayKey {
             out.extend_from_slice(segment);
         }
         Ok(Self(out))
+    }
+
+    pub fn prefix_from_segments<const N: usize>(
+        total_segments: u8,
+        segments: [&[u8]; N],
+    ) -> Result<OverlayKeyPrefix> {
+        if usize::from(total_segments) < N {
+            return Err(LoomError::invalid(
+                "overlay key prefix exceeds segment count",
+            ));
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(KEY_SCHEMA);
+        out.push(total_segments);
+        for segment in segments {
+            if segment.len() > u32::MAX as usize {
+                return Err(LoomError::invalid("overlay key segment too long"));
+            }
+            out.extend_from_slice(&(segment.len() as u32).to_be_bytes());
+            out.extend_from_slice(segment);
+        }
+        OverlayKeyPrefix::from_encoded_bytes(out)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -119,6 +140,9 @@ impl OverlayKey {
         let Some(count) = self.0.get(pos).copied() else {
             return Err(LoomError::corrupt("overlay key segment count missing"));
         };
+        if count != OVERLAY_KEY_SEGMENT_COUNT {
+            return Err(LoomError::corrupt("overlay key segment count mismatch"));
+        }
         pos += 1;
         let mut segments = Vec::with_capacity(count as usize);
         for _ in 0..count {
@@ -144,11 +168,86 @@ impl OverlayKey {
     }
 
     pub fn from_encoded_bytes(bytes: Vec<u8>) -> Result<Self> {
-        if !bytes.starts_with(KEY_SCHEMA) {
-            return Err(LoomError::corrupt("unknown overlay key schema"));
-        }
+        validate_overlay_key_framing(&bytes)?;
         Ok(Self(bytes))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayKeyPrefix(Vec<u8>);
+
+impl OverlayKeyPrefix {
+    pub fn from_encoded_bytes(bytes: Vec<u8>) -> Result<Self> {
+        validate_overlay_key_prefix_framing(&bytes)?;
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn start_key(&self) -> Result<OverlayKey> {
+        Ok(OverlayKey(self.0.clone()))
+    }
+
+    fn end_key(&self) -> Result<Option<OverlayKey>> {
+        Ok(byte_prefix_successor(&self.0).map(OverlayKey))
+    }
+}
+
+fn validate_overlay_key_framing(bytes: &[u8]) -> Result<()> {
+    let parsed = validate_overlay_key_common_framing(bytes, "overlay key")?;
+    if parsed != usize::from(OVERLAY_KEY_SEGMENT_COUNT) {
+        return Err(LoomError::corrupt("overlay key segment count mismatch"));
+    }
+    Ok(())
+}
+
+fn validate_overlay_key_prefix_framing(bytes: &[u8]) -> Result<()> {
+    let parsed = validate_overlay_key_common_framing(bytes, "overlay key prefix")?;
+    if parsed == 0 {
+        return Err(LoomError::corrupt("overlay key prefix has no segments"));
+    }
+    Ok(())
+}
+
+fn validate_overlay_key_common_framing(bytes: &[u8], label: &str) -> Result<usize> {
+    if !bytes.starts_with(KEY_SCHEMA) {
+        return Err(LoomError::corrupt(format!("unknown {label} schema")));
+    }
+    let mut pos = KEY_SCHEMA.len();
+    let Some(count) = bytes.get(pos).copied() else {
+        return Err(LoomError::corrupt(format!("{label} segment count missing")));
+    };
+    if count != OVERLAY_KEY_SEGMENT_COUNT {
+        return Err(LoomError::corrupt(format!(
+            "{label} segment count mismatch"
+        )));
+    }
+    pos += 1;
+    let mut parsed = 0usize;
+    while pos < bytes.len() {
+        if parsed >= usize::from(count) {
+            return Err(LoomError::corrupt(format!("{label} has too many segments")));
+        }
+        if pos + 4 > bytes.len() {
+            return Err(LoomError::corrupt(format!(
+                "{label} segment length truncated"
+            )));
+        }
+        let len = u32::from_be_bytes(
+            bytes[pos..pos + 4]
+                .try_into()
+                .map_err(|_| LoomError::corrupt(format!("{label} segment length invalid")))?,
+        ) as usize;
+        pos += 4;
+        if pos + len > bytes.len() {
+            return Err(LoomError::corrupt(format!("{label} segment truncated")));
+        }
+        pos += len;
+        parsed += 1;
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,7 +283,7 @@ pub struct MutableOverlay {
     generation: u64,
     entries: Arc<RwLock<Vec<OverlayEntry>>>,
     owner_tokens: BTreeMap<OverlayKey, OverlayOwnerToken>,
-    current_entries: BTreeMap<OverlayKey, MutableOverlayEntrySnapshot>,
+    current_entry_index: Arc<RwLock<BTreeMap<OverlayKey, Vec<usize>>>>,
     parent: Option<OverlaySnapshot>,
 }
 
@@ -403,7 +502,7 @@ impl MutableOverlay {
             generation: snapshot.generation().as_u64(),
             entries: Arc::new(RwLock::new(Vec::new())),
             owner_tokens: BTreeMap::new(),
-            current_entries: BTreeMap::new(),
+            current_entry_index: Arc::new(RwLock::new(BTreeMap::new())),
             parent: Some(snapshot),
         }
     }
@@ -416,6 +515,7 @@ impl MutableOverlay {
         OverlaySnapshot {
             generation: self.generation(),
             entries: Arc::clone(&self.entries),
+            current_entry_index: Arc::clone(&self.current_entry_index),
             parent: self.parent.clone().map(Arc::new),
         }
     }
@@ -467,23 +567,87 @@ impl MutableOverlay {
     }
 
     pub fn export_entries(&self) -> Result<Vec<MutableOverlayEntrySnapshot>> {
-        Ok(self
-            .snapshot()
-            .entries()?
-            .into_iter()
-            .map(|entry| MutableOverlayEntrySnapshot {
+        self.export_entries_with_progress(|_, _| {})
+    }
+
+    pub fn export_entries_with_progress(
+        &self,
+        mut progress: impl FnMut(u64, u64),
+    ) -> Result<Vec<MutableOverlayEntrySnapshot>> {
+        let entries = self.snapshot().entries()?;
+        let total = entries.len() as u64;
+        let mut snapshots = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.into_iter().enumerate() {
+            progress(index as u64, total);
+            snapshots.push(MutableOverlayEntrySnapshot {
                 generation: entry.generation,
                 key: entry.key,
                 owner_token: entry.owner_token,
                 kind: entry.kind,
                 payload: entry.payload,
-            })
-            .collect())
+            });
+        }
+        progress(total, total);
+        Ok(snapshots)
+    }
+
+    pub fn export_entries_with_key_prefix(
+        &self,
+        prefix: &OverlayKeyPrefix,
+    ) -> Result<Vec<MutableOverlayEntrySnapshot>> {
+        let mut entries = BTreeMap::new();
+        if let Some(parent) = &self.parent {
+            for entry in parent.current_entries_with_key_prefix(prefix)? {
+                entries.insert(entry.key.clone(), entry);
+            }
+        }
+        let start = prefix.start_key()?;
+        match prefix.end_key()? {
+            Some(end) => {
+                let local_entries = self.entries.read().map_err(|_| entry_storage_poisoned())?;
+                let current_entry_index = self
+                    .current_entry_index
+                    .read()
+                    .map_err(|_| entry_storage_poisoned())?;
+                for (key, history) in current_entry_index.range(start..end) {
+                    if let Some(entry) =
+                        latest_visible_entry(&local_entries, history, self.generation())
+                    {
+                        entries.insert(key.clone(), entry);
+                    }
+                }
+            }
+            None => {
+                let local_entries = self.entries.read().map_err(|_| entry_storage_poisoned())?;
+                let current_entry_index = self
+                    .current_entry_index
+                    .read()
+                    .map_err(|_| entry_storage_poisoned())?;
+                for (key, history) in current_entry_index.range(start..) {
+                    if let Some(entry) =
+                        latest_visible_entry(&local_entries, history, self.generation())
+                    {
+                        entries.insert(key.clone(), entry);
+                    }
+                }
+            }
+        }
+        Ok(entries.into_values().collect())
     }
 
     pub fn import_entries(entries: &[MutableOverlayEntrySnapshot]) -> Result<Self> {
+        Self::import_entries_with_progress(entries, |_, _| {})
+    }
+
+    pub fn import_entries_with_progress(
+        entries: &[MutableOverlayEntrySnapshot],
+        mut progress: impl FnMut(u64, u64),
+    ) -> Result<Self> {
         let mut overlay = Self::new();
-        for entry in entries {
+        let total = entries.len() as u64;
+        let mut seen = BTreeSet::new();
+        for (index, entry) in entries.iter().enumerate() {
+            progress(index as u64, total);
             let generation = if entry.generation.0 == 0 {
                 overlay
                     .generation
@@ -492,12 +656,17 @@ impl MutableOverlay {
             } else {
                 entry.generation.0
             };
-            if generation <= overlay.generation {
+            if generation < overlay.generation {
                 return Err(LoomError::invalid(
-                    "overlay import entries must have increasing generations",
+                    "overlay import entries must not decrease generations",
                 ));
             }
-            overlay.generation = generation;
+            if !seen.insert((generation, entry.key.clone())) {
+                return Err(LoomError::invalid(
+                    "overlay import entries must not repeat a key in one generation",
+                ));
+            }
+            overlay.generation = overlay.generation.max(generation);
             let imported = OverlayEntry {
                 generation: OverlayGeneration(overlay.generation),
                 key: entry.key.clone(),
@@ -508,22 +677,22 @@ impl MutableOverlay {
             overlay
                 .owner_tokens
                 .insert(imported.key.clone(), imported.owner_token.clone());
-            overlay.current_entries.insert(
-                imported.key.clone(),
-                MutableOverlayEntrySnapshot {
-                    generation: imported.generation,
-                    key: imported.key.clone(),
-                    owner_token: imported.owner_token.clone(),
-                    kind: imported.kind,
-                    payload: imported.payload.clone(),
-                },
-            );
-            overlay
+            let index_key = imported.key.clone();
+            let mut overlay_entries = overlay
                 .entries
                 .write()
+                .map_err(|_| entry_storage_poisoned())?;
+            let entry_index = overlay_entries.len();
+            overlay_entries.push(imported);
+            overlay
+                .current_entry_index
+                .write()
                 .map_err(|_| entry_storage_poisoned())?
-                .push(imported);
+                .entry(index_key)
+                .or_default()
+                .push(entry_index);
         }
+        progress(total, total);
         Ok(overlay)
     }
 
@@ -558,6 +727,64 @@ impl MutableOverlay {
         )
     }
 
+    pub fn put_entries_in_next_generation(
+        &mut self,
+        writes: Vec<(
+            OverlayKey,
+            Option<OverlayOwnerToken>,
+            OverlayEntryKind,
+            Vec<u8>,
+        )>,
+    ) -> Result<Vec<OverlayOwnerToken>> {
+        if writes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut seen = BTreeSet::new();
+        for (key, expected_owner_token, _, _) in &writes {
+            if !seen.insert(key.clone()) {
+                return Err(LoomError::invalid(
+                    "overlay transaction cannot write the same key twice",
+                ));
+            }
+            let current = self.current_owner_token(key)?;
+            if current.as_ref() != expected_owner_token.as_ref() {
+                return Err(LoomError::new(
+                    Code::Conflict,
+                    "overlay owner token does not match current record",
+                ));
+            }
+        }
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| LoomError::invalid("overlay generation overflow"))?;
+        let generation = self.generation();
+        let mut owner_tokens = Vec::with_capacity(writes.len());
+        let mut entries = self.entries.write().map_err(|_| entry_storage_poisoned())?;
+        let mut current_entry_index = self
+            .current_entry_index
+            .write()
+            .map_err(|_| entry_storage_poisoned())?;
+        for (key, expected_owner_token, kind, payload) in writes {
+            let owner_token = owner_token(&key, expected_owner_token.as_ref(), kind, &payload);
+            let entry_index = entries.len();
+            entries.push(OverlayEntry {
+                generation,
+                key: key.clone(),
+                owner_token: owner_token.clone(),
+                kind,
+                payload,
+            });
+            current_entry_index
+                .entry(key.clone())
+                .or_default()
+                .push(entry_index);
+            self.owner_tokens.insert(key, owner_token.clone());
+            owner_tokens.push(owner_token);
+        }
+        Ok(owner_tokens)
+    }
+
     fn write(
         &mut self,
         key: OverlayKey,
@@ -585,30 +812,34 @@ impl MutableOverlay {
             kind,
             payload,
         };
-        self.entries
+        let mut entries = self.entries.write().map_err(|_| entry_storage_poisoned())?;
+        let entry_index = entries.len();
+        entries.push(entry);
+        self.current_entry_index
             .write()
             .map_err(|_| entry_storage_poisoned())?
-            .push(entry.clone());
-        self.current_entries.insert(
-            key.clone(),
-            MutableOverlayEntrySnapshot {
-                generation,
-                key: key.clone(),
-                owner_token: owner_token.clone(),
-                kind,
-                payload: entry.payload,
-            },
-        );
+            .entry(key.clone())
+            .or_default()
+            .push(entry_index);
         self.owner_tokens.insert(key, owner_token.clone());
         Ok(owner_token)
     }
 
     pub fn current_entry(&self, key: &OverlayKey) -> Option<MutableOverlayEntrySnapshot> {
-        self.current_entries.get(key).cloned().or_else(|| {
-            self.parent
-                .as_ref()
-                .and_then(|parent| parent.current_entry(key).ok().flatten())
-        })
+        self.entries
+            .read()
+            .ok()
+            .zip(self.current_entry_index.read().ok())
+            .and_then(|(entries, current_entry_index)| {
+                current_entry_index
+                    .get(key)
+                    .and_then(|history| latest_visible_entry(&entries, history, self.generation()))
+            })
+            .or_else(|| {
+                self.parent
+                    .as_ref()
+                    .and_then(|parent| parent.current_entry(key).ok().flatten())
+            })
     }
 
     pub fn synchronize_current_entry(&mut self, entry: MutableOverlayEntrySnapshot) -> Result<()> {
@@ -627,13 +858,17 @@ impl MutableOverlay {
             kind: entry.kind,
             payload: entry.payload.clone(),
         };
-        self.entries
-            .write()
-            .map_err(|_| entry_storage_poisoned())?
-            .push(imported);
+        let mut entries = self.entries.write().map_err(|_| entry_storage_poisoned())?;
+        let entry_index = entries.len();
+        entries.push(imported);
         self.owner_tokens
             .insert(entry.key.clone(), entry.owner_token.clone());
-        self.current_entries.insert(entry.key.clone(), entry);
+        self.current_entry_index
+            .write()
+            .map_err(|_| entry_storage_poisoned())?
+            .entry(entry.key.clone())
+            .or_default()
+            .push(entry_index);
         Ok(())
     }
 
@@ -649,10 +884,45 @@ impl MutableOverlay {
     }
 }
 
+fn byte_prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for byte in end.iter_mut().rev() {
+        if *byte != u8::MAX {
+            *byte += 1;
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn latest_visible_entry(
+    entries: &[OverlayEntry],
+    history: &[usize],
+    generation: OverlayGeneration,
+) -> Option<MutableOverlayEntrySnapshot> {
+    history
+        .iter()
+        .rev()
+        .filter_map(|entry_index| entries.get(*entry_index))
+        .find(|entry| entry.generation <= generation)
+        .map(entry_snapshot)
+}
+
+fn entry_snapshot(entry: &OverlayEntry) -> MutableOverlayEntrySnapshot {
+    MutableOverlayEntrySnapshot {
+        generation: entry.generation,
+        key: entry.key.clone(),
+        owner_token: entry.owner_token.clone(),
+        kind: entry.kind,
+        payload: entry.payload.clone(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OverlaySnapshot {
     generation: OverlayGeneration,
     entries: Arc<RwLock<Vec<OverlayEntry>>>,
+    current_entry_index: Arc<RwLock<BTreeMap<OverlayKey, Vec<usize>>>>,
     parent: Option<Arc<OverlaySnapshot>>,
 }
 
@@ -686,20 +956,14 @@ impl OverlaySnapshot {
     }
 
     fn current_entry(&self, key: &OverlayKey) -> Result<Option<MutableOverlayEntrySnapshot>> {
-        let current = self
-            .entries
+        let local_entries = self.entries.read().map_err(|_| entry_storage_poisoned())?;
+        let current_entry_index = self
+            .current_entry_index
             .read()
-            .map_err(|_| entry_storage_poisoned())?
-            .iter()
-            .rev()
-            .find(|entry| &entry.key == key && entry.generation <= self.generation)
-            .map(|entry| MutableOverlayEntrySnapshot {
-                generation: entry.generation,
-                key: entry.key.clone(),
-                owner_token: entry.owner_token.clone(),
-                kind: entry.kind,
-                payload: entry.payload.clone(),
-            });
+            .map_err(|_| entry_storage_poisoned())?;
+        let current = current_entry_index
+            .get(key)
+            .and_then(|history| latest_visible_entry(&local_entries, history, self.generation));
         match current {
             Some(entry) => Ok(Some(entry)),
             None => self
@@ -709,6 +973,50 @@ impl OverlaySnapshot {
                 .transpose()
                 .map(Option::flatten),
         }
+    }
+
+    fn current_entries_with_key_prefix(
+        &self,
+        prefix: &OverlayKeyPrefix,
+    ) -> Result<Vec<MutableOverlayEntrySnapshot>> {
+        let mut entries = BTreeMap::new();
+        if let Some(parent) = &self.parent {
+            for entry in parent.current_entries_with_key_prefix(prefix)? {
+                entries.insert(entry.key.clone(), entry);
+            }
+        }
+        let start = prefix.start_key()?;
+        match prefix.end_key()? {
+            Some(end) => {
+                let local_entries = self.entries.read().map_err(|_| entry_storage_poisoned())?;
+                let current_entry_index = self
+                    .current_entry_index
+                    .read()
+                    .map_err(|_| entry_storage_poisoned())?;
+                for (key, history) in current_entry_index.range(start..end) {
+                    if let Some(entry) =
+                        latest_visible_entry(&local_entries, history, self.generation)
+                    {
+                        entries.insert(key.clone(), entry);
+                    }
+                }
+            }
+            None => {
+                let local_entries = self.entries.read().map_err(|_| entry_storage_poisoned())?;
+                let current_entry_index = self
+                    .current_entry_index
+                    .read()
+                    .map_err(|_| entry_storage_poisoned())?;
+                for (key, history) in current_entry_index.range(start..) {
+                    if let Some(entry) =
+                        latest_visible_entry(&local_entries, history, self.generation)
+                    {
+                        entries.insert(key.clone(), entry);
+                    }
+                }
+            }
+        }
+        Ok(entries.into_values().collect())
     }
 
     fn entries(&self) -> Result<Vec<OverlayEntry>> {
@@ -830,6 +1138,14 @@ mod tests {
         scoped_key(&[7; 16], b"document", record_id)
     }
 
+    fn key_prefix(scope_id: &[u8], domain: &[u8]) -> OverlayKeyPrefix {
+        OverlayKey::prefix_from_segments(
+            6,
+            [b"workspace", scope_id, domain, b"notes", b"document-head"],
+        )
+        .unwrap()
+    }
+
     fn base(
         values: BTreeMap<OverlayKey, Vec<u8>>,
     ) -> impl Fn(&OverlayKey) -> Result<Option<Vec<u8>>> {
@@ -868,6 +1184,149 @@ mod tests {
             .unwrap();
 
         assert_eq!(read, None);
+    }
+
+    #[test]
+    fn prefix_selection_uses_forked_parent_current_range_only() {
+        let wanted = scoped_key(&[7; 16], b"tickets", b"lane-a");
+        let prefix = key_prefix(&[7; 16], b"tickets");
+        let mut parent = MutableOverlay::new();
+        for index in 0..200 {
+            let unrelated = scoped_key(&[7; 16], b"document", format!("doc-{index}").as_bytes());
+            parent
+                .put_value(unrelated, None, format!("unrelated-{index}").into_bytes())
+                .unwrap();
+        }
+        parent
+            .put_value(wanted.clone(), None, b"lane".to_vec())
+            .unwrap();
+        let mut fork = MutableOverlay::fork_from_snapshot(parent.snapshot());
+        for index in 0..200 {
+            let unrelated = scoped_key(&[8; 16], b"tickets", format!("ticket-{index}").as_bytes());
+            fork.put_value(unrelated, None, format!("local-{index}").into_bytes())
+                .unwrap();
+        }
+
+        let entries = fork.export_entries_with_key_prefix(&prefix).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, wanted);
+        assert_eq!(entries[0].payload, b"lane");
+    }
+
+    #[test]
+    fn snapshot_creation_shares_current_entry_index_without_cloning_records() {
+        let mut overlay = MutableOverlay::new();
+        for index in 0..200 {
+            overlay
+                .put_value(
+                    key(format!("doc-{index}").as_bytes()),
+                    None,
+                    format!("payload-{index}").into_bytes(),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(Arc::strong_count(&overlay.current_entry_index), 1);
+        let snapshot = overlay.snapshot();
+
+        assert_eq!(Arc::strong_count(&overlay.current_entry_index), 2);
+        assert!(Arc::ptr_eq(
+            &overlay.current_entry_index,
+            &snapshot.current_entry_index
+        ));
+        assert_eq!(
+            snapshot
+                .current_entry(&key(b"doc-199"))
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"payload-199"
+        );
+    }
+
+    #[test]
+    fn current_entry_index_retains_log_positions_not_payload_copies() {
+        let item = key(b"doc-owned-once");
+        let mut overlay = MutableOverlay::new();
+        let mut expected = None;
+        for index in 0..32 {
+            let token = overlay
+                .put_value(
+                    item.clone(),
+                    expected.as_ref(),
+                    format!("payload-{index}").into_bytes(),
+                )
+                .unwrap();
+            expected = Some(token);
+        }
+
+        let entries = overlay.entries.read().unwrap();
+        let current_entry_index = overlay.current_entry_index.read().unwrap();
+        let indexes = current_entry_index.get(&item).unwrap();
+
+        assert_eq!(entries.len(), 32);
+        assert_eq!(indexes.len(), 32);
+        for (expected_index, entry_index) in indexes.iter().copied().enumerate() {
+            assert_eq!(entry_index, expected_index);
+            assert_eq!(
+                entries[entry_index].payload,
+                format!("payload-{expected_index}").into_bytes()
+            );
+        }
+        assert_eq!(
+            std::mem::size_of_val(indexes.as_slice()),
+            32 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn malformed_overlay_key_prefixes_fail_closed() {
+        assert!(OverlayKeyPrefix::from_encoded_bytes(b"not-a-key".to_vec()).is_err());
+        let mut missing_count = KEY_SCHEMA.to_vec();
+        assert!(OverlayKeyPrefix::from_encoded_bytes(missing_count.clone()).is_err());
+        missing_count.push(1);
+        missing_count.extend_from_slice(&5u32.to_be_bytes());
+        missing_count.extend_from_slice(b"abc");
+        assert!(OverlayKeyPrefix::from_encoded_bytes(missing_count).is_err());
+
+        let mut too_many_segments = KEY_SCHEMA.to_vec();
+        too_many_segments.push(0);
+        too_many_segments.extend_from_slice(&0u32.to_be_bytes());
+        assert!(OverlayKeyPrefix::from_encoded_bytes(too_many_segments).is_err());
+
+        let mut trailing_segment = KEY_SCHEMA.to_vec();
+        trailing_segment.push(1);
+        trailing_segment.extend_from_slice(&0u32.to_be_bytes());
+        trailing_segment.extend_from_slice(&0u32.to_be_bytes());
+        assert!(OverlayKeyPrefix::from_encoded_bytes(trailing_segment).is_err());
+
+        let mut wrong_declared_count = KEY_SCHEMA.to_vec();
+        wrong_declared_count.push(7);
+        wrong_declared_count.extend_from_slice(&0u32.to_be_bytes());
+        assert!(OverlayKeyPrefix::from_encoded_bytes(wrong_declared_count).is_err());
+
+        let mut no_bounded_segment = KEY_SCHEMA.to_vec();
+        no_bounded_segment.push(6);
+        assert!(OverlayKeyPrefix::from_encoded_bytes(no_bounded_segment).is_err());
+
+        let valid_partial = OverlayKey::prefix_from_segments(
+            6,
+            [
+                b"workspace",
+                &[7; 16],
+                b"document",
+                b"notes",
+                b"document-head",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            OverlayKeyPrefix::from_encoded_bytes(valid_partial.as_bytes().to_vec())
+                .unwrap()
+                .as_bytes(),
+            valid_partial.as_bytes()
+        );
     }
 
     #[test]

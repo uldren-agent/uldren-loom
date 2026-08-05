@@ -228,3 +228,10 @@ all = { level = "warn", priority = -1 }
 codegen-units = 1
 lto = "thin"
 strip = true
+
+# Keeps the full CLI practical for local debugging without overflowing Apple's
+# compact-unwind table as the workspace grows.
+[profile.dev-cli]
+inherits = "dev"
+debug = 1
+opt-level = 1

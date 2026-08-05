@@ -88,9 +88,9 @@ LANES_STRING(lanesTicketRemove, ticketId, loom_lanes_ticket_remove_cbor)
   } resolve:resolve reject:reject];
 }
 
-- (void)lanesTicketAdd:(NSString *)loomPath workspace:(NSString *)workspace laneId:(NSString *)laneId ticketId:(NSString *)ticketId updatedBy:(NSString *)updatedBy placement:(NSString *)placement anchor:(NSString *)anchor passphrase:(NSString *)passphrase kek:(NSArray *)kek authPrincipal:(NSString *)authPrincipal authPassphrase:(NSString *)authPassphrase resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+- (void)lanesTicketAdd:(NSString *)loomPath workspace:(NSString *)workspace laneId:(NSString *)laneId ticketId:(NSString *)ticketId updatedBy:(NSString *)updatedBy placement:(NSNumber *)placement anchor:(NSString *)anchor passphrase:(NSString *)passphrase kek:(NSArray *)kek authPrincipal:(NSString *)authPrincipal authPassphrase:(NSString *)authPassphrase resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
   [self lanesBytes:loomPath passphrase:passphrase kek:kek authPrincipal:authPrincipal authPassphrase:authPassphrase call:^int32_t(LoomSession *h, unsigned char **ptr, uintptr_t *len) {
-    return loom_lanes_ticket_add_cbor(h, workspace.UTF8String, laneId.UTF8String, ticketId.UTF8String, updatedBy.UTF8String, placement.UTF8String, anchor.UTF8String, ptr, len);
+    return loom_lanes_ticket_add_cbor(h, workspace.UTF8String, laneId.UTF8String, ticketId.UTF8String, updatedBy.UTF8String, placement.intValue, anchor.UTF8String, ptr, len);
   } resolve:resolve reject:reject];
 }
 

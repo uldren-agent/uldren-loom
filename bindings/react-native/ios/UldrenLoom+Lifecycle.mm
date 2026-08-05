@@ -99,4 +99,203 @@
   });
 }
 
+- (void)lifecycleDefineStandardJson:(NSString *)loomPath
+                           workspace:(NSString *)workspace
+                                kind:(NSString *)kind
+                             version:(NSString *)version
+           completionPredicateDigest:(NSString *)completionPredicateDigest
+                          passphrase:(NSString *)passphrase
+                                 kek:(NSArray *)kek
+                       authPrincipal:(NSString *)authPrincipal
+                      authPassphrase:(NSString *)authPassphrase
+                             resolve:(RCTPromiseResolveBlock)resolve
+                              reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    char *out = NULL;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_lifecycle_define_standard_json(
+          h, workspace.UTF8String, kind.UTF8String, version.UTF8String,
+          completionPredicateDigest.UTF8String, &out);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSString *result = out ? [NSString stringWithUTF8String:out] : @"";
+    if (out) {
+      loom_string_free(out);
+    }
+    resolve(result);
+  });
+}
+
+- (void)lifecycleDefineJson:(NSString *)loomPath
+                  workspace:(NSString *)workspace
+                 definition:(NSArray *)definition
+                 passphrase:(NSString *)passphrase
+                        kek:(NSArray *)kek
+              authPrincipal:(NSString *)authPrincipal
+             authPassphrase:(NSString *)authPassphrase
+                    resolve:(RCTPromiseResolveBlock)resolve
+                     reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSUInteger len = 0;
+    unsigned char *buf = loomBytesFromArray(definition, &len);
+    char *out = NULL;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_lifecycle_define_json(h, workspace.UTF8String, buf, (uintptr_t)len, &out);
+    }
+    free(buf);
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSString *result = out ? [NSString stringWithUTF8String:out] : @"";
+    if (out) {
+      loom_string_free(out);
+    }
+    resolve(result);
+  });
+}
+
+- (void)lifecycleInstantiateJson:(NSString *)loomPath
+                       workspace:(NSString *)workspace
+                      instanceId:(NSString *)instanceId
+                    definitionId:(NSString *)definitionId
+                 subjectRefsJson:(NSString *)subjectRefsJson
+                      passphrase:(NSString *)passphrase
+                             kek:(NSArray *)kek
+                   authPrincipal:(NSString *)authPrincipal
+                  authPassphrase:(NSString *)authPassphrase
+                         resolve:(RCTPromiseResolveBlock)resolve
+                          reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    char *out = NULL;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_lifecycle_instantiate_json(
+          h, workspace.UTF8String, instanceId.UTF8String, definitionId.UTF8String,
+          subjectRefsJson.UTF8String, &out);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSString *result = out ? [NSString stringWithUTF8String:out] : @"";
+    if (out) {
+      loom_string_free(out);
+    }
+    resolve(result);
+  });
+}
+
+- (void)lifecycleTransitionJson:(NSString *)loomPath
+                      workspace:(NSString *)workspace
+                     instanceId:(NSString *)instanceId
+                   transitionId:(NSString *)transitionId
+                      toStageId:(NSString *)toStageId
+               actorPrincipalId:(NSString *)actorPrincipalId
+            gateEvaluationsJson:(NSString *)gateEvaluationsJson
+                 snapshotDigest:(NSString *)snapshotDigest
+                     passphrase:(NSString *)passphrase
+                            kek:(NSArray *)kek
+                  authPrincipal:(NSString *)authPrincipal
+                 authPassphrase:(NSString *)authPassphrase
+                        resolve:(RCTPromiseResolveBlock)resolve
+                         reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    char *out = NULL;
+    const char *actor = actorPrincipalId != nil ? actorPrincipalId.UTF8String : NULL;
+    const char *snapshot = snapshotDigest != nil ? snapshotDigest.UTF8String : NULL;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_lifecycle_transition_json(
+          h, workspace.UTF8String, instanceId.UTF8String, transitionId.UTF8String,
+          toStageId.UTF8String, actor, gateEvaluationsJson.UTF8String, snapshot, &out);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSString *result = out ? [NSString stringWithUTF8String:out] : @"";
+    if (out) {
+      loom_string_free(out);
+    }
+    resolve(result);
+  });
+}
+
+- (void)refsReconcileJson:(NSString *)loomPath
+                workspace:(NSString *)workspace
+                      max:(NSString *)max
+               passphrase:(NSString *)passphrase
+                      kek:(NSArray *)kek
+            authPrincipal:(NSString *)authPrincipal
+           authPassphrase:(NSString *)authPassphrase
+                  resolve:(RCTPromiseResolveBlock)resolve
+                   reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    uint64_t maxValue = 0;
+    if (!loomResolveU64(max, &maxValue, reject)) {
+      return;
+    }
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    char *out = NULL;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_refs_reconcile_json(h, workspace.UTF8String, maxValue, &out);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSString *result = out ? [NSString stringWithUTF8String:out] : @"";
+    if (out) {
+      loom_string_free(out);
+    }
+    resolve(result);
+  });
+}
+
 @end

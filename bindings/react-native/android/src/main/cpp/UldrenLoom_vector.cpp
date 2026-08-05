@@ -154,6 +154,67 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeVectorGet(
 }
 
 extern "C" JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeVectorTextUpsert(
+    JNIEnv *env, jobject thiz, jstring loomPath, jbyteArray request, jbyteArray passphrase,
+    jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openAuthenticatedStoreKeyed(env, p, passphrase, kek, authPrincipal, authPassphrase, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jsize rlen = (request != nullptr) ? env->GetArrayLength(request) : 0;
+  jbyte *r = (request != nullptr) ? env->GetByteArrayElements(request, nullptr) : nullptr;
+  unsigned char *ptr = nullptr;
+  uintptr_t len = 0;
+  st = loom_vector_text_upsert(h, reinterpret_cast<const unsigned char *>(r),
+                               static_cast<uintptr_t>(rlen), &ptr, &len);
+  if (r) {
+    env->ReleaseByteArrayElements(request, r, JNI_ABORT);
+  }
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  return ownedBytes(env, ptr, len);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeVectorWorkspaceConfigureJson(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring workspace, jstring requestJson,
+    jbyteArray passphrase, jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openAuthenticatedStoreKeyed(env, p, passphrase, kek, authPrincipal, authPassphrase, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *w = env->GetStringUTFChars(workspace, nullptr);
+  const char *r = env->GetStringUTFChars(requestJson, nullptr);
+  char *out = nullptr;
+  st = loom_vector_workspace_configure_json(h, w, r, &out);
+  env->ReleaseStringUTFChars(workspace, w);
+  env->ReleaseStringUTFChars(requestJson, r);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jstring result = env->NewStringUTF(out ? out : "");
+  if (out) {
+    loom_string_free(out);
+  }
+  return result;
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
 Java_ai_uldren_loom_rn_UldrenLoomNative_nativeVectorSourceText(
     JNIEnv *env, jobject thiz, jstring loomPath, jstring ns, jstring name, jstring id,
     jbyteArray passphrase, jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {

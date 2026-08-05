@@ -24,17 +24,16 @@ static jbyteArray finishBytes(JNIEnv *env, LoomSession *h, int32_t st, unsigned 
 }
 
 static bool parseOptionalU64(JNIEnv *env, jstring value, uint64_t *out, bool *has) {
-  const char *chars = env->GetStringUTFChars(value, nullptr);
-  if (chars == nullptr) {
-    return false;
-  }
-  bool present = chars[0] != '\0';
-  env->ReleaseStringUTFChars(value, chars);
-  if (!present) {
+  if (value == nullptr) {
     *out = 0;
     *has = false;
     return true;
   }
+  const char *chars = env->GetStringUTFChars(value, nullptr);
+  if (chars == nullptr) {
+    return false;
+  }
+  env->ReleaseStringUTFChars(value, chars);
   *has = true;
   return parseU64String(env, value, out);
 }
@@ -388,16 +387,17 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeDrivePinRetentionJson(
   const char *pin = env->GetStringUTFChars(pinId, nullptr);
   const char *kd = env->GetStringUTFChars(kind, nullptr);
   const char *rt = env->GetStringUTFChars(root, nullptr);
-  const char *target = env->GetStringUTFChars(targetEntityId, nullptr);
-  const char *targetPtr = target[0] == '\0' ? nullptr : target;
+  const char *target = targetEntityId == nullptr ? nullptr : env->GetStringUTFChars(targetEntityId, nullptr);
   char *out = nullptr;
   st = loom_drive_pin_retention_json(
-      h, n, dw, pin, kd, rt, targetPtr, added, expires, hasExpires ? 1 : 0, &out);
+      h, n, dw, pin, kd, rt, target, added, expires, hasExpires ? 1 : 0, &out);
   DRIVE_RELEASE_NS();
   env->ReleaseStringUTFChars(pinId, pin);
   env->ReleaseStringUTFChars(kind, kd);
   env->ReleaseStringUTFChars(root, rt);
-  env->ReleaseStringUTFChars(targetEntityId, target);
+  if (targetEntityId != nullptr) {
+    env->ReleaseStringUTFChars(targetEntityId, target);
+  }
   return finishString(env, h, st, out);
 }
 

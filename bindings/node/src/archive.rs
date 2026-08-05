@@ -29,6 +29,8 @@ pub fn fs_import(
     loom_path: String,
     workspace: String,
     src_path: String,
+    author: Option<String>,
+    message: Option<String>,
     commit: bool,
     dry_run: bool,
     passphrase: Option<String>,
@@ -37,6 +39,12 @@ pub fn fs_import(
         open_loom_unlocked(&loom_path, key_spec(passphrase.as_deref()).as_ref()).map_err(reason)?;
     let ns = resolve_workspace_arg(&loom, &workspace)?;
     let mut options = FsImportOptions::new(&src_path);
+    if let Some(author) = author {
+        options.author = author;
+    }
+    if let Some(message) = message {
+        options.message = message;
+    }
     options.commit = commit;
     options.dry_run = dry_run;
     let report = import_fs(&mut loom, ns, Path::new(&src_path), &options).map_err(reason)?;
@@ -71,6 +79,10 @@ pub fn archive_import(
     workspace: String,
     src_path: String,
     kind: String,
+    gzip_output_path: Option<String>,
+    commit: bool,
+    author: Option<String>,
+    message: Option<String>,
     dry_run: bool,
     passphrase: Option<String>,
 ) -> napi::Result<Uint8Array> {
@@ -79,13 +91,21 @@ pub fn archive_import(
     let ns = resolve_workspace_arg(&loom, &workspace)?;
     let archive_kind = parse_archive_kind(&kind)?;
     let mut options = ArchiveImportOptions::new(&src_path);
+    options.gzip_output_path = gzip_output_path;
+    options.commit = commit;
+    if let Some(author) = author {
+        options.author = author;
+    }
+    if let Some(message) = message {
+        options.message = message;
+    }
     options.dry_run = dry_run;
     let result = import_archive(&mut loom, ns, Path::new(&src_path), archive_kind, &options)
         .map_err(reason)?;
     if !dry_run {
         save_loom(&mut loom).map_err(reason)?;
     }
-    result.report.encode().map(Uint8Array::from).map_err(reason)
+    result.encode().map(Uint8Array::from).map_err(reason)
 }
 
 #[napi]

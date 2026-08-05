@@ -53,6 +53,57 @@ pub(crate) fn task_handle(h: &LoomSession) -> LoomSession {
     }
 }
 
+pub(crate) fn with_generated_client<T>(
+    h: &LoomSession,
+    f: impl FnOnce(&loom_client::LocalLoomClient, loom_client::types::LoomSession) -> LoomResult<T>,
+) -> LoomResult<T> {
+    let client = loom_client::LocalLoomClient::new(&h.path);
+    let session = match h.key.as_ref() {
+        None => client.open()?,
+        Some(KeySpec::Passphrase(passphrase)) => client.open_keyed(passphrase.as_bytes())?,
+        Some(KeySpec::RawKek(kek)) => client.open_with_kek(**kek)?,
+    };
+    let attach_result = if let (Some(session_id), Some(principal)) =
+        (h.session_id.as_deref(), h.session_principal)
+    {
+        client.with_session(&session, |loom| {
+            if let Some(mut identity) = loom.store().identity_store()? {
+                identity.bind_session(principal, session_id.to_string())?;
+                loom.set_identity_store(identity);
+            }
+            loom.set_session(session_id.to_string());
+            Ok(())
+        })
+    } else {
+        Ok(())
+    };
+    finish_generated_client_result(
+        attach_result,
+        || f(&client, session.clone()),
+        || client.close(&session),
+    )
+}
+
+pub(crate) fn finish_generated_client_result<T>(
+    attach_result: LoomResult<()>,
+    operation: impl FnOnce() -> LoomResult<T>,
+    close: impl FnOnce() -> bool,
+) -> LoomResult<T> {
+    let result = match attach_result {
+        Ok(()) => operation(),
+        Err(error) => Err(error),
+    };
+    let closed = close();
+    match (result, closed) {
+        (Ok(value), true) => Ok(value),
+        (Ok(_), false) => Err(LoomError::new(
+            Code::Internal,
+            "generated session close failed",
+        )),
+        (Err(error), _) => Err(error),
+    }
+}
+
 fn resolve_ns(loom: &Loom<FileStore>, name: &str) -> LoomResult<WorkspaceId> {
     // Workspace names are unique across the loom, so a name or UUID identifies a workspace on its own.
     let selector = match WorkspaceId::parse(name) {
@@ -529,6 +580,114 @@ fn identity_authority_mode_str(mode: loom_core::IdentityAuthorityMode) -> &'stat
         loom_core::IdentityAuthorityMode::Mirror => "mirror",
         loom_core::IdentityAuthorityMode::Detached => "detached",
     }
+}
+
+fn identity_authority_witness_json(
+    witness: &loom_core::IdentityAuthorityWitness,
+    algo: loom_core::Algo,
+) -> String {
+    let record = witness.encode();
+    let record_digest = witness.digest(algo);
+    let mut out = String::new();
+    out.push('{');
+    out.push_str("\"authority\":");
+    out.push_str(&json_string(&witness.authority.to_string()));
+    out.push_str(",\"mode\":");
+    out.push_str(&json_string(identity_authority_mode_str(witness.mode)));
+    out.push_str(",\"generation\":");
+    out.push_str(&witness.generation.to_string());
+    out.push_str(",\"head\":");
+    match witness.head {
+        Some(head) => out.push_str(&json_string(&head.to_string())),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"snapshot_digest\":");
+    out.push_str(&json_string(&witness.snapshot_digest.to_string()));
+    out.push_str(",\"latest_handoff_digest\":");
+    match witness.latest_handoff_digest {
+        Some(digest) => out.push_str(&json_string(&digest.to_string())),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"record_hex\":");
+    out.push_str(&json_string(&hex_bytes(&record)));
+    out.push_str(",\"record_digest\":");
+    out.push_str(&json_string(&record_digest.to_string()));
+    out.push('}');
+    out
+}
+
+fn identity_authority_sync_report_json(
+    report: &loom_core::IdentityAuthoritySyncReport,
+    algo: loom_core::Algo,
+    seq: u64,
+) -> String {
+    let mut out = String::new();
+    out.push('{');
+    out.push_str("\"seq\":");
+    out.push_str(&seq.to_string());
+    out.push_str(",\"from_generation\":");
+    out.push_str(&report.from_generation.to_string());
+    out.push_str(",\"to_generation\":");
+    out.push_str(&report.to_generation.to_string());
+    out.push_str(",\"applied\":");
+    out.push_str(if report.applied { "true" } else { "false" });
+    out.push_str(",\"witness\":");
+    out.push_str(&identity_authority_witness_json(&report.witness, algo));
+    out.push('}');
+    out
+}
+
+fn push_json_u64_option(out: &mut String, value: Option<u64>) {
+    match value {
+        Some(value) => out.push_str(&value.to_string()),
+        None => out.push_str("null"),
+    }
+}
+
+fn push_json_string_option(out: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => out.push_str(&json_string(value)),
+        None => out.push_str("null"),
+    }
+}
+
+fn authority_replication_policy_json(policy: &loom_store::AuthorityReplicationPolicy) -> String {
+    let mut out = String::new();
+    out.push('{');
+    out.push_str("\"id\":");
+    out.push_str(&json_string(&policy.id));
+    out.push_str(",\"source\":");
+    out.push_str(&json_string(&policy.source));
+    out.push_str(",\"enabled\":");
+    out.push_str(if policy.enabled { "true" } else { "false" });
+    out.push_str(",\"pull_on_start\":");
+    out.push_str(if policy.pull_on_start {
+        "true"
+    } else {
+        "false"
+    });
+    out.push_str(",\"interval_ms\":");
+    push_json_u64_option(&mut out, policy.interval_ms);
+    out.push_str(",\"jitter_ms\":");
+    out.push_str(&policy.jitter_ms.to_string());
+    out.push_str(",\"backoff_ms\":");
+    out.push_str(&policy.backoff_ms.to_string());
+    out.push_str(",\"publish_witness\":");
+    out.push_str(if policy.publish_witness {
+        "true"
+    } else {
+        "false"
+    });
+    out.push_str(",\"last_success_ms\":");
+    push_json_u64_option(&mut out, policy.last_success_ms);
+    out.push_str(",\"last_failure_ms\":");
+    push_json_u64_option(&mut out, policy.last_failure_ms);
+    out.push_str(",\"last_error\":");
+    push_json_string_option(&mut out, policy.last_error.as_deref());
+    out.push_str(",\"last_modified_audit_seq\":");
+    push_json_u64_option(&mut out, policy.last_modified_audit_seq);
+    out.push('}');
+    out
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -2097,7 +2256,7 @@ pub unsafe extern "C" fn loom_clear_authentication(handle: *mut LoomSession) -> 
     0
 }
 
-fn require_global_admin_actor(loom: &Loom<FileStore>) -> LoomResult<WorkspaceId> {
+pub(crate) fn require_global_admin_actor(loom: &Loom<FileStore>) -> LoomResult<WorkspaceId> {
     let identity = loom
         .identity_store()
         .ok_or_else(|| LoomError::new(Code::Unsupported, "identity store not initialized"))?;
@@ -2686,6 +2845,202 @@ pub unsafe extern "C" fn loom_identity_revoke_public_key(
     })();
     match result {
         Ok(()) => 0,
+        Err(e) => fail(e),
+    }
+}
+
+/// Force-detach the identity authority and return the JSON mutation report.
+///
+/// # Safety
+/// `handle` must be from [`loom_open`]; `principal` and `reason` must be valid C strings; `out` null
+/// or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn loom_identity_force_detach_authority_json(
+    handle: *mut LoomSession,
+    principal: *const c_char,
+    generation: u64,
+    reason: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
+    clear_error();
+    let h = handle_ref!(handle, "loom_identity_force_detach_authority_json");
+    let principal = arg_str!(principal, "loom_identity_force_detach_authority_json");
+    let reason = arg_str!(reason, "loom_identity_force_detach_authority_json");
+    let result = (|| -> LoomResult<String> {
+        let mut loom = open_h_write(h)?;
+        let actor = require_global_admin_actor(&loom)?;
+        let principal = WorkspaceId::parse(principal)?;
+        let (detach, snapshot) = {
+            let identity = loom.identity_store_mut().ok_or_else(|| {
+                LoomError::new(Code::Unsupported, "identity store not initialized")
+            })?;
+            identity.principal(principal)?;
+            let detach = identity.force_detach_authority(principal, generation, reason)?;
+            (detach, identity.clone())
+        };
+        let target = format!(
+            "previous_authority={};new_authority={};generation={}",
+            detach.previous_authority, detach.new_authority, detach.generation
+        );
+        let seq = loom.store().save_identity_store_audited(
+            &snapshot,
+            Some(actor),
+            "identity.authority.force_detach",
+            Some(&target),
+        )?;
+        Ok(format!(
+            "{{\"seq\":{seq},\"detach\":{}}}",
+            identity_authority_detach_json(&detach)
+        ))
+    })();
+    match result {
+        Ok(json) => unsafe { ok_str(out, &json) },
+        Err(e) => fail(e),
+    }
+}
+
+/// Replicate identity authority from a local source store and return the JSON mutation report.
+///
+/// # Safety
+/// `handle` must be from [`loom_open`]; `source` must be a valid C string; `out` null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn loom_identity_replicate_authority_json(
+    handle: *mut LoomSession,
+    source: *const c_char,
+    become_authority: i32,
+    out: *mut *mut c_char,
+) -> i32 {
+    clear_error();
+    let h = handle_ref!(handle, "loom_identity_replicate_authority_json");
+    let source = arg_str!(source, "loom_identity_replicate_authority_json");
+    let result = (|| -> LoomResult<String> {
+        let source_loom =
+            attach_session_state(h, open_loom_read_unlocked(source, h.key.as_ref())?)?;
+        require_global_admin(&source_loom)?;
+        let source_identity = source_loom
+            .identity_store()
+            .ok_or_else(|| {
+                LoomError::new(Code::Unsupported, "source identity store not initialized")
+            })?
+            .clone();
+        let mut loom = open_h_write(h)?;
+        let actor = require_global_admin_actor(&loom)?;
+        let algo = loom.store().digest_algo();
+        let (report, snapshot) = {
+            let identity = loom.identity_store_mut().ok_or_else(|| {
+                LoomError::new(
+                    Code::Unsupported,
+                    "destination identity store not initialized",
+                )
+            })?;
+            let report =
+                identity.replicate_authority_from(&source_identity, algo, become_authority != 0)?;
+            (report, identity.clone())
+        };
+        let target = format!(
+            "source={source};from_generation={};to_generation={};applied={}",
+            report.from_generation, report.to_generation, report.applied
+        );
+        let seq = loom.store().save_identity_store_audited(
+            &snapshot,
+            Some(actor),
+            "identity.authority.replicate",
+            Some(&target),
+        )?;
+        Ok(identity_authority_sync_report_json(&report, algo, seq))
+    })();
+    match result {
+        Ok(json) => unsafe { ok_str(out, &json) },
+        Err(e) => fail(e),
+    }
+}
+
+/// Configure an authority replication policy and return the JSON mutation report.
+///
+/// # Safety
+/// `handle` must be from [`loom_open`]; `id` and `source` must be valid C strings; `out` null or
+/// writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn loom_identity_configure_authority_replication_json(
+    handle: *mut LoomSession,
+    id: *const c_char,
+    source: *const c_char,
+    disabled: i32,
+    pull_on_start: i32,
+    interval_ms: u64,
+    interval_ms_present: i32,
+    jitter_ms: u64,
+    backoff_ms: u64,
+    publish_witness: i32,
+    out: *mut *mut c_char,
+) -> i32 {
+    clear_error();
+    let h = handle_ref!(handle, "loom_identity_configure_authority_replication_json");
+    let id = arg_str!(id, "loom_identity_configure_authority_replication_json");
+    let source = arg_str!(source, "loom_identity_configure_authority_replication_json");
+    let result = (|| -> LoomResult<String> {
+        let loom = open_h_write(h)?;
+        let actor = require_global_admin_actor(&loom)?;
+        let mut policy = FileStore::authority_replication_policy(id, source, disabled == 0)?;
+        policy.pull_on_start = pull_on_start != 0;
+        policy.interval_ms = (interval_ms_present != 0).then_some(interval_ms);
+        policy.jitter_ms = jitter_ms;
+        policy.backoff_ms = backoff_ms;
+        policy.publish_witness = publish_witness != 0;
+        let target = format!("id={id};source={source}");
+        let seq = loom.store().save_authority_replication_policy_audited(
+            &policy,
+            Some(actor),
+            "authority.replication.configure",
+            Some(&target),
+        )?;
+        let stored = loom
+            .store()
+            .authority_replication_policy_by_id(id)?
+            .ok_or_else(|| {
+                LoomError::new(
+                    Code::Internal,
+                    "authority replication policy not found after save",
+                )
+            })?;
+        Ok(format!(
+            "{{\"seq\":{seq},\"policy\":{}}}",
+            authority_replication_policy_json(&stored)
+        ))
+    })();
+    match result {
+        Ok(json) => unsafe { ok_str(out, &json) },
+        Err(e) => fail(e),
+    }
+}
+
+/// Remove an authority replication policy and return the JSON mutation report.
+///
+/// # Safety
+/// `handle` must be from [`loom_open`]; `id` must be a valid C string; `out` null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn loom_identity_remove_authority_replication_json(
+    handle: *mut LoomSession,
+    id: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
+    clear_error();
+    let h = handle_ref!(handle, "loom_identity_remove_authority_replication_json");
+    let id = arg_str!(id, "loom_identity_remove_authority_replication_json");
+    let result = (|| -> LoomResult<String> {
+        let loom = open_h_write(h)?;
+        let actor = require_global_admin_actor(&loom)?;
+        let target = format!("id={id}");
+        let seq = loom.store().remove_authority_replication_policy_audited(
+            id,
+            Some(actor),
+            "authority.replication.remove",
+            Some(&target),
+        )?;
+        Ok(format!("{{\"seq\":{seq},\"id\":{}}}", json_string(id)))
+    })();
+    match result {
+        Ok(json) => unsafe { ok_str(out, &json) },
         Err(e) => fail(e),
     }
 }

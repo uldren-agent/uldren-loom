@@ -193,6 +193,39 @@
   });
 }
 
+- (void)sqlExecResult:(NSString *)loomPath
+                   ns:(NSString *)ns
+                   db:(NSString *)db
+                  sql:(NSString *)sql
+           passphrase:(NSString *)passphrase
+                  kek:(NSArray *)kek
+        authPrincipal:(NSString *)authPrincipal
+       authPassphrase:(NSString *)authPassphrase
+              resolve:(RCTPromiseResolveBlock)resolve
+               reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    unsigned char *ptr = NULL;
+    uintptr_t len = 0;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_sql_exec_result(h, ns.UTF8String, db.UTF8String, sql.UTF8String, &ptr, &len);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    resolve(loomArrayFromOwnedBytes(ptr, len));
+  });
+}
+
 - (void)sqlQueryBytes:(NSString *)loomPath
                    ns:(NSString *)ns
                    db:(NSString *)db

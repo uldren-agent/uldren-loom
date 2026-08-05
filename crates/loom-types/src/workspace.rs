@@ -25,10 +25,11 @@ pub enum FacetKind {
     Metrics,
     Logs,
     Traces,
+    Inference,
 }
 
 impl FacetKind {
-    pub const ALL: [FacetKind; 21] = [
+    pub const ALL: [FacetKind; 22] = [
         FacetKind::Files,
         FacetKind::Vcs,
         FacetKind::Sql,
@@ -50,6 +51,7 @@ impl FacetKind {
         FacetKind::Metrics,
         FacetKind::Logs,
         FacetKind::Traces,
+        FacetKind::Inference,
     ];
 
     pub const fn stable_tag(self) -> u8 {
@@ -75,6 +77,7 @@ impl FacetKind {
             FacetKind::Metrics => 18,
             FacetKind::Logs => 19,
             FacetKind::Traces => 20,
+            FacetKind::Inference => 21,
         }
     }
 
@@ -101,6 +104,7 @@ impl FacetKind {
             18 => FacetKind::Metrics,
             19 => FacetKind::Logs,
             20 => FacetKind::Traces,
+            21 => FacetKind::Inference,
             _ => return None,
         })
     }
@@ -128,6 +132,7 @@ impl FacetKind {
             FacetKind::Metrics => "metrics",
             FacetKind::Logs => "logs",
             FacetKind::Traces => "traces",
+            FacetKind::Inference => "inference",
         }
     }
 
@@ -154,6 +159,7 @@ impl FacetKind {
             "metrics" => FacetKind::Metrics,
             "logs" => FacetKind::Logs,
             "traces" => FacetKind::Traces,
+            "inference" => FacetKind::Inference,
             other => {
                 return Err(LoomError::invalid(format!(
                     "unknown workspace facet {other:?}"
@@ -210,10 +216,11 @@ pub enum AclDomain {
     Chat,
     Lifecycle,
     Meetings,
+    Inference,
 }
 
 impl AclDomain {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Files,
         Self::Vcs,
         Self::Sql,
@@ -240,6 +247,7 @@ impl AclDomain {
         Self::Chat,
         Self::Lifecycle,
         Self::Meetings,
+        Self::Inference,
     ];
 
     pub const fn stable_tag(self) -> u8 {
@@ -270,6 +278,7 @@ impl AclDomain {
             Self::Chat => 23,
             Self::Lifecycle => 24,
             Self::Meetings => 25,
+            Self::Inference => 26,
         }
     }
 
@@ -301,6 +310,7 @@ impl AclDomain {
             23 => Self::Chat,
             24 => Self::Lifecycle,
             25 => Self::Meetings,
+            26 => Self::Inference,
             _ => return None,
         })
     }
@@ -333,6 +343,7 @@ impl AclDomain {
             Self::Chat => "chat",
             Self::Lifecycle => "lifecycle",
             Self::Meetings => "meetings",
+            Self::Inference => "inference",
         }
     }
 
@@ -346,7 +357,30 @@ impl AclDomain {
 
 impl From<FacetKind> for AclDomain {
     fn from(facet: FacetKind) -> Self {
-        Self::from_stable_tag(facet.stable_tag()).expect("every facet has an ACL domain")
+        match facet {
+            FacetKind::Files => Self::Files,
+            FacetKind::Vcs => Self::Vcs,
+            FacetKind::Sql => Self::Sql,
+            FacetKind::Kv => Self::Kv,
+            FacetKind::Document => Self::Document,
+            FacetKind::Vector => Self::Vector,
+            FacetKind::Graph => Self::Graph,
+            FacetKind::Columnar => Self::Columnar,
+            FacetKind::Queue => Self::Queue,
+            FacetKind::TimeSeries => Self::TimeSeries,
+            FacetKind::Cas => Self::Cas,
+            FacetKind::Ledger => Self::Ledger,
+            FacetKind::Program => Self::Program,
+            FacetKind::Calendar => Self::Calendar,
+            FacetKind::Contacts => Self::Contacts,
+            FacetKind::Mail => Self::Mail,
+            FacetKind::Search => Self::Search,
+            FacetKind::Dataframe => Self::Dataframe,
+            FacetKind::Metrics => Self::Metrics,
+            FacetKind::Logs => Self::Logs,
+            FacetKind::Traces => Self::Traces,
+            FacetKind::Inference => Self::Inference,
+        }
     }
 }
 

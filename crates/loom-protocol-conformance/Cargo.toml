@@ -13,19 +13,34 @@ integration-tests = ["loom-mcp/integration-tests"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-loom-client.workspace = true
+loom-client = { workspace = true, features = ["test-hooks"] }
+loom-codec.workspace = true
 loom-core.workspace = true
 loom-hosted = { workspace = true, features = ["grpc", "http"] }
+loom-hosted-core.workspace = true
+loom-inference.workspace = true
+loom-interchange.workspace = true
+loom-chat = { workspace = true, features = ["test-clock"] }
+loom-drive.workspace = true
 loom-lanes.workspace = true
+loom-lifecycle.workspace = true
+loom-locator.workspace = true
 loom-mcp = { workspace = true, features = ["server"] }
-loom-store.workspace = true
+loom-pages.workspace = true
+loom-reference.workspace = true
+loom-remote-client.workspace = true
+loom-remote-protocol.workspace = true
+loom-store = { workspace = true, features = ["test-hooks"] }
 loom-substrate = { workspace = true, features = ["studio-meetings"] }
+loom-tickets.workspace = true
+loom-types.workspace = true
 loom-wire.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 tokio-stream = { version = "0.1", default-features = false }
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
+zip.workspace = true
 
 [lints]
 workspace = true

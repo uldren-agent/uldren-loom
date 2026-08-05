@@ -38,12 +38,22 @@ impl LoomStore {
         source_name: String,
         kind: String,
         bytes: Vec<u8>,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
         dry_run: bool,
     ) -> Result<Vec<u8>, JsError> {
         let ns = resolve_workspace_arg(&self.loom, &workspace)?;
         let archive_kind = parse_archive_kind(&kind)?;
         let mut options = ArchiveImportOptions::new(&source_name);
         options.archive_id = source_name.clone();
+        options.commit = commit;
+        if let Some(author) = author {
+            options.author = author;
+        }
+        if let Some(message) = message {
+            options.message = message;
+        }
         options.dry_run = dry_run;
         let result = import_archive_bytes(
             &mut self.loom,
@@ -57,7 +67,7 @@ impl LoomStore {
         if !dry_run {
             save_loom(&mut self.loom).map_err(le)?;
         }
-        result.report.encode().map_err(le)
+        result.encode().map_err(le)
     }
 
     pub fn archive_export_bytes(

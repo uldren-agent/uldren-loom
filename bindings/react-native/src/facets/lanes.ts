@@ -2,6 +2,17 @@ import UldrenLoom from '../NativeUldrenLoom';
 import { authArgs, keyArgs } from '../internal';
 import type { LoomAuth, LoomKey } from '../internal';
 
+export const LANE_TICKET_PLACEMENT_FIRST = 1;
+export const LANE_TICKET_PLACEMENT_LAST = 2;
+export const LANE_TICKET_PLACEMENT_BEFORE = 3;
+export const LANE_TICKET_PLACEMENT_AFTER = 4;
+
+export type LaneTicketPlacement =
+  | typeof LANE_TICKET_PLACEMENT_FIRST
+  | typeof LANE_TICKET_PLACEMENT_LAST
+  | typeof LANE_TICKET_PLACEMENT_BEFORE
+  | typeof LANE_TICKET_PLACEMENT_AFTER;
+
 function args(key?: LoomKey, auth?: LoomAuth): [string, number[], string, string] {
   const [passphrase, kek] = keyArgs(key);
   const [authPrincipal, authPassphrase] = authArgs(auth);
@@ -32,7 +43,7 @@ export function lanesUpdate(loomPath: string, workspace: string, laneId: string,
   return UldrenLoom.lanesUpdate(loomPath, workspace, laneId, fields.title ?? null, fields.description ?? null, fields.laneStatus ?? null, fields.statusReport ?? null, fields.reviewerFeedback ?? null, updatedBy, ...args(key, auth)).then(Uint8Array.from);
 }
 
-export function lanesTicketAdd(loomPath: string, workspace: string, laneId: string, ticketId: string, updatedBy: string, placement: string = 'append', anchor?: string | null, key?: LoomKey, auth?: LoomAuth): Promise<Uint8Array> {
+export function lanesTicketAdd(loomPath: string, workspace: string, laneId: string, ticketId: string, updatedBy: string, placement: LaneTicketPlacement = LANE_TICKET_PLACEMENT_LAST, anchor?: string | null, key?: LoomKey, auth?: LoomAuth): Promise<Uint8Array> {
   return UldrenLoom.lanesTicketAdd(loomPath, workspace, laneId, ticketId, updatedBy, placement, anchor ?? '', ...args(key, auth)).then(Uint8Array.from);
 }
 

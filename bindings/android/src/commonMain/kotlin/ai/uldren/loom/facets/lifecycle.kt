@@ -1,18 +1,60 @@
 package ai.uldren.loom
 
-    /**
-     * Create a fresh `.loom` at [path] under an identity [profile] (`"default"`/`"blake3"` or
-     * `"fips"`/`"sha256"`), optionally encrypted - the binding counterpart of `loom init`.
-     * A non-null/non-empty [passphrase] encrypts the store; the DEK is wrapped
-     * under it with [suite], or the profile default when [suite] is null); otherwise unencrypted.
-     * Throws on failure (e.g. `ALREADY_EXISTS`).
-     */
-expect fun Loom.create(path: String, profile: String, suite: String? = null, passphrase: String? = null)
+expect fun Loom.lifecycleDefineStandardJson(
+    path: String,
+    workspace: String,
+    kind: String,
+    version: String,
+    completionPredicateDigest: String,
+    passphrase: String? = null,
+    kek: ByteArray? = null,
+    authPrincipal: String? = null,
+    authPassphrase: String? = null,
+): String
 
+expect fun Loom.lifecycleDefineJson(
+    path: String,
+    workspace: String,
+    definition: ByteArray,
+    passphrase: String? = null,
+    kek: ByteArray? = null,
+    authPrincipal: String? = null,
+    authPassphrase: String? = null,
+): String
 
-    /**
-     * Create a fresh **encrypted** `.loom` whose DEK is wrapped under a host-supplied 256-bit [kek].
-     * [profile] selects the content-address algorithm and [suite] the object AEAD (profile default
-     * when null). [kek] must be 32 bytes.
-     */
-expect fun Loom.createWithKek(path: String, profile: String, kek: ByteArray, suite: String? = null)
+expect fun Loom.lifecycleInstantiateJson(
+    path: String,
+    workspace: String,
+    instanceId: String,
+    definitionId: String,
+    subjectRefsJson: String,
+    passphrase: String? = null,
+    kek: ByteArray? = null,
+    authPrincipal: String? = null,
+    authPassphrase: String? = null,
+): String
+
+expect fun Loom.lifecycleTransitionJson(
+    path: String,
+    workspace: String,
+    instanceId: String,
+    transitionId: String,
+    toStageId: String,
+    actorPrincipalId: String? = null,
+    gateEvaluationsJson: String,
+    snapshotDigest: String? = null,
+    passphrase: String? = null,
+    kek: ByteArray? = null,
+    authPrincipal: String? = null,
+    authPassphrase: String? = null,
+): String
+
+expect fun Loom.refsReconcileJson(
+    path: String,
+    workspace: String,
+    max: Long,
+    passphrase: String? = null,
+    kek: ByteArray? = null,
+    authPrincipal: String? = null,
+    authPassphrase: String? = null,
+): String

@@ -44,19 +44,19 @@ public final class DriveOps {
                     ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
     private static final MethodHandle COMMIT_UPLOAD_JSON = down("loom_drive_commit_upload_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
     private static final MethodHandle RENAME_JSON = down("loom_drive_rename_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
     private static final MethodHandle MOVE_JSON = down("loom_drive_move_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
     private static final MethodHandle DELETE_JSON = down("loom_drive_delete_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS));
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
     private static final MethodHandle RESOLVE_CONFLICT_JSON = down("loom_drive_resolve_conflict_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
@@ -69,7 +69,7 @@ public final class DriveOps {
                     ValueLayout.ADDRESS));
     private static final MethodHandle REVOKE_SHARE_JSON = down("loom_drive_revoke_share_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
     private static final MethodHandle APPLY_SHARE_EXPIRY_JSON = down("loom_drive_apply_share_expiry_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
@@ -80,7 +80,7 @@ public final class DriveOps {
                     ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
     private static final MethodHandle UNPIN_RETENTION_JSON = down("loom_drive_unpin_retention_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
     private static final MethodHandle APPLY_RETENTION_JSON = down("loom_drive_apply_retention_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
@@ -255,10 +255,13 @@ public final class DriveOps {
             String kind, String root, String targetEntityId, long addedAtMs, Long expiresAtMs) {
         return session.onHandle("loom_drive_pin_retention_json", (arena, handle) -> {
             MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            MemorySegment targetEntity = targetEntityId != null
+                    ? arena.allocateFrom(targetEntityId)
+                    : MemorySegment.NULL;
             int status = (int) PIN_RETENTION_JSON.invokeExact(handle, arena.allocateFrom(workspace),
                     arena.allocateFrom(driveWorkspaceId), arena.allocateFrom(pinId), arena.allocateFrom(kind),
-                    arena.allocateFrom(root), targetEntityId != null ? arena.allocateFrom(targetEntityId) : MemorySegment.NULL,
-                    addedAtMs, expiresAtMs != null ? expiresAtMs : 0L, expiresAtMs != null ? 1 : 0, out);
+                    arena.allocateFrom(root), targetEntity, addedAtMs, expiresAtMs != null ? expiresAtMs : 0L,
+                    expiresAtMs != null ? 1 : 0, out);
             return takeString("loom_drive_pin_retention_json", status, out);
         });
     }

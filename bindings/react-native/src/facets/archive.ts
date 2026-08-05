@@ -6,6 +6,8 @@ export async function fsImport(
   loomPath: string,
   workspace: string,
   srcPath: string,
+  author?: string | null,
+  message?: string | null,
   commit = false,
   dryRun = false,
   key?: LoomKey,
@@ -14,7 +16,8 @@ export async function fsImport(
   const [passphrase, kek] = keyArgs(key);
   const [authPrincipal, authPassphrase] = authArgs(auth);
   const bytes = await UldrenLoom.fsImport(
-    loomPath, workspace, srcPath, commit, dryRun, passphrase, kek, authPrincipal, authPassphrase
+    loomPath, workspace, srcPath, author ?? '', message ?? '', commit, dryRun, passphrase, kek,
+    authPrincipal, authPassphrase
   );
   return Uint8Array.from(bytes);
 }
@@ -42,6 +45,10 @@ export async function archiveImport(
   workspace: string,
   srcPath: string,
   kind: string,
+  gzipOutputPath?: string | null,
+  commit = false,
+  author?: string | null,
+  message?: string | null,
   dryRun = false,
   key?: LoomKey,
   auth?: LoomAuth
@@ -49,7 +56,8 @@ export async function archiveImport(
   const [passphrase, kek] = keyArgs(key);
   const [authPrincipal, authPassphrase] = authArgs(auth);
   const bytes = await UldrenLoom.archiveImport(
-    loomPath, workspace, srcPath, kind, dryRun, passphrase, kek, authPrincipal, authPassphrase
+    loomPath, workspace, srcPath, kind, gzipOutputPath ?? '', commit, author ?? '', message ?? '',
+    dryRun, passphrase, kek, authPrincipal, authPassphrase
   );
   return Uint8Array.from(bytes);
 }

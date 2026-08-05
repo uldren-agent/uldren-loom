@@ -37,6 +37,8 @@ When the owner is told to go, inspect lanes with tickets that are waiting for re
 
 Accepting a ticket is a correctness and code-review pass, not a cursory source-link inspection. Before accepting, personally inspect the relevant source anchors and verify that the changed code implements the requested behavior, follows the intended architecture, handles relevant edge cases and error paths, and updates public, generated, binding, protocol, test, and documentation surfaces together when contracts change.
 
+Projects may configure required acceptance reviews as typed ticket comments, currently `design_review` and `code_review`. The required review set defaults empty. When configured and acceptance evidence enforcement is enabled, record one non-redacted comment for each required review type before accepting the ticket.
+
 If completed work does not meet the original ticket requirement as written, do not accept it as close enough and do not silently redefine the ticket around the delivered implementation. Record the unmet requirement on the ticket with source-backed evidence, move the ticket to feedback_available, blocked, or waiting_for_decision as appropriate, and state the exact owner or worker action needed. If the original requirement appears impossible, unsafe, or materially wrong, ask the human owner before changing scope.
 
 Review feedback belongs on the ticket as a ticket comment. Do not rely on chat-only feedback. Feedback must name the issue, cite the source anchor when source is involved, and state the next action needed from the worker.
@@ -1023,6 +1025,7 @@ fn optional_text(value: Value) -> Result<Option<String>> {
 pub struct TicketAcceptanceEvidencePolicy {
     pub enforcement_enabled: bool,
     pub required_keys: BTreeSet<TicketAcceptanceEvidenceKey>,
+    pub required_reviews: BTreeSet<TicketReviewType>,
 }
 
 impl TicketAcceptanceEvidencePolicy {
@@ -1043,6 +1046,12 @@ impl TicketAcceptanceEvidencePolicy {
                         .map(|key| Value::Text(key.as_str().to_string()))
                         .collect(),
                 ),
+                Value::Array(
+                    self.required_reviews
+                        .iter()
+                        .map(|review| Value::Text(review.as_str().to_string()))
+                        .collect(),
+                ),
             ]),
         ])
     }
@@ -1050,12 +1059,17 @@ impl TicketAcceptanceEvidencePolicy {
     pub fn from_value(value: Value) -> Result<Self> {
         let mut outer = Fields::array(value, "ticket acceptance evidence policy")?;
         outer.expect_text(Self::SCHEMA)?;
-        let mut fields = Fields::array(
-            outer.next("ticket acceptance evidence policy fields")?,
-            "ticket acceptance evidence policy",
-        )?;
+        let raw_fields = match outer.next("ticket acceptance evidence policy fields")? {
+            Value::Array(values) => values,
+            _ => {
+                return Err(LoomError::corrupt(
+                    "ticket acceptance evidence policy fields must be an array",
+                ));
+            }
+        };
         outer.end("ticket acceptance evidence policy")?;
-        let enforcement_enabled = match fields.next("enforcement_enabled")? {
+        let mut fields = raw_fields.into_iter();
+        let enforcement_enabled = match read_required_value(fields.next(), "enforcement_enabled")? {
             Value::Bool(value) => value,
             _ => {
                 return Err(LoomError::corrupt(
@@ -1063,7 +1077,7 @@ impl TicketAcceptanceEvidencePolicy {
                 ));
             }
         };
-        let required_keys = match fields.next("required_keys")? {
+        let required_keys = match read_required_value(fields.next(), "required_keys")? {
             Value::Array(values) => values
                 .into_iter()
                 .map(|value| match value {
@@ -1079,10 +1093,29 @@ impl TicketAcceptanceEvidencePolicy {
                 ));
             }
         };
-        fields.end("ticket acceptance evidence policy")?;
+        let required_reviews = match read_required_value(fields.next(), "required_reviews")? {
+            Value::Array(values) => values
+                .into_iter()
+                .map(|value| match value {
+                    Value::Text(text) => TicketReviewType::parse(&text),
+                    _ => Err(LoomError::corrupt("ticket review type must be text")),
+                })
+                .collect::<Result<BTreeSet<_>>>()?,
+            _ => {
+                return Err(LoomError::corrupt(
+                    "ticket acceptance evidence required_reviews must be an array",
+                ));
+            }
+        };
+        if fields.next().is_some() {
+            return Err(LoomError::corrupt(
+                "ticket acceptance evidence policy has trailing fields",
+            ));
+        }
         let policy = Self {
             enforcement_enabled,
             required_keys,
+            required_reviews,
         };
         policy.validate()?;
         Ok(policy)
@@ -1203,6 +1236,58 @@ impl TicketAcceptanceEvidenceKey {
             Self::Followups => "known follow-up work left outside this ticket",
             Self::DecisionPoints => "owner decisions raised or resolved for this ticket",
             Self::RiskNotes => "risks, caveats, or rollback notes relevant to acceptance",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TicketReviewType {
+    DesignReview,
+    CodeReview,
+}
+
+impl TicketReviewType {
+    pub const ALL: [Self; 2] = [Self::DesignReview, Self::CodeReview];
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "design_review" => Ok(Self::DesignReview),
+            "code_review" => Ok(Self::CodeReview),
+            other => Err(LoomError::invalid(format!(
+                "unknown ticket review type `{other}`; allowed review types: {}",
+                Self::allowed_values_display()
+            ))
+            .with_detail(loom_types::error::ErrorDetail::invalid_field(
+                "ticket_review_type",
+                Some(other.to_string()),
+                Self::ALL.iter().map(|review| review.as_str().to_string()),
+            ))),
+        }
+    }
+
+    pub fn allowed_values_display() -> String {
+        Self::ALL
+            .iter()
+            .map(|review| format!("`{}`", review.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DesignReview => "design_review",
+            Self::CodeReview => "code_review",
+        }
+    }
+
+    pub const fn meaning(self) -> &'static str {
+        match self {
+            Self::DesignReview => {
+                "architectural review covering ownership boundaries, canonical paths, absence of parallel systems, and long-term suitability"
+            }
+            Self::CodeReview => {
+                "implementation review covering logic, errors, concurrency, security, edge cases, tests, and cross-surface consistency"
+            }
         }
     }
 }
@@ -5734,6 +5819,16 @@ mod tests {
         assert_eq!(decoded, contracts);
         assert_eq!(decoded.owner.details, TICKET_DEFAULT_OWNER_CONTRACT);
         assert_eq!(decoded.worker.details, TICKET_DEFAULT_WORKER_CONTRACT);
+    }
+
+    #[test]
+    fn acceptance_evidence_policy_requires_review_field() {
+        let legacy_value = Value::Array(vec![
+            Value::Text(TicketAcceptanceEvidencePolicy::SCHEMA.to_string()),
+            Value::Array(vec![Value::Bool(false), Value::Array(Vec::new())]),
+        ]);
+        let err = TicketAcceptanceEvidencePolicy::from_value(legacy_value).unwrap_err();
+        assert!(err.message.contains("required_reviews"));
     }
 
     #[test]

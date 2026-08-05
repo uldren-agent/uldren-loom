@@ -16,13 +16,16 @@ public final class TicketsOps {
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS));
     private static final MethodHandle PROJECT_SETTINGS_GET_JSON = down("loom_tickets_project_settings_get_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_BOOLEAN,
+                    ValueLayout.ADDRESS));
     private static final MethodHandle PROJECT_SETTINGS_SET_JSON = down("loom_tickets_project_settings_set_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.JAVA_BOOLEAN, ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                    ValueLayout.JAVA_BOOLEAN, ValueLayout.JAVA_BOOLEAN, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
     private static final MethodHandle FIELDS_JSON = down("loom_tickets_fields_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
@@ -127,26 +130,42 @@ public final class TicketsOps {
     }
 
     public String projectSettingsGetJson(String workspace, String ticketWorkspaceId,
-            String projectId) {
-        return string3("loom_tickets_project_settings_get_json", PROJECT_SETTINGS_GET_JSON,
-                workspace, ticketWorkspaceId, projectId);
+            String projectId, boolean includeContracts) {
+        return session.onHandle("loom_tickets_project_settings_get_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) PROJECT_SETTINGS_GET_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(ticketWorkspaceId),
+                    arena.allocateFrom(projectId), includeContracts, out);
+            return takeString("loom_tickets_project_settings_get_json", status, out);
+        });
     }
 
     public String projectSettingsSetJson(String workspace, String ticketWorkspaceId,
             String projectId, String defaultProjection, String enableProjectionsJson,
             String disableProjectionsJson, String actorEnforcement, String projectOwnerPrincipal,
             boolean clearProjectOwnerPrincipal, String acceptanceAuthoritiesJson,
-            String expectedRoot) {
+            Boolean acceptanceEvidenceEnforcement, String requiredAcceptanceEvidenceKeysJson,
+            String requiredAcceptanceReviewsJson,
+            String ownerContractSummary, String ownerContractDetails, String workerContractSummary,
+            String workerContractDetails, String expectedRoot) {
         return session.onHandle("loom_tickets_project_settings_set_json", (arena, handle) -> {
             MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            boolean hasAcceptanceEvidenceEnforcement = acceptanceEvidenceEnforcement != null;
+            boolean acceptanceEvidenceEnforcementValue =
+                    hasAcceptanceEvidenceEnforcement && acceptanceEvidenceEnforcement;
             int status = (int) PROJECT_SETTINGS_SET_JSON.invokeExact(handle,
                     arena.allocateFrom(workspace), arena.allocateFrom(ticketWorkspaceId),
                     arena.allocateFrom(projectId), nullable(arena, defaultProjection),
                     arena.allocateFrom(enableProjectionsJson),
                     arena.allocateFrom(disableProjectionsJson), nullable(arena, actorEnforcement),
                     nullable(arena, projectOwnerPrincipal), clearProjectOwnerPrincipal,
-                    nullable(arena, acceptanceAuthoritiesJson), arena.allocateFrom(expectedRoot),
-                    out);
+                    nullable(arena, acceptanceAuthoritiesJson), acceptanceEvidenceEnforcementValue,
+                    hasAcceptanceEvidenceEnforcement,
+                    nullable(arena, requiredAcceptanceEvidenceKeysJson),
+                    nullable(arena, requiredAcceptanceReviewsJson),
+                    nullable(arena, ownerContractSummary), nullable(arena, ownerContractDetails),
+                    nullable(arena, workerContractSummary), nullable(arena, workerContractDetails),
+                    arena.allocateFrom(expectedRoot), out);
             return takeString("loom_tickets_project_settings_set_json", status, out);
         });
     }

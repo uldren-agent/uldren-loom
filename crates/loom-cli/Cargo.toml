@@ -14,6 +14,16 @@ version.workspace = true
 name = "loom"
 path = "src/main.rs"
 
+[[test]]
+name = "offline_cli_reads"
+path = "tests/offline_cli_reads.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "interchange_import_dry_runs"
+path = "tests/interchange_import_dry_runs.rs"
+required-features = ["interchange-import-tests"]
+
 [lints]
 workspace = true
 
@@ -27,15 +37,18 @@ workspace = true
 [features]
 default = ["nfs", "fuse", "mcp", "serve", "remote-client", "native-fts", "inference-native-hf"]
 integration-tests = []
+interchange-import-tests = []
+daemon-cli-tests = []
+mcp-daemon-cli-tests = []
 # Locator-aware remote CLI execution: connect to a `loom serve remote` endpoint and forward migrated
 # store commands through the generated `RemoteLoomClient` over HTTP/2-over-TLS.
-remote-client = ["dep:tokio", "dep:loom-remote-client", "loom-remote-client/carrier", "dep:loom-remote-protocol", "dep:rustls-native-certs"]
+remote-client = ["dep:tokio", "dep:loom-remote-client", "loom-remote-client/carrier", "dep:rustls-native-certs"]
 fips = ["serve-fips", "loom-hosted/fips"]
 nfs = ["dep:loom-vfs-nfs", "dep:ctrlc"]
 fuse = ["dep:loom-vfs-fuse", "loom-vfs-fuse/fuse"]
 mcp = ["dep:tokio", "dep:uldren-loom-mcp", "dep:loom-hosted", "uldren-loom-mcp/http", "loom-hosted/http"]
-serve = ["dep:tokio", "dep:ctrlc", "dep:loom-hosted", "dep:loom-hosted-core", "dep:loom-remote-protocol", "loom-hosted-core/http", "loom-hosted-core/tls", "loom-hosted/external-auth-standard", "loom-hosted/grpc", "loom-hosted/http", "loom-hosted/inference", "loom-hosted/kafka-wire", "loom-hosted/mysql-wire", "loom-hosted/neo4j-wire", "loom-hosted/pg-wire", "loom-hosted/tls"]
-serve-fips = ["dep:tokio", "dep:ctrlc", "dep:loom-hosted", "dep:loom-hosted-core", "dep:loom-remote-protocol", "loom-hosted-core/http", "loom-hosted-core/tls", "loom-hosted/grpc", "loom-hosted/http", "loom-hosted/inference", "loom-hosted/kafka-wire", "loom-hosted/mysql-wire", "loom-hosted/neo4j-wire", "loom-hosted/pg-wire", "loom-hosted/tls"]
+serve = ["dep:tokio", "dep:ctrlc", "dep:loom-hosted", "loom-hosted-core/http", "loom-hosted-core/tls", "loom-hosted/external-auth-standard", "loom-hosted/grpc", "loom-hosted/http", "loom-hosted/inference", "loom-hosted/kafka-wire", "loom-hosted/mysql-wire", "loom-hosted/neo4j-wire", "loom-hosted/pg-wire", "loom-hosted/tls"]
+serve-fips = ["dep:tokio", "dep:ctrlc", "dep:loom-hosted", "loom-hosted-core/http", "loom-hosted-core/tls", "loom-hosted/grpc", "loom-hosted/http", "loom-hosted/inference", "loom-hosted/kafka-wire", "loom-hosted/mysql-wire", "loom-hosted/neo4j-wire", "loom-hosted/pg-wire", "loom-hosted/tls"]
 inference-native-hf = ["dep:tokio", "loom-inference/native-hf"]
 inference-genai = ["loom-inference/genai"]
 # Local execution backends are opt-in so the default CLI remains portable across
@@ -48,6 +61,7 @@ backend-mlx = ["loom-inference/mlx"]
 native-fts = ["dep:loom-tantivy"]
 
 [dependencies]
+base64 = "0.22"
 clap.workspace = true
 loom-core = { workspace = true, features = ["columnar-arrow"] }
 loom-client.workspace = true
@@ -71,9 +85,10 @@ loom-types.workspace = true
 loom-wire.workspace = true
 loom-tantivy = { package = "uldren-loom-tantivy", path = "../loom-tantivy", version = "0.1.0-alpha.1", optional = true }
 loom-hosted = { package = "uldren-loom-hosted", path = "../loom-hosted", version = "0.1.0-alpha.1", optional = true }
-loom-hosted-core = { package = "uldren-loom-hosted-core", path = "../loom-hosted-core", version = "0.1.0-alpha.1", optional = true }
+loom-hosted-core = { package = "uldren-loom-hosted-core", path = "../loom-hosted-core", version = "0.1.0-alpha.1" }
 loom-remote-client = { package = "uldren-loom-remote-client", path = "../loom-remote-client", version = "0.1.0-alpha.1", optional = true }
-loom-remote-protocol = { package = "uldren-loom-remote-protocol", path = "../loom-remote-protocol", version = "0.1.0-alpha.1", optional = true }
+loom-remote-protocol = { package = "uldren-loom-remote-protocol", path = "../loom-remote-protocol", version = "0.1.0-alpha.1" }
+loom-result.workspace = true
 loom-vfs-fuse = { package = "uldren-loom-vfs-fuse", path = "../loom-vfs-fuse", version = "0.1.0-alpha.1", optional = true }
 loom-vfs-nfs = { package = "uldren-loom-vfs-nfs", path = "../loom-vfs-nfs", version = "0.1.0-alpha.1", optional = true }
 uldren-loom-mcp = { path = "../loom-mcp", version = "0.1.0-alpha.1", optional = true }
@@ -106,6 +121,7 @@ zip.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 kafka-protocol.workspace = true
+loom-store = { workspace = true, features = ["test-hooks"] }
 loom-protocol-conformance.workspace = true
 p256.workspace = true
 

@@ -237,6 +237,20 @@ export async function sqlExecBytes(
   return Uint8Array.from(bytes);
 }
 
+export async function sqlExecResult(
+  loomPath: string,
+  ns: string,
+  db: string,
+  sql: string,
+  key?: LoomKey,
+  auth?: LoomAuth
+): Promise<Uint8Array> {
+  const [passphrase, kek] = keyArgs(key);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  const bytes = await UldrenLoom.sqlExecResult(loomPath, ns, db, sql, passphrase, kek, authPrincipal, authPassphrase);
+  return Uint8Array.from(bytes);
+}
+
 /**
  * Run read-only SQL and resolve one canonical-CBOR row byte array per result row. Mutating statements
  * are rejected by the native query path.

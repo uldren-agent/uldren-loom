@@ -23,9 +23,10 @@ use loom_core::workspace::{FacetKind, WorkspaceId};
 use loom_core::{
     AclDomain, AclRight, Algo, DataframePlan, Digest, LogRecord, Loom, MetricDescriptor,
     MetricObservation, SpanRecord, cas_delete, cas_put, columnar_append, columnar_compact,
-    columnar_create, dataframe_create, dataframe_materialize, graph_remove_edge, graph_remove_node,
-    graph_upsert_edge, graph_upsert_node, key_from_cbor, ledger_append, logs_put_record,
-    metrics_put_descriptor, metrics_put_observation, search_create, search_delete, search_index,
+    columnar_create, columnar_from_arrow_ipc, columnar_from_parquet, dataframe_create,
+    dataframe_materialize, get_columnar, graph_remove_edge, graph_remove_node, graph_upsert_edge,
+    graph_upsert_node, key_from_cbor, ledger_append, logs_put_record, metrics_put_descriptor,
+    metrics_put_observation, put_columnar, search_create, search_delete, search_index,
     search_remap, traces_put_span, ts_put, vector_create, vector_create_metadata_index,
     vector_delete, vector_drop_metadata_index, vector_upsert, vector_upsert_text,
     vector_upsert_with_source,
@@ -96,6 +97,11 @@ use crate::reads::{SubstrateAliasSummary, resolve_ns};
 use crate::substrate_refs::{bind_alias, release_alias};
 use crate::substrate_views::{VIEW_DIR, ViewDefinitionSummary, view_path};
 use crate::{authorize_workgraph_task, now_ms, reject_stateless_ephemeral_kv};
+use loom_client::local::{
+    apply_store_bundle_import_generated, apply_vector_text_upsert_generated,
+    apply_vector_workspace_configure_json, parse_vector_workspace_configure_request,
+    publish_document_put_binary, vector_text_upsert_request_from_cbor,
+};
 use loom_lanes::{Lane, LaneInput, LaneKind, LaneStatus, LaneTicket, LaneTicketPlacement};
 use loom_lifecycle::{
     LifecycleDefinitionSummary, LifecycleInstanceSummary, LifecycleTransitionRequest,
@@ -1275,62 +1281,6 @@ fn apply_document_put<S: loom_core::ObjectStore>(
 ) -> Result<()> {
     let ns = resolve_ns(loom, workspace)?;
     loom_reference::put_document_indexed(loom, ns, name, id, doc)
-}
-
-fn apply_document_put_binary(
-    loom: &mut Loom<FileStore>,
-    workspace: &str,
-    name: &str,
-    id: &str,
-    bytes: Vec<u8>,
-    expected_entity_tag: Option<&str>,
-) -> Result<loom_core::document::DocumentPutResult> {
-    let ns = resolve_ns(loom, workspace)?;
-    enforce_document_entity_tag(loom, ns, name, id, expected_entity_tag)?;
-    let digest = Digest::hash(loom.store().digest_algo(), &bytes);
-    loom_reference::put_document_indexed(loom, ns, name, id, bytes)?;
-    Ok(loom_core::document::DocumentPutResult {
-        entity_tag: loom_core::document_entity_tag_string_from_digest(digest),
-        digest,
-    })
-}
-
-fn apply_document_put_text(
-    loom: &mut Loom<FileStore>,
-    workspace: &str,
-    name: &str,
-    id: &str,
-    text: &str,
-    expected_entity_tag: Option<&str>,
-) -> Result<loom_core::document::DocumentPutResult> {
-    let ns = resolve_ns(loom, workspace)?;
-    enforce_document_entity_tag(loom, ns, name, id, expected_entity_tag)?;
-    let bytes = text.as_bytes().to_vec();
-    let digest = Digest::hash(loom.store().digest_algo(), &bytes);
-    loom_reference::put_document_indexed(loom, ns, name, id, bytes)?;
-    Ok(loom_core::document::DocumentPutResult {
-        entity_tag: loom_core::document_entity_tag_string_from_digest(digest),
-        digest,
-    })
-}
-
-fn enforce_document_entity_tag(
-    loom: &Loom<FileStore>,
-    ns: WorkspaceId,
-    collection: &str,
-    id: &str,
-    expected_entity_tag: Option<&str>,
-) -> Result<()> {
-    let Some(expected_entity_tag) = expected_entity_tag else {
-        return Ok(());
-    };
-    match loom_core::document::document_get_binary(loom, ns, collection, id)? {
-        Some(current) if current.entity_tag == expected_entity_tag => Ok(()),
-        Some(_) | None => Err(LoomError::new(
-            Code::Conflict,
-            loom_types::ConflictReason::ExpectedTagMismatch.as_str(),
-        )),
-    }
 }
 
 fn apply_document_delete<S: loom_core::ObjectStore>(
@@ -2820,6 +2770,47 @@ impl crate::LoomMcp {
         })
     }
 
+    pub fn write_vector_text_upsert(&self, request: &[u8]) -> Result<Vec<u8>> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.vector_text_upsert(request);
+        }
+        let request = vector_text_upsert_request_from_cbor(request)?;
+        self.store.write_without_persist(|loom| {
+            let bytes = apply_vector_text_upsert_generated(loom, request)?;
+            save_loom(loom)?;
+            Ok(bytes)
+        })
+    }
+
+    pub fn write_vector_workspace_configure_json(
+        &self,
+        workspace: &str,
+        request_json: &str,
+    ) -> Result<String> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.vector_workspace_configure_json(workspace, request_json);
+        }
+        let request = parse_vector_workspace_configure_request(request_json)?;
+        self.store.write_without_persist(|loom| {
+            let json = apply_vector_workspace_configure_json(loom, workspace, request)?;
+            save_loom(loom)?;
+            Ok(json)
+        })
+    }
+
+    pub fn write_store_bundle_import(&self, bundle: &[u8], dry_run: bool) -> Result<Vec<u8>> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.store_bundle_import(bundle, dry_run);
+        }
+        self.store.write_without_persist(|loom| {
+            let (bytes, persist) = apply_store_bundle_import_generated(loom, bundle, dry_run)?;
+            if persist {
+                save_loom(loom)?;
+            }
+            Ok(bytes)
+        })
+    }
+
     // ---- columnar ----
 
     /// `columnar.create`: create an empty dataset from canonical-CBOR columns.
@@ -2863,6 +2854,133 @@ impl crate::LoomMcp {
             let ns = resolve_ns(loom, workspace)?;
             columnar_compact(loom, ns, name)
         })
+    }
+
+    fn write_columnar_import_dataset(
+        &self,
+        workspace: &str,
+        name: &str,
+        format: &str,
+        bytes_in: usize,
+        dataset: loom_core::ColumnarSet,
+        replace: bool,
+        dry_run: bool,
+    ) -> Result<Vec<u8>> {
+        self.store.write_without_persist(|loom| {
+            let existing_ns = loom
+                .registry()
+                .open(&WsSelector::Typed {
+                    ty: FacetKind::Columnar,
+                    name: workspace.to_string(),
+                })
+                .ok();
+            let replaced = match existing_ns {
+                Some(ns) => match get_columnar(loom, ns, name) {
+                    Ok(_) => {
+                        if !replace {
+                            return Err(LoomError::new(
+                                Code::Conflict,
+                                format!(
+                                    "columnar dataset {name:?} already exists; replace is required"
+                                ),
+                            ));
+                        }
+                        true
+                    }
+                    Err(error) if error.code == Code::NotFound => false,
+                    Err(error) => return Err(error),
+                },
+                None => false,
+            };
+            let report = loom_wire::columnar::ColumnarImportReport {
+                format: format.to_string(),
+                columns: dataset.columns().to_vec(),
+                rows: dataset.rows(),
+                segment_count: dataset.segment_count(),
+                target_segment_rows: dataset.target_segment_rows(),
+                bytes_in,
+                replaced,
+                dry_run,
+            };
+            if !dry_run {
+                let ns = loom.registry_mut().ensure_for_write(
+                    &WsSelector::Typed {
+                        ty: FacetKind::Columnar,
+                        name: workspace.to_string(),
+                    },
+                    fresh_workspace_id()?,
+                )?;
+                put_columnar(loom, ns, name, &dataset)?;
+                save_loom(loom)?;
+            }
+            Ok(loom_wire::columnar::import_report_to_cbor(report))
+        })
+    }
+
+    pub fn write_columnar_import_arrow(
+        &self,
+        workspace: &str,
+        name: &str,
+        payload: &[u8],
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> Result<Vec<u8>> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.columnar_import_arrow(
+                workspace,
+                name,
+                payload,
+                target_segment_rows,
+                replace,
+                dry_run,
+            );
+        }
+        let target_segment_rows = usize::try_from(target_segment_rows)
+            .map_err(|_| LoomError::invalid("columnar target_segment_rows out of range"))?;
+        let dataset = columnar_from_arrow_ipc(payload, target_segment_rows)?;
+        self.write_columnar_import_dataset(
+            workspace,
+            name,
+            "arrow-ipc",
+            payload.len(),
+            dataset,
+            replace,
+            dry_run,
+        )
+    }
+
+    pub fn write_columnar_import_parquet(
+        &self,
+        workspace: &str,
+        name: &str,
+        payload: &[u8],
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> Result<Vec<u8>> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.columnar_import_parquet(
+                workspace,
+                name,
+                payload,
+                target_segment_rows,
+                replace,
+                dry_run,
+            );
+        }
+        let target_segment_rows = usize::try_from(target_segment_rows)
+            .map_err(|_| LoomError::invalid("columnar target_segment_rows out of range"))?;
+        let dataset = columnar_from_parquet(payload, target_segment_rows)?;
+        self.write_columnar_import_dataset(
+            workspace,
+            name,
+            "parquet",
+            payload.len(),
+            dataset,
+            replace,
+            dry_run,
+        )
     }
 
     // ---- dataframe ----
@@ -3049,9 +3167,8 @@ impl crate::LoomMcp {
                     digest,
                 });
         }
-        self.store.write(|loom| {
-            apply_document_put_text(loom, workspace, name, id, text, expected_entity_tag)
-        })
+        self.store
+            .local_document_put_text(workspace, name, id, text, expected_entity_tag)
     }
 
     pub fn write_document_put_binary(
@@ -3076,8 +3193,21 @@ impl crate::LoomMcp {
                     digest,
                 });
         }
-        self.store.write(|loom| {
-            apply_document_put_binary(loom, workspace, name, id, bytes, expected_entity_tag)
+        self.store.write_durable_transaction(|loom| {
+            let result = publish_document_put_binary(
+                loom,
+                workspace,
+                name,
+                id,
+                bytes,
+                expected_entity_tag,
+                |_| crate::document_publication_pre_commit_hook(),
+            )?;
+            let (digest, entity_tag) = loom_wire::document::put_result_from_cbor(&result)?;
+            Ok(loom_core::document::DocumentPutResult {
+                entity_tag,
+                digest: Digest::parse(&digest)?,
+            })
         })
     }
 
@@ -3326,7 +3456,7 @@ impl crate::LoomMcp {
         workspace: &str,
         request: TicketCreateRequest<'_>,
     ) -> Result<TicketSummary> {
-        let ticket = self.store.write(|loom| {
+        let ticket = self.store.write_durable_transaction(|loom| {
             let ns = resolve_ns(loom, workspace)?;
             loom_tickets::create_ticket(loom, ns, request)
         })?;
@@ -3339,7 +3469,7 @@ impl crate::LoomMcp {
         workspace: &str,
         request: TicketUpdateRequest<'_>,
     ) -> Result<TicketSummary> {
-        let ticket = self.store.write(|loom| {
+        let ticket = self.store.write_durable_transaction(|loom| {
             let ns = resolve_ns(loom, workspace)?;
             loom_tickets::update_ticket(loom, ns, request)
         })?;
@@ -3352,7 +3482,7 @@ impl crate::LoomMcp {
         workspace: &str,
         request: TicketDeleteRequest<'_>,
     ) -> Result<TicketSummary> {
-        self.store.write(|loom| {
+        self.store.write_durable_transaction(|loom| {
             let ns = resolve_ns(loom, workspace)?;
             loom_tickets::delete_ticket(loom, ns, request)
         })
@@ -3618,13 +3748,13 @@ impl crate::LoomMcp {
                 active_ticket_id: request.active_ticket_id,
                 status_report: request.status_report,
                 reviewer_feedback: request.reviewer_feedback,
-                updated_at: now_ms(),
+                updated_at: crate::now_ms(),
                 updated_by,
             })
         };
         if let Some(backend) = self.store.remote_backend() {
-            // Remote host derives the actor; forward the caller-provided override verbatim.
-            return backend.lanes_create(workspace, build_lane(request.updated_by.unwrap_or(""))?);
+            return backend
+                .lanes_create(workspace, build_lane(request.updated_by.unwrap_or("mcp"))?);
         }
         self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
@@ -3678,29 +3808,16 @@ impl crate::LoomMcp {
                 },
             );
         }
-        self.write_lanes_mutation(
+        self.store.local_lanes_update(
             workspace,
-            request.lane_id,
-            "lane.updated",
-            |lane, loom, ns| {
-                if let Some(title) = request.title {
-                    lane.title = title.to_string();
-                }
-                if let Some(description) = request.description {
-                    lane.description = description.to_string();
-                }
-                if let Some(lane_status) = request.lane_status {
-                    lane.lane_status = LaneStatus::parse(lane_status)?.as_str().to_string();
-                }
-                if let Some(status_report) = request.status_report {
-                    lane.status_report = status_report.to_string();
-                }
-                if let Some(reviewer_feedback) = request.reviewer_feedback {
-                    lane.reviewer_feedback = reviewer_feedback.to_string();
-                }
-                let actor = resolve_lane_actor(loom, ns, request.updated_by)?;
-                update_lane_metadata(lane, &actor);
-                Ok(())
+            crate::RemoteLaneUpdate {
+                lane_id: request.lane_id,
+                title: request.title,
+                description: request.description,
+                lane_status: request.lane_status,
+                status_report: request.status_report,
+                reviewer_feedback: request.reviewer_feedback,
+                updated_by: request.updated_by.unwrap_or(""),
             },
         )
     }
@@ -3797,6 +3914,15 @@ impl crate::LoomMcp {
         workspace: &str,
         request: LaneTicketUpdateRequest<'_>,
     ) -> Result<Lane> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.lanes_ticket_add(
+                workspace,
+                request.lane_id,
+                request.ticket_id,
+                request.placement,
+                request.updated_by.unwrap_or(""),
+            );
+        }
         self.write_lanes_mutation(
             workspace,
             request.lane_id,
@@ -4039,6 +4165,9 @@ impl crate::LoomMcp {
         title: &str,
         expected_root: Option<&str>,
     ) -> Result<SpaceSummary> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.spaces_create(workspace, workspace_id, space_id, title, expected_root);
+        }
         self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
             crate::pages::create_space(loom, ns, workspace_id, space_id, title, expected_root)
@@ -4050,6 +4179,9 @@ impl crate::LoomMcp {
         workspace: &str,
         request: PageCreateRequest<'_>,
     ) -> Result<PageSummary> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.pages_create(workspace, request);
+        }
         self.store.write(|loom| {
             let ns = resolve_ns(loom, workspace)?;
             crate::pages::create_page(loom, ns, request)
@@ -4086,18 +4218,22 @@ impl crate::LoomMcp {
         body_text: &str,
         expected_root: Option<&str>,
     ) -> Result<PageUpdateSummary> {
-        self.store.write(|loom| {
-            let ns = resolve_ns(loom, workspace)?;
-            crate::pages::update_page_text(
-                loom,
-                ns,
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.pages_update_text(
+                workspace,
                 workspace_id,
                 page_id,
                 body_text,
-                now_ms(),
                 expected_root,
-            )
-        })
+            );
+        }
+        self.store.local_pages_update_text(
+            workspace,
+            workspace_id,
+            page_id,
+            body_text,
+            expected_root,
+        )
     }
 
     pub fn write_pages_publish(
@@ -4107,10 +4243,11 @@ impl crate::LoomMcp {
         page_id: &str,
         expected_root: Option<&str>,
     ) -> Result<PagePublishSummary> {
-        self.store.write(|loom| {
-            let ns = resolve_ns(loom, workspace)?;
-            crate::pages::publish_page(loom, ns, workspace_id, page_id, now_ms(), expected_root)
-        })
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.pages_publish(workspace, workspace_id, page_id, expected_root);
+        }
+        self.store
+            .local_pages_publish(workspace, workspace_id, page_id, expected_root)
     }
 
     pub fn write_lifecycles_define(
@@ -6227,6 +6364,13 @@ impl crate::LoomMcp {
         Ok(payload)
     }
 
+    pub fn write_sql_exec_result(&self, workspace: &str, db: &str, sql: &str) -> Result<Vec<u8>> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.sql_exec_result(workspace, db, sql);
+        }
+        self.write_sql_exec(workspace, db, sql)
+    }
+
     /// `sql.commit`: record a version-control commit over the SQL-facet workspace; returns its address.
     pub fn write_sql_commit(
         &self,
@@ -6569,7 +6713,7 @@ mod tests {
     };
     use crate::{LoomMcp, StoreAccess};
     use loom_codec::Value as WireValue;
-    use loom_core::error::Code;
+    use loom_core::error::{Code, LoomError};
     use loom_core::workspace::{FacetKind, WorkspaceId};
     use loom_core::{
         AclDomain, AclEffect, AclGrant, AclRight, AclScope, AclScopeKind, AclSubject, Algo, Digest,
@@ -6595,6 +6739,8 @@ mod tests {
     use loom_substrate::workgraph::{WorkgraphFact, WorkgraphFactKind, WorkgraphState};
     use loom_tickets::{ExternalTicketIdentity, TicketProfileReader};
     use serde_json::json;
+    #[cfg(feature = "test-hooks")]
+    use std::path::Path;
     use std::path::PathBuf;
 
     fn temp_path() -> PathBuf {
@@ -7022,6 +7168,739 @@ mod tests {
 
     fn mcp(path: &std::path::Path) -> crate::LoomMcp {
         crate::LoomMcp::new(StoreAccess::per_request(path, None))
+    }
+
+    fn persistent_mcp(path: &std::path::Path) -> crate::LoomMcp {
+        crate::LoomMcp::new(StoreAccess::persistent(
+            open_loom_unlocked(path, None).unwrap(),
+        ))
+    }
+
+    fn mcp_generation(m: &crate::LoomMcp) -> loom_core::OverlayGeneration {
+        m.store()
+            .read(|loom| loom.store().mutable_overlay_generation())
+            .unwrap()
+    }
+
+    fn mcp_fsync_count(m: &crate::LoomMcp) -> u64 {
+        m.store()
+            .read(|loom| Ok(loom.store().group_commit_diagnostics()?.fsync_count))
+            .unwrap()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn assert_single_workflow_publication<T>(
+        path: &Path,
+        m: &crate::LoomMcp,
+        label: &str,
+        mutation: impl FnOnce() -> loom_core::error::Result<T>,
+    ) -> T {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = std::sync::Arc::clone(&events);
+        let guard = loom_store::install_store_publication_test_observer(
+            path.to_path_buf(),
+            std::sync::Arc::new(move |event| {
+                observed.lock().expect("publication event lock").push(event);
+            }),
+        );
+        assert!(loom_store::store_publication_test_observer_registered(path));
+        let before_generation = mcp_generation(m);
+        let before_fsync = mcp_fsync_count(m);
+        let result = mutation().unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        drop(guard);
+        assert!(!loom_store::store_publication_test_observer_registered(
+            path
+        ));
+        let events = events.lock().expect("publication events").clone();
+        assert_eq!(
+            events,
+            vec![loom_store::StorePublicationTestEvent::WorkflowTransaction],
+            "{label} publication events"
+        );
+        assert_eq!(
+            mcp_generation(m).as_u64(),
+            before_generation.as_u64() + 1,
+            "{label} overlay generation"
+        );
+        assert_eq!(
+            mcp_fsync_count(m),
+            before_fsync + 2,
+            "{label} non-checkpoint fsyncs"
+        );
+        result
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn assert_no_publication_on_error<T: std::fmt::Debug>(
+        path: &Path,
+        m: &crate::LoomMcp,
+        label: &str,
+        mutation: impl FnOnce() -> loom_core::error::Result<T>,
+        expected_code: Code,
+    ) {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = std::sync::Arc::clone(&events);
+        let guard = loom_store::install_store_publication_test_observer(
+            path.to_path_buf(),
+            std::sync::Arc::new(move |event| {
+                observed.lock().expect("publication event lock").push(event);
+            }),
+        );
+        let before_generation = mcp_generation(m);
+        let before_fsync = mcp_fsync_count(m);
+        let error = mutation().expect_err(label);
+        drop(guard);
+        assert_eq!(error.code, expected_code, "{label} error code");
+        assert_eq!(
+            events.lock().expect("publication events").as_slice(),
+            &[],
+            "{label} publication events"
+        );
+        assert_eq!(mcp_generation(m), before_generation, "{label} generation");
+        assert_eq!(mcp_fsync_count(m), before_fsync, "{label} fsyncs");
+    }
+
+    #[test]
+    fn persistent_mcp_document_text_put_uses_single_publication_and_rolls_back() {
+        let path = temp_path();
+        fresh(&path);
+        let m = persistent_mcp(&path);
+        let before_generation = mcp_generation(&m);
+        let before_fsync = mcp_fsync_count(&m);
+        let doc = m
+            .write_document_put_text("repo", "notes", "doc-1", "hello !ticket:DOC-1", None)
+            .expect("persistent text put");
+        assert_eq!(mcp_generation(&m).as_u64(), before_generation.as_u64() + 1);
+        assert_eq!(mcp_fsync_count(&m), before_fsync + 2);
+        let read = m
+            .read_document_get_text("repo", "notes", "doc-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.text, "hello !ticket:DOC-1");
+        assert_eq!(read.entity_tag, doc.entity_tag);
+        assert_eq!(read.digest, doc.digest);
+        assert_eq!(
+            m.read_substrate_refs("repo", "ticket:DOC-1")
+                .unwrap()
+                .inbound
+                .len(),
+            1
+        );
+        drop(m);
+
+        let m = persistent_mcp(&path);
+        let read = m
+            .read_document_get_text("repo", "notes", "doc-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.text, "hello !ticket:DOC-1");
+        assert_eq!(read.entity_tag, doc.entity_tag);
+        assert_eq!(read.digest, doc.digest);
+        let before_stale_generation = mcp_generation(&m);
+        let before_stale_fsync = mcp_fsync_count(&m);
+        let before_stale_text = m
+            .read_document_get_text("repo", "notes", "doc-1")
+            .unwrap()
+            .unwrap();
+        let before_stale_refs = m.read_substrate_refs("repo", "ticket:DOC-1").unwrap();
+        let stale = m
+            .write_document_put_text(
+                "repo",
+                "notes",
+                "doc-1",
+                "stale !ticket:DOC-2",
+                Some("entity-tag:0000"),
+            )
+            .unwrap_err();
+        assert_eq!(stale.code, Code::Conflict);
+        assert_eq!(mcp_generation(&m), before_stale_generation);
+        assert_eq!(mcp_fsync_count(&m), before_stale_fsync);
+        let after_stale_text = m
+            .read_document_get_text("repo", "notes", "doc-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_stale_text.text, before_stale_text.text);
+        assert_eq!(after_stale_text.entity_tag, before_stale_text.entity_tag);
+        assert_eq!(after_stale_text.digest, before_stale_text.digest);
+        assert_eq!(
+            m.read_substrate_refs("repo", "ticket:DOC-1")
+                .unwrap()
+                .inbound,
+            before_stale_refs.inbound
+        );
+
+        crate::install_document_publication_test_hook(Box::new(|| {
+            Err(LoomError::new(
+                Code::Internal,
+                "injected persistent document text publication failure",
+            ))
+        }));
+        let before_failure_generation = mcp_generation(&m);
+        let before_failure_fsync = mcp_fsync_count(&m);
+        let before_failure_text = m
+            .read_document_get_text("repo", "notes", "doc-1")
+            .unwrap()
+            .unwrap();
+        let failed = m
+            .write_document_put_text(
+                "repo",
+                "notes",
+                "doc-1",
+                "failed !ticket:DOC-3",
+                Some(&doc.entity_tag),
+            )
+            .unwrap_err();
+        assert_eq!(failed.code, Code::Internal);
+        assert_eq!(mcp_generation(&m), before_failure_generation);
+        assert_eq!(mcp_fsync_count(&m), before_failure_fsync);
+        let after_failure_text = m
+            .read_document_get_text("repo", "notes", "doc-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_failure_text.text, before_failure_text.text);
+        assert_eq!(
+            after_failure_text.entity_tag,
+            before_failure_text.entity_tag
+        );
+        assert_eq!(after_failure_text.digest, before_failure_text.digest);
+        drop(m);
+
+        let m = persistent_mcp(&path);
+        let reopened = m
+            .read_document_get_text("repo", "notes", "doc-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.text, before_failure_text.text);
+        assert_eq!(reopened.entity_tag, before_failure_text.entity_tag);
+        assert_eq!(reopened.digest, before_failure_text.digest);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persistent_mcp_document_binary_put_uses_single_publication_and_rolls_back() {
+        let path = temp_path();
+        fresh(&path);
+        let m = persistent_mcp(&path);
+        let before_generation = mcp_generation(&m);
+        let before_fsync = mcp_fsync_count(&m);
+        let doc = m
+            .write_document_put_binary("repo", "notes", "blob", vec![0xFF, 0xFE, 0x00], None)
+            .expect("persistent binary put");
+        assert_eq!(mcp_generation(&m).as_u64(), before_generation.as_u64() + 1);
+        assert_eq!(mcp_fsync_count(&m), before_fsync + 2);
+        let read = m
+            .read_document_get_binary("repo", "notes", "blob")
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.bytes, vec![0xFF, 0xFE, 0x00]);
+        assert_eq!(read.entity_tag, doc.entity_tag);
+        assert_eq!(read.digest, doc.digest);
+        drop(m);
+
+        let m = persistent_mcp(&path);
+        let read = m
+            .read_document_get_binary("repo", "notes", "blob")
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.bytes, vec![0xFF, 0xFE, 0x00]);
+        assert_eq!(read.entity_tag, doc.entity_tag);
+        assert_eq!(read.digest, doc.digest);
+        let before_stale_generation = mcp_generation(&m);
+        let before_stale_fsync = mcp_fsync_count(&m);
+        let before_stale_binary = m
+            .read_document_get_binary("repo", "notes", "blob")
+            .unwrap()
+            .unwrap();
+        let stale = m
+            .write_document_put_binary(
+                "repo",
+                "notes",
+                "blob",
+                vec![1, 2, 3],
+                Some("entity-tag:0000"),
+            )
+            .unwrap_err();
+        assert_eq!(stale.code, Code::Conflict);
+        assert_eq!(mcp_generation(&m), before_stale_generation);
+        assert_eq!(mcp_fsync_count(&m), before_stale_fsync);
+        let after_stale_binary = m
+            .read_document_get_binary("repo", "notes", "blob")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_stale_binary.bytes, before_stale_binary.bytes);
+        assert_eq!(
+            after_stale_binary.entity_tag,
+            before_stale_binary.entity_tag
+        );
+        assert_eq!(after_stale_binary.digest, before_stale_binary.digest);
+
+        crate::install_document_publication_test_hook(Box::new(|| {
+            Err(LoomError::new(
+                Code::Internal,
+                "injected persistent document binary publication failure",
+            ))
+        }));
+        let before_failure_generation = mcp_generation(&m);
+        let before_failure_fsync = mcp_fsync_count(&m);
+        let before_failure_binary = m
+            .read_document_get_binary("repo", "notes", "blob")
+            .unwrap()
+            .unwrap();
+        let failed = m
+            .write_document_put_binary(
+                "repo",
+                "notes",
+                "blob",
+                vec![4, 5, 6],
+                Some(&doc.entity_tag),
+            )
+            .unwrap_err();
+        assert_eq!(failed.code, Code::Internal);
+        assert_eq!(mcp_generation(&m), before_failure_generation);
+        assert_eq!(mcp_fsync_count(&m), before_failure_fsync);
+        let after_failure_binary = m
+            .read_document_get_binary("repo", "notes", "blob")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_failure_binary.bytes, before_failure_binary.bytes);
+        assert_eq!(
+            after_failure_binary.entity_tag,
+            before_failure_binary.entity_tag
+        );
+        assert_eq!(after_failure_binary.digest, before_failure_binary.digest);
+        drop(m);
+
+        let m = persistent_mcp(&path);
+        let reopened = m
+            .read_document_get_binary("repo", "notes", "blob")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.bytes, before_failure_binary.bytes);
+        assert_eq!(reopened.entity_tag, before_failure_binary.entity_tag);
+        assert_eq!(reopened.digest, before_failure_binary.digest);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn mu_17j_g_c4_representative_mutations_use_single_publication_boundary() {
+        let path = temp_path();
+        fresh(&path);
+        add_document_and_queue_facets(&path);
+        let m = persistent_mcp(&path);
+        let repo_workspace_id = WorkspaceId::v4_from_bytes([3u8; 16]).to_string();
+
+        let project = m
+            .write_tickets_project_create("repo", "studio", "eng", "ENG", "Engineering", None)
+            .expect("ticket project");
+        let ticket = assert_single_workflow_publication(&path, &m, "ticket create", || {
+            m.write_tickets_create(
+                "repo",
+                TicketCreateRequest {
+                    workspace_id: "studio",
+                    project_id: "eng",
+                    ticket_type: "task",
+                    external_source: None,
+                    external_id: None,
+                    fields: &json!({"title": "Original ticket"}),
+                    policy_labels: &[],
+                    expected_root: Some(&project.profile_root),
+                },
+            )
+        });
+        let ticket = assert_single_workflow_publication(&path, &m, "ticket update", || {
+            m.write_tickets_update(
+                "repo",
+                TicketUpdateRequest {
+                    workspace_id: "studio",
+                    ticket_id: &ticket.ticket_id,
+                    set_fields: Some(&json!({"title": "Updated ticket"})),
+                    delete_fields: &[],
+                    action: None,
+                    target_status: None,
+                    observed_source_status: None,
+                    observed_workflow_version: None,
+                    assignee: None,
+                    expected_root: Some(&ticket.profile_root),
+                    comment: None,
+                    comments: &[],
+                    relation_sets: &[],
+                    relation_removes: &[],
+                },
+            )
+        });
+        assert_eq!(ticket.fields["title"], json!("Updated ticket"));
+        assert_no_publication_on_error(
+            &path,
+            &m,
+            "stale ticket update",
+            || {
+                m.write_tickets_update(
+                    "repo",
+                    TicketUpdateRequest {
+                        workspace_id: "studio",
+                        ticket_id: &ticket.ticket_id,
+                        set_fields: Some(&json!({"title": "Stale ticket"})),
+                        delete_fields: &[],
+                        action: None,
+                        target_status: None,
+                        observed_source_status: None,
+                        observed_workflow_version: None,
+                        assignee: None,
+                        expected_root: Some(&project.profile_root),
+                        comment: None,
+                        comments: &[],
+                        relation_sets: &[],
+                        relation_removes: &[],
+                    },
+                )
+            },
+            Code::Conflict,
+        );
+
+        let space = m
+            .write_spaces_create("repo", "studio", "eng", "Engineering", None)
+            .expect("space");
+        let page = m
+            .write_pages_create(
+                "repo",
+                PageCreateRequest {
+                    workspace_id: "studio",
+                    page_id: "page-1",
+                    space_id: "eng",
+                    parent_page_id: None,
+                    title: "Roadmap",
+                    expected_root: Some(&space.profile_root),
+                },
+            )
+            .expect("page");
+        let draft = m
+            .write_pages_update_text(
+                "repo",
+                "studio",
+                "page-1",
+                "Published body !ticket:ENG-1",
+                Some(&page.profile_root),
+            )
+            .expect("draft page");
+        let published = assert_single_workflow_publication(&path, &m, "page publish", || {
+            m.write_pages_publish("repo", "studio", "page-1", Some(&draft.profile_root))
+        });
+        assert_eq!(published.outcome, "published");
+        assert_no_publication_on_error(
+            &path,
+            &m,
+            "stale page publish",
+            || m.write_pages_publish("repo", "studio", "page-1", Some(&draft.profile_root)),
+            Code::Conflict,
+        );
+
+        drop(m);
+        update_store(&path, |loom| {
+            let lane = loom_lanes::Lane::new(loom_lanes::LaneInput {
+                lane_id: "review-lane-c4",
+                lane_key: "review-lane-c4",
+                title: "Review",
+                description: "Review lane",
+                lane_kind: loom_lanes::LaneKind::Assignment,
+                owner_principal: Some("user:reviewer-c4"),
+                lane_status: loom_lanes::LaneStatus::Ready,
+                lane_tickets: &[],
+                active_ticket_id: None,
+                status_report: "",
+                reviewer_feedback: "",
+                updated_at: crate::now_ms(),
+                updated_by: "user:reviewer-c4",
+            })
+            .expect("lane input");
+            loom_lanes::create_lane(loom, WorkspaceId::v4_from_bytes([3u8; 16]), lane)
+                .expect("seed lane");
+        });
+        let m = persistent_mcp(&path);
+        let lane = assert_single_workflow_publication(&path, &m, "lane update", || {
+            m.write_lanes_update(
+                &repo_workspace_id,
+                LaneUpdateRequest {
+                    lane_id: "review-lane-c4",
+                    title: Some("Review updated"),
+                    description: None,
+                    lane_status: Some("working"),
+                    status_report: Some("in progress"),
+                    reviewer_feedback: None,
+                    updated_by: Some("user:reviewer-c4"),
+                },
+            )
+        });
+        assert_eq!(lane.title, "Review updated");
+        assert_eq!(lane.lane_status, "working");
+        assert_no_publication_on_error(
+            &path,
+            &m,
+            "invalid lane update",
+            || {
+                m.write_lanes_update(
+                    &repo_workspace_id,
+                    LaneUpdateRequest {
+                        lane_id: "review-lane-c4",
+                        title: None,
+                        description: None,
+                        lane_status: None,
+                        status_report: None,
+                        reviewer_feedback: None,
+                        updated_by: Some("user:reviewer-c4"),
+                    },
+                )
+            },
+            Code::InvalidArgument,
+        );
+
+        let document = assert_single_workflow_publication(&path, &m, "document text put", || {
+            m.write_document_put_text("repo", "notes", "doc-1", "hello !ticket:ENG-1", None)
+        });
+        assert_no_publication_on_error(
+            &path,
+            &m,
+            "stale document text put",
+            || {
+                m.write_document_put_text(
+                    "repo",
+                    "notes",
+                    "doc-1",
+                    "stale !ticket:ENG-2",
+                    Some("entity-tag:0000"),
+                )
+            },
+            Code::Conflict,
+        );
+
+        drop(m);
+        let m = persistent_mcp(&path);
+        let reopened_ticket = m
+            .read_tickets_get("repo", "studio", &ticket.ticket_id, None)
+            .expect("reopen ticket")
+            .expect("ticket present");
+        assert_eq!(reopened_ticket.fields["title"], json!("Updated ticket"));
+        let reopened_page = m
+            .read_pages_get("repo", "studio", "page-1")
+            .expect("reopen page")
+            .expect("page present");
+        assert_eq!(reopened_page.status, "published");
+        assert_eq!(
+            reopened_page.body_text.as_deref(),
+            Some("Published body !ticket:ENG-1\n")
+        );
+        let reopened_lane = m
+            .read_lanes_get(&repo_workspace_id, "review-lane-c4")
+            .expect("reopen lane")
+            .expect("lane present");
+        assert_eq!(reopened_lane.title, "Review updated");
+        assert_eq!(reopened_lane.lane_status, "working");
+        let reopened_document = m
+            .read_document_get_text("repo", "notes", "doc-1")
+            .expect("reopen document")
+            .expect("document present");
+        assert_eq!(reopened_document.text, "hello !ticket:ENG-1");
+        assert_eq!(reopened_document.entity_tag, document.entity_tag);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn add_document_and_queue_facets(path: &std::path::Path) {
+        update_store(path, |loom| {
+            let repo = loom
+                .registry()
+                .open(&loom_core::WsSelector::Name("repo".to_string()))
+                .unwrap();
+            loom.registry_mut()
+                .add_facet(repo, FacetKind::Document)
+                .unwrap();
+            loom.registry_mut()
+                .add_facet(repo, FacetKind::Queue)
+                .unwrap();
+        });
+    }
+
+    fn run_mu_17j_g_b2_page_document_lane_sequence(m: &crate::LoomMcp) {
+        let space = m
+            .write_spaces_create("repo", "studio", "eng", "Engineering", None)
+            .expect("space");
+        let page = m
+            .write_pages_create(
+                "repo",
+                PageCreateRequest {
+                    workspace_id: "studio",
+                    page_id: "page-1",
+                    space_id: "eng",
+                    parent_page_id: None,
+                    title: "Roadmap",
+                    expected_root: Some(&space.profile_root),
+                },
+            )
+            .expect("page");
+        let update = m
+            .write_pages_update_text(
+                "repo",
+                "studio",
+                "page-1",
+                "Draft body",
+                Some(&page.profile_root),
+            )
+            .expect("page update");
+        assert_eq!(update.workspace_id, "studio");
+        assert_eq!(update.page_id, "page-1");
+        assert_eq!(update.status, "draft");
+        assert!(Digest::parse(&update.profile_root).is_ok());
+        let before_stale_update = mcp_generation(m);
+        let stale_update = m
+            .write_pages_update_text(
+                "repo",
+                "studio",
+                "page-1",
+                "Stale draft",
+                Some(&page.profile_root),
+            )
+            .unwrap_err();
+        assert_eq!(stale_update.code, Code::Conflict);
+        assert_eq!(mcp_generation(m), before_stale_update);
+
+        let publish = m
+            .write_pages_publish("repo", "studio", "page-1", Some(&update.profile_root))
+            .expect("page publish");
+        assert_eq!(publish.workspace_id, "studio");
+        assert_eq!(publish.page_id, "page-1");
+        assert_eq!(publish.outcome, "published");
+        assert!(Digest::parse(&publish.profile_root).is_ok());
+        let before_stale_publish = mcp_generation(m);
+        let stale_publish = m
+            .write_pages_publish("repo", "studio", "page-1", Some(&update.profile_root))
+            .unwrap_err();
+        assert_eq!(stale_publish.code, Code::Conflict);
+        assert_eq!(mcp_generation(m), before_stale_publish);
+
+        let doc = m
+            .write_document_put_text("repo", "notes", "doc-1", "hello", None)
+            .expect("document put");
+        assert!(Digest::parse(&doc.digest.to_string()).is_ok());
+        assert_eq!(
+            m.read_document_get_text("repo", "notes", "doc-1")
+                .unwrap()
+                .unwrap()
+                .text,
+            "hello"
+        );
+        let doc2 = m
+            .write_document_put_text(
+                "repo",
+                "notes",
+                "doc-1",
+                "hello again",
+                Some(&doc.entity_tag),
+            )
+            .expect("guarded document put");
+        assert_ne!(doc2.entity_tag, doc.entity_tag);
+        let before_stale_doc = mcp_generation(m);
+        let stale_doc = m
+            .write_document_put_text("repo", "notes", "doc-1", "stale", Some(&doc.entity_tag))
+            .unwrap_err();
+        assert_eq!(stale_doc.code, Code::Conflict);
+        assert_eq!(mcp_generation(m), before_stale_doc);
+
+        let lane = m
+            .write_lanes_create(
+                "repo",
+                LaneCreateRequest {
+                    lane_id: "review-lane-a",
+                    lane_key: "review-lane-a",
+                    title: "Original title",
+                    description: "Original description",
+                    lane_kind: loom_lanes::LaneKind::Assignment.as_str(),
+                    owner_principal: Some("user:reviewer-a"),
+                    lane_status: "ready",
+                    lane_tickets: &[],
+                    active_ticket_id: None,
+                    status_report: "",
+                    reviewer_feedback: "",
+                    updated_by: Some("user:reviewer-a"),
+                },
+            )
+            .expect("lane create");
+        assert_eq!(lane.lane_id, "review-lane-a");
+        let lane = m
+            .write_lanes_update(
+                "repo",
+                LaneUpdateRequest {
+                    lane_id: "review-lane-a",
+                    title: Some("Updated title"),
+                    description: None,
+                    lane_status: Some("working"),
+                    status_report: Some("in progress"),
+                    reviewer_feedback: Some("looks good"),
+                    updated_by: Some("user:reviewer-b"),
+                },
+            )
+            .expect("lane update");
+        assert_eq!(lane.title, "Updated title");
+        assert_eq!(lane.lane_status, "working");
+        assert_eq!(lane.status_report, "in progress");
+        assert_eq!(lane.reviewer_feedback, "looks good");
+        let before_invalid_lane = mcp_generation(m);
+        let invalid_lane = m
+            .write_lanes_update(
+                "repo",
+                LaneUpdateRequest {
+                    lane_id: "review-lane-a",
+                    title: None,
+                    description: None,
+                    lane_status: None,
+                    status_report: None,
+                    reviewer_feedback: None,
+                    updated_by: Some("user:reviewer-b"),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(invalid_lane.code, Code::InvalidArgument);
+        assert_eq!(mcp_generation(m), before_invalid_lane);
+    }
+
+    #[test]
+    fn mu_17j_g_b2_scoped_mcp_routes_do_not_use_store_access_write() {
+        let source = include_str!("writes.rs");
+        for method in [
+            "write_document_put_text",
+            "write_pages_update_text",
+            "write_pages_publish",
+            "write_lanes_update",
+        ] {
+            let start = source.find(method).expect("method present");
+            let rest = &source[start..];
+            let end = rest.find("\n    pub fn ").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                !body.contains("self.store.write("),
+                "{method} must not use StoreAccess::write"
+            );
+        }
+    }
+
+    #[test]
+    fn mu_17j_g_b2_scoped_mutations_work_per_request_and_persistent() {
+        let per_request_path = temp_path();
+        fresh(&per_request_path);
+        add_document_and_queue_facets(&per_request_path);
+        {
+            let m = mcp(&per_request_path);
+            run_mu_17j_g_b2_page_document_lane_sequence(&m);
+        }
+        let _ = std::fs::remove_file(&per_request_path);
+
+        let persistent_path = temp_path();
+        fresh(&persistent_path);
+        add_document_and_queue_facets(&persistent_path);
+        {
+            let loom = open_loom_unlocked(&persistent_path, None).unwrap();
+            let m = crate::LoomMcp::new(StoreAccess::persistent(loom));
+            run_mu_17j_g_b2_page_document_lane_sequence(&m);
+        }
+        let _ = std::fs::remove_file(&persistent_path);
     }
 
     fn workgraph_fact(task_id: &str, event_id: &str) -> WorkgraphFact {
@@ -9933,7 +10812,7 @@ mod tests {
     }
 
     #[test]
-    fn lanes_list_is_fail_soft_and_surfaces_decode_diagnostics() {
+    fn lanes_list_reads_canonical_lane_views() {
         let path = temp_path();
         fresh(&path);
         update_store(&path, |loom| {
@@ -9968,38 +10847,12 @@ mod tests {
         )
         .expect("create healthy lane");
 
-        // Inject a malformed lane document directly into the coordination collection.
-        update_store(&path, |loom| {
-            let repo = loom
-                .registry()
-                .open(&loom_core::WsSelector::Name("repo".to_string()))
-                .unwrap();
-            loom_core::document::document_put_text(
-                loom,
-                repo,
-                loom_lanes::LANE_COLLECTION,
-                "lane-broken",
-                "{ this is not valid lane json",
-                None,
-            )
-            .unwrap();
-        });
-
-        // lanes_list is fail-soft: the healthy lane view plus one diagnostic for the broken record.
         let (views, diagnostics) = m
             .read_lanes_list_views_with_diagnostics("repo")
-            .expect("fail-soft lane list");
+            .expect("canonical lane list");
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].lane_id, "review-lane-a");
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].lane_id, "lane-broken");
-        assert!(!diagnostics[0].error.is_empty());
-
-        // Targeted lanes_get on the malformed record returns an actionable error, not a silent drop.
-        let error = m
-            .read_lanes_get_view("repo", "lane-broken")
-            .expect_err("malformed targeted get must error");
-        assert_eq!(error.code, Code::InvalidArgument);
+        assert!(diagnostics.is_empty());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -10127,6 +10980,7 @@ mod tests {
                     acceptance_authorities: None,
                     acceptance_evidence_enforcement: None,
                     required_acceptance_evidence_keys: None,
+                    required_acceptance_reviews: None,
                     owner_contract_summary: None,
                     owner_contract_details: None,
                     worker_contract_summary: None,
@@ -10170,6 +11024,7 @@ mod tests {
                     acceptance_authorities: None,
                     acceptance_evidence_enforcement: None,
                     required_acceptance_evidence_keys: None,
+                    required_acceptance_reviews: None,
                     owner_contract_summary: Some("Owner verifies work."),
                     owner_contract_details: Some(owner_details),
                     worker_contract_summary: Some("Worker records state."),

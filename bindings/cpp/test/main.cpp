@@ -70,6 +70,47 @@ int main() {
     assert(!uldren::loom::version().empty());
     assert(uldren::loom::blob_digest(bytes("abc")).rfind("blake3:", 0) == 0);
 
+    {
+        auto path = temp_loom_path();
+        uldren::loom::create(path, "default");
+        {
+            auto store = uldren::loom::Loom::open(path);
+            assert(!store.audit_compact(0).empty());
+        }
+        std::filesystem::remove(path);
+    }
+    {
+        auto path = temp_loom_path();
+        uldren::loom::create(path, "default");
+        {
+            auto store = uldren::loom::Loom::open(path);
+            assert(!store.store_maintenance_status(std::vector<std::uint8_t>{0x81, 0xf4}).empty());
+        }
+        std::filesystem::remove(path);
+    }
+    {
+        auto path = temp_loom_path();
+        uldren::loom::create(path, "default");
+        {
+            auto store = uldren::loom::Loom::open(path);
+            assert(!store.store_maintenance_policy_set(std::vector<std::uint8_t>{
+                        0x8e, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6,
+                        0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6, 0xf6})
+                        .empty());
+        }
+        std::filesystem::remove(path);
+    }
+    {
+        auto path = temp_loom_path();
+        uldren::loom::create(path, "default");
+        {
+            auto store = uldren::loom::Loom::open(path);
+            assert(!store.store_maintenance_run(std::vector<std::uint8_t>{0x82, 0x01, 0x01})
+                        .empty());
+        }
+        std::filesystem::remove(path);
+    }
+
     auto path = temp_loom_path();
     uldren::loom::create(path, "default");
 
@@ -214,6 +255,14 @@ int main() {
         assert(result.cell(0, 1, 0).as_int64() == 2);
         assert(result.cell(0, 1, 1).text() == "b");
         assert(db.commit("seed", "cpp").rfind("blake3:", 0) == 0);
+
+        store.workspace_create(std::optional<std::string>{"studio"},
+                               std::optional<std::string>{"vcs"});
+        auto snapshot = bytes(
+            R"({"snapshot_version":1,"profile":"granola-app","source_system":"granola-app","source_scope":"local-cache","observed_at":500,"coverage":"complete","items":[{"source_entity_id":"note-1","source_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000","source_sidecar":{"id":"note-1","raw":true},"title":"Planning","summary_text":"Planning summary","transcript_spans":[{"text":"Capture decisions."}],"decisions":[{"label":"Use normalized meeting imports."}]}]})");
+        auto meetings_report = store.meetings_import_snapshot("studio", "granola-app", snapshot);
+        assert(meetings_report.find("\"profile\":\"meetings\"") != std::string::npos);
+        assert(meetings_report.find("\"rows_imported\":1") != std::string::npos);
     }
 
     std::filesystem::remove(path);

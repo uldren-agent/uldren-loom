@@ -12,26 +12,25 @@ pub(crate) fn run_audit(action: AuditCmd, keys: &KeyOpts) -> Result<(), String> 
 }
 
 fn run_audit_compact(store: &str, through_seq: u64, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let stats = loom
-        .store()
-        .audit_prune_through(Some(actor), through_seq)
-        .map_err(|e| e.to_string())?;
-    println!("{}", audit_prune_stats_json(stats));
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let bytes = execute_generated_bytes(
+        &client,
+        "Audit",
+        "audit_compact",
+        vec![through_seq.to_value()],
+    )?;
+    let result =
+        loom_wire::audit::audit_compact_result_from_cbor(&bytes).map_err(|e| e.to_string())?;
+    println!("{}", audit_compact_result_json(&result));
     Ok(())
 }
 
 fn run_audit_config(action: AuditConfigCmd, keys: &KeyOpts) -> Result<(), String> {
     match action {
         AuditConfigCmd::Show { store } => {
-            let loom = cli_open_loom(&store, keys)?;
-            let actor = require_global_admin_actor(&loom)?;
-            let config = loom.store().audit_config().map_err(|e| e.to_string())?;
-            loom.store()
-                .audit_append(Some(actor), "audit.config.show", None)
-                .map_err(|e| e.to_string())?;
-            println!("{}", audit_config_json(config));
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let out = execute_generated_string(&client, "Audit", "audit_config_show_json", vec![])?;
+            println!("{out}");
             Ok(())
         }
         AuditConfigCmd::Set {
@@ -39,135 +38,69 @@ fn run_audit_config(action: AuditConfigCmd, keys: &KeyOpts) -> Result<(), String
             retention_days,
             legal_hold,
         } => {
-            let loom = cli_open_loom(&store, keys)?;
-            let actor = require_global_admin_actor(&loom)?;
-            let mut config = loom.store().audit_config().map_err(|e| e.to_string())?;
-            if let Some(value) = retention_days {
-                config.retention_days = value;
-            }
-            if let Some(value) = legal_hold {
-                config.legal_hold = value;
-            }
-            let target = format!(
-                "retention_days={};legal_hold={}",
-                config.retention_days, config.legal_hold
-            );
-            let seq = loom
-                .store()
-                .save_audit_config_audited(config, Some(actor), "audit.config.set", Some(&target))
-                .map_err(|e| e.to_string())?;
-            println!("{}", audit_config_set_json(seq, config));
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let out = execute_generated_string(
+                &client,
+                "Audit",
+                "audit_config_set_json",
+                vec![retention_days.to_value(), legal_hold.to_value()],
+            )?;
+            println!("{out}");
             Ok(())
         }
     }
 }
 
 fn run_audit_list(store: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let records = loom.store().audit_records().map_err(|e| e.to_string())?;
-    loom.store()
-        .audit_append(Some(actor), "audit.list", None)
-        .map_err(|e| e.to_string())?;
-    println!("seq\thash\tprincipal\taction\ttarget");
-    for record in records {
-        println!(
-            "{}\t{}\t{}\t{}\t{}",
-            record.seq,
-            record.hash,
-            record
-                .principal
-                .map_or_else(|| "-".to_string(), |principal| principal.to_string()),
-            record.action,
-            record.target.unwrap_or_else(|| "-".to_string())
-        );
-    }
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let out = execute_generated_string(&client, "Audit", "audit_list_json", vec![])?;
+    println!("{out}");
     Ok(())
 }
 
 fn run_audit_view(store: &str, record: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let records = loom.store().audit_records().map_err(|e| e.to_string())?;
-    let found = find_audit_record(&records, record)?;
-    let target = format!("seq={}", found.seq);
-    loom.store()
-        .audit_append(Some(actor), "audit.view", Some(&target))
-        .map_err(|e| e.to_string())?;
-    println!("{}", audit_record_json(found));
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let out =
+        execute_generated_string(&client, "Audit", "audit_view_json", vec![record.to_value()])?;
+    println!("{out}");
     Ok(())
 }
 
-fn find_audit_record<'a>(
-    records: &'a [loom_store::AuditRecord],
-    record: &str,
-) -> Result<&'a loom_store::AuditRecord, String> {
-    if let Ok(seq) = record.parse::<u64>() {
-        return records
-            .iter()
-            .find(|entry| entry.seq == seq)
-            .ok_or_else(|| format!("audit record not found: {record}"));
-    }
-    let digest = Digest::parse(record).map_err(|e| e.to_string())?;
-    records
-        .iter()
-        .find(|entry| entry.hash == digest)
-        .ok_or_else(|| format!("audit record not found: {record}"))
-}
-
-fn audit_config_json(config: AuditConfig) -> String {
-    format!(
-        "{{\"retention_days\":{},\"legal_hold\":{}}}",
-        config.retention_days, config.legal_hold
-    )
-}
-
-fn audit_config_set_json(seq: u64, config: AuditConfig) -> String {
-    format!(
-        "{{\"seq\":{},\"config\":{}}}",
-        seq,
-        audit_config_json(config)
-    )
-}
-
-fn audit_prune_stats_json(stats: loom_store::AuditPruneStats) -> String {
-    let checkpoint_seq = stats
+fn audit_compact_result_json(result: &loom_wire::audit::AuditCompactResult) -> String {
+    let checkpoint_seq = result
         .checkpoint_seq
         .map_or_else(|| "null".to_string(), |value| value.to_string());
-    let checkpoint_hash = stats.checkpoint_hash.map_or_else(
+    let checkpoint_hash = result.checkpoint_hash.as_ref().map_or_else(
         || "null".to_string(),
         |value| json_string(&value.to_string()),
     );
     format!(
         "{{\"pruned\":{},\"checkpoint_seq\":{},\"checkpoint_hash\":{},\"audit_seq\":{}}}",
-        stats.pruned, checkpoint_seq, checkpoint_hash, stats.audit_seq
+        result.pruned, checkpoint_seq, checkpoint_hash, result.audit_seq
     )
 }
 
-fn audit_record_json(record: &loom_store::AuditRecord) -> String {
-    let mut out = String::new();
-    out.push('{');
-    out.push_str("\"seq\":");
-    out.push_str(&record.seq.to_string());
-    out.push_str(",\"hash\":");
-    out.push_str(&json_string(&record.hash.to_string()));
-    out.push_str(",\"principal\":");
-    match record.principal {
-        Some(principal) => out.push_str(&json_string(&principal.to_string())),
-        None => out.push_str("null"),
+#[cfg(test)]
+mod mu6i_d4_tests {
+    use super::*;
+
+    #[test]
+    fn audit_compact_generated_result_preserves_json_shape_and_nulls() {
+        let result = loom_wire::audit::audit_compact_result_from_cbor(
+            &loom_wire::audit::audit_compact_result_to_cbor(
+                &loom_wire::audit::AuditCompactResult {
+                    pruned: 7,
+                    checkpoint_seq: None,
+                    checkpoint_hash: None,
+                    audit_seq: 9,
+                },
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            audit_compact_result_json(&result),
+            "{\"pruned\":7,\"checkpoint_seq\":null,\"checkpoint_hash\":null,\"audit_seq\":9}"
+        );
     }
-    out.push_str(",\"action\":");
-    out.push_str(&json_string(&record.action));
-    out.push_str(",\"target\":");
-    match record.target.as_deref() {
-        Some(target) => out.push_str(&json_string(target)),
-        None => out.push_str("null"),
-    }
-    out.push_str(",\"prev_hash\":");
-    match record.prev_hash {
-        Some(hash) => out.push_str(&json_string(&hash.to_string())),
-        None => out.push_str("null"),
-    }
-    out.push('}');
-    out
 }

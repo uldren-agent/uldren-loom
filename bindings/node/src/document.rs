@@ -154,8 +154,7 @@ pub fn doc_delete_collection(
     let mut loom =
         open_loom_unlocked(&loom_path, key_spec(passphrase.as_deref()).as_ref()).map_err(reason)?;
     let ns = resolve_workspace_arg(&loom, &workspace)?;
-    let present =
-        loom_core::doc_delete_collection(&mut loom, ns, &collection).map_err(reason)?;
+    let present = loom_core::doc_delete_collection(&mut loom, ns, &collection).map_err(reason)?;
     if present {
         save_loom(&mut loom).map_err(reason)?;
     }

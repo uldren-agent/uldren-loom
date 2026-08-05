@@ -19,6 +19,39 @@ _FIXTURE = json.loads(
 )
 
 
+def _cbor_text(value: str) -> bytes:
+    encoded = value.encode()
+    assert len(encoded) < 24
+    return bytes([0x60 + len(encoded)]) + encoded
+
+
+def _cbor_uint(value: int) -> bytes:
+    if value < 24:
+        return bytes([value])
+    if value < 256:
+        return bytes([0x18, value])
+    assert value < 65536
+    return bytes([0x19, (value >> 8) & 0xFF, value & 0xFF])
+
+
+def _exec_apply_request(workspace: str, base: str, fork: str) -> bytes:
+    return b"".join(
+        (
+            bytes([0xA5]),
+            _cbor_text("base"),
+            _cbor_text(base),
+            _cbor_text("fork"),
+            _cbor_text(fork),
+            _cbor_text("author"),
+            _cbor_text("agent"),
+            _cbor_text("workspace"),
+            _cbor_text(workspace),
+            _cbor_text("timestamp_ms"),
+            _cbor_uint(3000),
+        )
+    )
+
+
 def test_version_is_non_empty():
     assert uldrenai_loom.version() != ""
 
@@ -62,6 +95,71 @@ def test_runtime_profile_report():
     assert "crypto_provider" in report
 
 
+def test_mu6i_d7_audit_and_store_maintenance_public_runtime(tmp_path):
+    for name in (
+        "audit_compact",
+        "store_maintenance_status",
+        "store_maintenance_policy_set",
+        "store_maintenance_run",
+    ):
+        assert callable(getattr(uldrenai_loom, name))
+
+    def fresh_store(name: str) -> str:
+        path = str(tmp_path / f"{name}.loom")
+        uldrenai_loom.create_loom(path, "default", None, None)
+        return path
+
+    def assert_canonical_array_bytes(value: bytes, label: str):
+        assert isinstance(value, (bytes, bytearray)) and len(value) > 0, label
+        assert value[0] & 0xE0 == 0x80, label
+
+    audit_path = fresh_store("audit")
+    assert_canonical_array_bytes(uldrenai_loom.audit_compact(audit_path, 0), "audit_compact")
+    with pytest.raises(OverflowError):
+        uldrenai_loom.audit_compact(audit_path, -1)
+
+    status_path = fresh_store("status")
+    assert_canonical_array_bytes(
+        uldrenai_loom.store_maintenance_status(status_path, bytes([0x81, 0xF4])),
+        "store_maintenance_status",
+    )
+    with pytest.raises(RuntimeError, match="INVALID_ARGUMENT|invalid|break|CBOR"):
+        uldrenai_loom.store_maintenance_status(status_path, bytes([0xFF]))
+
+    policy_path = fresh_store("policy")
+    assert_canonical_array_bytes(
+        uldrenai_loom.store_maintenance_policy_set(
+            policy_path,
+            bytes(
+                [
+                    0x8E,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                    0xF6,
+                ]
+            ),
+        ),
+        "store_maintenance_policy_set",
+    )
+
+    run_path = fresh_store("run")
+    assert_canonical_array_bytes(
+        uldrenai_loom.store_maintenance_run(run_path, bytes([0x82, 0x01, 0x01])),
+        "store_maintenance_run",
+    )
+
+
 def test_studio_surface_catalog_json():
     catalog = json.loads(uldrenai_loom.studio_surface_catalog_json("studio", "core"))
     assert catalog["workspace"] == "studio"
@@ -69,6 +167,140 @@ def test_studio_surface_catalog_json():
     assert any(app["app_id"] == "ticket-details" for app in catalog["apps"])
     with pytest.raises(RuntimeError, match="unsupported Studio surface catalog set"):
         uldrenai_loom.studio_surface_catalog_json("studio", "bogus")
+
+
+def test_lifecycle_and_refs_generated_wrappers(tmp_path):
+    for name in (
+        "lifecycle_define_standard_json",
+        "lifecycle_define_json",
+        "lifecycle_instantiate_json",
+        "lifecycle_transition_json",
+        "refs_reconcile_json",
+    ):
+        assert callable(getattr(uldrenai_loom, name))
+
+    path = str(tmp_path / "lifecycle.loom")
+    uldrenai_loom.create_loom(path, "default", None, None)
+    completion_digest = f"blake3:{'0' * 64}"
+    custom_lifecycle_definition = bytes.fromhex(
+        "8278236c6f6f6d2e73747564696f2e6c6966656379636c652e646566696e6974696f6e2e7631846b637573746f6d2d666c6f776a323032362d30372d3238828766717565756564665175657565648080008080876772756e6e696e676752756e6e696e67808000808066717565756564"
+    )
+    definition = json.loads(
+        uldrenai_loom.lifecycle_define_standard_json(
+            path, "lifecycle", "feature", "1", completion_digest
+        )
+    )
+    assert definition["definition_id"] == "feature"
+    custom_definition = json.loads(
+        uldrenai_loom.lifecycle_define_json(
+            path, "lifecycle", custom_lifecycle_definition
+        )
+    )
+    assert custom_definition["definition_id"] == "custom-flow"
+    assert custom_definition["initial_stage_id"] == "queued"
+    instance = json.loads(
+        uldrenai_loom.lifecycle_instantiate_json(
+            path, "lifecycle", "feature-1", "feature", ["ticket:MX-1"]
+        )
+    )
+    assert instance["current_stage_id"] == "ideate"
+    transition = json.loads(
+        uldrenai_loom.lifecycle_transition_json(
+            path,
+            "lifecycle",
+            "feature-1",
+            "transition-1",
+            "draft",
+            None,
+            json.dumps([{"gate_id": "enter-draft", "passed": True}]),
+            None,
+        )
+    )
+    assert transition["instance"]["current_stage_id"] == "draft"
+    with pytest.raises(RuntimeError, match="already exists|AlreadyExists"):
+        uldrenai_loom.lifecycle_instantiate_json(
+            path, "lifecycle", "feature-1", "feature", []
+        )
+    uldrenai_loom.lifecycle_instantiate_json(
+        path, "lifecycle", "feature-gate", "feature", []
+    )
+    with pytest.raises(RuntimeError, match="CONFLICT|missing required gate|did not pass"):
+        uldrenai_loom.lifecycle_transition_json(
+            path,
+            "lifecycle",
+            "feature-gate",
+            "transition-gate",
+            "draft",
+            None,
+            "[]",
+            None,
+        )
+    with pytest.raises(RuntimeError, match="auth_principal and auth_passphrase"):
+        uldrenai_loom.lifecycle_define_json(
+            path, "lifecycle", b"bad", None, "root-only", None
+        )
+    with pytest.raises(RuntimeError, match="unauthenticated-root mode|not found|Authentication|authentication"):
+        uldrenai_loom.lifecycle_define_json(
+            path,
+            "lifecycle",
+            b"bad",
+            None,
+            "00000000-0000-4000-8000-000000000001",
+            "bad-pass",
+        )
+    refs = json.loads(uldrenai_loom.refs_reconcile_json(path, "lifecycle", 0))
+    assert refs["processed"] == 0
+    assert refs["pending"] == 0
+    assert refs["resolved"] == 0
+    assert refs["failed"] == 0
+    with pytest.raises(OverflowError):
+        uldrenai_loom.refs_reconcile_json(path, "lifecycle", -1)
+
+    refs_path = str(tmp_path / "refs.loom")
+    uldrenai_loom.create_loom(refs_path, "default", None, None)
+    refs_workspace_id = uldrenai_loom.workspace_create(refs_path, "refs", "vcs")
+    uldrenai_loom.tickets_project_create_json(
+        refs_path, "refs", refs_workspace_id, "project", "MX", "Project"
+    )
+    uldrenai_loom.tickets_create_json(
+        refs_path,
+        "refs",
+        refs_workspace_id,
+        "project",
+        "task",
+        None,
+        None,
+        json.dumps({"description": "Related !ticket:MX-2"}),
+        "[]",
+    )
+    uldrenai_loom.tickets_create_json(
+        refs_path, "refs", refs_workspace_id, "project", "task", None, None, "{}", "[]"
+    )
+    refs_pending = json.loads(uldrenai_loom.refs_reconcile_json(refs_path, "refs", 0))
+    assert refs_pending["processed"] == 0
+    assert refs_pending["pending"] == 1
+    assert refs_pending["resolved"] == 0
+    assert refs_pending["failed"] == 0
+    refs_processed = json.loads(uldrenai_loom.refs_reconcile_json(refs_path, "refs", 1))
+    assert refs_processed["processed"] == 1
+    assert refs_processed["pending"] == 0
+    assert refs_processed["resolved"] == 1
+    assert refs_processed["failed"] == 0
+    refs_reopened = json.loads(uldrenai_loom.refs_reconcile_json(refs_path, "refs", 1))
+    assert refs_reopened["processed"] == 0
+    assert refs_reopened["pending"] == 0
+    assert refs_reopened["resolved"] == 1
+    assert refs_reopened["failed"] == 0
+    refs_audits = [
+        record
+        for record in json.loads(uldrenai_loom.audit_list_json(refs_path))["records"]
+        if record["action"] == "refs.reconcile"
+    ]
+    assert len(refs_audits) == 1
+    assert (
+        refs_audits[0]["target"]
+        == f"workspace={refs_workspace_id};processed=1;resolved=1;failed=0;pending=0"
+    )
 
 
 def test_meetings_import_snapshot_and_source_read(tmp_path):
@@ -96,6 +328,20 @@ def test_meetings_import_snapshot_and_source_read(tmp_path):
             ],
         }
     ).encode()
+    dry_path = str(tmp_path / "meetings-dry.loom")
+    uldrenai_loom.create_loom(dry_path, "default", None, None)
+    uldrenai_loom.workspace_create(dry_path, "studio", "vcs")
+    dry_report = json.loads(
+        uldrenai_loom.meetings_import_snapshot(
+            dry_path, "studio", "granola-app", snapshot, True
+        )
+    )
+    assert dry_report["profile"] == "meetings"
+    assert dry_report["rows_imported"] == 1
+    with pytest.raises(Exception, match="not found|NOT_FOUND"):
+        uldrenai_loom.meetings_source_read(
+            dry_path, "studio", "note-1", "summary.txt"
+        )
     report = json.loads(
         uldrenai_loom.meetings_import_snapshot(
             path, "studio", "granola-app", snapshot, False
@@ -107,6 +353,68 @@ def test_meetings_import_snapshot_and_source_read(tmp_path):
         uldrenai_loom.meetings_source_read(path, "studio", "note-1", "summary.txt")
         == b"Planning summary"
     )
+    with pytest.raises(Exception, match="authentication|not found|unauthenticated"):
+        uldrenai_loom.meetings_import_snapshot(
+            path,
+            "studio",
+            "unknown-profile",
+            b"not-json",
+            False,
+            None,
+            "00000000-0000-4000-8000-000000000001",
+            "bad-passphrase",
+        )
+
+
+def test_apply_cbor_generated_wrapper(tmp_path):
+    path = str(tmp_path / "apply.loom")
+    uldrenai_loom.create_loom(path, "default", None, None)
+    uldrenai_loom.workspace_create(path, "repo", "files")
+    uldrenai_loom.write_file(path, "files", "repo", "base.txt", b"base")
+    uldrenai_loom.stage_all(path, "files", "repo")
+    uldrenai_loom.commit_staged(path, "files", "repo", "agent", "base")
+    result = uldrenai_loom.apply_cbor(path, _exec_apply_request("repo", "main", "main"))
+    assert b"loom.exec.apply.result.v1" in result
+    assert b"up_to_date" in result
+    with pytest.raises(Exception, match="decode|invalid|cbor"):
+        uldrenai_loom.apply_cbor(path, b"not-cbor")
+    with pytest.raises(Exception, match="authentication|not found|unauthenticated"):
+        uldrenai_loom.apply_cbor(
+            path,
+            b"not-cbor",
+            None,
+            "00000000-0000-4000-8000-000000000001",
+            "bad-passphrase",
+        )
+
+
+def test_sql_exec_result_generated_wrapper(tmp_path):
+    path = str(tmp_path / "generated-sql.loom")
+    uldrenai_loom.create_loom(path, "default", None, None)
+    uldrenai_loom.workspace_create(path, "repo", None)
+    created = uldrenai_loom.sql_exec_result(
+        path,
+        "repo",
+        "db",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'a')",
+    )
+    assert created
+    with pytest.raises(Exception, match="sql|parse|syntax|invalid"):
+        uldrenai_loom.sql_exec_result(path, "repo", "db", "THIS IS NOT SQL")
+    with pytest.raises(Exception, match="authentication|not found|unauthenticated"):
+        uldrenai_loom.sql_exec_result(
+            path,
+            "repo",
+            "db",
+            "THIS IS NOT SQL",
+            None,
+            "00000000-0000-4000-8000-000000000001",
+            "bad-passphrase",
+        )
+    selected = uldrenai_loom.sql_exec_result(
+        path, "repo", "db", "SELECT id, v FROM t ORDER BY id"
+    )
+    assert b"a" in selected
 
 def test_drive_round_trip(tmp_path):
     path = str(tmp_path / "drive.loom")

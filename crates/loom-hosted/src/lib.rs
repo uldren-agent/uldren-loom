@@ -350,6 +350,11 @@ impl HostedKernel {
         self
     }
 
+    pub fn with_shared_engine(mut self, engine: Arc<std::sync::Mutex<Loom<FileStore>>>) -> Self {
+        self.inner = self.inner.with_shared_engine(engine);
+        self
+    }
+
     pub fn path(&self) -> &Path {
         self.inner.path()
     }

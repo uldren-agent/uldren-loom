@@ -62,6 +62,67 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeColumnarAppend(
   }
 }
 
+static jbyteArray columnarImportBytes(
+    JNIEnv *env, jstring loomPath, jstring workspace, jstring name, jbyteArray payload,
+    jstring targetSegmentRows, jboolean replace, jboolean dryRun, jbyteArray passphrase,
+    jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase,
+    int32_t (*importFn)(LoomSession *, const char *, const char *, const unsigned char *,
+                        uintptr_t, uint64_t, int32_t, int32_t, unsigned char **, uintptr_t *)) {
+  uint64_t rows = 0;
+  if (!parseU64String(env, targetSegmentRows, &rows)) {
+    return nullptr;
+  }
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openAuthenticatedStoreKeyed(env, p, passphrase, kek, authPrincipal, authPassphrase, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *w = env->GetStringUTFChars(workspace, nullptr);
+  const char *nm = env->GetStringUTFChars(name, nullptr);
+  jsize plen = (payload != nullptr) ? env->GetArrayLength(payload) : 0;
+  jbyte *bytes = (payload != nullptr) ? env->GetByteArrayElements(payload, nullptr) : nullptr;
+  unsigned char *ptr = nullptr;
+  uintptr_t len = 0;
+  st = importFn(h, w, nm, reinterpret_cast<const unsigned char *>(bytes),
+                static_cast<uintptr_t>(plen), rows, replace ? 1 : 0, dryRun ? 1 : 0, &ptr, &len);
+  env->ReleaseStringUTFChars(workspace, w);
+  env->ReleaseStringUTFChars(name, nm);
+  if (bytes) {
+    env->ReleaseByteArrayElements(payload, bytes, JNI_ABORT);
+  }
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  return ownedBytes(env, ptr, len);
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeColumnarImportArrow(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring workspace, jstring name,
+    jbyteArray payload, jstring targetSegmentRows, jboolean replace, jboolean dryRun,
+    jbyteArray passphrase, jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  return columnarImportBytes(env, loomPath, workspace, name, payload, targetSegmentRows,
+                             replace, dryRun, passphrase, kek, authPrincipal, authPassphrase,
+                             loom_columnar_import_arrow);
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeColumnarImportParquet(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring workspace, jstring name,
+    jbyteArray payload, jstring targetSegmentRows, jboolean replace, jboolean dryRun,
+    jbyteArray passphrase, jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  return columnarImportBytes(env, loomPath, workspace, name, payload, targetSegmentRows,
+                             replace, dryRun, passphrase, kek, authPrincipal, authPassphrase,
+                             loom_columnar_import_parquet);
+}
+
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_ai_uldren_loom_rn_UldrenLoomNative_nativeColumnarScan(
     JNIEnv *env, jobject thiz, jstring loomPath, jstring ns, jstring name, jbyteArray passphrase,

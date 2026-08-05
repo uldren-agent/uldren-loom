@@ -2,8 +2,9 @@ use loom_core::error::Code;
 use loom_core::lock::LockMode;
 use loom_store::FileStore;
 use loom_store::daemon::{self, AcquireRequest};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -36,6 +37,58 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap()
+}
+
+#[test]
+fn reader_reclamation_lease_is_visible_across_processes() {
+    const CHILD_ENV: &str = "LOOM_STORE_RECLAMATION_READER_CHILD";
+    if let Ok(path) = std::env::var(CHILD_ENV) {
+        let _reader = FileStore::open_read(path).unwrap();
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+        let mut release = String::new();
+        std::io::stdin().read_line(&mut release).unwrap();
+        return;
+    }
+
+    let tp = TempPath::new("cross-process-reclamation-reader");
+    drop(FileStore::open(tp.path()).unwrap());
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("reader_reclamation_lease_is_visible_across_processes")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(CHILD_ENV, tp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        assert_ne!(stdout.read_line(&mut line).unwrap(), 0);
+        if line.trim() == "ready" {
+            break;
+        }
+        line.clear();
+    }
+
+    let writer = FileStore::open(tp.path()).unwrap();
+    assert_eq!(
+        writer
+            .group_commit_diagnostics()
+            .unwrap()
+            .pinned_reader_blockers,
+        Some(1)
+    );
+    child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(
+        writer
+            .group_commit_diagnostics()
+            .unwrap()
+            .pinned_reader_blockers,
+        Some(0)
+    );
 }
 
 #[test]

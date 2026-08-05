@@ -17,8 +17,8 @@ use loom_core::digest::Digest;
 use loom_core::{
     AppCredential, ExternalCredential, ExternalCredentialKind, ExternalCredentialSpec,
     IdentityAuthorityDetach, IdentityAuthorityHandoff, IdentityAuthorityMode,
-    IdentityAuthorityState, IdentityPublicKey, IdentityRole, IdentityStore, Principal,
-    PrincipalKind, WorkspaceId,
+    IdentityAuthorityState, IdentityAuthorityWitness, IdentityPublicKey, IdentityRole,
+    IdentityStore, Principal, PrincipalKind, WorkspaceId,
 };
 use loom_types::{Code, LoomError};
 
@@ -47,6 +47,13 @@ fn opt_digest_text(digest: &Option<Digest>) -> CborValue {
 fn opt_string(value: &Option<String>) -> CborValue {
     match value {
         Some(value) => CborValue::Text(value.clone()),
+        None => CborValue::Null,
+    }
+}
+
+fn opt_u64(value: Option<u64>) -> CborValue {
+    match value {
+        Some(value) => CborValue::Uint(value),
         None => CborValue::Null,
     }
 }
@@ -146,6 +153,25 @@ fn authority_detach_to_value(detach: &IdentityAuthorityDetach) -> CborValue {
         CborValue::Uint(detach.generation),
         CborValue::Text(detach.reason.clone()),
     ])
+}
+
+fn authority_witness_to_value(witness: &IdentityAuthorityWitness) -> CborValue {
+    CborValue::Array(vec![
+        uuid_text(witness.authority),
+        CborValue::Uint(authority_mode_tag(witness.mode)),
+        CborValue::Uint(witness.generation),
+        opt_digest_text(&witness.head),
+        CborValue::Text(witness.snapshot_digest.to_string()),
+        opt_digest_text(&witness.latest_handoff_digest),
+    ])
+}
+
+/// Encode an `IdentityAuthorityWitnessRecord`
+/// `[authority, mode, generation, head, snapshot_digest, latest_handoff_digest]`.
+pub fn identity_authority_witness_to_cbor(
+    witness: &IdentityAuthorityWitness,
+) -> Result<Vec<u8>, LoomError> {
+    encode_value(authority_witness_to_value(witness))
 }
 
 /// Encode a `PrincipalRecord` `[id, handle, name, kind_tag, enabled, has_passphrase, roles]`.
@@ -372,6 +398,13 @@ fn as_opt_text(value: &CborValue, field: &str) -> Result<Option<String>, LoomErr
     }
 }
 
+fn as_opt_u64(value: &CborValue, field: &str) -> Result<Option<u64>, LoomError> {
+    match value {
+        CborValue::Null => Ok(None),
+        _ => Ok(Some(as_uint(value, field)?)),
+    }
+}
+
 /// Decode the stable authority-mode tag (Authority=0, Mirror=1, Detached=2) written by
 /// [`authority_mode_tag`].
 fn authority_mode_from_tag(tag: u64) -> Result<IdentityAuthorityMode, LoomError> {
@@ -440,6 +473,90 @@ fn authority_detach_from_value(value: &CborValue) -> Result<IdentityAuthorityDet
         generation: as_uint(generation, "detach generation")?,
         reason: as_text(reason, "detach reason")?,
     })
+}
+
+fn authority_witness_from_value(value: &CborValue) -> Result<IdentityAuthorityWitness, LoomError> {
+    let [
+        authority,
+        mode,
+        generation,
+        head,
+        snapshot_digest,
+        latest_handoff_digest,
+    ] = as_array(value, "authority witness")?
+    else {
+        return Err(LoomError::invalid(
+            "authority witness must be [authority, mode, generation, head, snapshot_digest, \
+             latest_handoff_digest]",
+        ));
+    };
+    Ok(IdentityAuthorityWitness {
+        authority: as_uuid(authority, "witness authority")?,
+        mode: authority_mode_from_tag(as_uint(mode, "witness mode")?)?,
+        generation: as_uint(generation, "witness generation")?,
+        head: as_opt_digest(head, "witness head")?,
+        snapshot_digest: Digest::parse(&as_text(snapshot_digest, "witness snapshot_digest")?)
+            .map_err(|err| LoomError::invalid(format!("witness snapshot_digest: {err}")))?,
+        latest_handoff_digest: as_opt_digest(
+            latest_handoff_digest,
+            "witness latest_handoff_digest",
+        )?,
+    })
+}
+
+/// Decode an `IdentityAuthorityWitnessRecord`.
+pub fn identity_authority_witness_from_cbor(
+    bytes: &[u8],
+) -> Result<IdentityAuthorityWitness, LoomError> {
+    let value = decode(bytes)
+        .map_err(|err| LoomError::invalid(format!("identity authority witness: {err}")))?;
+    authority_witness_from_value(&value)
+}
+
+/// A decoded `AuthorityReplicationPolicyRecord` carrying the durable authority-replication policy
+/// fields in IDL order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityReplicationPolicyRecord {
+    pub id: String,
+    pub schema_version: u32,
+    pub source: String,
+    pub enabled: bool,
+    pub pull_on_start: bool,
+    pub interval_ms: Option<u64>,
+    pub jitter_ms: u64,
+    pub backoff_ms: u64,
+    pub publish_witness: bool,
+    pub last_success_ms: Option<u64>,
+    pub last_failure_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub last_modified_audit_seq: Option<u64>,
+}
+
+fn authority_replication_policy_to_value(policy: &AuthorityReplicationPolicyRecord) -> CborValue {
+    CborValue::Array(vec![
+        CborValue::Text(policy.id.clone()),
+        CborValue::Uint(u64::from(policy.schema_version)),
+        CborValue::Text(policy.source.clone()),
+        CborValue::Bool(policy.enabled),
+        CborValue::Bool(policy.pull_on_start),
+        opt_u64(policy.interval_ms),
+        CborValue::Uint(policy.jitter_ms),
+        CborValue::Uint(policy.backoff_ms),
+        CborValue::Bool(policy.publish_witness),
+        opt_u64(policy.last_success_ms),
+        opt_u64(policy.last_failure_ms),
+        opt_string(&policy.last_error),
+        opt_u64(policy.last_modified_audit_seq),
+    ])
+}
+
+/// Encode an `AuthorityReplicationPolicyRecord`
+/// `[id, schema_version, source, enabled, pull_on_start, interval_ms, jitter_ms, backoff_ms,
+/// publish_witness, last_success_ms, last_failure_ms, last_error, last_modified_audit_seq]`.
+pub fn authority_replication_policy_record_to_cbor(
+    policy: &AuthorityReplicationPolicyRecord,
+) -> Result<Vec<u8>, LoomError> {
+    encode_value(authority_replication_policy_to_value(policy))
 }
 
 fn principal_from_value(value: &CborValue) -> Result<Principal, LoomError> {
@@ -537,6 +654,65 @@ fn public_key_from_value(value: &CborValue) -> Result<IdentityPublicKey, LoomErr
         public_key: as_bytes(public_key, "public key material")?,
         enabled: as_bool(enabled, "public key enabled")?,
     })
+}
+
+fn u32_from_value(value: &CborValue, field: &str) -> Result<u32, LoomError> {
+    let value = as_uint(value, field)?;
+    u32::try_from(value).map_err(|_| LoomError::invalid(format!("{field} exceeds u32")))
+}
+
+fn authority_replication_policy_from_value(
+    value: &CborValue,
+) -> Result<AuthorityReplicationPolicyRecord, LoomError> {
+    let [
+        id,
+        schema_version,
+        source,
+        enabled,
+        pull_on_start,
+        interval_ms,
+        jitter_ms,
+        backoff_ms,
+        publish_witness,
+        last_success_ms,
+        last_failure_ms,
+        last_error,
+        last_modified_audit_seq,
+    ] = as_array(value, "authority replication policy")?
+    else {
+        return Err(LoomError::invalid(
+            "authority replication policy must be [id, schema_version, source, enabled, \
+             pull_on_start, interval_ms, jitter_ms, backoff_ms, publish_witness, last_success_ms, \
+             last_failure_ms, last_error, last_modified_audit_seq]",
+        ));
+    };
+    Ok(AuthorityReplicationPolicyRecord {
+        id: as_text(id, "authority replication id")?,
+        schema_version: u32_from_value(schema_version, "authority replication schema_version")?,
+        source: as_text(source, "authority replication source")?,
+        enabled: as_bool(enabled, "authority replication enabled")?,
+        pull_on_start: as_bool(pull_on_start, "authority replication pull_on_start")?,
+        interval_ms: as_opt_u64(interval_ms, "authority replication interval_ms")?,
+        jitter_ms: as_uint(jitter_ms, "authority replication jitter_ms")?,
+        backoff_ms: as_uint(backoff_ms, "authority replication backoff_ms")?,
+        publish_witness: as_bool(publish_witness, "authority replication publish_witness")?,
+        last_success_ms: as_opt_u64(last_success_ms, "authority replication last_success_ms")?,
+        last_failure_ms: as_opt_u64(last_failure_ms, "authority replication last_failure_ms")?,
+        last_error: as_opt_text(last_error, "authority replication last_error")?,
+        last_modified_audit_seq: as_opt_u64(
+            last_modified_audit_seq,
+            "authority replication last_modified_audit_seq",
+        )?,
+    })
+}
+
+/// Decode an `AuthorityReplicationPolicyRecord`.
+pub fn authority_replication_policy_record_from_cbor(
+    bytes: &[u8],
+) -> Result<AuthorityReplicationPolicyRecord, LoomError> {
+    let value = decode(bytes)
+        .map_err(|err| LoomError::invalid(format!("authority replication policy: {err}")))?;
+    authority_replication_policy_from_value(&value)
 }
 
 fn decode_list<T>(

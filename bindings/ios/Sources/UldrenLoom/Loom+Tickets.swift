@@ -1,6 +1,11 @@
 import CUldrenLoom
 import Foundation
 
+public enum TicketReviewType: String {
+    case designReview = "design_review"
+    case codeReview = "code_review"
+}
+
 extension Loom {
     private func ticketsString(_ call: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32) throws -> String {
         var out: UnsafeMutablePointer<CChar>?
@@ -29,8 +34,13 @@ extension Loom {
     }
 
     public func ticketsProjectSettingsGetJson(workspace: String, ticketWorkspaceId: String,
-                                              projectId: String) throws -> String {
-        try ticketsString { loom_tickets_project_settings_get_json(session, workspace, ticketWorkspaceId, projectId, $0) }
+                                              projectId: String,
+                                              includeContracts: Bool = false) throws -> String {
+        try ticketsString {
+            loom_tickets_project_settings_get_json(
+                session, workspace, ticketWorkspaceId, projectId, includeContracts, $0
+            )
+        }
     }
 
     public func ticketsProjectSettingsSetJson(workspace: String, ticketWorkspaceId: String,
@@ -41,13 +51,27 @@ extension Loom {
                                               projectOwnerPrincipal: String?,
                                               clearProjectOwnerPrincipal: Bool = false,
                                               acceptanceAuthoritiesJson: String?,
+                                              acceptanceEvidenceEnforcement: Bool? = nil,
+                                              requiredAcceptanceEvidenceKeysJson: String? = nil,
+                                              requiredAcceptanceReviews: [TicketReviewType]? = nil,
+                                              ownerContractSummary: String? = nil,
+                                              ownerContractDetails: String? = nil,
+                                              workerContractSummary: String? = nil,
+                                              workerContractDetails: String? = nil,
                                               expectedRoot: String) throws -> String {
         try ticketsString {
-            loom_tickets_project_settings_set_json(
+            let requiredAcceptanceReviewsJson = requiredAcceptanceReviews.map { reviews in
+                "[" + reviews.map { "\"\($0.rawValue)\"" }.joined(separator: ",") + "]"
+            }
+            return loom_tickets_project_settings_set_json(
                 session, workspace, ticketWorkspaceId, projectId, defaultProjection ?? "",
                 enableProjectionsJson, disableProjectionsJson, actorEnforcement ?? "",
                 projectOwnerPrincipal ?? "", clearProjectOwnerPrincipal,
-                acceptanceAuthoritiesJson ?? "", expectedRoot, $0
+                acceptanceAuthoritiesJson ?? "", acceptanceEvidenceEnforcement ?? false,
+                acceptanceEvidenceEnforcement != nil, requiredAcceptanceEvidenceKeysJson ?? "",
+                requiredAcceptanceReviewsJson ?? "",
+                ownerContractSummary ?? "", ownerContractDetails ?? "",
+                workerContractSummary ?? "", workerContractDetails ?? "", expectedRoot, $0
             )
         }
     }

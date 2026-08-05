@@ -69,13 +69,13 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeTicketsProjectRekeyJson(
 extern "C" JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_rn_UldrenLoomNative_nativeTicketsProjectSettingsGetJson(
     JNIEnv *env, jobject thiz, jstring loomPath, jstring ns, jstring ticketWorkspaceId,
-    jstring projectId, jbyteArray passphrase, jbyteArray kek, jstring authPrincipal,
-    jbyteArray authPassphrase) {
+    jstring projectId, jboolean includeContracts, jbyteArray passphrase, jbyteArray kek,
+    jstring authPrincipal, jbyteArray authPassphrase) {
   (void)thiz;
   TICKETS_OPEN();
   const char *project = env->GetStringUTFChars(projectId, nullptr);
   char *out = nullptr;
-  st = loom_tickets_project_settings_get_json(h, n, tw, project, &out);
+  st = loom_tickets_project_settings_get_json(h, n, tw, project, includeContracts, &out);
   TICKETS_RELEASE_NS();
   env->ReleaseStringUTFChars(projectId, project);
   return finishTicketsString(env, h, st, out);
@@ -87,6 +87,10 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeTicketsProjectSettingsSetJson(
     jstring projectId, jstring defaultProjection, jstring enableProjectionsJson,
     jstring disableProjectionsJson, jstring actorEnforcement, jstring projectOwnerPrincipal,
     jboolean clearProjectOwnerPrincipal, jstring acceptanceAuthoritiesJson,
+    jboolean acceptanceEvidenceEnforcement, jboolean hasAcceptanceEvidenceEnforcement,
+    jstring requiredAcceptanceEvidenceKeysJson, jstring requiredAcceptanceReviewsJson,
+    jstring ownerContractSummary,
+    jstring ownerContractDetails, jstring workerContractSummary, jstring workerContractDetails,
     jstring expectedRoot, jbyteArray passphrase, jbyteArray kek, jstring authPrincipal,
     jbyteArray authPassphrase) {
   (void)thiz;
@@ -98,15 +102,29 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeTicketsProjectSettingsSetJson(
   const char *actor = env->GetStringUTFChars(actorEnforcement, nullptr);
   const char *owner = env->GetStringUTFChars(projectOwnerPrincipal, nullptr);
   const char *authorities = env->GetStringUTFChars(acceptanceAuthoritiesJson, nullptr);
+  const char *requiredKeys = env->GetStringUTFChars(requiredAcceptanceEvidenceKeysJson, nullptr);
+  const char *requiredReviews = env->GetStringUTFChars(requiredAcceptanceReviewsJson, nullptr);
+  const char *ownerSummary = env->GetStringUTFChars(ownerContractSummary, nullptr);
+  const char *ownerDetails = env->GetStringUTFChars(ownerContractDetails, nullptr);
+  const char *workerSummary = env->GetStringUTFChars(workerContractSummary, nullptr);
+  const char *workerDetails = env->GetStringUTFChars(workerContractDetails, nullptr);
   const char *root = env->GetStringUTFChars(expectedRoot, nullptr);
   const char *defArg = def[0] != '\0' ? def : nullptr;
   const char *actorArg = actor[0] != '\0' ? actor : nullptr;
   const char *ownerArg = owner[0] != '\0' ? owner : nullptr;
   const char *authoritiesArg = authorities[0] != '\0' ? authorities : nullptr;
+  const char *requiredKeysArg = requiredKeys[0] != '\0' ? requiredKeys : nullptr;
+  const char *requiredReviewsArg = requiredReviews[0] != '\0' ? requiredReviews : nullptr;
+  const char *ownerSummaryArg = ownerSummary[0] != '\0' ? ownerSummary : nullptr;
+  const char *ownerDetailsArg = ownerDetails[0] != '\0' ? ownerDetails : nullptr;
+  const char *workerSummaryArg = workerSummary[0] != '\0' ? workerSummary : nullptr;
+  const char *workerDetailsArg = workerDetails[0] != '\0' ? workerDetails : nullptr;
   char *out = nullptr;
   st = loom_tickets_project_settings_set_json(
       h, n, tw, project, defArg, enable, disable, actorArg, ownerArg,
-      clearProjectOwnerPrincipal, authoritiesArg, root, &out);
+      clearProjectOwnerPrincipal, authoritiesArg, acceptanceEvidenceEnforcement,
+      hasAcceptanceEvidenceEnforcement, requiredKeysArg, requiredReviewsArg, ownerSummaryArg, ownerDetailsArg,
+      workerSummaryArg, workerDetailsArg, root, &out);
   TICKETS_RELEASE_NS();
   env->ReleaseStringUTFChars(projectId, project);
   env->ReleaseStringUTFChars(defaultProjection, def);
@@ -115,6 +133,12 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeTicketsProjectSettingsSetJson(
   env->ReleaseStringUTFChars(actorEnforcement, actor);
   env->ReleaseStringUTFChars(projectOwnerPrincipal, owner);
   env->ReleaseStringUTFChars(acceptanceAuthoritiesJson, authorities);
+  env->ReleaseStringUTFChars(requiredAcceptanceEvidenceKeysJson, requiredKeys);
+  env->ReleaseStringUTFChars(requiredAcceptanceReviewsJson, requiredReviews);
+  env->ReleaseStringUTFChars(ownerContractSummary, ownerSummary);
+  env->ReleaseStringUTFChars(ownerContractDetails, ownerDetails);
+  env->ReleaseStringUTFChars(workerContractSummary, workerSummary);
+  env->ReleaseStringUTFChars(workerContractDetails, workerDetails);
   env->ReleaseStringUTFChars(expectedRoot, root);
   return finishTicketsString(env, h, st, out);
 }

@@ -424,6 +424,36 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeSqlExecBytes(JNIEnv *env, jobject 
   return result;
 }
 
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeSqlExecResult(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring ns, jstring db, jstring sql,
+    jbyteArray passphrase, jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openAuthenticatedStoreKeyed(env, p, passphrase, kek, authPrincipal, authPassphrase, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *n = env->GetStringUTFChars(ns, nullptr);
+  const char *d = env->GetStringUTFChars(db, nullptr);
+  const char *q = env->GetStringUTFChars(sql, nullptr);
+  unsigned char *ptr = nullptr;
+  uintptr_t len = 0;
+  st = loom_sql_exec_result(h, n, d, q, &ptr, &len);
+  env->ReleaseStringUTFChars(ns, n);
+  env->ReleaseStringUTFChars(db, d);
+  env->ReleaseStringUTFChars(sql, q);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  return ownedBytes(env, ptr, len);
+}
+
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_ai_uldren_loom_rn_UldrenLoomNative_nativeSqlQueryBytes(JNIEnv *env, jobject thiz,
                                                             jstring loomPath, jstring ns, jstring db,

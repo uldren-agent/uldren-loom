@@ -208,7 +208,7 @@ RCT_EXPORT_MODULE()
                                       (const unsigned char *)pd.bytes, (uintptr_t)pd.length);
 }
 
-- (void)execCbor:(NSString *)loomPath
+- (void)applyCbor:(NSString *)loomPath
          request:(NSArray *)request
       passphrase:(NSString *)passphrase
              kek:(NSArray *)kek
@@ -233,7 +233,7 @@ RCT_EXPORT_MODULE()
     unsigned char *req = loomBytesFromArray(request, &reqLen);
     unsigned char *ptr = NULL;
     uintptr_t len = 0;
-    int32_t st = loom_exec_cbor(h, req, (uintptr_t)reqLen, &ptr, &len);
+    int32_t st = loom_apply_cbor(h, req, (uintptr_t)reqLen, &ptr, &len);
     free(req);
     loom_close(h);
     if (st != 0) {

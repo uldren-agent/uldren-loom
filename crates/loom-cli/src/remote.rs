@@ -12,38 +12,83 @@
 //! Licensed under BUSL-1.1 (see the workspace `LICENSE`). (c) Uldren Technologies LLC.
 
 use super::*;
-use loom_core::FileKind;
 use loom_locator::Target;
-use loom_remote_protocol::api_types::{Digest as WireDigest, LoomSession};
+#[cfg(all(feature = "remote-client", any(test, feature = "mcp")))]
+use loom_remote_protocol::api_types::Digest as WireDigest;
+use loom_remote_protocol::api_types::LoomSession;
+#[cfg(test)]
+use loom_remote_protocol::generated::GeneratedOperationId;
 use loom_remote_protocol::generated::{METHODS, MethodSig};
 
 #[cfg(feature = "remote-client")]
 use loom_locator::{ContextResolver, Discovery as LocatorDiscovery, RemoteTarget};
 #[cfg(feature = "remote-client")]
 use loom_remote_client::carrier::Http2TlsTransport;
-#[cfg(feature = "remote-client")]
+#[cfg(all(feature = "remote-client", feature = "mcp"))]
 use loom_remote_client::transport::{FrameSource, Transport};
 #[cfg(feature = "remote-client")]
 use loom_remote_client::{CallOptions, RemoteConnection, RemoteLoomClient};
-#[cfg(feature = "remote-client")]
-use loom_remote_protocol::api_types::Uuid;
 #[cfg(feature = "serve")]
 use loom_remote_protocol::codec::FromValue;
 #[cfg(any(feature = "serve", feature = "remote-client"))]
 use loom_remote_protocol::codec::ToValue;
 #[cfg(feature = "remote-client")]
 use loom_remote_protocol::discovery::DiscoveryMode;
-#[cfg(feature = "remote-client")]
+#[cfg(all(feature = "remote-client", feature = "mcp"))]
 use loom_remote_protocol::generated_api::{
-    Acl, Calendar, Cas, Columnar, Contacts, Dataframe, Document, FileSystem, Graph, Identity,
-    KeySource, Kv, Lanes, Ledger, Logs, Mail, Metrics, ProtectedRefs, Queue, QueueConsumers,
-    Search, Sql, Store, StoreAdmin, TimeSeries, Traces, Transfer, Vector, VersionControl, Watch,
-    Workspaces,
+    Calendar, Cas, Columnar, Contacts, Dataframe, Document, FileSystem, Graph, Kv, Lanes, Ledger,
+    Logs, Mail, Metrics, Pages, Queue, QueueConsumers, Search, Sql, StoreAdmin, Tickets,
+    TimeSeries, Traces, Vector, VersionControl, Watch, Workspaces,
 };
+#[cfg(feature = "remote-client")]
+use loom_remote_protocol::generated_api::{Store, Transfer};
 #[cfg(any(feature = "serve", feature = "remote-client"))]
 use loom_remote_protocol::session::SessionAuth;
 #[cfg(feature = "remote-client")]
 use std::sync::Arc;
+
+fn remote_lane_ticket_placement(
+    placement: Option<&str>,
+) -> loom_core::Result<Option<loom_remote_protocol::api_types::LaneTicketPlacement>> {
+    placement
+        .map(|placement| match placement {
+            "FIRST" => Ok(loom_remote_protocol::api_types::LaneTicketPlacement::First),
+            "LAST" => Ok(loom_remote_protocol::api_types::LaneTicketPlacement::Last),
+            "BEFORE" => Ok(loom_remote_protocol::api_types::LaneTicketPlacement::Before),
+            "AFTER" => Ok(loom_remote_protocol::api_types::LaneTicketPlacement::After),
+            other => Err(loom_types::LoomError::invalid(format!(
+                "lane ticket placement must be FIRST, LAST, BEFORE, or AFTER: {other}"
+            ))),
+        })
+        .transpose()
+}
+
+#[cfg(feature = "remote-client")]
+fn remote_lane_ticket_placement_parts(
+    placement: loom_lanes::LaneTicketPlacement<'_>,
+) -> (
+    Option<loom_remote_protocol::api_types::LaneTicketPlacement>,
+    Option<String>,
+) {
+    match placement {
+        loom_lanes::LaneTicketPlacement::First => (
+            Some(loom_remote_protocol::api_types::LaneTicketPlacement::First),
+            None,
+        ),
+        loom_lanes::LaneTicketPlacement::Last => (
+            Some(loom_remote_protocol::api_types::LaneTicketPlacement::Last),
+            None,
+        ),
+        loom_lanes::LaneTicketPlacement::Before(anchor) => (
+            Some(loom_remote_protocol::api_types::LaneTicketPlacement::Before),
+            Some(anchor.to_string()),
+        ),
+        loom_lanes::LaneTicketPlacement::After(anchor) => (
+            Some(loom_remote_protocol::api_types::LaneTicketPlacement::After),
+            Some(anchor.to_string()),
+        ),
+    }
+}
 
 /// A locator-aware store client: a local engine handle or a connected remote endpoint.
 pub(crate) enum StoreClient {
@@ -191,7 +236,7 @@ impl CliGeneratedClient {
         match self {
             Self::DirectLocal { client, handle } => {
                 let args = operation.wire_args(handle);
-                match loom_hosted_core::generated_dispatch::dispatch(
+                match loom_hosted_core::generated_dispatch::dispatch_local(
                     client.as_ref(),
                     handle,
                     operation.interface(),
@@ -289,17 +334,31 @@ impl CliGeneratedClient {
         collection: &str,
         id: &str,
     ) -> Result<Option<loom_core::document::DocumentText>, String> {
-        let Some(document) = self.doc_get_binary(workspace, collection, id)? else {
-            return Ok(None);
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Document",
+            "get_text",
+            vec![
+                workspace.to_string().to_value(),
+                collection.to_string().to_value(),
+                id.to_string().to_value(),
+            ],
+        )?)?;
+        let bytes = match value {
+            loom_codec::Value::Null => return Ok(None),
+            loom_codec::Value::Bytes(bytes) => bytes,
+            other => {
+                return Err(format!(
+                    "Document.get_text returned unexpected value {other:?}"
+                ));
+            }
         };
-        let text = String::from_utf8(document.bytes).map_err(|_| {
-            loom_types::LoomError::document_not_text("document payload is not valid UTF-8 text")
-                .to_string()
-        })?;
+        let (text, digest, entity_tag) =
+            loom_wire::document::text_result_from_cbor(&bytes).map_err(|err| err.to_string())?;
+        let digest = Digest::parse(&digest).map_err(|err| err.to_string())?;
         Ok(Some(loom_core::document::DocumentText {
             text,
-            digest: document.digest,
-            entity_tag: document.entity_tag,
+            digest,
+            entity_tag,
         }))
     }
 
@@ -554,6 +613,7 @@ impl CliGeneratedClient {
         anchor: Option<&str>,
         updated_by: &str,
     ) -> Result<loom_lanes::Lane, String> {
+        let placement = remote_lane_ticket_placement(placement).map_err(|err| err.to_string())?;
         let value = self.execute_unary(&CliGeneratedOperation::new(
             "Lanes",
             "ticket_add",
@@ -561,7 +621,7 @@ impl CliGeneratedClient {
                 workspace.to_string().to_value(),
                 lane_id.to_string().to_value(),
                 ticket_id.to_string().to_value(),
-                placement.map(str::to_string).to_value(),
+                placement.to_value(),
                 anchor.map(str::to_string).to_value(),
                 updated_by.to_string().to_value(),
             ],
@@ -835,32 +895,30 @@ impl CliGeneratedClient {
                 "Workspaces.workspace_list returned unexpected value {value:?}"
             ));
         };
-        let infos = records
-            .iter()
-            .map(|record| match record {
-                loom_codec::Value::Bytes(bytes) => cli_workspace_info_from_remote(bytes),
-                other => Err(format!(
-                    "Workspaces.workspace_list returned unexpected record {other:?}"
-                )),
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let parsed = loom_core::WorkspaceId::parse(workspace).ok();
-        for info in infos {
-            let matches = match &parsed {
-                Some(id) => info.id.as_bytes() == id.as_bytes(),
-                None => info.name == workspace,
-            };
-            if matches {
-                return Ok(info.id);
-            }
-        }
-        Err(format!("workspace {workspace:?} not found"))
+        let infos = cli_workspace_infos_from_generated_records(&records)?;
+        cli_select_workspace_id(&infos, workspace)
+            .ok_or_else(|| format!("workspace {workspace:?} not found"))
+    }
+
+    pub(crate) fn workspace_list(&self) -> Result<Vec<loom_core::WorkspaceInfo>, String> {
+        let value = self.execute_unary(&CliGeneratedOperation::new(
+            "Workspaces",
+            "workspace_list",
+            Vec::new(),
+        )?)?;
+        let loom_codec::Value::Array(records) = value else {
+            return Err(format!(
+                "Workspaces.workspace_list returned unexpected value {value:?}"
+            ));
+        };
+        cli_workspace_infos_from_generated_records(&records)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CliStoreAdministrationBoundary {
     GeneratedStoreAdmin,
+    #[cfg(test)]
     OfflineStoreOwner,
 }
 
@@ -871,7 +929,8 @@ pub(crate) enum CliExecutionBoundary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CliOperation {
+#[cfg(test)]
+pub enum CliOperation {
     BundleExport,
     BundleImport,
     Clone,
@@ -890,40 +949,40 @@ pub(crate) enum CliOperation {
     Stat,
 }
 
-const CLI_OFFLINE_STORE_OWNER_OPERATIONS: &[CliOperation] = &[
-    CliOperation::BundleExport,
-    CliOperation::BundleImport,
-    CliOperation::Clone,
-    CliOperation::Copy,
-    CliOperation::Get,
-    CliOperation::Hash,
-    CliOperation::Init,
-    CliOperation::KeyChange,
-    CliOperation::KeyCreate,
-    CliOperation::Put,
-    CliOperation::Replace,
-];
-
-const CLI_GENERATED_STORE_ADMIN_OPERATIONS: &[CliOperation] = &[
-    CliOperation::KeyStatus,
-    CliOperation::KeyVerify,
-    CliOperation::Policy,
-    CliOperation::Rekey,
-    CliOperation::Stat,
-];
-
-pub(crate) fn classify_cli_operation(operation: CliOperation) -> CliExecutionBoundary {
-    if CLI_OFFLINE_STORE_OWNER_OPERATIONS.contains(&operation) {
-        return CliExecutionBoundary::StoreAdministration(
+#[cfg(test)]
+fn cli_store_administration_boundary_reason(
+    operation: CliOperation,
+) -> (CliStoreAdministrationBoundary, &'static str) {
+    match operation {
+        CliOperation::BundleExport
+        | CliOperation::BundleImport
+        | CliOperation::Clone
+        | CliOperation::Copy
+        | CliOperation::Get
+        | CliOperation::Hash
+        | CliOperation::Init
+        | CliOperation::KeyChange
+        | CliOperation::KeyCreate
+        | CliOperation::Put
+        | CliOperation::Replace => (
             CliStoreAdministrationBoundary::OfflineStoreOwner,
-        );
-    }
-    if CLI_GENERATED_STORE_ADMIN_OPERATIONS.contains(&operation) {
-        return CliExecutionBoundary::StoreAdministration(
+            "operation owns file creation, copy, replacement, or byte-level access outside a generated store session",
+        ),
+        CliOperation::KeyStatus
+        | CliOperation::KeyVerify
+        | CliOperation::Policy
+        | CliOperation::Rekey
+        | CliOperation::Stat => (
             CliStoreAdministrationBoundary::GeneratedStoreAdmin,
-        );
+            "operation is represented by the generated StoreAdmin interface",
+        ),
     }
-    CliExecutionBoundary::GeneratedClient
+}
+
+#[cfg(test)]
+pub(crate) fn classify_cli_operation(operation: CliOperation) -> CliExecutionBoundary {
+    let (boundary, _reason) = cli_store_administration_boundary_reason(operation);
+    CliExecutionBoundary::StoreAdministration(boundary)
 }
 
 pub(crate) fn classify_generated_operation(
@@ -968,24 +1027,61 @@ impl CliExecutionContext {
         self,
         keys: &KeyOpts,
     ) -> Result<CliGeneratedClient, String> {
+        self.into_generated_client_with_mode(keys, OpenGeneratedMode::ReadWrite)
+    }
+
+    pub(crate) fn into_read_only_generated_client_with_keys(
+        self,
+        keys: &KeyOpts,
+    ) -> Result<CliGeneratedClient, String> {
+        self.into_generated_client_with_mode(keys, OpenGeneratedMode::ReadOnly)
+    }
+
+    fn into_generated_client_with_mode(
+        self,
+        keys: &KeyOpts,
+        mode: OpenGeneratedMode,
+    ) -> Result<CliGeneratedClient, String> {
         match self {
             Self::DirectLocal { locator } => {
                 let client = Box::new(loom_client::LocalLoomClient::new(&locator));
                 let encrypted = {
-                    let fs = FileStore::open(&locator).map_err(|e| e.to_string())?;
+                    let fs = match mode {
+                        OpenGeneratedMode::ReadOnly => {
+                            FileStore::open_read(&locator).map_err(|e| e.to_string())?
+                        }
+                        OpenGeneratedMode::ReadWrite => {
+                            FileStore::open(&locator).map_err(|e| e.to_string())?
+                        }
+                    };
                     fs.is_encrypted()
                 };
                 let handle = if encrypted {
                     match acquire_key_spec(&keys.source, "Passphrase", false)? {
-                        KeySpec::Passphrase(passphrase) => client
-                            .open_keyed(passphrase.as_bytes())
-                            .map_err(|e| e.to_string())?,
-                        KeySpec::RawKek(kek) => {
-                            client.open_with_kek(*kek).map_err(|e| e.to_string())?
-                        }
+                        KeySpec::Passphrase(passphrase) => match mode {
+                            OpenGeneratedMode::ReadOnly => client
+                                .open_read_keyed(passphrase.as_bytes())
+                                .map_err(|e| e.to_string())?,
+                            OpenGeneratedMode::ReadWrite => client
+                                .open_keyed(passphrase.as_bytes())
+                                .map_err(|e| e.to_string())?,
+                        },
+                        KeySpec::RawKek(kek) => match mode {
+                            OpenGeneratedMode::ReadOnly => {
+                                client.open_read_with_kek(*kek).map_err(|e| e.to_string())?
+                            }
+                            OpenGeneratedMode::ReadWrite => {
+                                client.open_with_kek(*kek).map_err(|e| e.to_string())?
+                            }
+                        },
                     }
                 } else {
-                    client.open().map_err(|e| e.to_string())?
+                    match mode {
+                        OpenGeneratedMode::ReadOnly => {
+                            client.open_read().map_err(|e| e.to_string())?
+                        }
+                        OpenGeneratedMode::ReadWrite => client.open().map_err(|e| e.to_string())?,
+                    }
                 };
                 if let Some((principal, passphrase)) = acquire_auth_session(keys)? {
                     client
@@ -1002,6 +1098,12 @@ impl CliExecutionContext {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OpenGeneratedMode {
+    ReadOnly,
+    ReadWrite,
+}
+
 pub(crate) fn open_cli_execution_context(store: &str) -> Result<CliExecutionContext, String> {
     open_cli_execution_context_with_keys(store, &KeyOpts::default())
 }
@@ -1013,6 +1115,26 @@ pub(crate) fn open_cli_generated_client(
     open_cli_execution_context_with_keys(store, keys)?.into_generated_client_with_keys(keys)
 }
 
+pub(crate) fn open_cli_generated_client_for_dry_run(
+    store: &str,
+    keys: &KeyOpts,
+    dry_run: bool,
+) -> Result<CliGeneratedClient, String> {
+    if dry_run {
+        open_cli_read_only_generated_client(store, keys)
+    } else {
+        open_cli_generated_client(store, keys)
+    }
+}
+
+pub(crate) fn open_cli_read_only_generated_client(
+    store: &str,
+    keys: &KeyOpts,
+) -> Result<CliGeneratedClient, String> {
+    open_cli_read_only_execution_context_with_keys(store, keys)?
+        .into_read_only_generated_client_with_keys(keys)
+}
+
 pub(crate) fn open_cli_execution_context_with_keys(
     store: &str,
     keys: &KeyOpts,
@@ -1021,7 +1143,7 @@ pub(crate) fn open_cli_execution_context_with_keys(
         Target::Local(path) => open_local_execution_context(path.to_string_lossy().as_ref(), keys),
         #[cfg(feature = "remote-client")]
         Target::Remote(target) => {
-            let store = match remote_session_auth(&target)? {
+            let store = match remote_session_auth(&target, keys)? {
                 SessionAuth::Unauthenticated => RemoteStore::connect(&target)?,
                 auth => RemoteStore::connect_with_auth(&target, auth)?,
             };
@@ -1035,19 +1157,65 @@ pub(crate) fn open_cli_execution_context_with_keys(
     }
 }
 
+fn open_cli_read_only_execution_context_with_keys(
+    store: &str,
+    keys: &KeyOpts,
+) -> Result<CliExecutionContext, String> {
+    match crate::locator_cx::current().resolve_target(store)? {
+        Target::Local(path) => open_local_execution_context(path.to_string_lossy().as_ref(), keys),
+        #[cfg(feature = "remote-client")]
+        Target::Remote(target) => {
+            let store = match remote_session_auth(&target, keys)? {
+                SessionAuth::Unauthenticated => RemoteStore::connect(&target)?,
+                auth => RemoteStore::connect_with_auth(&target, auth)?,
+            };
+            Ok(CliExecutionContext::Remote(Box::new(store)))
+        }
+        #[cfg(not(feature = "remote-client"))]
+        Target::Remote(target) => {
+            let _ = keys;
+            Err(format!(
+                "locator resolves to remote endpoint {}; rebuild with the `remote-client` feature to forward remote commands",
+                target.url
+            ))
+        }
+    }
+}
+
 fn open_local_execution_context(
     store: &str,
     keys: &KeyOpts,
 ) -> Result<CliExecutionContext, String> {
     #[cfg(feature = "serve")]
     {
-        if let Ok(paths) = daemon::paths(store)
-            && daemon::status_response(&paths).is_ok()
-        {
-            let auth = local_session_auth(keys)?;
-            return DaemonLocalStore::connect(store, auth)
-                .map(Box::new)
-                .map(CliExecutionContext::DaemonLocal);
+        if let Ok(paths) = daemon::paths(store) {
+            match daemon::runtime_compatibility(&paths) {
+                daemon::DaemonRuntimeCompatibility::Current(_) => {
+                    let auth = local_session_auth(keys)?;
+                    return DaemonLocalStore::connect(store, auth)
+                        .map(Box::new)
+                        .map(CliExecutionContext::DaemonLocal);
+                }
+                daemon::DaemonRuntimeCompatibility::Prior(status) => {
+                    return Err(format!(
+                        "daemon owns store {:?} but uses an incompatible runtime: {}; stop or upgrade the daemon before running generated CLI commands",
+                        paths.store, status.reason
+                    ));
+                }
+                daemon::DaemonRuntimeCompatibility::Unresponsive(runtime) => {
+                    return Err(format!(
+                        "daemon owns store {:?} but generated CLI negotiation failed: {}; stop or restart daemon pid {} before running generated CLI commands",
+                        paths.store, runtime.reason, runtime.metadata.pid
+                    ));
+                }
+                daemon::DaemonRuntimeCompatibility::Starting(_) => {
+                    return Err(format!(
+                        "daemon owns store {:?} but is still starting; retry after daemon status is running",
+                        paths.store
+                    ));
+                }
+                daemon::DaemonRuntimeCompatibility::Stopped => {}
+            }
         }
     }
     Ok(CliExecutionContext::DirectLocal {
@@ -1074,7 +1242,9 @@ pub(crate) fn open_store_client(store: &str) -> Result<StoreClient, String> {
             let version_operation = CliGeneratedOperation::new("Store", "version", Vec::new())?;
             let _version = generated.execute_unary(&version_operation)?;
             let generated_boundary = classify_generated_operation("Store", "version")?;
-            let command_boundary = classify_cli_operation(CliOperation::Stat);
+            let command_boundary = CliExecutionBoundary::StoreAdministration(
+                CliStoreAdministrationBoundary::GeneratedStoreAdmin,
+            );
             Err(format!(
                 "daemon-local generated execution selected for {store:?} as {:?}, but this command family still uses the legacy StoreClient path for {:?} after {:?} was validated; migrate it to CliExecutionContext instead of reopening the store directly",
                 generated.target(),
@@ -1091,6 +1261,7 @@ pub(crate) struct DaemonLocalStore {
     paths: daemon::DaemonPaths,
     session_id: Vec<u8>,
     handle: LoomSession,
+    close_session_on_drop: bool,
 }
 
 #[cfg(feature = "serve")]
@@ -1120,7 +1291,51 @@ impl DaemonLocalStore {
             paths,
             session_id,
             handle,
+            close_session_on_drop: true,
         })
+    }
+
+    pub(crate) fn resume_logical_session(
+        store: &str,
+        auth: SessionAuth,
+        credential: &[u8],
+    ) -> Result<(Self, Vec<u8>), String> {
+        let paths = daemon::paths(store).map_err(|e| e.to_string())?;
+        daemon::status_response(&paths).map_err(|error| {
+            format!("daemon-local logical session requires a running coordinator: {error}")
+        })?;
+        let request = loom_remote_protocol::session::resume_request_bytes(&auth, credential);
+        let reply = daemon::generated_session_open(&paths, &request)
+            .map_err(|error| format!("daemon-local logical session resume failed: {error}"))?;
+        let reply = loom_remote_protocol::session::parse_open_reply(&reply)
+            .map_err(|error| format!("decode logical session resume response: {error}"))?;
+        let (session_id, credential) = match reply {
+            loom_remote_protocol::session::SessionOpenReply::Ok {
+                session_id,
+                credential: Some(credential),
+                ..
+            } => (session_id, credential),
+            loom_remote_protocol::session::SessionOpenReply::Ok {
+                credential: None, ..
+            } => return Err("logical session resume omitted rotated credential".to_string()),
+            loom_remote_protocol::session::SessionOpenReply::Err(error) => {
+                return Err(format!(
+                    "logical session resume failed: {:?}: {}",
+                    error.code, error.message
+                ));
+            }
+        };
+        let handle = daemon_generated_open_store(&paths, &session_id)?;
+        Ok((
+            Self {
+                locator: store.to_string(),
+                paths,
+                session_id,
+                handle,
+                close_session_on_drop: false,
+            },
+            credential,
+        ))
     }
 
     fn generated_unary(
@@ -1158,6 +1373,9 @@ pub(crate) fn local_session_auth(keys: &KeyOpts) -> Result<SessionAuth, String> 
 #[cfg(feature = "serve")]
 impl Drop for DaemonLocalStore {
     fn drop(&mut self) {
+        if !self.close_session_on_drop {
+            return;
+        }
         let _ = daemon_generated_call(
             &self.paths,
             Some(self.session_id.clone()),
@@ -1227,11 +1445,6 @@ fn daemon_generated_payload_error(
     }
 }
 
-/// Defensive message for a StoreAdmin facade method invoked on a local client. The `store` admin
-/// handlers branch on `is_remote` and only call these on a remote client, so this is not reached.
-const LOCAL_ADMIN_VIA_LOCAL_PATH: &str =
-    "store admin over a local store is handled by the local path, not the StoreAdmin facade";
-
 /// Render a decoded [`loom_wire::store_admin::StoreStat`] as JSON (the remote `store stat` output).
 fn store_stat_json(stat: &loom_wire::store_admin::StoreStat) -> String {
     format!(
@@ -1249,6 +1462,25 @@ fn store_stat_json(stat: &loom_wire::store_admin::StoreStat) -> String {
     )
 }
 
+pub(crate) fn generated_store_stat_json(
+    context: CliExecutionContext,
+    keys: &KeyOpts,
+) -> Result<String, String> {
+    let client = context.into_generated_client_with_keys(keys)?;
+    let value = client.execute_unary(&CliGeneratedOperation::new(
+        "StoreAdmin",
+        "store_stat",
+        Vec::new(),
+    )?)?;
+    let loom_codec::Value::Bytes(cbor) = value else {
+        return Err(format!(
+            "StoreAdmin.store_stat returned unexpected value {value:?}"
+        ));
+    };
+    let stat = loom_wire::store_admin::store_stat_from_cbor(&cbor).map_err(|e| e.to_string())?;
+    Ok(store_stat_json(&stat))
+}
+
 /// Whether `store` resolves to a remote endpoint, without opening a connection. Used to reject the
 /// path-shaped `fs` import/export over a remote locator (fs-tree byte transfer is deferred).
 pub(crate) fn target_is_remote(store: &str) -> Result<bool, String> {
@@ -1257,9 +1489,6 @@ pub(crate) fn target_is_remote(store: &str) -> Result<bool, String> {
         Target::Remote(_)
     ))
 }
-
-/// Chunk size for the byte-transfer import write loop (bounded frames, `specs/0067` §17.5).
-const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Map a byte-transfer archive kind to the interchange `ArchiveKind`.
 fn transfer_kind_to_archive(
@@ -1280,49 +1509,6 @@ fn transfer_kind_to_archive(
             ));
         }
     })
-}
-
-/// Apply a local byte-transfer import (archive family or CAR) to `workspace`, returning the report.
-fn local_transfer_import(
-    loom: &mut Loom<FileStore>,
-    workspace: &str,
-    kind: &str,
-    bytes: &[u8],
-    commit: bool,
-    dry_run: bool,
-) -> Result<loom_interchange::ImportReport, String> {
-    use loom_interchange_io::transfer::TransferKind;
-    let kind = TransferKind::parse(kind).map_err(|e| e.to_string())?;
-    let report = match kind {
-        TransferKind::Car => {
-            let mut options = loom_interchange_io::CarImportOptions::new(workspace);
-            options.dry_run = dry_run;
-            loom_interchange_io::import_car_bytes(loom, bytes, &options)
-                .map_err(|e| e.to_string())?
-                .report
-        }
-        _ => {
-            let archive_kind = transfer_kind_to_archive(kind)?;
-            let ns = ensure_facet_workspace(loom, workspace, FacetKind::Files)?;
-            let mut options = loom_interchange_io::ArchiveImportOptions::new(workspace);
-            options.commit = commit;
-            options.dry_run = dry_run;
-            loom_interchange_io::import_archive_bytes(
-                loom,
-                ns,
-                bytes,
-                std::path::Path::new("transfer"),
-                archive_kind,
-                &options,
-            )
-            .map_err(|e| e.to_string())?
-            .report
-        }
-    };
-    if !dry_run {
-        save_loom(loom).map_err(|e| e.to_string())?;
-    }
-    Ok(report)
 }
 
 /// Export a local `workspace` as a byte-transfer `kind` payload.
@@ -1358,47 +1544,21 @@ fn local_transfer_export_bytes(
     }
 }
 
-/// A one-line summary of a typed import-report (local byte-transfer path).
-fn summary_from_report(r: &loom_interchange::ImportReport) -> String {
-    format!(
-        "imported: profile={}, objects_added={}, bytes_in={}, dry_run={}",
-        r.profile, r.objects_added, r.bytes_in, r.dry_run
-    )
-}
-
-/// A one-line summary of an import-report CBOR (remote byte-transfer path). The canonical
-/// `loom.interchange.import-report.v1` array is `[profile, source_scope, commit, objects_added,
-/// bytes_in, bytes_stored, rows_imported, skipped, operations_planned, operations_applied, dry_run,
-/// warnings, fidelity_issues]`.
-fn summary_from_report_cbor(bytes: &[u8]) -> Result<String, String> {
-    use loom_codec::Value;
-    let Value::Array(items) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("import-report is not a CBOR array".to_string());
-    };
-    let text = |i: usize| match items.get(i) {
-        Some(Value::Text(t)) => t.clone(),
-        _ => String::new(),
-    };
-    let uint = |i: usize| match items.get(i) {
-        Some(Value::Uint(n)) => *n,
-        _ => 0,
-    };
-    let dry_run = matches!(items.get(10), Some(Value::Bool(true)));
-    Ok(format!(
-        "imported: profile={}, objects_added={}, bytes_in={}, dry_run={}",
-        text(0),
-        uint(3),
-        uint(4),
-        dry_run
-    ))
-}
-
 /// Resolve the `SessionAuth` for a remote endpoint from its `target.auth` selector. The selector is a
 /// non-secret principal id (never credential material); the passphrase is acquired at connect time via the
 /// interactive prompt and never stored in locator/config files. No selector means an unauthenticated
 /// session; a bad passphrase fails at session open, not later at mutation time.
 #[cfg(feature = "remote-client")]
-fn remote_session_auth(target: &RemoteTarget) -> Result<SessionAuth, String> {
+pub(crate) fn remote_session_auth(
+    target: &RemoteTarget,
+    keys: &KeyOpts,
+) -> Result<SessionAuth, String> {
+    if let Some((principal, passphrase)) = acquire_auth_session(keys)? {
+        return Ok(SessionAuth::Passphrase {
+            principal: *principal.as_bytes(),
+            passphrase: passphrase.into_bytes(),
+        });
+    }
     match target.auth.as_deref() {
         None => Ok(SessionAuth::Unauthenticated),
         Some(selector) => {
@@ -1418,2198 +1578,6 @@ fn remote_session_auth(target: &RemoteTarget) -> Result<SessionAuth, String> {
 }
 
 impl StoreClient {
-    /// Store `value` under the typed `key` in `collection` of `workspace` (KV put).
-    pub(crate) fn kv_put(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        key: loom_core::Value,
-        value: Vec<u8>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Kv)?;
-                loom_core::kv_put(&mut loom, ns, collection, key, value)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Kv::put(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                loom_core::kv::key_to_cbor(&key),
-                value,
-            )),
-        }
-    }
-
-    /// Read the value under the typed `key` in `collection` of `workspace` (KV get), or `None` when
-    /// absent.
-    pub(crate) fn kv_get(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        key: loom_core::Value,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::kv_get(&loom, ns, collection, &key).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Kv::get(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                loom_core::kv::key_to_cbor(&key),
-            )),
-        }
-    }
-
-    /// The canonical-CBOR `[key, value]` list for `collection` of `workspace` (KV list).
-    pub(crate) fn kv_list(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let map = loom_core::kv_list(&loom, ns, collection).map_err(|e| e.to_string())?;
-                Ok(map.encode())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Kv::list(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-            )),
-        }
-    }
-
-    /// Delete the typed `key` from `collection` of `workspace` (KV delete); returns whether it existed.
-    pub(crate) fn kv_delete(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        key: loom_core::Value,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present = loom_core::kv_delete(&mut loom, ns, collection, &key)
-                    .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Kv::delete(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                loom_core::kv::key_to_cbor(&key),
-            )),
-        }
-    }
-
-    /// The canonical-CBOR `[key, value]` list for `[from, to]` of `collection` in `workspace` (KV range).
-    pub(crate) fn kv_range(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        from: loom_core::Value,
-        to: loom_core::Value,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let map = loom_core::kv_range(&loom, ns, collection, &from, &to)
-                    .map_err(|e| e.to_string())?;
-                Ok(map.encode())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Kv::range(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                loom_core::kv::key_to_cbor(&from),
-                loom_core::kv::key_to_cbor(&to),
-            )),
-        }
-    }
-
-    /// Append `entry` to `stream` of `workspace` (queue append), returning the assigned sequence.
-    pub(crate) fn queue_append(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        stream: &str,
-        entry: Vec<u8>,
-    ) -> Result<u64, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Queue)?;
-                let seq = loom_core::log::append(&mut loom, ns, stream, &entry)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                Ok(seq as u64)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Queue::append(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                stream.to_string(),
-                entry,
-            )),
-        }
-    }
-
-    /// The entries in `[from, to)` of `stream` in `workspace` (queue range).
-    pub(crate) fn queue_range(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        stream: &str,
-        from: u64,
-        to: u64,
-    ) -> Result<Vec<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::log::range(&loom, ns, stream, from as usize, to as usize)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Queue::range(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                stream.to_string(),
-                from,
-                to,
-            )),
-        }
-    }
-
-    /// The entry at `seq` of `stream` in `workspace` (queue get), or `None` when absent.
-    pub(crate) fn queue_get(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        stream: &str,
-        seq: usize,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::log::get(&loom, ns, stream, seq).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Queue::get(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                stream.to_string(),
-                seq as u64,
-            )),
-        }
-    }
-
-    /// The number of entries in `stream` of `workspace` (queue len).
-    pub(crate) fn queue_len(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        stream: &str,
-    ) -> Result<usize, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::log::len(&loom, ns, stream).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let len = remote.block(Queue::len(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    stream.to_string(),
-                ))?;
-                Ok(len as usize)
-            }
-        }
-    }
-
-    /// The named consumer's next sequence in `stream` of `workspace` (queue position).
-    pub(crate) fn queue_consumer_position(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        stream: &str,
-        consumer: &str,
-    ) -> Result<u64, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::log::consumer_position(&loom, ns, stream, consumer)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(QueueConsumers::consumer_position(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                stream.to_string(),
-                consumer.to_string(),
-            )),
-        }
-    }
-
-    /// Up to `max` entries from the named consumer's position in `stream` of `workspace`, without
-    /// advancing (queue read).
-    pub(crate) fn queue_consumer_read(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        stream: &str,
-        consumer: &str,
-        max: usize,
-    ) -> Result<Vec<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::log::consumer_read(&loom, ns, stream, consumer, max)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(QueueConsumers::consumer_read(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                stream.to_string(),
-                consumer.to_string(),
-                max as u32,
-            )),
-        }
-    }
-
-    /// Advance the named consumer's next sequence to `next` in `stream` of `workspace` (queue advance);
-    /// rejects backward movement.
-    pub(crate) fn queue_consumer_advance(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        stream: &str,
-        consumer: &str,
-        next: u64,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::log::consumer_advance(&mut loom, ns, stream, consumer, next)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(QueueConsumers::consumer_advance(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                stream.to_string(),
-                consumer.to_string(),
-                next,
-            )),
-        }
-    }
-
-    /// Set the named consumer's next sequence to `next` in `stream` of `workspace` (queue reset), which
-    /// may move backward.
-    pub(crate) fn queue_consumer_reset(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        stream: &str,
-        consumer: &str,
-        next: u64,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::log::consumer_reset(&mut loom, ns, stream, consumer, next)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(QueueConsumers::consumer_reset(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                stream.to_string(),
-                consumer.to_string(),
-                next,
-            )),
-        }
-    }
-
-    /// Store `content` in the content-addressed facet of `workspace`, returning its digest (CAS put).
-    pub(crate) fn cas_put(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        content: Vec<u8>,
-    ) -> Result<Digest, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Cas)?;
-                let digest =
-                    loom_core::cas_put(&mut loom, ns, &content).map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                Ok(digest)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Cas::put(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    content,
-                ))?;
-                Digest::parse(&wire.0).map_err(|e| e.to_string())
-            }
-        }
-    }
-
-    /// Read the blob at `digest` in `workspace` (CAS get), or `None` when absent.
-    pub(crate) fn cas_get(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        digest: &Digest,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::cas_get(&loom, ns, digest).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Cas::get(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                loom_remote_protocol::api_types::Digest(digest.to_string()),
-            )),
-        }
-    }
-
-    /// Whether the blob at `digest` is present in `workspace` (CAS has).
-    pub(crate) fn cas_has(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        digest: &Digest,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::cas_has(&loom, ns, digest).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Cas::has(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                loom_remote_protocol::api_types::Digest(digest.to_string()),
-            )),
-        }
-    }
-
-    /// Unlink the blob at `digest` from `workspace`'s working tree (CAS delete); returns whether present.
-    pub(crate) fn cas_delete(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        digest: &Digest,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present =
-                    loom_core::cas_delete(&mut loom, ns, digest).map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Cas::delete(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                loom_remote_protocol::api_types::Digest(digest.to_string()),
-            )),
-        }
-    }
-
-    /// The digests reachable in `workspace`'s content-addressed working tree (CAS list).
-    pub(crate) fn cas_list(&self, keys: &KeyOpts, workspace: &str) -> Result<Vec<Digest>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::cas_list(&loom, ns).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Cas::list(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                ))?;
-                wire.into_iter()
-                    .map(|d| Digest::parse(&d.0).map_err(|e| e.to_string()))
-                    .collect()
-            }
-        }
-    }
-
-    /// Append `payload` to the hash-linked `collection` of `workspace` (Ledger append), returning its seq.
-    pub(crate) fn ledger_append(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        payload: Vec<u8>,
-    ) -> Result<u64, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Ledger)?;
-                let seq = loom_core::ledger_append(&mut loom, ns, collection, payload)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                Ok(seq)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Ledger::append(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                payload,
-            )),
-        }
-    }
-
-    /// The payload at `seq` in `collection` of `workspace` (Ledger get), or `None` when absent.
-    pub(crate) fn ledger_get(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-        seq: u64,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::ledger_get(&loom, ns, collection, seq).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Ledger::get(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-                seq,
-            )),
-        }
-    }
-
-    /// The head digest of `collection` in `workspace` (Ledger head), or `None` when empty.
-    pub(crate) fn ledger_head(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-    ) -> Result<Option<Digest>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::ledger_head(&loom, ns, collection).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let head = remote.block(Ledger::head(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    collection.to_string(),
-                ))?;
-                match head {
-                    Some(d) => Ok(Some(Digest::parse(&d.0).map_err(|e| e.to_string())?)),
-                    None => Ok(None),
-                }
-            }
-        }
-    }
-
-    /// The number of entries in `collection` of `workspace` (Ledger len).
-    pub(crate) fn ledger_len(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-    ) -> Result<u64, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::ledger_len(&loom, ns, collection).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Ledger::len(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-            )),
-        }
-    }
-
-    /// Verify the hash-linked integrity of `collection` in `workspace` (Ledger verify).
-    pub(crate) fn ledger_verify(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        collection: &str,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::ledger_verify(&loom, ns, collection).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Ledger::verify(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                collection.to_string(),
-            )),
-        }
-    }
-
-    /// Store `value` at `ts` in `series` of `workspace` (TimeSeries put).
-    pub(crate) fn ts_put(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        series: &str,
-        ts: i64,
-        value: Vec<u8>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::TimeSeries)?;
-                loom_core::ts_put(&mut loom, ns, series, ts, value).map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(TimeSeries::put(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                series.to_string(),
-                ts,
-                value,
-            )),
-        }
-    }
-
-    /// The value at `ts` in `series` of `workspace` (TimeSeries get), or `None` when absent.
-    pub(crate) fn ts_get(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        series: &str,
-        ts: i64,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::ts_get(&loom, ns, series, ts).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(TimeSeries::get(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                series.to_string(),
-                ts,
-            )),
-        }
-    }
-
-    /// The canonical-CBOR series of points in `[from, to]` of `series` in `workspace` (TimeSeries range).
-    pub(crate) fn ts_range(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        series: &str,
-        from: i64,
-        to: i64,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let result =
-                    loom_core::ts_range(&loom, ns, series, from, to).map_err(|e| e.to_string())?;
-                Ok(result.encode())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(TimeSeries::range(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                series.to_string(),
-                from,
-                to,
-            )),
-        }
-    }
-
-    /// Create search index `name` in `workspace` from the canonical-CBOR `mapping` (Search create).
-    ///
-    /// `mapping` is the canonical-CBOR field mapping crossing the wire unchanged; the local arm decodes
-    /// it with the shared [`search_mapping_from_cbor`] bridge before applying it to the engine.
-    pub(crate) fn search_create(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        mapping: Vec<u8>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mapping = search_mapping_from_cbor(&mapping)?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Search)?;
-                loom_core::search_create(&mut loom, ns, name, mapping)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Search::create(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                mapping,
-            )),
-        }
-    }
-
-    /// Index the canonical-CBOR `doc` under `id` in search index `name` of `workspace` (Search index).
-    pub(crate) fn search_index(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: Vec<u8>,
-        doc: Vec<u8>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let doc = search_document_from_cbor(&doc)?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::search_index(&mut loom, ns, name, id, doc).map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Search::index(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id,
-                doc,
-            )),
-        }
-    }
-
-    /// Read the canonical-CBOR document under `id` in search index `name` of `workspace` (Search get),
-    /// or `None` when absent.
-    pub(crate) fn search_get(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: Vec<u8>,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                match loom_core::search_get(&loom, ns, name, &id).map_err(|e| e.to_string())? {
-                    Some(doc) => Ok(Some(search_document_cbor(&doc)?)),
-                    None => Ok(None),
-                }
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Search::get(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id,
-            )),
-        }
-    }
-
-    /// Delete document `id` from search index `name` of `workspace` (Search delete); returns whether
-    /// it was present.
-    pub(crate) fn search_delete(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: Vec<u8>,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present = loom_core::search_delete(&mut loom, ns, name, &id)
-                    .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Search::delete(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id,
-            )),
-        }
-    }
-
-    /// The canonical-CBOR id list for search index `name` of `workspace`, optionally filtered by
-    /// `prefix` (Search ids).
-    pub(crate) fn search_ids(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        prefix: Option<Vec<u8>>,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let ids = loom_core::search_ids(&loom, ns, name, prefix.as_deref())
-                    .map_err(|e| e.to_string())?;
-                search_ids_cbor(ids)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Search::ids(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                prefix.clone().unwrap_or_default(),
-                prefix.is_some(),
-            )),
-        }
-    }
-
-    /// Replace the field mapping of search index `name` in `workspace` with the canonical-CBOR
-    /// `mapping` (Search remap).
-    pub(crate) fn search_remap(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        mapping: Vec<u8>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mapping = search_mapping_from_cbor(&mapping)?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::search_remap(&mut loom, ns, name, mapping).map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Search::remap(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                mapping,
-            )),
-        }
-    }
-
-    /// Execute the canonical-CBOR `request` against search index `name` of `workspace`, returning the
-    /// canonical-CBOR response (Search query).
-    pub(crate) fn search_query(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        request: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let request = search_request_from_cbor(&request)?;
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let response = loom_core::search_query(&loom, ns, name, &request)
-                    .map_err(|e| e.to_string())?;
-                search_response_cbor(&response)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Search::query(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                request,
-            )),
-        }
-    }
-
-    /// The full search-index status of `name` at `engine_version`: `(workspace_display, source_digest,
-    /// DerivedArtifactStatus)` about the served store's derived tantivy artifact. The remote arm decodes
-    /// the `[source_digest, status]` wire payload from `Search.status`.
-    pub(crate) fn search_status(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        engine_version: &str,
-    ) -> Result<(String, Digest, DerivedArtifactStatus), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let source_digest =
-                    loom_core::search_source_digest(&loom, ns, name).map_err(|e| e.to_string())?;
-                let status = loom
-                    .store()
-                    .search_tantivy_status(ns, name, source_digest, engine_version)
-                    .map_err(|e| e.to_string())?;
-                Ok((ns.to_string(), source_digest, status))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Search::status(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    name.to_string(),
-                    engine_version.to_string(),
-                ))?;
-                let (source_digest, status) =
-                    loom_store::decode_search_status_result(&wire).map_err(|e| e.to_string())?;
-                Ok((workspace.to_string(), source_digest, status))
-            }
-        }
-    }
-
-    // ---- Calendar ----
-    //
-    // The CLI's calendar output uses presentation encoders (`calendar_collection_cbor`,
-    // `calendar_range_cbor`, `record_array_cbor`, `text_array_cbor`) that differ in shape from the
-    // canonical wire encoders the server emits. So the remote arm of each such method decodes the
-    // canonical server response and re-encodes it with the same CLI presentation encoder the local arm
-    // uses, yielding identical output for a local and a remote locator.
-
-    /// Create calendar `collection` for `principal` (Calendar create_collection). `display_name` and
-    /// `component_set` are the CLI args; the remote arm encodes them as the canonical `CollectionMeta`.
-    pub(crate) fn cal_create_collection(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-        display_name: String,
-        component_set: Vec<loom_core::calendar::Component>,
-    ) -> Result<(), String> {
-        let meta = loom_core::calendar::CollectionMeta {
-            display_name,
-            component_set,
-        };
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Calendar)?;
-                loom_core::calendar::create_collection(&mut loom, ns, principal, collection, &meta)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Calendar::create_collection(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                collection.to_string(),
-                meta.encode(),
-            )),
-        }
-    }
-
-    /// Delete calendar `collection` for `principal` (Calendar delete_collection); returns whether present.
-    pub(crate) fn cal_delete_collection(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present =
-                    loom_core::calendar::delete_collection(&mut loom, ns, principal, collection)
-                        .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Calendar::delete_collection(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                collection.to_string(),
-            )),
-        }
-    }
-
-    /// Delete calendar entry `uid` in `collection` for `principal` (Calendar delete_entry); returns
-    /// whether present.
-    pub(crate) fn cal_delete_entry(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-        uid: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present =
-                    loom_core::calendar::delete_entry(&mut loom, ns, principal, collection, uid)
-                        .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Calendar::delete_entry(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                collection.to_string(),
-                uid.to_string(),
-            )),
-        }
-    }
-
-    /// The CLI presentation bytes for calendar `collection` of `principal` (Calendar get_collection), or
-    /// `None` when absent. DIVERGENT: the remote arm decodes the canonical `CollectionMeta` and re-encodes
-    /// it with the CLI's `calendar_collection_cbor`.
-    pub(crate) fn cal_get_collection(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                match loom_core::calendar::get_collection(&loom, ns, principal, collection)
-                    .map_err(|e| e.to_string())?
-                {
-                    Some(meta) => Ok(Some(calendar_collection_cbor(&meta)?)),
-                    None => Ok(None),
-                }
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Calendar::get_collection(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    collection.to_string(),
-                ))?;
-                match wire {
-                    Some(bytes) => Ok(Some(cli_calendar_collection_from_remote(&bytes)?)),
-                    None => Ok(None),
-                }
-            }
-        }
-    }
-
-    /// The canonical-CBOR calendar entry `uid` in `collection` of `principal` (Calendar get_entry), or
-    /// `None` when absent. CLEAN: local and remote both use `CalendarEntry::encode`.
-    pub(crate) fn cal_get_entry(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-        uid: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                Ok(
-                    loom_core::calendar::get_entry(&loom, ns, principal, collection, uid)
-                        .map_err(|e| e.to_string())?
-                        .map(|entry| entry.encode()),
-                )
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Calendar::get_entry(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                collection.to_string(),
-                uid.to_string(),
-            )),
-        }
-    }
-
-    /// The calendar collection ids for `principal` (Calendar list_collections). CLEAN: the remote arm
-    /// decodes the canonical string list, matching the CLI's `text_array_cbor`/line output.
-    pub(crate) fn cal_list_collections(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-    ) -> Result<Vec<String>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::calendar::list_collections(&loom, ns, principal)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Calendar::list_collections(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                ))?;
-                cli_strings_from_remote(&wire)
-            }
-        }
-    }
-
-    /// The CLI presentation bytes for the entries of calendar `collection` (Calendar list_entries).
-    /// DIVERGENT: the remote arm re-encodes the canonical byte-blob list with the CLI's
-    /// `record_array_cbor`.
-    pub(crate) fn cal_list_entries(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let entries = loom_core::calendar::list_entries(&loom, ns, principal, collection)
-                    .map_err(|e| e.to_string())?;
-                record_array_cbor(entries.into_iter().map(|entry| entry.encode()))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Calendar::list_entries(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    collection.to_string(),
-                ))?;
-                cli_record_array_from_remote(&wire)
-            }
-        }
-    }
-
-    /// Put the canonical-CBOR calendar `entry` in `collection` of `principal` (Calendar put_entry),
-    /// returning the etag string the CLI prints. CLEAN: the remote `Digest` string equals the local etag.
-    pub(crate) fn cal_put_entry(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-        entry: Vec<u8>,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let entry = loom_core::calendar::CalendarEntry::decode(&entry)
-                    .map_err(|e| e.to_string())?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Calendar)?;
-                let etag =
-                    loom_core::calendar::put_entry(&mut loom, ns, principal, collection, &entry)
-                        .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                Ok(etag.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Calendar::put_entry(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    collection.to_string(),
-                    entry,
-                ))?;
-                Ok(wire.0)
-            }
-        }
-    }
-
-    /// Import an iCalendar document into `collection` (Calendar `put_ics`), returning the etag string.
-    pub(crate) fn cal_put_ics(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-        ics: String,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Calendar)?;
-                let etag = loom_core::calendar::put_ics(&mut loom, ns, principal, collection, &ics)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                Ok(etag.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Calendar::put_ics(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    collection.to_string(),
-                    ics,
-                ))?;
-                Ok(wire.0)
-            }
-        }
-    }
-
-    /// The CLI presentation bytes for the occurrences of `collection` in `[from, to)` (Calendar range).
-    /// `from`/`to` are the raw CLI date-time args. DIVERGENT: the remote arm normalizes the bounds to the
-    /// wire form, then reconstructs `Occurrence`s from the canonical response and re-encodes them with the
-    /// CLI's `calendar_range_cbor`.
-    pub(crate) fn cal_range(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-        from: &str,
-        to: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let from = parse_calendar_datetime(from)?;
-                let to = parse_calendar_datetime(to)?;
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let entries =
-                    loom_core::calendar::range(&loom, ns, principal, collection, from, to)
-                        .map_err(|e| e.to_string())?;
-                calendar_range_cbor(&entries)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                // The server parses bounds as a 15-char `YYYYMMDDTHHMMSS` wall-clock string; normalize the
-                // CLI args (which also accept bare `YYYYMMDD`) so remote accepts the same inputs as local.
-                let from = cli_window_bound(from)?;
-                let to = cli_window_bound(to)?;
-                let wire = remote.block(Calendar::range(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    collection.to_string(),
-                    from,
-                    to,
-                ))?;
-                cli_calendar_range_from_remote(&wire)
-            }
-        }
-    }
-
-    /// The CLI presentation bytes for the entries of `collection` matching `component`/`text` (Calendar
-    /// search). DIVERGENT: same re-encode as `cal_list_entries`.
-    pub(crate) fn cal_search(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-        component: Option<loom_core::calendar::Component>,
-        text: Option<String>,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let entries = loom_core::calendar::search(
-                    &loom,
-                    ns,
-                    principal,
-                    collection,
-                    component,
-                    text.as_deref(),
-                )
-                .map_err(|e| e.to_string())?;
-                record_array_cbor(entries.into_iter().map(|entry| entry.encode()))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let component = component
-                    .map(|c| c.as_str().to_string())
-                    .unwrap_or_default();
-                let wire = remote.block(Calendar::search(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    collection.to_string(),
-                    component,
-                    text.unwrap_or_default(),
-                ))?;
-                cli_record_array_from_remote(&wire)
-            }
-        }
-    }
-
-    /// The iCalendar text for entry `uid` in `collection` of `principal` (Calendar to_ics), or `None`
-    /// when absent. CLEAN: the local arm's ics string bytes equal the server's ics bytes.
-    pub(crate) fn cal_to_ics(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        collection: &str,
-        uid: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                Ok(
-                    loom_core::calendar::entry_ics(&loom, ns, principal, collection, uid)
-                        .map_err(|e| e.to_string())?
-                        .map(String::into_bytes),
-                )
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Calendar::to_ics(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                collection.to_string(),
-                uid.to_string(),
-            )),
-        }
-    }
-
-    // ---- Contacts ----
-    //
-    // Mirrors Calendar: the CLI presents `get_book` metadata with `metadata_cbor` and entry lists with
-    // `record_array_cbor`, both of which differ from the server's canonical wire form, so the remote arm
-    // re-encodes those. `list_books`/`get_entry`/`put_entry`/`create_book`/`delete_*`/`to_vcard` forward
-    // directly.
-
-    /// Create contacts `book` for `principal` (Contacts create_book). The remote arm encodes the CLI's
-    /// `display_name` as the canonical `BookMeta`.
-    pub(crate) fn con_create_book(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        book: &str,
-        display_name: String,
-    ) -> Result<(), String> {
-        let meta = loom_core::contacts::BookMeta { display_name };
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Contacts)?;
-                loom_core::contacts::create_book(&mut loom, ns, principal, book, &meta)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Contacts::create_book(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                book.to_string(),
-                meta.encode(),
-            )),
-        }
-    }
-
-    /// Delete contacts `book` for `principal` (Contacts delete_book); returns whether present.
-    pub(crate) fn con_delete_book(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        book: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present = loom_core::contacts::delete_book(&mut loom, ns, principal, book)
-                    .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Contacts::delete_book(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                book.to_string(),
-            )),
-        }
-    }
-
-    /// Delete contacts entry `uid` in `book` for `principal` (Contacts delete_entry); returns whether
-    /// present.
-    pub(crate) fn con_delete_entry(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        book: &str,
-        uid: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present =
-                    loom_core::contacts::delete_entry(&mut loom, ns, principal, book, uid)
-                        .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Contacts::delete_entry(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                book.to_string(),
-                uid.to_string(),
-            )),
-        }
-    }
-
-    /// The CLI presentation bytes for contacts `book` of `principal` (Contacts get_book), or `None` when
-    /// absent. DIVERGENT: the remote arm decodes the canonical `BookMeta` and re-encodes it with the CLI's
-    /// `metadata_cbor`.
-    pub(crate) fn con_get_book(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        book: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                match loom_core::contacts::get_book(&loom, ns, principal, book)
-                    .map_err(|e| e.to_string())?
-                {
-                    Some(meta) => Ok(Some(metadata_cbor(&meta.display_name)?)),
-                    None => Ok(None),
-                }
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Contacts::get_book(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    book.to_string(),
-                ))?;
-                match wire {
-                    Some(bytes) => Ok(Some(cli_contacts_book_from_remote(&bytes)?)),
-                    None => Ok(None),
-                }
-            }
-        }
-    }
-
-    /// The canonical-CBOR contacts entry `uid` in `book` of `principal` (Contacts get_entry), or `None`
-    /// when absent. CLEAN: local and remote both use `ContactEntry::encode`.
-    pub(crate) fn con_get_entry(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        book: &str,
-        uid: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                Ok(
-                    loom_core::contacts::get_entry(&loom, ns, principal, book, uid)
-                        .map_err(|e| e.to_string())?
-                        .map(|entry| entry.encode()),
-                )
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Contacts::get_entry(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                book.to_string(),
-                uid.to_string(),
-            )),
-        }
-    }
-
-    /// The contacts book ids for `principal` (Contacts list_books). CLEAN: the remote arm decodes the
-    /// canonical string list, matching the CLI's `text_array_cbor`/line output.
-    pub(crate) fn con_list_books(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-    ) -> Result<Vec<String>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::contacts::list_books(&loom, ns, principal).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Contacts::list_books(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                ))?;
-                cli_strings_from_remote(&wire)
-            }
-        }
-    }
-
-    /// The CLI presentation bytes for the entries of contacts `book` (Contacts list_entries). DIVERGENT:
-    /// same re-encode as Calendar's `list_entries`.
-    pub(crate) fn con_list_entries(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        book: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let entries = loom_core::contacts::list_entries(&loom, ns, principal, book)
-                    .map_err(|e| e.to_string())?;
-                record_array_cbor(entries.into_iter().map(|entry| entry.encode()))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Contacts::list_entries(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    book.to_string(),
-                ))?;
-                cli_record_array_from_remote(&wire)
-            }
-        }
-    }
-
-    /// Put the canonical-CBOR contacts `entry` in `book` of `principal` (Contacts put_entry), returning
-    /// the etag string the CLI prints. CLEAN: the remote `Digest` string equals the local etag.
-    pub(crate) fn con_put_entry(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        book: &str,
-        entry: Vec<u8>,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let entry =
-                    loom_core::contacts::ContactEntry::decode(&entry).map_err(|e| e.to_string())?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Contacts)?;
-                let etag = loom_core::contacts::put_entry(&mut loom, ns, principal, book, &entry)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                Ok(etag.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Contacts::put_entry(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    book.to_string(),
-                    entry,
-                ))?;
-                Ok(wire.0)
-            }
-        }
-    }
-
-    /// Import a vCard document into `book` (Contacts `put_vcard`), returning the etag string.
-    pub(crate) fn con_put_vcard(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        book: &str,
-        vcard: String,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Contacts)?;
-                let etag = loom_core::contacts::put_vcard(&mut loom, ns, principal, book, &vcard)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                Ok(etag.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Contacts::put_vcard(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    book.to_string(),
-                    vcard,
-                ))?;
-                Ok(wire.0)
-            }
-        }
-    }
-
-    /// The CLI presentation bytes for the entries of `book` matching `text` (Contacts search). DIVERGENT:
-    /// same re-encode as `con_list_entries`.
-    pub(crate) fn con_search(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        book: &str,
-        text: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let entries = loom_core::contacts::search(&loom, ns, principal, book, text)
-                    .map_err(|e| e.to_string())?;
-                record_array_cbor(entries.into_iter().map(|entry| entry.encode()))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Contacts::search(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    book.to_string(),
-                    text.to_string(),
-                ))?;
-                cli_record_array_from_remote(&wire)
-            }
-        }
-    }
-
-    /// The vCard text for entry `uid` in `book` of `principal` (Contacts to_vcard), or `None` when absent.
-    /// CLEAN: the local arm's vCard string bytes equal the server's vCard bytes.
-    pub(crate) fn con_to_vcard(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        book: &str,
-        uid: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                Ok(
-                    loom_core::contacts::entry_vcard(&loom, ns, principal, book, uid)
-                        .map_err(|e| e.to_string())?
-                        .map(String::into_bytes),
-                )
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Contacts::to_vcard(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                book.to_string(),
-                uid.to_string(),
-            )),
-        }
-    }
-
-    // ---- Mail ----
-    //
-    // Same Option-1 shape as Calendar/Contacts: `get_mailbox` metadata and message lists diverge from the
-    // canonical wire form and are re-encoded in the remote arm; the rest are clean direct-forward. Flag
-    // lists cross as canonical `Array(Text)` (CLI `text_array_cbor` == server `string_list_to_cbor`).
-
-    /// Create `mailbox` for `principal` (Mail create_mailbox). The remote arm encodes the CLI's
-    /// `display_name` as the canonical `MailboxMeta`.
-    pub(crate) fn mail_create_mailbox(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-        display_name: String,
-    ) -> Result<(), String> {
-        let meta = loom_core::mail::MailboxMeta { display_name };
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Mail)?;
-                loom_core::mail::create_mailbox(&mut loom, ns, principal, mailbox, &meta)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Mail::create_mailbox(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                mailbox.to_string(),
-                meta.encode(),
-            )),
-        }
-    }
-
-    /// Delete `mailbox` for `principal` (Mail delete_mailbox); returns whether present.
-    pub(crate) fn mail_delete_mailbox(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present = loom_core::mail::delete_mailbox(&mut loom, ns, principal, mailbox)
-                    .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Mail::delete_mailbox(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                mailbox.to_string(),
-            )),
-        }
-    }
-
-    /// Delete message `uid` in `mailbox` for `principal` (Mail delete_message); returns whether present.
-    pub(crate) fn mail_delete_message(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-        uid: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present =
-                    loom_core::mail::delete_message(&mut loom, ns, principal, mailbox, uid)
-                        .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Mail::delete_message(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                mailbox.to_string(),
-                uid.to_string(),
-            )),
-        }
-    }
-
-    /// The flags on message `uid` in `mailbox` of `principal` (Mail get_flags). CLEAN: the remote arm
-    /// decodes the canonical string list, matching the CLI's `text_array_cbor`/line output.
-    pub(crate) fn mail_get_flags(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-        uid: &str,
-    ) -> Result<Vec<String>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::mail::get_flags(&loom, ns, principal, mailbox, uid)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Mail::get_flags(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    mailbox.to_string(),
-                    uid.to_string(),
-                ))?;
-                cli_strings_from_remote(&wire)
-            }
-        }
-    }
-
-    /// The CLI presentation bytes for `mailbox` of `principal` (Mail get_mailbox), or `None` when absent.
-    /// DIVERGENT: the remote arm decodes the canonical `MailboxMeta` and re-encodes it with the CLI's
-    /// `metadata_cbor`.
-    pub(crate) fn mail_get_mailbox(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                match loom_core::mail::get_mailbox(&loom, ns, principal, mailbox)
-                    .map_err(|e| e.to_string())?
-                {
-                    Some(meta) => Ok(Some(metadata_cbor(&meta.display_name)?)),
-                    None => Ok(None),
-                }
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Mail::get_mailbox(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    mailbox.to_string(),
-                ))?;
-                match wire {
-                    Some(bytes) => Ok(Some(cli_mail_mailbox_from_remote(&bytes)?)),
-                    None => Ok(None),
-                }
-            }
-        }
-    }
-
-    /// The canonical-CBOR message `uid` in `mailbox` of `principal` (Mail get_message), or `None` when
-    /// absent. CLEAN: local and remote both use `MailMessage::encode`.
-    pub(crate) fn mail_get_message(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-        uid: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                Ok(
-                    loom_core::mail::get_message(&loom, ns, principal, mailbox, uid)
-                        .map_err(|e| e.to_string())?
-                        .map(|message| message.encode()),
-                )
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Mail::get_message(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                mailbox.to_string(),
-                uid.to_string(),
-            )),
-        }
-    }
-
-    /// Ingest raw RFC822 `message` under `uid` in `mailbox` of `principal` (Mail ingest_message),
-    /// returning the digest string the CLI prints. CLEAN: the remote `Digest` string equals the local one.
-    pub(crate) fn mail_ingest_message(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-        uid: &str,
-        message: Vec<u8>,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Mail)?;
-                let digest = loom_core::mail::ingest_message(
-                    &mut loom, ns, principal, mailbox, uid, &message,
-                )
-                .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                Ok(digest.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Mail::ingest_message(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    mailbox.to_string(),
-                    uid.to_string(),
-                    message,
-                ))?;
-                Ok(wire.0)
-            }
-        }
-    }
-
-    /// The mailbox ids for `principal` (Mail list_mailboxes). CLEAN: the remote arm decodes the canonical
-    /// string list.
-    pub(crate) fn mail_list_mailboxes(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-    ) -> Result<Vec<String>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::mail::list_mailboxes(&loom, ns, principal).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Mail::list_mailboxes(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                ))?;
-                cli_strings_from_remote(&wire)
-            }
-        }
-    }
-
-    /// The CLI presentation bytes for the messages of `mailbox` (Mail list_messages). DIVERGENT: same
-    /// re-encode as Calendar's `list_entries`.
-    pub(crate) fn mail_list_messages(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let messages = loom_core::mail::list_messages(&loom, ns, principal, mailbox)
-                    .map_err(|e| e.to_string())?;
-                record_array_cbor(messages.into_iter().map(|message| message.encode()))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Mail::list_messages(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    mailbox.to_string(),
-                ))?;
-                cli_record_array_from_remote(&wire)
-            }
-        }
-    }
-
-    /// The CLI presentation bytes for the messages of `mailbox` matching `text` (Mail search). DIVERGENT:
-    /// same re-encode as `mail_list_messages`.
-    pub(crate) fn mail_search(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-        text: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let messages = loom_core::mail::search(&loom, ns, principal, mailbox, text)
-                    .map_err(|e| e.to_string())?;
-                record_array_cbor(messages.into_iter().map(|message| message.encode()))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Mail::search(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    mailbox.to_string(),
-                    text.to_string(),
-                ))?;
-                cli_record_array_from_remote(&wire)
-            }
-        }
-    }
-
-    /// Set the `flags` on message `uid` in `mailbox` of `principal` (Mail set_flags). The remote arm
-    /// encodes the flag list as canonical `Array(Text)` (`text_array_cbor`), which the server decodes with
-    /// `string_list_from_cbor`.
-    pub(crate) fn mail_set_flags(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-        uid: &str,
-        flags: Vec<String>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::mail::set_flags(&mut loom, ns, principal, mailbox, uid, &flags)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let encoded = text_array_cbor(&flags)?;
-                remote.block(Mail::set_flags(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    principal.to_string(),
-                    mailbox.to_string(),
-                    uid.to_string(),
-                    encoded,
-                ))
-            }
-        }
-    }
-
-    /// The RFC822 (.eml) bytes for message `uid` in `mailbox` of `principal` (Mail to_eml), or `None`
-    /// when absent. CLEAN: the local arm's eml bytes equal the server's.
-    pub(crate) fn mail_to_eml(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        principal: &str,
-        mailbox: &str,
-        uid: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::mail::to_eml(&loom, ns, principal, mailbox, uid)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Mail::to_eml(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                principal.to_string(),
-                mailbox.to_string(),
-                uid.to_string(),
-            )),
-        }
-    }
-
-    // ---- FileSystem (files read/write) ----
-    //
-    // `read_file`/`write_file` forward directly; raw file bytes cross unchanged.
-
-    /// Read the staged bytes of `path` in the Files working tree of `workspace` (FileSystem read_file).
-    pub(crate) fn fs_read_file(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        path: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom.read_file(ns, path).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(FileSystem::read_file(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                path.to_string(),
-            )),
-        }
-    }
-
-    /// Write `content` to `path` in the Files working tree of `workspace` (FileSystem write_file). The
-    /// local arm ensures the Files facet and auto-creates the parent directory for a nested path; the
-    /// remote arm forwards to `write_file`, whose server impl ensures the facet but does not create parent
-    /// directories, so a nested remote write requires the parent to already exist.
-    pub(crate) fn fs_write_file(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        path: &str,
-        content: Vec<u8>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                // Ensure the Files workspace, creating it on first write so `files write` does not require
-                // a pre-existing workspace.
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Files)?;
-                if let Some((parent, _)) = path.rsplit_once('/') {
-                    loom.create_directory(ns, parent, true)
-                        .map_err(|e| e.to_string())?;
-                }
-                loom.write_file(ns, path, &content, 0o100644)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(FileSystem::write_file(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                path.to_string(),
-                content,
-                0o100644,
-            )),
-        }
-    }
-
     /// Whether this client targets a remote endpoint (used to route path-shaped commands to the
     /// byte-transfer contract for remote and keep the server-local/admin path for local).
     pub(crate) fn is_remote(&self) -> bool {
@@ -3617,206 +1585,6 @@ impl StoreClient {
             StoreClient::Local { .. } => false,
             #[cfg(feature = "remote-client")]
             StoreClient::Remote(_) => true,
-        }
-    }
-
-    // ---- StoreAdmin (server-owned store administration over remote, specs/0067 §13, task 640) ----
-    // These facade methods serve the *remote* path only; local `store` admin commands keep their
-    // existing FileStore-direct handlers (the caller branches on `is_remote`).
-
-    /// Remote `store stat`: read the served store's maintenance snapshot as JSON.
-    pub(crate) fn admin_stat_json(&self) -> Result<String, String> {
-        match self {
-            StoreClient::Local { .. } => Err(LOCAL_ADMIN_VIA_LOCAL_PATH.to_string()),
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let cbor = remote.block(StoreAdmin::store_stat(
-                    &remote.client,
-                    remote.handle.clone(),
-                ))?;
-                let stat = loom_wire::store_admin::store_stat_from_cbor(&cbor)
-                    .map_err(|e| e.to_string())?;
-                Ok(store_stat_json(&stat))
-            }
-        }
-    }
-
-    /// Remote `store policy` (get): read the served store policy as JSON.
-    pub(crate) fn admin_policy_get_json(&self) -> Result<String, String> {
-        match self {
-            StoreClient::Local { .. } => Err(LOCAL_ADMIN_VIA_LOCAL_PATH.to_string()),
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let cbor = remote.block(StoreAdmin::store_policy_get(
-                    &remote.client,
-                    remote.handle.clone(),
-                ))?;
-                let r = loom_wire::store_admin::store_policy_result_from_cbor(&cbor)
-                    .map_err(|e| e.to_string())?;
-                Ok(store_policy_json(
-                    loom_store::StorePolicy {
-                        fips_required: r.fips_required,
-                        ..loom_store::StorePolicy::default()
-                    },
-                    r.audit_seq,
-                ))
-            }
-        }
-    }
-
-    /// Remote `store policy` (set): audited set of the served store policy, returned as JSON.
-    pub(crate) fn admin_policy_set_json(&self, fips_required: bool) -> Result<String, String> {
-        match self {
-            StoreClient::Local { .. } => Err(LOCAL_ADMIN_VIA_LOCAL_PATH.to_string()),
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let cbor = remote.block(StoreAdmin::store_policy_set(
-                    &remote.client,
-                    remote.handle.clone(),
-                    fips_required,
-                ))?;
-                let r = loom_wire::store_admin::store_policy_result_from_cbor(&cbor)
-                    .map_err(|e| e.to_string())?;
-                Ok(store_policy_json(
-                    loom_store::StorePolicy {
-                        fips_required: r.fips_required,
-                        ..loom_store::StorePolicy::default()
-                    },
-                    r.audit_seq,
-                ))
-            }
-        }
-    }
-
-    /// Remote `store rekey`: server-side rekey (fast rewrap or full reseal); the DEK never leaves the
-    /// server. Returns a human summary of the audited result.
-    pub(crate) fn admin_rekey_summary(
-        &self,
-        new_passphrase: Vec<u8>,
-        reseal: bool,
-        suite: Option<String>,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { .. } => Err(LOCAL_ADMIN_VIA_LOCAL_PATH.to_string()),
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let cbor = remote.block(StoreAdmin::store_rekey(
-                    &remote.client,
-                    remote.handle.clone(),
-                    new_passphrase,
-                    reseal,
-                    suite,
-                ))?;
-                let r = loom_wire::store_admin::store_rekey_result_from_cbor(&cbor)
-                    .map_err(|e| e.to_string())?;
-                let bytes = match (r.bytes_before, r.bytes_after) {
-                    (Some(b), Some(a)) => format!(" ({b} -> {a} bytes)"),
-                    _ => String::new(),
-                };
-                Ok(format!(
-                    "rekeyed remote store (resealed={}, suite={}, audit_seq={}){}",
-                    r.resealed, r.suite, r.audit_seq, bytes
-                ))
-            }
-        }
-    }
-
-    /// Remote `store key add-wrap` (passphrase): add an unlock wrap to the served store.
-    pub(crate) fn admin_key_add_wrap(
-        &self,
-        new_passphrase: Vec<u8>,
-        allow_no_recovery: bool,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { .. } => Err(LOCAL_ADMIN_VIA_LOCAL_PATH.to_string()),
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(KeySource::key_add_wrap_keyed(
-                &remote.client,
-                remote.handle.clone(),
-                new_passphrase,
-                allow_no_recovery,
-            )),
-        }
-    }
-
-    /// Remote `store key remove-wrap`: remove an unlock wrap by index from the served store.
-    pub(crate) fn admin_key_remove_wrap(
-        &self,
-        index: u64,
-        allow_no_recovery: bool,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { .. } => Err(LOCAL_ADMIN_VIA_LOCAL_PATH.to_string()),
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(KeySource::key_remove_wrap(
-                &remote.client,
-                remote.handle.clone(),
-                index,
-                allow_no_recovery,
-            )),
-        }
-    }
-
-    // ---- Transfer (byte-transfer interchange, specs/0067 §17) ----
-
-    /// Import the local archive/CAR file at `local_path` into `workspace` as a byte transfer: the
-    /// client reads the payload and drives `transfer_import_open`/`write`/`finish`, so the server
-    /// never sees the client path. `kind` is a transfer kind name (`tar`/`tar-zstd`/`tar-gzip`/`zip`/
-    /// `gzip`/`car`). Returns a human summary of the import-report.
-    pub(crate) fn transfer_import(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        kind: &str,
-        local_path: &str,
-        commit: bool,
-        dry_run: bool,
-    ) -> Result<String, String> {
-        let bytes = std::fs::read(local_path)
-            .map_err(|e| format!("read transfer source {local_path}: {e}"))?;
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let import_scope = transfer_import_source_scope(kind, workspace, local_path)?;
-                let report =
-                    local_transfer_import(&mut loom, import_scope, kind, &bytes, commit, dry_run)?;
-                Ok(summary_from_report(&report))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                // The final digest must use the served store's algo (digest equality is byte-only).
-                let algo =
-                    loom_core::Algo::from_name(&remote.block(Store::digest_algo(&remote.client))?)
-                        .map_err(|e| e.to_string())?;
-                let final_digest = WireDigest(loom_core::Digest::hash(algo, &bytes).to_string());
-                let import_scope = transfer_import_source_scope(kind, workspace, local_path)?;
-                let transfer = remote.block(Transfer::transfer_import_open(
-                    &remote.client,
-                    remote.handle.clone(),
-                    import_scope.to_string(),
-                    kind.to_string(),
-                    Vec::new(),
-                ))?;
-                for (seq, chunk) in (0_u64..).zip(bytes.chunks(TRANSFER_CHUNK_BYTES)) {
-                    remote.block(Transfer::transfer_import_write(
-                        &remote.client,
-                        remote.handle.clone(),
-                        transfer.clone(),
-                        chunk.to_vec(),
-                        seq,
-                        None,
-                    ))?;
-                }
-                let report_cbor = remote.block(Transfer::transfer_import_finish(
-                    &remote.client,
-                    remote.handle.clone(),
-                    transfer,
-                    commit,
-                    dry_run,
-                    final_digest,
-                ))?;
-                summary_from_report_cbor(&report_cbor)
-            }
         }
     }
 
@@ -3850,2673 +1618,15 @@ impl StoreClient {
             .map_err(|e| format!("write transfer destination {local_path}: {e}"))?;
         Ok(format!("exported {} byte(s) to {local_path}", bytes.len()))
     }
-
-    /// Create directory `path` in the Files working tree of `workspace` (FileSystem create_directory).
-    /// `parents` creates missing intermediate directories.
-    pub(crate) fn fs_mkdir(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        path: &str,
-        parents: bool,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                // Ensure the Files workspace, creating it on first write so `files mkdir` does not require
-                // a pre-existing workspace.
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Files)?;
-                loom.create_directory(ns, path, parents)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(FileSystem::create_directory(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                path.to_string(),
-                parents,
-            )),
-        }
-    }
-
-    /// Delete file or directory `path` in `workspace`. `stat` classifies the path, then a file/symlink is
-    /// removed via `remove_file` and a directory via `remove_directory` (`recursive` deletes a non-empty
-    /// directory; otherwise a non-empty directory is `INVALID_ARGUMENT`). Mirrors the local `files delete`.
-    pub(crate) fn fs_delete(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        path: &str,
-        recursive: bool,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                match loom.stat(ns, path).map_err(|e| e.to_string())?.kind {
-                    FileKind::Directory => loom
-                        .remove_directory(ns, path, recursive)
-                        .map_err(|e| e.to_string())?,
-                    FileKind::File | FileKind::Symlink => {
-                        loom.remove_file(ns, path).map_err(|e| e.to_string())?;
-                    }
-                }
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let stat_bytes = remote.block(FileSystem::stat(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    path.to_string(),
-                ))?;
-                let stat =
-                    loom_wire::fs::fs_stat_from_cbor(&stat_bytes).map_err(|e| e.to_string())?;
-                match stat.kind {
-                    FileKind::Directory => remote.block(FileSystem::remove_directory(
-                        &remote.client,
-                        remote.handle.clone(),
-                        workspace.to_string(),
-                        path.to_string(),
-                        recursive,
-                    )),
-                    FileKind::File | FileKind::Symlink => remote.block(FileSystem::remove_file(
-                        &remote.client,
-                        remote.handle.clone(),
-                        workspace.to_string(),
-                        path.to_string(),
-                    )),
-                }
-            }
-        }
-    }
-
-    /// All file paths in the Files working tree of `workspace`, sorted, matching what `files ls` prints.
-    /// The local arm returns `loom.staged_paths(ns)` (the working-tree file keys, already sorted); the
-    /// remote arm reproduces that set by a recursive `FileSystem::list_directory` walk (descending into
-    /// directories, emitting only file/symlink leaves), then sorts, so local and remote output match.
-    pub(crate) fn fs_ls(&self, keys: &KeyOpts, workspace: &str) -> Result<Vec<String>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                Ok(loom.staged_paths(ns))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                fn walk(
-                    remote: &RemoteStore,
-                    workspace: &str,
-                    dir: &str,
-                    out: &mut Vec<String>,
-                ) -> Result<(), String> {
-                    let bytes = remote.block(FileSystem::list_directory(
-                        &remote.client,
-                        remote.handle.clone(),
-                        workspace.to_string(),
-                        dir.to_string(),
-                    ))?;
-                    let entries =
-                        loom_wire::fs::dir_listing_from_cbor(&bytes).map_err(|e| e.to_string())?;
-                    for entry in entries {
-                        let child = if dir.is_empty() {
-                            entry.name.clone()
-                        } else {
-                            format!("{dir}/{}", entry.name)
-                        };
-                        match entry.kind {
-                            FileKind::Directory => walk(remote, workspace, &child, out)?,
-                            FileKind::File | FileKind::Symlink => out.push(child),
-                        }
-                    }
-                    Ok(())
-                }
-                let mut out = Vec::new();
-                walk(remote, workspace, "", &mut out)?;
-                out.sort();
-                Ok(out)
-            }
-        }
-    }
-
-    // ---- ProtectedRefs ----
-    //
-    // The CLI prints protected-ref policies as JSON (`protected_ref_policy_json`/`_policies_json`), so
-    // the remote arm decodes the canonical policy records into the typed `ProtectedRefPolicy` and returns
-    // them for the handler to format through those same printers. The local arm applies its
-    // effective-principal audit; the remote arm relies on the server session principal.
-
-    /// The named protected-ref policies for `workspace` (ProtectedRefs list).
-    pub(crate) fn pr_list(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-    ) -> Result<Vec<(String, loom_core::vcs::ProtectedRefPolicy)>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom.protected_ref_policies(ns).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(ProtectedRefs::protected_ref_list(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                ))?;
-                wire.iter()
-                    .map(|record| cli_named_protected_ref_from_remote(record))
-                    .collect()
-            }
-        }
-    }
-
-    /// The protected-ref policy for `ref_name` in `workspace` (ProtectedRefs get), or `None` when absent.
-    pub(crate) fn pr_get(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        ref_name: &str,
-    ) -> Result<Option<loom_core::vcs::ProtectedRefPolicy>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom.protected_ref_policy(ns, ref_name)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(ProtectedRefs::protected_ref_get(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    ref_name.to_string(),
-                ))?;
-                match wire {
-                    Some(record) => Ok(Some(cli_protected_ref_policy_from_remote(&record)?)),
-                    None => Ok(None),
-                }
-            }
-        }
-    }
-
-    /// Set the protected-ref `policy` for `ref_name` in `workspace` (ProtectedRefs set). The local arm
-    /// keeps its effective-principal audit; the remote arm relies on the server session principal.
-    pub(crate) fn pr_set(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        ref_name: &str,
-        policy: loom_core::vcs::ProtectedRefPolicy,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = loom.effective_principal().map_err(|e| e.to_string())?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom.set_protected_ref_policy(ns, ref_name, policy)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                let target = format!("workspace={ns};ref={ref_name}");
-                loom.store()
-                    .audit_append(actor, "protected_ref.set", Some(&target))
-                    .map_err(|e| e.to_string())?;
-                Ok(())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(ProtectedRefs::protected_ref_set(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                ref_name.to_string(),
-                policy.fast_forward_only,
-                policy.signed_commits_required,
-                policy.signed_ref_advance_required,
-                policy.required_review_count,
-                policy.retention_lock,
-                policy.governance_lock,
-            )),
-        }
-    }
-
-    /// Remove the protected-ref policy for `ref_name` in `workspace` (ProtectedRefs remove); returns
-    /// whether it was present. The local arm keeps its effective-principal audit on removal.
-    pub(crate) fn pr_remove(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        ref_name: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = loom.effective_principal().map_err(|e| e.to_string())?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let removed = loom
-                    .remove_protected_ref_policy(ns, ref_name)
-                    .map_err(|e| e.to_string())?;
-                if removed {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                    let target = format!("workspace={ns};ref={ref_name}");
-                    loom.store()
-                        .audit_append(actor, "protected_ref.remove", Some(&target))
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok(removed)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(ProtectedRefs::protected_ref_remove(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                ref_name.to_string(),
-            )),
-        }
-    }
-
-    // ---- Workspaces (session-level workspace management) ----
-    //
-    // Authz + audit stay local on the local arm (`require_global_admin*` + `audit_append`); the remote arm
-    // relies on the server session principal. `workspace list` output is reproduced by decoding the
-    // canonical `WorkspaceInfo` records and formatting through `print_workspaces_infos`. `rename`/`delete`
-    // print the resolved `WorkspaceId`; the remote arm resolves it from the remote workspace list before
-    // mutating so the output matches local.
-
-    /// Create a workspace (optionally typed by `facet`); returns the new workspace id string the CLI
-    /// prints (Workspaces create).
-    pub(crate) fn ws_create(
-        &self,
-        keys: &KeyOpts,
-        name: &str,
-        facet: Option<&str>,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let id = match facet {
-                    Some(facet) => {
-                        let facet = FacetKind::parse(facet).map_err(|e| e.to_string())?;
-                        loom.registry_mut()
-                            .ensure_for_write(
-                                &loom_core::WsSelector::Typed {
-                                    ty: facet,
-                                    name: name.to_string(),
-                                },
-                                random_workspace_id()?,
-                            )
-                            .map_err(|e| e.to_string())?
-                    }
-                    None => loom
-                        .registry_mut()
-                        .create_workspace(Some(name), random_workspace_id()?)
-                        .map_err(|e| e.to_string())?,
-                };
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                let target = format!("workspace={id};name={name}");
-                loom.store()
-                    .audit_append(Some(actor), "workspace.create", Some(&target))
-                    .map_err(|e| e.to_string())?;
-                Ok(id.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let facet_bytes = match facet {
-                    Some(facet) => Some(vec![
-                        FacetKind::parse(facet)
-                            .map_err(|e| e.to_string())?
-                            .stable_tag(),
-                    ]),
-                    None => None,
-                };
-                let uuid = remote.block(Workspaces::workspace_create(
-                    &remote.client,
-                    remote.handle.clone(),
-                    Some(name.to_string()),
-                    facet_bytes,
-                ))?;
-                Ok(loom_core::WorkspaceId::from_bytes(uuid.0).to_string())
-            }
-        }
-    }
-
-    /// The workspaces for the store (Workspaces list), for the CLI to format via
-    /// `print_workspaces_infos`.
-    pub(crate) fn ws_list(&self, keys: &KeyOpts) -> Result<Vec<loom_core::WorkspaceInfo>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_registry_read(locator, keys)?;
-                require_global_admin(&loom)?;
-                Ok(loom.registry().list(None))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Workspaces::workspace_list(
-                    &remote.client,
-                    remote.handle.clone(),
-                ))?;
-                wire.iter()
-                    .map(|record| cli_workspace_info_from_remote(record))
-                    .collect()
-            }
-        }
-    }
-
-    /// Rename `workspace` to `new_name` (Workspaces rename); returns the resolved workspace id string the
-    /// CLI prints.
-    pub(crate) fn ws_rename(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        new_name: &str,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom.registry_mut()
-                    .rename(ns, new_name)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                let target = format!("workspace={ns};name={new_name}");
-                loom.store()
-                    .audit_append(Some(actor), "workspace.rename", Some(&target))
-                    .map_err(|e| e.to_string())?;
-                Ok(ns.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let ns = remote.resolve_workspace_id(workspace)?;
-                remote.block(Workspaces::workspace_rename(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    new_name.to_string(),
-                ))?;
-                Ok(ns.to_string())
-            }
-        }
-    }
-
-    /// Delete `workspace` (Workspaces delete); returns the resolved workspace id string the CLI prints.
-    pub(crate) fn ws_delete(&self, keys: &KeyOpts, workspace: &str) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom.registry_mut().delete(ns).map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                let target = ns.to_string();
-                loom.store()
-                    .audit_append(Some(actor), "workspace.delete", Some(&target))
-                    .map_err(|e| e.to_string())?;
-                Ok(ns.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let ns = remote.resolve_workspace_id(workspace)?;
-                remote.block(Workspaces::workspace_delete(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                ))?;
-                Ok(ns.to_string())
-            }
-        }
-    }
-
-    // ---- Acl (global admin ACL management) ----
-    //
-    // `acl list` prints JSON; the remote arm decodes the canonical grant records (`acl_grant_from_cbor`)
-    // and the handler formats through `acl_grants_json`. `grant`/`revoke` map to the generated 9-arg `Acl`
-    // methods: the remote arm encodes each argument with the `loom_wire` ACL codecs and passes the raw
-    // `workspace` string for the server to resolve (it does not pre-resolve against a local registry).
-    // Authz + audit stay local on the local arm; the remote arm relies on the server session principal.
-
-    /// The ACL grant list (Acl list), for the CLI to format via `acl_grants_json`.
-    pub(crate) fn acl_list(&self, keys: &KeyOpts) -> Result<Vec<loom_core::AclGrant>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                require_global_admin(&loom)?;
-                Ok(loom.acl_store().grants().to_vec())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Acl::acl_list(&remote.client, remote.handle.clone()))?;
-                wire.iter()
-                    .map(|record| {
-                        loom_wire::acl::acl_grant_from_cbor(record).map_err(|e| e.to_string())
-                    })
-                    .collect()
-            }
-        }
-    }
-
-    /// Grant an ACL rule (Acl grant). The local arm applies it to the local `AclStore` with a local audit;
-    /// the remote arm encodes the wire args and lets the server apply + audit it.
-    pub(crate) fn acl_grant(&self, keys: &KeyOpts, args: AclGrantArgs<'_>) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let grant = acl_grant_from_args(&loom, args)?;
-                let target = acl_grant_json(&grant);
-                let snapshot = {
-                    let acl = loom.acl_store_mut();
-                    acl.grant(grant).map_err(|e| e.to_string())?;
-                    acl.clone()
-                };
-                loom.store()
-                    .save_acl_store_audited(&snapshot, Some(actor), "acl.grant", Some(&target))
-                    .map_err(|e| e.to_string())?;
-                Ok(())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = encode_acl_wire_args(&args)?;
-                remote.block(Acl::acl_grant(
-                    &remote.client,
-                    remote.handle.clone(),
-                    wire.effect,
-                    wire.subject,
-                    wire.workspace,
-                    wire.domain,
-                    wire.ref_glob,
-                    wire.scopes,
-                    wire.rights,
-                    wire.predicate,
-                ))
-            }
-        }
-    }
-
-    /// Revoke an ACL rule (Acl revoke); returns whether a matching grant was present.
-    pub(crate) fn acl_revoke(
-        &self,
-        keys: &KeyOpts,
-        args: AclGrantArgs<'_>,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let grant = acl_grant_from_args(&loom, args)?;
-                let target = acl_grant_json(&grant);
-                let (removed, snapshot) = {
-                    let acl = loom.acl_store_mut();
-                    let removed = acl.revoke(&grant);
-                    (removed, acl.clone())
-                };
-                if removed {
-                    loom.store()
-                        .save_acl_store_audited(&snapshot, Some(actor), "acl.revoke", Some(&target))
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok(removed)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = encode_acl_wire_args(&args)?;
-                remote.block(Acl::acl_revoke(
-                    &remote.client,
-                    remote.handle.clone(),
-                    wire.effect,
-                    wire.subject,
-                    wire.workspace,
-                    wire.domain,
-                    wire.ref_glob,
-                    wire.scopes,
-                    wire.rights,
-                    wire.predicate,
-                ))
-            }
-        }
-    }
-
-    // ---- Identity (global admin identity control plane) ----
-    //
-    // `list`/`public-key list` print JSON. The remote arm decodes the canonical `IdentitySnapshot`
-    // (`identity_snapshot_from_cbor`) and formats through the shared `identity_snapshot_json` /
-    // `identity_public_keys_json`, so the output matches the local arm byte-for-byte. Mutations forward
-    // to the generated `Identity` methods; `set_passphrase` sends the passphrase bytes and the server
-    // mints the salt. Authz + audit stay local on the local arm; the remote arm relies on the server
-    // session principal. The audit-seq-bearing credential/key mutations are not on this facade (the IDL
-    // methods return only a `Uuid` or nothing, so a remote client cannot reproduce the `seq` the CLI
-    // prints); they open through `cli_open_loom` directly.
-
-    /// The identity snapshot JSON the CLI prints (Identity list).
-    pub(crate) fn id_list(&self, keys: &KeyOpts) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                require_global_admin(&loom)?;
-                let identity = loom
-                    .identity_store()
-                    .ok_or_else(|| "identity store not initialized".to_string())?;
-                Ok(identity_list_json(identity))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let bytes = remote.block(Identity::identity_list(
-                    &remote.client,
-                    remote.handle.clone(),
-                ))?;
-                let view = loom_wire::identity::identity_snapshot_from_cbor(&bytes)
-                    .map_err(|e| e.to_string())?;
-                Ok(identity_snapshot_json(&view))
-            }
-        }
-    }
-
-    /// Add a principal (Identity add); returns the new principal id string the CLI prints.
-    pub(crate) fn id_add(
-        &self,
-        keys: &KeyOpts,
-        handle: &str,
-        name: &str,
-        kind: loom_core::PrincipalKind,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let id = random_workspace_id()?;
-                let snapshot = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    identity
-                        .add_principal_with_handle(id, handle, name, kind)
-                        .map_err(|e| e.to_string())?;
-                    identity.clone()
-                };
-                let target = id.to_string();
-                loom.store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.add_principal",
-                        Some(&target),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(id.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let uuid = remote.block(Identity::identity_add_principal(
-                    &remote.client,
-                    remote.handle.clone(),
-                    handle.to_string(),
-                    name.to_string(),
-                    vec![kind.stable_tag()],
-                ))?;
-                Ok(loom_core::WorkspaceId::from_bytes(uuid.0).to_string())
-            }
-        }
-    }
-
-    /// Rename a principal handle (Identity rename-handle); returns the principal id string the CLI prints.
-    pub(crate) fn id_rename_handle(
-        &self,
-        keys: &KeyOpts,
-        principal: &str,
-        handle: &str,
-    ) -> Result<String, String> {
-        let principal = WorkspaceId::parse(principal).map_err(|e| e.to_string())?;
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let snapshot = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    identity
-                        .rename_principal_handle(principal, handle)
-                        .map_err(|e| e.to_string())?;
-                    identity.clone()
-                };
-                loom.store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.rename_principal_handle",
-                        Some(&principal.to_string()),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(principal.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                remote.block(Identity::identity_rename_principal_handle(
-                    &remote.client,
-                    remote.handle.clone(),
-                    Uuid(*principal.as_bytes()),
-                    handle.to_string(),
-                ))?;
-                Ok(principal.to_string())
-            }
-        }
-    }
-
-    /// Set a principal passphrase (Identity set-passphrase). The local arm mints the salt; the remote arm
-    /// sends the passphrase bytes and the server mints its own salt.
-    pub(crate) fn id_set_passphrase(
-        &self,
-        keys: &KeyOpts,
-        principal: &str,
-        passphrase: &[u8],
-    ) -> Result<(), String> {
-        let principal = WorkspaceId::parse(principal).map_err(|e| e.to_string())?;
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let passphrase = std::str::from_utf8(passphrase)
-                    .map_err(|_| "passphrase is not valid utf-8".to_string())?;
-                let salt = rand_bytes(16)?;
-                let snapshot = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    identity
-                        .set_passphrase(principal, passphrase, &salt)
-                        .map_err(|e| e.to_string())?;
-                    identity.clone()
-                };
-                loom.store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.set_passphrase",
-                        Some(&principal.to_string()),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Identity::identity_set_passphrase(
-                &remote.client,
-                remote.handle.clone(),
-                Uuid(*principal.as_bytes()),
-                passphrase.to_vec(),
-            )),
-        }
-    }
-
-    /// Remove a principal (Identity remove).
-    pub(crate) fn id_remove(&self, keys: &KeyOpts, principal: &str) -> Result<(), String> {
-        let principal = WorkspaceId::parse(principal).map_err(|e| e.to_string())?;
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let snapshot = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    identity
-                        .remove_principal(principal)
-                        .map_err(|e| e.to_string())?;
-                    identity.clone()
-                };
-                loom.store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.remove_principal",
-                        Some(&principal.to_string()),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Identity::identity_remove_principal(
-                &remote.client,
-                remote.handle.clone(),
-                Uuid(*principal.as_bytes()),
-            )),
-        }
-    }
-
-    /// Assign a role to a principal (Identity assign-role).
-    pub(crate) fn id_assign_role(
-        &self,
-        keys: &KeyOpts,
-        principal: &str,
-        role: &str,
-    ) -> Result<(), String> {
-        let principal = WorkspaceId::parse(principal).map_err(|e| e.to_string())?;
-        let role = WorkspaceId::parse(role).map_err(|e| e.to_string())?;
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let snapshot = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    identity
-                        .assign_role(principal, role)
-                        .map_err(|e| e.to_string())?;
-                    identity.clone()
-                };
-                let target = format!("principal={principal};role={role}");
-                loom.store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.assign_role",
-                        Some(&target),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Identity::identity_assign_role(
-                &remote.client,
-                remote.handle.clone(),
-                Uuid(*principal.as_bytes()),
-                Uuid(*role.as_bytes()),
-            )),
-        }
-    }
-
-    /// Revoke a role from a principal (Identity revoke-role); returns whether a grant was removed.
-    pub(crate) fn id_revoke_role(
-        &self,
-        keys: &KeyOpts,
-        principal: &str,
-        role: &str,
-    ) -> Result<bool, String> {
-        let principal = WorkspaceId::parse(principal).map_err(|e| e.to_string())?;
-        let role = WorkspaceId::parse(role).map_err(|e| e.to_string())?;
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let (removed, snapshot) = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    let removed = identity
-                        .revoke_role(principal, role)
-                        .map_err(|e| e.to_string())?;
-                    (removed, identity.clone())
-                };
-                if removed {
-                    let target = format!("principal={principal};role={role}");
-                    loom.store()
-                        .save_identity_store_audited(
-                            &snapshot,
-                            Some(actor),
-                            "identity.revoke_role",
-                            Some(&target),
-                        )
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok(removed)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Identity::identity_revoke_role(
-                &remote.client,
-                remote.handle.clone(),
-                Uuid(*principal.as_bytes()),
-                Uuid(*role.as_bytes()),
-            )),
-        }
-    }
-
-    /// The identity public-key list JSON the CLI prints (Identity public-key list).
-    /// Create an external credential and return the `{"seq":N,"credential":{...}}` line the CLI prints.
-    /// The remote path reconstructs the full record with a follow-up `identity_list`, keyed by the minted
-    /// id from the audit result, so its output matches the local command.
-    pub(crate) fn id_external_credential_create(
-        &self,
-        keys: &KeyOpts,
-        principal: WorkspaceId,
-        kind: loom_core::ExternalCredentialKind,
-        label: String,
-        issuer: String,
-        subject: String,
-        material_digest: Option<String>,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let id = random_workspace_id()?;
-                let (credential, snapshot) = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    let credential = identity
-                        .create_external_credential(
-                            principal,
-                            loom_core::ExternalCredentialSpec {
-                                id,
-                                kind,
-                                label,
-                                issuer,
-                                subject,
-                                material_digest,
-                            },
-                        )
-                        .map_err(|e| e.to_string())?;
-                    (credential, identity.clone())
-                };
-                let target = format!("principal={principal};credential={id}");
-                let seq = loom
-                    .store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.external_credential.create",
-                        Some(&target),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{seq},\"credential\":{}}}",
-                    crate::helpers::external_credential_json(&credential)
-                ))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let spec = loom_core::ExternalCredentialSpec {
-                    id: random_workspace_id()?,
-                    kind,
-                    label,
-                    issuer,
-                    subject,
-                    material_digest,
-                };
-                let wire = loom_wire::identity::external_credential_spec_to_wire(&spec)
-                    .map_err(|e| e.to_string())?;
-                let audit = remote.block(Identity::identity_create_external_credential(
-                    &remote.client,
-                    remote.handle.clone(),
-                    Uuid(*principal.as_bytes()),
-                    wire,
-                ))?;
-                let result = loom_wire::identity::identity_audit_result_from_cbor(&audit)
-                    .map_err(|e| e.to_string())?;
-                let id = result
-                    .id
-                    .ok_or_else(|| "create did not return a credential id".to_string())?;
-                let view = loom_wire::identity::identity_snapshot_from_cbor(&remote.block(
-                    Identity::identity_list(&remote.client, remote.handle.clone()),
-                )?)
-                .map_err(|e| e.to_string())?;
-                let credential = view
-                    .external_credentials
-                    .iter()
-                    .find(|c| c.id == id)
-                    .ok_or_else(|| "created credential not found on read-back".to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{},\"credential\":{}}}",
-                    result.audit_seq,
-                    crate::helpers::external_credential_json(credential)
-                ))
-            }
-        }
-    }
-
-    /// Revoke an external credential and return the `{"seq":N,"credential":{...}}` line. The remote path
-    /// reads the record before revoking it so its output matches the local command.
-    pub(crate) fn id_external_credential_revoke(
-        &self,
-        keys: &KeyOpts,
-        id: WorkspaceId,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let (credential, snapshot) = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    let credential = identity
-                        .revoke_external_credential(id)
-                        .map_err(|e| e.to_string())?;
-                    (credential, identity.clone())
-                };
-                let target = format!(
-                    "principal={};credential={}",
-                    credential.principal, credential.id
-                );
-                let seq = loom
-                    .store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.external_credential.revoke",
-                        Some(&target),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{seq},\"credential\":{}}}",
-                    crate::helpers::external_credential_json(&credential)
-                ))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let view = loom_wire::identity::identity_snapshot_from_cbor(&remote.block(
-                    Identity::identity_list(&remote.client, remote.handle.clone()),
-                )?)
-                .map_err(|e| e.to_string())?;
-                let credential = view
-                    .external_credentials
-                    .iter()
-                    .find(|c| c.id == id)
-                    .cloned()
-                    .ok_or_else(|| "external credential not found".to_string())?;
-                let audit = remote.block(Identity::identity_revoke_external_credential(
-                    &remote.client,
-                    remote.handle.clone(),
-                    Uuid(*id.as_bytes()),
-                ))?;
-                let result = loom_wire::identity::identity_audit_result_from_cbor(&audit)
-                    .map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{},\"credential\":{}}}",
-                    result.audit_seq,
-                    crate::helpers::external_credential_json(&credential)
-                ))
-            }
-        }
-    }
-
-    /// Add a public key and return the `{"seq":N,"public_key":{...}}` line. The remote path reconstructs
-    /// the full record with a follow-up `identity_list`, keyed by the minted id from the audit result.
-    pub(crate) fn id_add_public_key(
-        &self,
-        keys: &KeyOpts,
-        principal: WorkspaceId,
-        label: String,
-        algorithm: String,
-        public_key: Vec<u8>,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let id = random_workspace_id()?;
-                let (key, snapshot) = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    let key = identity
-                        .add_public_key(
-                            principal,
-                            loom_core::IdentityPublicKeySpec {
-                                id,
-                                label,
-                                algorithm,
-                                public_key,
-                            },
-                        )
-                        .map_err(|e| e.to_string())?;
-                    (key, identity.clone())
-                };
-                let target = format!("principal={principal};key={id}");
-                let seq = loom
-                    .store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.public_key.add",
-                        Some(&target),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{seq},\"public_key\":{}}}",
-                    crate::helpers::identity_public_key_json(&key)
-                ))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let audit = remote.block(Identity::identity_add_public_key(
-                    &remote.client,
-                    remote.handle.clone(),
-                    Uuid(*principal.as_bytes()),
-                    label,
-                    algorithm,
-                    public_key,
-                ))?;
-                let result = loom_wire::identity::identity_audit_result_from_cbor(&audit)
-                    .map_err(|e| e.to_string())?;
-                let id = result
-                    .id
-                    .ok_or_else(|| "add did not return a public key id".to_string())?;
-                let view = loom_wire::identity::identity_snapshot_from_cbor(&remote.block(
-                    Identity::identity_list(&remote.client, remote.handle.clone()),
-                )?)
-                .map_err(|e| e.to_string())?;
-                let key = view
-                    .public_keys
-                    .iter()
-                    .find(|k| k.id == id)
-                    .ok_or_else(|| "added public key not found on read-back".to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{},\"public_key\":{}}}",
-                    result.audit_seq,
-                    crate::helpers::identity_public_key_json(key)
-                ))
-            }
-        }
-    }
-
-    /// Revoke a public key and return the `{"seq":N,"public_key":{...}}` line. The remote path reads the
-    /// record before revoking it so its output matches the local command.
-    pub(crate) fn id_revoke_public_key(
-        &self,
-        keys: &KeyOpts,
-        id: WorkspaceId,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let (key, snapshot) = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    let key = identity.revoke_public_key(id).map_err(|e| e.to_string())?;
-                    (key, identity.clone())
-                };
-                let target = format!("principal={};key={}", key.principal, key.id);
-                let seq = loom
-                    .store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.public_key.revoke",
-                        Some(&target),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{seq},\"public_key\":{}}}",
-                    crate::helpers::identity_public_key_json(&key)
-                ))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let view = loom_wire::identity::identity_snapshot_from_cbor(&remote.block(
-                    Identity::identity_list(&remote.client, remote.handle.clone()),
-                )?)
-                .map_err(|e| e.to_string())?;
-                let key = view
-                    .public_keys
-                    .iter()
-                    .find(|k| k.id == id)
-                    .cloned()
-                    .ok_or_else(|| "public key not found".to_string())?;
-                let audit = remote.block(Identity::identity_revoke_public_key(
-                    &remote.client,
-                    remote.handle.clone(),
-                    Uuid(*id.as_bytes()),
-                ))?;
-                let result = loom_wire::identity::identity_audit_result_from_cbor(&audit)
-                    .map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{},\"public_key\":{}}}",
-                    result.audit_seq,
-                    crate::helpers::identity_public_key_json(&key)
-                ))
-            }
-        }
-    }
-
-    /// Create an app credential (server-minted secret) and return the
-    /// `{"seq":N,"credential":{...},"secret":"<token>"}` line. The secret is minted by the authority that
-    /// stores the verifier (the CLI process for a local store, the hosted server for a remote store) and
-    /// returned exactly once; the store keeps only the salted verifier.
-    pub(crate) fn id_app_credential_create(
-        &self,
-        keys: &KeyOpts,
-        principal: WorkspaceId,
-        label: String,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let (credential, token, snapshot) = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    // Same server-side mint the hosted server runs via
-                    // `LocalLoomClient::identity_create_app_credential`: id/secret/salt are generated by the
-                    // authority that stores the verifier, and only the salted verifier is persisted.
-                    let (credential, token) =
-                        loom_client::local::mint_app_credential(identity, principal, &label)
-                            .map_err(|e| e.to_string())?;
-                    let snapshot = identity.clone();
-                    (credential, token, snapshot)
-                };
-                let target = format!("principal={principal};credential={}", credential.id);
-                let seq = loom
-                    .store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.app_credential.create",
-                        Some(&target),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{seq},\"credential\":{},\"secret\":{}}}",
-                    crate::helpers::app_credential_json(&credential),
-                    crate::helpers::json_string(&token)
-                ))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let result = loom_wire::identity::app_credential_create_result_from_cbor(
-                    &remote.block(Identity::identity_create_app_credential(
-                        &remote.client,
-                        remote.handle.clone(),
-                        Uuid(*principal.as_bytes()),
-                        label,
-                    ))?,
-                )
-                .map_err(|e| e.to_string())?;
-                let credential = loom_core::AppCredential {
-                    id: result.id,
-                    principal: result.principal,
-                    label: result.label,
-                    enabled: result.enabled,
-                };
-                Ok(format!(
-                    "{{\"seq\":{},\"credential\":{},\"secret\":{}}}",
-                    result.audit_seq,
-                    crate::helpers::app_credential_json(&credential),
-                    crate::helpers::json_string(&result.secret_token)
-                ))
-            }
-        }
-    }
-
-    /// Revoke an app credential and return the `{"seq":N,"credential":{...}}` line. The remote path reads
-    /// the record before revoking it so its output matches the local command.
-    pub(crate) fn id_app_credential_revoke(
-        &self,
-        keys: &KeyOpts,
-        id: WorkspaceId,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let actor = require_global_admin_actor(&loom)?;
-                let (credential, snapshot) = {
-                    let identity = loom
-                        .identity_store_mut()
-                        .ok_or_else(|| "identity store not initialized".to_string())?;
-                    let credential = identity
-                        .revoke_app_credential(id)
-                        .map_err(|e| e.to_string())?;
-                    (credential, identity.clone())
-                };
-                let target = format!(
-                    "principal={};credential={}",
-                    credential.principal, credential.id
-                );
-                let seq = loom
-                    .store()
-                    .save_identity_store_audited(
-                        &snapshot,
-                        Some(actor),
-                        "identity.app_credential.revoke",
-                        Some(&target),
-                    )
-                    .map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{seq},\"credential\":{}}}",
-                    crate::helpers::app_credential_json(&credential)
-                ))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let view = loom_wire::identity::identity_snapshot_from_cbor(&remote.block(
-                    Identity::identity_list(&remote.client, remote.handle.clone()),
-                )?)
-                .map_err(|e| e.to_string())?;
-                let credential = view
-                    .app_credentials
-                    .iter()
-                    .find(|c| c.id == id)
-                    .cloned()
-                    .ok_or_else(|| "app credential not found".to_string())?;
-                let result = loom_wire::identity::identity_audit_result_from_cbor(&remote.block(
-                    Identity::identity_revoke_app_credential(
-                        &remote.client,
-                        remote.handle.clone(),
-                        Uuid(*id.as_bytes()),
-                    ),
-                )?)
-                .map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "{{\"seq\":{},\"credential\":{}}}",
-                    result.audit_seq,
-                    crate::helpers::app_credential_json(&credential)
-                ))
-            }
-        }
-    }
-
-    pub(crate) fn id_public_key_list(&self, keys: &KeyOpts) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                require_global_admin(&loom)?;
-                let identity = loom
-                    .identity_store()
-                    .ok_or_else(|| "identity store not initialized".to_string())?;
-                let keys: Vec<_> = identity.public_keys().cloned().collect();
-                Ok(identity_public_keys_json(&keys))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let bytes = remote.block(Identity::identity_list(
-                    &remote.client,
-                    remote.handle.clone(),
-                ))?;
-                let view = loom_wire::identity::identity_snapshot_from_cbor(&bytes)
-                    .map_err(|e| e.to_string())?;
-                Ok(identity_public_keys_json(&view.public_keys))
-            }
-        }
-    }
-
-    // ---- Columnar ----
-    //
-    // The CLI's `columnar_*` CBOR codecs are the same wire format as the server's `loom_wire::columnar`
-    // codecs, so every payload is a bytes pass-through: inputs (schema / row / select columns+filter /
-    // aggregates) cross as the raw file bytes the CLI reads, and outputs (scan / columns / inspect /
-    // select / aggregate rows) cross as the canonical CBOR the CLI prints. `source_digest` is the one
-    // exception (the CLI prints the digest string, the wire form is CBOR text) and is decoded back to the
-    // string in the remote arm.
-
-    /// Create columnar dataset `name` from the canonical-CBOR `columns` schema (Columnar create).
-    pub(crate) fn col_create(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        columns: Vec<u8>,
-        target_segment_rows: u64,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let columns = columnar_columns_from_cbor(&columns)?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Columnar)?;
-                loom_core::columnar_create(
-                    &mut loom,
-                    ns,
-                    name,
-                    columns,
-                    target_segment_rows as usize,
-                )
-                .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Columnar::create(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                columns,
-                target_segment_rows,
-            )),
-        }
-    }
-
-    /// Append the canonical-CBOR `row` to columnar dataset `name` (Columnar append).
-    pub(crate) fn col_append(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        row: Vec<u8>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let row = columnar_row_from_cbor(&row)?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::columnar_append(&mut loom, ns, name, row).map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Columnar::append(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                row,
-            )),
-        }
-    }
-
-    /// The canonical-CBOR rows of columnar dataset `name` (Columnar scan).
-    pub(crate) fn col_scan(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let rows = loom_core::columnar_scan(&loom, ns, name).map_err(|e| e.to_string())?;
-                columnar_rows_cbor(rows)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Columnar::scan(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-            )),
-        }
-    }
-
-    /// The canonical-CBOR schema of columnar dataset `name` (Columnar columns).
-    pub(crate) fn col_columns(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let columns =
-                    loom_core::columnar_columns(&loom, ns, name).map_err(|e| e.to_string())?;
-                columnar_columns_cbor(columns)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Columnar::columns(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-            )),
-        }
-    }
-
-    /// The row count of columnar dataset `name` (Columnar rows).
-    pub(crate) fn col_rows(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-    ) -> Result<u64, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::columnar_rows(&loom, ns, name)
-                    .map(|rows| rows as u64)
-                    .map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Columnar::rows(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-            )),
-        }
-    }
-
-    /// Compact columnar dataset `name` (Columnar compact).
-    pub(crate) fn col_compact(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::columnar_compact(&mut loom, ns, name).map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Columnar::compact(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-            )),
-        }
-    }
-
-    /// The canonical-CBOR inspection report of columnar dataset `name` (Columnar inspect).
-    pub(crate) fn col_inspect(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let inspect =
-                    loom_core::columnar_inspect(&loom, ns, name).map_err(|e| e.to_string())?;
-                columnar_inspect_cbor(inspect)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Columnar::inspect(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-            )),
-        }
-    }
-
-    /// The source digest string of columnar dataset `name` the CLI prints (Columnar source_digest). The
-    /// remote arm decodes the canonical CBOR-text wire form back to the digest string.
-    pub(crate) fn col_source_digest(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                Ok(loom_core::columnar_source_digest(&loom, ns, name)
-                    .map_err(|e| e.to_string())?
-                    .to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Columnar::source_digest(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    name.to_string(),
-                ))?;
-                match loom_codec::decode(&wire).map_err(|e| e.to_string())? {
-                    loom_codec::Value::Text(text) => Ok(text),
-                    _ => Err("expected a CBOR text digest from the remote endpoint".to_string()),
-                }
-            }
-        }
-    }
-
-    /// The canonical-CBOR rows of a projection/filter over columnar dataset `name` (Columnar select).
-    /// `columns` is the canonical-CBOR projected column list; `filter` is the canonical-CBOR filter (empty
-    /// for no filter).
-    pub(crate) fn col_select(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        columns: Vec<u8>,
-        filter: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let columns = columnar_select_columns_from_cbor(&columns)?;
-                let filter = columnar_filter_from_cbor(&filter)?;
-                let column_refs = columns.iter().map(String::as_str).collect::<Vec<_>>();
-                let filter_ref = filter
-                    .as_ref()
-                    .map(|(column, op, value)| (column.as_str(), *op, value));
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let rows = loom_core::columnar_select(&loom, ns, name, &column_refs, filter_ref)
-                    .map_err(|e| e.to_string())?;
-                columnar_rows_cbor(rows)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Columnar::select(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                columns,
-                filter,
-            )),
-        }
-    }
-
-    /// The canonical-CBOR aggregate values over columnar dataset `name` (Columnar aggregate).
-    /// `aggregates` is the canonical-CBOR aggregate list; `filter` is the canonical-CBOR filter (empty for
-    /// no filter).
-    pub(crate) fn col_aggregate(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        aggregates: Vec<u8>,
-        filter: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let aggregates = columnar_aggregates_from_cbor(&aggregates)?;
-                let filter = columnar_filter_from_cbor(&filter)?;
-                let filter_ref = filter
-                    .as_ref()
-                    .map(|(column, op, value)| (column.as_str(), *op, value));
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let values =
-                    loom_core::columnar_aggregate(&loom, ns, name, &aggregates, filter_ref)
-                        .map_err(|e| e.to_string())?;
-                columnar_values_cbor(values)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Columnar::aggregate(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                aggregates,
-                filter,
-            )),
-        }
-    }
-
-    // ---- Graph ----
-    //
-    // The CLI's graph CBOR codecs (`props_*`, `graph_edge_cbor`, `graph_strings_cbor`,
-    // `graph_edges_cbor`) are the same wire format as the server's `loom_wire::graph` codecs, so every
-    // payload is a clean bytes pass-through (node/edge props in, node/edge/neighbor/path records out).
-    // `reachable`'s `max_depth` bound is carried by the IDL (i64), so it forwards directly - no gap.
-
-    /// Upsert graph node `id` with the canonical-CBOR `props` (Graph upsert_node). Empty `props` is an
-    /// empty bag on both arms.
-    pub(crate) fn g_upsert_node(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-        props: Vec<u8>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let props = props_from_cbor(&props)?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Graph)?;
-                loom_core::graph_upsert_node(&mut loom, ns, name, id, props)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::upsert_node(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-                props,
-            )),
-        }
-    }
-
-    /// The canonical-CBOR props of graph node `id` (Graph get_node), or `None` when absent.
-    pub(crate) fn g_get_node(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                match loom_core::graph_get_node(&loom, ns, name, id).map_err(|e| e.to_string())? {
-                    Some(props) => Ok(Some(props_to_cbor(&props)?)),
-                    None => Ok(None),
-                }
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::get_node(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-            )),
-        }
-    }
-
-    /// Remove graph node `id` (Graph remove_node), optionally cascading to its edges.
-    pub(crate) fn g_remove_node(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-        cascade: bool,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::graph_remove_node(&mut loom, ns, name, id, cascade)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::remove_node(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-                cascade,
-            )),
-        }
-    }
-
-    /// Upsert graph edge `id` from `src` to `dst` labelled `label` with the canonical-CBOR `props`
-    /// (Graph upsert_edge).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn g_upsert_edge(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-        src: &str,
-        dst: &str,
-        label: &str,
-        props: Vec<u8>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let props = props_from_cbor(&props)?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_facet_workspace(&mut loom, workspace, FacetKind::Graph)?;
-                loom_core::graph_upsert_edge(&mut loom, ns, name, id, src, dst, label, props)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::upsert_edge(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-                src.to_string(),
-                dst.to_string(),
-                label.to_string(),
-                props,
-            )),
-        }
-    }
-
-    /// The canonical-CBOR record of graph edge `id` (Graph get_edge), or `None` when absent.
-    pub(crate) fn g_get_edge(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                match loom_core::graph_get_edge(&loom, ns, name, id).map_err(|e| e.to_string())? {
-                    Some(edge) => Ok(Some(graph_edge_cbor(&edge)?)),
-                    None => Ok(None),
-                }
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::get_edge(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-            )),
-        }
-    }
-
-    /// Remove graph edge `id` (Graph remove_edge); returns whether it was present.
-    pub(crate) fn g_remove_edge(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present = loom_core::graph_remove_edge(&mut loom, ns, name, id)
-                    .map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::remove_edge(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-            )),
-        }
-    }
-
-    /// The canonical-CBOR neighbor id list of graph node `id` (Graph neighbors).
-    pub(crate) fn g_neighbors(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let ids =
-                    loom_core::graph_neighbors(&loom, ns, name, id).map_err(|e| e.to_string())?;
-                graph_strings_cbor(ids)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::neighbors(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-            )),
-        }
-    }
-
-    /// The canonical-CBOR out-edge records of graph node `id` (Graph out_edges).
-    pub(crate) fn g_out_edges(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let edges =
-                    loom_core::graph_out_edges(&loom, ns, name, id).map_err(|e| e.to_string())?;
-                graph_edges_cbor(edges)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::out_edges(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-            )),
-        }
-    }
-
-    /// The canonical-CBOR in-edge records of graph node `id` (Graph in_edges).
-    pub(crate) fn g_in_edges(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let edges =
-                    loom_core::graph_in_edges(&loom, ns, name, id).map_err(|e| e.to_string())?;
-                graph_edges_cbor(edges)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::in_edges(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-            )),
-        }
-    }
-
-    /// The canonical-CBOR ids reachable from `start` (Graph reachable). `max_depth < 0` is unbounded;
-    /// `via_label` empty is any label. The IDL `Graph.reachable` carries `max_depth` (i64), so the remote
-    /// arm forwards it directly.
-    pub(crate) fn g_reachable(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        start: &str,
-        max_depth: i64,
-        via_label: Option<&str>,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let depth = (max_depth >= 0).then_some(max_depth as usize);
-                let via = via_label.filter(|value| !value.is_empty());
-                let ids = loom_core::graph_reachable(&loom, ns, name, start, depth, via)
-                    .map_err(|e| e.to_string())?;
-                graph_strings_cbor(ids)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::reachable(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                start.to_string(),
-                max_depth,
-                via_label.unwrap_or_default().to_string(),
-            )),
-        }
-    }
-
-    /// The canonical-CBOR shortest path from `from` to `to` (Graph shortest_path), or `None` when there
-    /// is no path. `via_label` empty is any label.
-    pub(crate) fn g_shortest_path(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        from: &str,
-        to: &str,
-        via_label: Option<&str>,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let via = via_label.filter(|value| !value.is_empty());
-                match loom_core::graph_shortest_path(&loom, ns, name, from, to, via)
-                    .map_err(|e| e.to_string())?
-                {
-                    Some(path) => Ok(Some(graph_strings_cbor(path)?)),
-                    None => Ok(None),
-                }
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::shortest_path(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                from.to_string(),
-                to.to_string(),
-                via_label.unwrap_or_default().to_string(),
-            )),
-        }
-    }
-
-    pub(crate) fn g_query(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        query: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let query = loom_core::GraphQuery::parse_opencypher(query)
-                    .map_err(|err| err.to_string())?;
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let result =
-                    loom_core::graph_query(&loom, ns, name, &query).map_err(|e| e.to_string())?;
-                Ok(loom_wire::graph::graph_query_result_to_cbor(&result))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::query(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                query.to_string(),
-            )),
-        }
-    }
-
-    pub(crate) fn g_explain_query(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        query: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let query = loom_core::GraphQuery::parse_opencypher(query)
-                    .map_err(|err| err.to_string())?;
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let explain = loom_core::graph_explain_query(&loom, ns, name, &query)
-                    .map_err(|e| e.to_string())?;
-                Ok(loom_wire::graph::graph_query_explain_to_cbor(&explain))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Graph::explain_query(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                query.to_string(),
-            )),
-        }
-    }
-
-    // ---- Vector ----
-    //
-    // Vectors cross as little-endian f32 bytes and metadata/filters/hits/entries as canonical CBOR; the
-    // CLI's `vector_*` codecs are the same wire format as the server's `loom_wire::vector` codecs, so it
-    // is a bytes pass-through. The `metric` (create) and accelerator `policy` (search) selectors are CLI
-    // strings converted to the IDL's `i32` tags in the remote arm.
-
-    /// Create vector set `name` with dimension `dim` and metric selector (Vector create).
-    pub(crate) fn v_create(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        dim: u64,
-        metric: &str,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let metric = parse_vector_metric(metric)?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = ensure_vector_workspace(&mut loom, workspace)?;
-                loom_core::vector_create(&mut loom, ns, name, dim as usize, metric)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let metric_int: i32 = match parse_vector_metric(metric)? {
-                    Metric::Cosine => 1,
-                    Metric::L2 => 2,
-                    Metric::Dot => 3,
-                };
-                remote.block(Vector::create(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    name.to_string(),
-                    dim,
-                    metric_int,
-                ))
-            }
-        }
-    }
-
-    /// Upsert vector `id` from le-f32 `vector` bytes with canonical-CBOR `metadata` (Vector upsert).
-    pub(crate) fn v_upsert(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-        vector: Vec<u8>,
-        metadata: Vec<u8>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let vector = vector_floats_from_bytes(&vector)?;
-                let metadata = vector_metadata_from_cbor(&metadata)?;
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::vector_upsert(&mut loom, ns, name, id, vector, metadata)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Vector::upsert(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-                vector,
-                metadata,
-            )),
-        }
-    }
-
-    /// Upsert vector `id` with source text and an optional embedding model (Vector upsert_source).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn v_upsert_source(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-        vector: Vec<u8>,
-        metadata: Vec<u8>,
-        source_text: Vec<u8>,
-        model_id: Option<String>,
-        weights_digest: Option<String>,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let vector = vector_floats_from_bytes(&vector)?;
-                let metadata = vector_metadata_from_cbor(&metadata)?;
-                let source_text = String::from_utf8(source_text)
-                    .map_err(|_| "vector source text must be UTF-8".to_string())?;
-                let model = model_id
-                    .map(|model_id| EmbeddingModel::new(model_id, vector.len(), weights_digest));
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::vector_upsert_with_source(
-                    &mut loom,
-                    ns,
-                    name,
-                    id,
-                    vector,
-                    metadata,
-                    &source_text,
-                    model,
-                )
-                .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Vector::upsert_source(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-                vector,
-                metadata,
-                source_text,
-                model_id,
-                weights_digest,
-            )),
-        }
-    }
-
-    /// The canonical-CBOR `[vector, metadata]` entry for `id` (Vector get), or `None` when absent.
-    pub(crate) fn v_get(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                match loom_core::vector_get(&loom, ns, name, id).map_err(|e| e.to_string())? {
-                    Some((vector, metadata)) => Ok(Some(vector_get_cbor(vector, metadata)?)),
-                    None => Ok(None),
-                }
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Vector::get(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-            )),
-        }
-    }
-
-    /// The source text bytes for vector `id` (Vector source_text), or `None` when absent.
-    pub(crate) fn v_source_text(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                Ok(loom_core::vector_source_text(&loom, ns, name, id)
-                    .map_err(|e| e.to_string())?
-                    .map(String::into_bytes))
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Vector::source_text(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-            )),
-        }
-    }
-
-    /// The vector ids for `name`, optionally filtered by `prefix` (Vector ids).
-    pub(crate) fn v_ids(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        prefix: Option<&str>,
-    ) -> Result<Vec<String>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::vector_ids(&loom, ns, name, prefix).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Vector::ids(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    name.to_string(),
-                    prefix.map(str::to_string),
-                ))?;
-                cli_strings_from_remote(&wire)
-            }
-        }
-    }
-
-    /// The metadata index keys for `name` (Vector metadata_index_keys).
-    pub(crate) fn v_index_keys(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-    ) -> Result<Vec<String>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom_core::vector_metadata_index_keys(&loom, ns, name).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(Vector::metadata_index_keys(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    name.to_string(),
-                ))?;
-                cli_strings_from_remote(&wire)
-            }
-        }
-    }
-
-    /// Create a metadata index on `key` (Vector create_metadata_index); returns whether it changed.
-    pub(crate) fn v_create_index(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        key: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let changed = loom_core::vector_create_metadata_index(&mut loom, ns, name, key)
-                    .map_err(|e| e.to_string())?;
-                if changed {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(changed)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Vector::create_metadata_index(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                key.to_string(),
-            )),
-        }
-    }
-
-    /// Drop the metadata index on `key` (Vector drop_metadata_index); returns whether it changed.
-    pub(crate) fn v_drop_index(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        key: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let changed = loom_core::vector_drop_metadata_index(&mut loom, ns, name, key)
-                    .map_err(|e| e.to_string())?;
-                if changed {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(changed)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Vector::drop_metadata_index(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                key.to_string(),
-            )),
-        }
-    }
-
-    /// Delete vector `id` (Vector delete); returns whether it was present.
-    pub(crate) fn v_delete(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        id: &str,
-    ) -> Result<bool, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let present =
-                    loom_core::vector_delete(&mut loom, ns, name, id).map_err(|e| e.to_string())?;
-                if present {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(present)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(Vector::delete(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                name.to_string(),
-                id.to_string(),
-            )),
-        }
-    }
-
-    /// Search vector set `name` with the accelerator `policy` selector (Vector search_policy), returning
-    /// the canonical-CBOR hits. `query` is le-f32 bytes; `filter` is canonical CBOR (empty = match all).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn v_search(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        name: &str,
-        query: Vec<u8>,
-        k: u64,
-        filter: Vec<u8>,
-        policy: &str,
-        threshold: u64,
-        ef: u64,
-        pq_m: u64,
-        pq_k: u64,
-        pq_iters: u64,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let query = vector_floats_from_bytes(&query)?;
-                let filter = vector_filter_from_cbor(&filter)?;
-                let policy = match policy {
-                    "exact" => AcceleratorPolicy::ExactAlways,
-                    "approximate-pq" => AcceleratorPolicy::ApproximateAbove {
-                        threshold: threshold as usize,
-                    },
-                    other => {
-                        return Err(format!(
-                            "unknown vector accelerator policy {other}; expected exact or approximate-pq"
-                        ));
-                    }
-                };
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let hits = loom_core::vector_search_with_pq_policy(
-                    &loom,
-                    ns,
-                    name,
-                    &query,
-                    k as usize,
-                    &filter,
-                    policy,
-                    ef as usize,
-                    pq_m as usize,
-                    pq_k as usize,
-                    pq_iters as usize,
-                )
-                .map_err(|e| e.to_string())?;
-                vector_hits_cbor(&hits)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let policy_int: i32 = match policy {
-                    "exact" => 0,
-                    "approximate-pq" => 1,
-                    other => {
-                        return Err(format!(
-                            "unknown vector accelerator policy {other}; expected exact or approximate-pq"
-                        ));
-                    }
-                };
-                remote.block(Vector::search_policy(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    name.to_string(),
-                    query,
-                    k,
-                    filter,
-                    policy_int,
-                    threshold,
-                    ef,
-                    pq_m,
-                    pq_k,
-                    pq_iters,
-                ))
-            }
-        }
-    }
-
-    // ---- VersionControl ----
-    //
-    // `branch`/`checkout` are void, `commit` returns the commit digest string, `diff` is a bytes
-    // pass-through (the server `diff` is `loom.diff_commits`), and `merge` returns a typed `MergeOutcome`
-    // that the remote arm decodes from the canonical `MergeResult` CBOR via
-    // `loom_wire::vcs::merge_result_from_cbor`.
-
-    /// The commit log of `workspace`'s current HEAD branch, newest first, as digest strings. The head
-    /// is resolved via the `head_branch` accessor, then `log`.
-    pub(crate) fn vcs_log(&self, keys: &KeyOpts, workspace: &str) -> Result<Vec<String>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let head = loom.registry().head_branch(ns).map_err(|e| e.to_string())?;
-                Ok(loom
-                    .log(ns, &head)
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .map(|c| c.to_string())
-                    .collect())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let head = remote.block(VersionControl::head_branch(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                ))?;
-                let commits = remote.block(VersionControl::log(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    head,
-                ))?;
-                Ok(commits.into_iter().map(|d| d.0).collect())
-            }
-        }
-    }
-
-    pub(crate) fn vcs_branch(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        branch: &str,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom.branch(ns, branch).map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(VersionControl::branch(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                branch.to_string(),
-            )),
-        }
-    }
-
-    /// Commit the working tree of `workspace` (VersionControl commit); returns the commit digest string.
-    pub(crate) fn vcs_commit(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        author: &str,
-        message: &str,
-    ) -> Result<String, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let commit = loom
-                    .commit(ns, author, message, now_ms())
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-                Ok(commit.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(VersionControl::commit(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    author.to_string(),
-                    message.to_string(),
-                    now_ms(),
-                ))?;
-                Ok(wire.0)
-            }
-        }
-    }
-
-    /// Check out branch `branch` in `workspace` (VersionControl checkout).
-    pub(crate) fn vcs_checkout(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        branch: &str,
-    ) -> Result<(), String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                loom.checkout_branch(ns, branch)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(VersionControl::checkout(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                branch.to_string(),
-            )),
-        }
-    }
-
-    /// The canonical structural-diff bytes between commits `from` and `to` (VersionControl diff).
-    pub(crate) fn vcs_diff(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        from: &str,
-        to: &str,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let loom = cli_open_loom_read(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let from = Digest::parse(from).map_err(|e| e.to_string())?;
-                let to = Digest::parse(to).map_err(|e| e.to_string())?;
-                loom.diff_commits(ns, from, to).map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => remote.block(VersionControl::diff(
-                &remote.client,
-                remote.handle.clone(),
-                workspace.to_string(),
-                from.to_string(),
-                to.to_string(),
-            )),
-        }
-    }
-
-    /// Merge branch `from` into the current branch of `workspace` (VersionControl merge), returning the
-    /// typed outcome. The remote arm decodes the canonical `MergeResult` CBOR.
-    pub(crate) fn vcs_merge(
-        &self,
-        keys: &KeyOpts,
-        workspace: &str,
-        from: &str,
-        author: &str,
-        cell_level: bool,
-    ) -> Result<loom_core::MergeOutcome, String> {
-        match self {
-            StoreClient::Local { locator } => {
-                let mut loom = cli_open_loom(locator, keys)?;
-                let ns = resolve_ns(&loom, workspace)?;
-                let outcome = if cell_level {
-                    loom.merge_cell_level(ns, from, author, now_ms())
-                } else {
-                    loom.merge(ns, from, author, now_ms())
-                }
-                .map_err(|e| e.to_string())?;
-                // Only persist a merge that changed something; a conflict leaves the store as-is.
-                if !matches!(outcome, loom_core::MergeOutcome::Conflicts(_)) {
-                    save_loom(&mut loom).map_err(|e| e.to_string())?;
-                }
-                Ok(outcome)
-            }
-            #[cfg(feature = "remote-client")]
-            StoreClient::Remote(remote) => {
-                let wire = remote.block(VersionControl::merge(
-                    &remote.client,
-                    remote.handle.clone(),
-                    workspace.to_string(),
-                    from.to_string(),
-                    author.to_string(),
-                    cell_level,
-                    now_ms(),
-                ))?;
-                loom_wire::vcs::merge_result_from_cbor(&wire).map_err(|e| e.to_string())
-            }
-        }
-    }
-}
-
-fn transfer_import_source_scope<'a>(
-    kind: &str,
-    workspace: &'a str,
-    local_path: &'a str,
-) -> Result<&'a str, String> {
-    if kind == "car" && workspace.trim().is_empty() {
-        if local_path.trim().is_empty() {
-            Err("CAR transfer import source path must not be blank".to_string())
-        } else {
-            Ok(local_path)
-        }
-    } else {
-        Ok(workspace)
-    }
 }
 
 // CLI-output bridge helpers for the remote arm. Each takes a canonical server response and produces the
 // exact bytes (or values) the CLI presentation layer expects, so a remote locator prints the same output
 // as a local one. These are named around CLI output (not protocol wire) to keep the direction clear.
 
-/// Decode a canonical string-list response (`Array(Text)`) into the `Vec<String>` the CLI list handlers
-/// print or pass to `text_array_cbor`.
-#[cfg(feature = "remote-client")]
-fn cli_strings_from_remote(wire: &[u8]) -> Result<Vec<String>, String> {
-    match loom_codec::decode(wire).map_err(|e| e.to_string())? {
-        loom_codec::Value::Array(items) => items
-            .into_iter()
-            .map(|item| match item {
-                loom_codec::Value::Text(text) => Ok(text),
-                _ => Err("expected a CBOR text list from the remote endpoint".to_string()),
-            })
-            .collect(),
-        _ => Err("expected a CBOR array from the remote endpoint".to_string()),
-    }
-}
-
-/// Re-encode a canonical byte-blob-list response (`Array(Bytes(record))`, the server's
-/// `bytes_list_to_cbor` form) with the CLI's `record_array_cbor`, so the remote output matches the local
-/// `record_array_cbor(...)` output.
-#[cfg(feature = "remote-client")]
-fn cli_record_array_from_remote(wire: &[u8]) -> Result<Vec<u8>, String> {
-    let records = match loom_codec::decode(wire).map_err(|e| e.to_string())? {
-        loom_codec::Value::Array(items) => items
-            .into_iter()
-            .map(|item| match item {
-                loom_codec::Value::Bytes(bytes) => Ok(bytes),
-                _ => Err("expected a CBOR byte-string list from the remote endpoint".to_string()),
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-        _ => return Err("expected a CBOR array from the remote endpoint".to_string()),
-    };
-    record_array_cbor(records)
-}
-
-/// Re-encode a canonical `CollectionMeta` response with the CLI's `calendar_collection_cbor`.
-#[cfg(feature = "remote-client")]
-fn cli_calendar_collection_from_remote(meta: &[u8]) -> Result<Vec<u8>, String> {
-    let meta = loom_core::calendar::CollectionMeta::decode(meta).map_err(|e| e.to_string())?;
-    calendar_collection_cbor(&meta)
-}
-
-/// Re-encode a canonical contacts `BookMeta` response with the CLI's `metadata_cbor`.
-#[cfg(feature = "remote-client")]
-fn cli_contacts_book_from_remote(meta: &[u8]) -> Result<Vec<u8>, String> {
-    let meta = loom_core::contacts::BookMeta::decode(meta).map_err(|e| e.to_string())?;
-    metadata_cbor(&meta.display_name)
-}
-
-/// Re-encode a canonical mail `MailboxMeta` response with the CLI's `metadata_cbor`.
-#[cfg(feature = "remote-client")]
-fn cli_mail_mailbox_from_remote(meta: &[u8]) -> Result<Vec<u8>, String> {
-    let meta = loom_core::mail::MailboxMeta::decode(meta).map_err(|e| e.to_string())?;
-    metadata_cbor(&meta.display_name)
-}
-
 /// Decode the 6 protected-ref policy fields (`[bool, bool, bool, uint, bool, bool]`, the
 /// `protected_ref_policy_to_cbor` field order) into a typed `ProtectedRefPolicy`.
-#[cfg(feature = "remote-client")]
-fn decode_protected_ref_policy_fields(
+pub(crate) fn decode_protected_ref_policy_fields(
     fields: &[loom_codec::Value],
 ) -> Result<loom_core::vcs::ProtectedRefPolicy, String> {
     let flag = |index: usize| -> Result<bool, String> {
@@ -6547,78 +1657,13 @@ fn decode_protected_ref_policy_fields(
 }
 
 /// Decode a canonical `protected_ref_get` record (`[..6 policy fields]`) into a typed policy.
-#[cfg(feature = "remote-client")]
-fn cli_protected_ref_policy_from_remote(
+pub(crate) fn cli_protected_ref_policy_from_remote(
     wire: &[u8],
 ) -> Result<loom_core::vcs::ProtectedRefPolicy, String> {
     match loom_codec::decode(wire).map_err(|e| e.to_string())? {
         loom_codec::Value::Array(items) => decode_protected_ref_policy_fields(&items),
         _ => Err("expected a CBOR array from the remote endpoint".to_string()),
     }
-}
-
-/// The wire-typed `acl_grant`/`acl_revoke` arguments, encoded from the raw CLI args for the remote arm.
-/// `workspace` stays a raw string for the server to resolve (name or id), matching the server's
-/// `acl_grant`/`acl_revoke` handling.
-#[cfg(feature = "remote-client")]
-struct AclWireArgs {
-    effect: Vec<u8>,
-    subject: String,
-    workspace: Option<String>,
-    domain: Option<Vec<u8>>,
-    ref_glob: Option<String>,
-    scopes: Option<Vec<Vec<u8>>>,
-    rights: Option<Vec<Vec<u8>>>,
-    predicate: Option<Vec<u8>>,
-}
-
-/// Encode the raw CLI ACL args into their canonical wire atoms via the `loom_wire` ACL codecs (the same
-/// forms the server's `acl_grant_from_wire` decodes). Reuses the CLI's own parsers for effect / rights /
-/// scopes / domain / predicate so the typed interpretation matches the local path exactly.
-#[cfg(feature = "remote-client")]
-fn encode_acl_wire_args(args: &AclGrantArgs<'_>) -> Result<AclWireArgs, String> {
-    let effect = loom_wire::acl::acl_effect_to_wire(parse_acl_effect(args.effect)?);
-    let domain = optional_acl_domain_arg(args.domain)?.map(|domain| vec![domain.stable_tag()]);
-    // An empty scope list means "all resources" on both sides (the CLI uses `[AclScope::All]`, the server
-    // treats an absent/empty list as all), so send `None` rather than an encoded `All` for parity.
-    let scopes = if args.scopes.is_empty() {
-        None
-    } else {
-        Some(
-            args.scopes
-                .iter()
-                .map(|scope| {
-                    loom_wire::acl::acl_scope_to_wire(&parse_acl_scope(scope)?)
-                        .map_err(|e| e.to_string())
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        )
-    };
-    let rights = Some(
-        args.rights
-            .iter()
-            .map(|right| Ok(loom_wire::acl::acl_right_to_wire(parse_acl_right(right)?)))
-            .collect::<Result<Vec<_>, String>>()?,
-    );
-    let predicate = match optional_acl_predicate(args.predicate_cel)? {
-        Some(predicate) => {
-            Some(loom_wire::acl::acl_predicate_to_wire(&predicate).map_err(|e| e.to_string())?)
-        }
-        None => None,
-    };
-    Ok(AclWireArgs {
-        effect,
-        subject: args.subject.to_string(),
-        workspace: args.workspace.map(str::to_string),
-        domain,
-        ref_glob: args
-            .ref_glob
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        scopes,
-        rights,
-        predicate,
-    })
 }
 
 /// Decode a canonical `workspace_info_to_cbor` record (`[id, name, [facet_tag...], head]`) into a typed
@@ -6668,9 +1713,45 @@ fn cli_workspace_info_from_remote(wire: &[u8]) -> Result<loom_core::WorkspaceInf
     })
 }
 
+fn cli_workspace_infos_from_generated_records(
+    records: &[loom_codec::Value],
+) -> Result<Vec<loom_core::WorkspaceInfo>, String> {
+    records
+        .iter()
+        .map(|record| match record {
+            loom_codec::Value::Bytes(bytes) => cli_workspace_info_from_remote(bytes),
+            other => Err(format!(
+                "Workspaces.workspace_list returned unexpected record {other:?}"
+            )),
+        })
+        .collect()
+}
+
+fn cli_workspace_infos_from_remote_records(
+    records: &[Vec<u8>],
+) -> Result<Vec<loom_core::WorkspaceInfo>, String> {
+    records
+        .iter()
+        .map(|record| cli_workspace_info_from_remote(record))
+        .collect()
+}
+
+fn cli_select_workspace_id(
+    infos: &[loom_core::WorkspaceInfo],
+    workspace: &str,
+) -> Option<loom_core::WorkspaceId> {
+    let parsed = loom_core::WorkspaceId::parse(workspace).ok();
+    infos
+        .iter()
+        .find(|info| match &parsed {
+            Some(id) => info.id.as_bytes() == id.as_bytes(),
+            None => info.name == workspace,
+        })
+        .map(|info| info.id)
+}
+
 /// Decode a canonical `protected_ref_list` record (`[ref_name, ..6 policy fields]`).
-#[cfg(feature = "remote-client")]
-fn cli_named_protected_ref_from_remote(
+pub(crate) fn cli_named_protected_ref_from_remote(
     wire: &[u8],
 ) -> Result<(String, loom_core::vcs::ProtectedRefPolicy), String> {
     match loom_codec::decode(wire).map_err(|e| e.to_string())? {
@@ -6684,55 +1765,6 @@ fn cli_named_protected_ref_from_remote(
         }
         _ => Err("expected a CBOR array from the remote endpoint".to_string()),
     }
-}
-
-/// Re-encode a canonical range response (`Array([Text(uid), Text(YYYYMMDDTHHMMSS)])`) with the CLI's
-/// `calendar_range_cbor` by reconstructing the `Occurrence`s.
-#[cfg(feature = "remote-client")]
-fn cli_calendar_range_from_remote(wire: &[u8]) -> Result<Vec<u8>, String> {
-    let occurrences = match loom_codec::decode(wire).map_err(|e| e.to_string())? {
-        loom_codec::Value::Array(items) => items
-            .into_iter()
-            .map(|item| {
-                let mut fields = match item {
-                    loom_codec::Value::Array(fields) => fields.into_iter(),
-                    _ => {
-                        return Err(
-                            "expected a [uid, start] pair from the remote endpoint".to_string()
-                        );
-                    }
-                };
-                let uid = match fields.next() {
-                    Some(loom_codec::Value::Text(uid)) => uid,
-                    _ => return Err("expected a text uid from the remote endpoint".to_string()),
-                };
-                let start = match fields.next() {
-                    Some(loom_codec::Value::Text(bound)) => parse_calendar_datetime(&bound)?,
-                    _ => return Err("expected a text start from the remote endpoint".to_string()),
-                };
-                Ok(loom_core::calendar::Occurrence { uid, start })
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-        _ => return Err("expected a CBOR array from the remote endpoint".to_string()),
-    };
-    calendar_range_cbor(&occurrences)
-}
-
-/// Normalize a CLI calendar date-time arg (`YYYYMMDD` or `YYYYMMDDTHHMMSS[Z]`) to the 15-char
-/// `YYYYMMDDTHHMMSS` wall-clock string the server's range/window parser requires, so a remote range
-/// accepts the same inputs as a local one.
-#[cfg(feature = "remote-client")]
-fn cli_window_bound(raw: &str) -> Result<String, String> {
-    let dt = parse_calendar_datetime(raw)?;
-    Ok(format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}",
-        dt.year(),
-        u8::from(dt.month()),
-        dt.day(),
-        dt.hour(),
-        dt.minute(),
-        dt.second(),
-    ))
 }
 
 /// A connected remote endpoint: an async runtime, the discovered client, and the store session handle
@@ -6794,6 +1826,57 @@ impl RemoteStore {
         })
     }
 
+    pub(crate) fn resume_logical_session(
+        target: &RemoteTarget,
+        auth: SessionAuth,
+        credential: &[u8],
+    ) -> Result<(Self, Vec<u8>), String> {
+        use std::net::ToSocketAddrs;
+        let (host, port) = url_host_port(&target.url)?;
+        let addr = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|error| format!("resolve {host}:{port}: {error}"))?
+            .next()
+            .ok_or_else(|| format!("no address for {host}:{port}"))?;
+        let call_path = format!("{}/v1/call", url_path(&target.url).trim_end_matches('/'));
+        let transport = Http2TlsTransport::new(
+            addr,
+            host,
+            call_path,
+            build_client_config(target.tls.as_deref())?,
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("build async runtime: {error}"))?;
+        let url = target.url.clone();
+        let mode = discovery_mode(target.discovery);
+        let credential = credential.to_vec();
+        let (client, handle, rotated) = runtime.block_on(async move {
+            let connection =
+                RemoteConnection::connect(transport, &url, &ContextResolver::default(), mode)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            let client = RemoteLoomClient::new(connection);
+            let session = client
+                .resume_logical_session(auth, &credential)
+                .await
+                .map_err(|error| error.to_string())?;
+            let handle = Store::open(&client)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((client, handle, session.credential))
+        })?;
+        Ok((
+            Self {
+                runtime,
+                client,
+                handle,
+            },
+            rotated,
+        ))
+    }
+
     /// Drive `future` to completion on the endpoint's runtime, mapping the error to a message.
     fn block<F, T>(&self, future: F) -> Result<T, String>
     where
@@ -6825,31 +1908,86 @@ impl RemoteStore {
             })
             .map_err(|e| e.to_string())
     }
+}
 
-    /// Resolve `workspace` (an id or a name) to its `WorkspaceId` using the remote workspace list, so a
-    /// remote `workspace rename`/`delete` can print the same resolved id as the local path. Mirrors
-    /// `resolve_ns`: a parseable id is matched by id, otherwise the value is matched by name.
-    fn resolve_workspace_id(&self, workspace: &str) -> Result<loom_core::WorkspaceId, String> {
-        let wire = self.block(Workspaces::workspace_list(
-            &self.client,
-            self.handle.clone(),
-        ))?;
-        let infos = wire
-            .iter()
-            .map(|record| cli_workspace_info_from_remote(record))
-            .collect::<Result<Vec<_>, String>>()?;
-        let found = match loom_core::WorkspaceId::parse(workspace) {
-            Ok(id) => infos
-                .iter()
-                .find(|info| info.id.as_bytes() == id.as_bytes())
-                .map(|info| info.id),
-            Err(_) => infos
-                .iter()
-                .find(|info| info.name == workspace)
-                .map(|info| info.id),
-        };
-        found.ok_or_else(|| format!("workspace {workspace:?} not found"))
-    }
+#[cfg(feature = "remote-client")]
+pub(crate) fn create_remote_logical_session(
+    target: &RemoteTarget,
+    keys: &KeyOpts,
+) -> Result<Vec<u8>, String> {
+    use std::net::ToSocketAddrs;
+    let auth = remote_session_auth(target, keys)?;
+    let (host, port) = url_host_port(&target.url)?;
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| format!("resolve {host}:{port}: {error}"))?
+        .next()
+        .ok_or_else(|| format!("no address for {host}:{port}"))?;
+    let call_path = format!("{}/v1/call", url_path(&target.url).trim_end_matches('/'));
+    let transport = Http2TlsTransport::new(
+        addr,
+        host,
+        call_path,
+        build_client_config(target.tls.as_deref())?,
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("build async runtime: {error}"))?;
+    let url = target.url.clone();
+    let mode = discovery_mode(target.discovery);
+    runtime.block_on(async move {
+        let connection =
+            RemoteConnection::connect(transport, &url, &ContextResolver::default(), mode)
+                .await
+                .map_err(|error| error.to_string())?;
+        let client = RemoteLoomClient::new(connection);
+        client
+            .create_logical_session(auth)
+            .await
+            .map(|session| session.credential)
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(feature = "remote-client")]
+pub(crate) fn close_remote_logical_session(
+    target: &RemoteTarget,
+    keys: &KeyOpts,
+    credential: &[u8],
+) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let auth = remote_session_auth(target, keys)?;
+    let (host, port) = url_host_port(&target.url)?;
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| format!("resolve {host}:{port}: {error}"))?
+        .next()
+        .ok_or_else(|| format!("no address for {host}:{port}"))?;
+    let call_path = format!("{}/v1/call", url_path(&target.url).trim_end_matches('/'));
+    let transport = Http2TlsTransport::new(
+        addr,
+        host,
+        call_path,
+        build_client_config(target.tls.as_deref())?,
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("build async runtime: {error}"))?;
+    let url = target.url.clone();
+    let mode = discovery_mode(target.discovery);
+    let credential = credential.to_vec();
+    runtime.block_on(async move {
+        let connection =
+            RemoteConnection::connect(transport, &url, &ContextResolver::default(), mode)
+                .await
+                .map_err(|error| error.to_string())?;
+        RemoteLoomClient::new(connection)
+            .close_logical_session(auth, &credential)
+            .await
+            .map_err(|error| error.to_string())
+    })
 }
 
 /// A remote backend for the MCP host: forwards the KV MCP tool family to a `loom serve remote` endpoint
@@ -6861,6 +1999,8 @@ pub(crate) struct McpRemoteBackend<T: Transport = Http2TlsTransport> {
     runtime: tokio::runtime::Runtime,
     client: Arc<RemoteLoomClient<T>>,
     handle: LoomSession,
+    logical_auth: SessionAuth,
+    logical_credential: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 #[cfg(all(feature = "mcp", feature = "remote-client"))]
@@ -6884,23 +2024,27 @@ impl McpRemoteBackend {
             .map_err(|e| format!("build async runtime: {e}"))?;
         let url = target.url.clone();
         let mode = discovery_mode(target.discovery);
-        let (client, handle) = runtime.block_on(async move {
+        let logical_auth = SessionAuth::Unauthenticated;
+        let auth = logical_auth.clone();
+        let (client, handle, logical_credential) = runtime.block_on(async move {
             let conn =
                 RemoteConnection::connect(transport, &url, &ContextResolver::default(), mode)
                     .await
                     .map_err(|e| e.to_string())?;
             let client = RemoteLoomClient::new(conn);
-            client
-                .open_session(SessionAuth::Unauthenticated)
+            let logical_session = client
+                .create_logical_session(auth)
                 .await
                 .map_err(|e| e.to_string())?;
             let handle = Store::open(&client).await.map_err(|e| e.to_string())?;
-            Ok::<_, String>((Arc::new(client), handle))
+            Ok::<_, String>((Arc::new(client), handle, logical_session.credential))
         })?;
         Ok(Self {
             runtime,
             client,
             handle,
+            logical_auth,
+            logical_credential: std::sync::Mutex::new(Some(logical_credential)),
         })
     }
 }
@@ -6937,21 +2081,51 @@ where
             .build()
             .map_err(|e| format!("build async runtime: {e}"))?;
         let locator = locator.to_string();
-        let (client, handle) = runtime.block_on(async move {
+        let logical_auth = auth.clone();
+        let (client, handle, logical_credential) = runtime.block_on(async move {
             let conn =
                 RemoteConnection::connect(transport, &locator, &ContextResolver::default(), mode)
                     .await
                     .map_err(|e| e.to_string())?;
             let client = RemoteLoomClient::new(conn);
-            client.open_session(auth).await.map_err(|e| e.to_string())?;
+            let logical_session = client
+                .create_logical_session(auth)
+                .await
+                .map_err(|e| e.to_string())?;
             let handle = Store::open(&client).await.map_err(|e| e.to_string())?;
-            Ok::<_, String>((Arc::new(client), handle))
+            Ok::<_, String>((Arc::new(client), handle, logical_session.credential))
         })?;
         Ok(Self {
             runtime,
             client,
             handle,
+            logical_auth,
+            logical_credential: std::sync::Mutex::new(Some(logical_credential)),
         })
+    }
+
+    pub(crate) fn close_logical_session(&self) -> Result<(), String> {
+        let credential = self
+            .logical_credential
+            .lock()
+            .map_err(|_| "MCP logical-session credential lock is poisoned".to_string())?
+            .take();
+        let Some(credential) = credential else {
+            return Ok(());
+        };
+        let result = self.runtime.block_on(
+            self.client
+                .close_logical_session(self.logical_auth.clone(), &credential),
+        );
+        if let Err(error) = result {
+            *self
+                .logical_credential
+                .lock()
+                .map_err(|_| "MCP logical-session credential lock is poisoned".to_string())? =
+                Some(credential);
+            return Err(error.to_string());
+        }
+        Ok(())
     }
 
     /// Resolve `workspace` (an id or a name) to its `WorkspaceId` via the remote workspace list, mirroring
@@ -6968,27 +2142,104 @@ where
             let _ = tx.send(Workspaces::workspace_list(client.as_ref(), handle).await);
         });
         let records = rx.recv().map_err(|_| remote_backend_channel_closed())??;
-        let parsed = loom_core::WorkspaceId::parse(workspace).ok();
-        for record in &records {
-            let info =
-                cli_workspace_info_from_remote(record).map_err(loom_types::LoomError::invalid)?;
-            let matches = match &parsed {
-                Some(id) => info.id.as_bytes() == id.as_bytes(),
-                None => info.name == workspace,
-            };
-            if matches {
-                return Ok(info.id);
-            }
+        let infos = cli_workspace_infos_from_remote_records(&records)
+            .map_err(loom_types::LoomError::invalid)?;
+        if let Some(id) = cli_select_workspace_id(&infos, workspace) {
+            return Ok(id);
         }
         Err(loom_types::LoomError::not_found(format!(
             "workspace {workspace:?}"
         )))
+    }
+
+    fn block_generated<R, F, C>(&self, call: C) -> std::result::Result<R, loom_types::LoomError>
+    where
+        R: Send + 'static,
+        F: std::future::Future<Output = std::result::Result<R, loom_types::LoomError>>
+            + Send
+            + 'static,
+        C: FnOnce(Arc<RemoteLoomClient<T>>, LoomSession) -> F + Send + 'static,
+    {
+        let client = self.client.clone();
+        let handle = self.handle.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.runtime.handle().spawn(async move {
+            let _ = tx.send(call(client, handle).await);
+        });
+        rx.recv().map_err(|_| remote_backend_channel_closed())?
     }
 }
 
 #[cfg(all(feature = "mcp", feature = "remote-client"))]
 fn remote_backend_channel_closed() -> loom_types::LoomError {
     loom_types::LoomError::corrupt("remote MCP backend response channel closed")
+}
+
+#[cfg(all(feature = "mcp", feature = "remote-client"))]
+fn decode_generated_json<T: serde::de::DeserializeOwned>(
+    json: &str,
+) -> std::result::Result<T, loom_types::LoomError> {
+    serde_json::from_str(json)
+        .map_err(|e| loom_types::LoomError::corrupt(format!("decode generated JSON result: {e}")))
+}
+
+#[cfg(all(feature = "mcp", feature = "remote-client"))]
+fn optional_json_array<T>(
+    items: &[T],
+    encode: impl Fn(&T) -> serde_json::Value,
+) -> std::result::Result<Option<String>, loom_types::LoomError> {
+    if items.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(&items.iter().map(encode).collect::<Vec<_>>())
+        .map(Some)
+        .map_err(|e| loom_types::LoomError::invalid(format!("encode generated JSON array: {e}")))
+}
+
+#[cfg(all(feature = "mcp", feature = "remote-client"))]
+fn ticket_action_name(action: loom_tickets::TicketLifecycleAction) -> &'static str {
+    match action {
+        loom_tickets::TicketLifecycleAction::Assign => "assign",
+        loom_tickets::TicketLifecycleAction::Claim => "claim",
+        loom_tickets::TicketLifecycleAction::Release => "release",
+        loom_tickets::TicketLifecycleAction::RequestReview => "request_review",
+        loom_tickets::TicketLifecycleAction::Accept => "accept",
+        loom_tickets::TicketLifecycleAction::Reject => "reject",
+        loom_tickets::TicketLifecycleAction::Block => "block",
+        loom_tickets::TicketLifecycleAction::Complete => "complete",
+    }
+}
+
+#[cfg(all(feature = "mcp", feature = "remote-client"))]
+fn ticket_comment_update_json(
+    comment: &loom_tickets::TicketUpdateCommentRequest<'_>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "comment_id": comment.comment_id,
+        "comment_type": comment.comment_type,
+        "body": comment.body,
+        "evidence": comment.evidence,
+    })
+}
+
+#[cfg(all(feature = "mcp", feature = "remote-client"))]
+fn ticket_relation_set_json(
+    relation: &loom_tickets::TicketUpdateRelationSetRequest<'_>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "relation_id": relation.relation_id,
+        "kind": relation.kind.as_str(),
+        "target_id": relation.target_id,
+    })
+}
+
+#[cfg(all(feature = "mcp", feature = "remote-client"))]
+fn ticket_relation_remove_json(
+    relation: &loom_tickets::TicketUpdateRelationRemoveRequest<'_>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "relation_id": relation.relation_id,
+    })
 }
 
 #[cfg(all(feature = "mcp", feature = "remote-client", feature = "serve"))]
@@ -7061,6 +2312,61 @@ impl<T> uldren_loom_mcp::RemoteMcpBackend for McpRemoteBackend<T>
 where
     T: Transport + Send + Sync + 'static,
 {
+    fn execute_generated_operation(
+        &self,
+        call: uldren_loom_mcp::GeneratedMcpCall,
+    ) -> uldren_loom_mcp::GeneratedMcpFuture<'_> {
+        let sig = METHODS
+            .iter()
+            .find(|sig| sig.operation == call.operation)
+            .ok_or_else(move || {
+                loom_types::LoomError::not_found(format!(
+                    "unknown generated operation {:?}",
+                    call.operation
+                ))
+            });
+        let sig = match sig {
+            Ok(sig) => sig,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        if sig.ret.starts_with("stream<") {
+            let error = loom_types::LoomError::unsupported(format!(
+                "{}.{} is streaming and cannot use the unary MCP generated boundary",
+                sig.interface, sig.method
+            ));
+            return Box::pin(async move { Err(error) });
+        }
+        if call.args_without_handle.len() != sig.args_without_handle.len() {
+            let error = loom_types::LoomError::invalid(format!(
+                "{}.{} expects {} MCP arguments, got {}",
+                sig.interface,
+                sig.method,
+                sig.args_without_handle.len(),
+                call.args_without_handle.len()
+            ));
+            return Box::pin(async move { Err(error) });
+        }
+        let mut args = Vec::with_capacity(sig.args.len());
+        let mut next = 0usize;
+        for (_, name) in sig.args {
+            if *name == "handle" {
+                args.push(self.handle.to_value());
+            } else {
+                args.push(call.args_without_handle[next].clone());
+                next += 1;
+            }
+        }
+        let options = if sig.requires_idempotency_key {
+            self.client.idempotency_options()
+        } else {
+            loom_remote_client::CallOptions::default()
+        };
+        let client = self.client.clone();
+        let interface = sig.interface;
+        let method = sig.method;
+        Box::pin(async move { client.call(interface, method, args, &options).await })
+    }
+
     fn workspace_create(
         &self,
         name: Option<&str>,
@@ -7117,6 +2423,426 @@ where
                 format!("Mcp.call_tool returned a non-bytes value: {other:?}"),
             )),
         }
+    }
+
+    fn store_bundle_import(
+        &self,
+        bundle: &[u8],
+        dry_run: bool,
+    ) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        let bundle = bundle.to_vec();
+        self.block_generated(move |client, handle| async move {
+            StoreAdmin::store_bundle_import(client.as_ref(), handle, bundle, dry_run).await
+        })
+    }
+
+    fn store_maintenance_status(
+        &self,
+        request: &[u8],
+    ) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        let request = request.to_vec();
+        self.block_generated(move |client, handle| async move {
+            StoreAdmin::store_maintenance_status(client.as_ref(), handle, request).await
+        })
+    }
+
+    fn store_maintenance_policy_set(
+        &self,
+        update: &[u8],
+    ) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        let update = update.to_vec();
+        self.block_generated(move |client, handle| async move {
+            StoreAdmin::store_maintenance_policy_set(client.as_ref(), handle, update).await
+        })
+    }
+
+    fn store_maintenance_run(
+        &self,
+        request: &[u8],
+    ) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        let request = request.to_vec();
+        self.block_generated(move |client, handle| async move {
+            StoreAdmin::store_maintenance_run(client.as_ref(), handle, request).await
+        })
+    }
+
+    fn workspace_id(&self, workspace: &str) -> std::result::Result<String, loom_types::LoomError> {
+        self.resolve_workspace_id(workspace)
+            .map(|id| id.to_string())
+    }
+
+    fn tickets_create_json(
+        &self,
+        workspace: &str,
+        request: loom_tickets::TicketCreateRequest<'_>,
+    ) -> std::result::Result<String, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = request.workspace_id.to_string();
+        let project_id = request.project_id.to_string();
+        let ticket_type = request.ticket_type.to_string();
+        let external_source = request.external_source.map(str::to_string);
+        let external_id = request.external_id.map(str::to_string);
+        let fields_json = serde_json::to_string(request.fields)
+            .map_err(|e| loom_types::LoomError::invalid(format!("ticket fields json: {e}")))?;
+        let policy_labels_json = serde_json::to_string(request.policy_labels).map_err(|e| {
+            loom_types::LoomError::invalid(format!("ticket policy labels json: {e}"))
+        })?;
+        let expected_root = request.expected_root.map(str::to_string);
+        self.block_generated(move |client, handle| async move {
+            Tickets::tickets_create_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                workspace_id,
+                project_id,
+                ticket_type,
+                external_source,
+                external_id,
+                fields_json,
+                policy_labels_json,
+                expected_root,
+            )
+            .await
+        })
+    }
+
+    fn tickets_update_json(
+        &self,
+        workspace: &str,
+        request: loom_tickets::TicketUpdateRequest<'_>,
+    ) -> std::result::Result<String, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = request.workspace_id.to_string();
+        let ticket_id = request.ticket_id.to_string();
+        let set_fields = request
+            .set_fields
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| loom_types::LoomError::invalid(format!("ticket set fields json: {e}")))?;
+        let delete_fields = serde_json::to_string(request.delete_fields).map_err(|e| {
+            loom_types::LoomError::invalid(format!("ticket delete fields json: {e}"))
+        })?;
+        let action = request.action.map(ticket_action_name).map(str::to_string);
+        let target_status = request.target_status.map(str::to_string);
+        let observed_source_status = request.observed_source_status.map(str::to_string);
+        let observed_workflow_version = request.observed_workflow_version.map(str::to_string);
+        let assignee = request.assignee.map(str::to_string);
+        let comment_id = request
+            .comment
+            .as_ref()
+            .and_then(|comment| comment.comment_id.map(str::to_string));
+        let comment_type = request
+            .comment
+            .as_ref()
+            .and_then(|comment| comment.comment_type.map(str::to_string));
+        let comment_body = request
+            .comment
+            .as_ref()
+            .map(|comment| comment.body.to_string());
+        let comment_evidence = request
+            .comment
+            .as_ref()
+            .and_then(|comment| comment.evidence.as_ref())
+            .map(|evidence| serde_json::to_string(&evidence))
+            .transpose()
+            .map_err(|e| loom_types::LoomError::invalid(format!("comment evidence json: {e}")))?;
+        let expected_root = request.expected_root.map(str::to_string);
+        let comments = optional_json_array(request.comments, ticket_comment_update_json)?;
+        let relation_sets = optional_json_array(request.relation_sets, ticket_relation_set_json)?;
+        let relation_removes =
+            optional_json_array(request.relation_removes, ticket_relation_remove_json)?;
+        self.block_generated(move |client, handle| async move {
+            Tickets::tickets_update_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                workspace_id,
+                ticket_id,
+                set_fields,
+                delete_fields,
+                action,
+                target_status,
+                observed_source_status,
+                observed_workflow_version,
+                assignee,
+                comment_id,
+                comment_type,
+                comment_body,
+                comment_evidence,
+                expected_root,
+                comments,
+                relation_sets,
+                relation_removes,
+            )
+            .await
+        })
+    }
+
+    fn tickets_get_json(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        ticket_id: &str,
+        projection: Option<&str>,
+    ) -> std::result::Result<String, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = workspace_id.to_string();
+        let ticket_id = ticket_id.to_string();
+        let projection = projection.map(str::to_string);
+        self.block_generated(move |client, handle| async move {
+            Tickets::tickets_get_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                workspace_id,
+                ticket_id,
+                projection,
+            )
+            .await
+        })
+    }
+
+    fn tickets_list_json(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        query: &loom_tickets::TicketListQuery,
+    ) -> std::result::Result<serde_json::Value, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = workspace_id.to_string();
+        let request = serde_json::json!({
+            "projection": query.projection.map(loom_tickets::TicketProjectionProfile::profile_id),
+            "statuses": &query.statuses,
+            "assignees": &query.assignees,
+            "priorities": &query.priorities,
+            "ticket_types": &query.ticket_types,
+            "labels": &query.labels,
+            "policy_labels": &query.policy_labels,
+            "lane": query.lane_id.as_deref(),
+            "ready": query.ready_only,
+            "include_completed": query.include_completed,
+            "board": query.board_id.as_deref(),
+            "cursor": query.cursor.as_deref(),
+            "limit": query.limit,
+        })
+        .to_string();
+        let json = self.block_generated(move |client, handle| async move {
+            Tickets::tickets_list_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                workspace_id,
+                Some(request),
+            )
+            .await
+        })?;
+        decode_generated_json(&json)
+    }
+
+    fn tickets_history_json(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        ticket_id: Option<&str>,
+    ) -> std::result::Result<Vec<loom_tickets::TicketHistoryRecord>, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = workspace_id.to_string();
+        let ticket_id = ticket_id.map(str::to_string);
+        let json = self.block_generated(move |client, handle| async move {
+            Tickets::tickets_history_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                workspace_id,
+                ticket_id,
+            )
+            .await
+        })?;
+        decode_generated_json(&json)
+    }
+
+    fn lanes_get_view(
+        &self,
+        workspace: &str,
+        ticket_workspace_id: &str,
+        lane_id: &str,
+        detailed: bool,
+    ) -> std::result::Result<Option<loom_lanes::LaneView>, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let ticket_workspace_id = ticket_workspace_id.to_string();
+        let lane_id = lane_id.to_string();
+        let json = self.block_generated(move |client, handle| async move {
+            Lanes::get_view_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                ticket_workspace_id,
+                lane_id,
+                detailed,
+            )
+            .await
+        })?;
+        decode_generated_json(&json)
+    }
+
+    fn lanes_list_views_json(
+        &self,
+        workspace: &str,
+        ticket_workspace_id: &str,
+    ) -> std::result::Result<Vec<loom_lanes::LaneView>, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let ticket_workspace_id = ticket_workspace_id.to_string();
+        let json = self.block_generated(move |client, handle| async move {
+            Lanes::list_views_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                ticket_workspace_id,
+                true,
+            )
+            .await
+        })?;
+        decode_generated_json(&json)
+    }
+
+    fn spaces_create(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        space_id: &str,
+        title: &str,
+        expected_root: Option<&str>,
+    ) -> std::result::Result<loom_pages::SpaceSummary, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = workspace_id.to_string();
+        let space_id = space_id.to_string();
+        let title = title.to_string();
+        let expected_root = expected_root.map(str::to_string);
+        let json = self.block_generated(move |client, handle| async move {
+            Pages::spaces_create_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                workspace_id,
+                space_id,
+                title,
+                expected_root,
+            )
+            .await
+        })?;
+        decode_generated_json(&json)
+    }
+
+    fn spaces_get_json(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        space_id: &str,
+    ) -> std::result::Result<Option<loom_pages::SpaceSummary>, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = workspace_id.to_string();
+        let space_id = space_id.to_string();
+        let json = self.block_generated(move |client, handle| async move {
+            Pages::spaces_get_json(client.as_ref(), handle, workspace, workspace_id, space_id).await
+        })?;
+        decode_generated_json(&json)
+    }
+
+    fn pages_create(
+        &self,
+        workspace: &str,
+        request: loom_pages::PageCreateRequest<'_>,
+    ) -> std::result::Result<loom_pages::PageSummary, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = request.workspace_id.to_string();
+        let page_id = request.page_id.to_string();
+        let space_id = request.space_id.to_string();
+        let parent_page_id = request.parent_page_id.map(str::to_string);
+        let title = request.title.to_string();
+        let expected_root = request.expected_root.map(str::to_string);
+        let json = self.block_generated(move |client, handle| async move {
+            Pages::pages_create_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                workspace_id,
+                page_id,
+                space_id,
+                parent_page_id,
+                title,
+                expected_root,
+            )
+            .await
+        })?;
+        decode_generated_json(&json)
+    }
+
+    fn pages_update_text(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        page_id: &str,
+        body_text: &str,
+        expected_root: Option<&str>,
+    ) -> std::result::Result<loom_pages::PageUpdateSummary, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = workspace_id.to_string();
+        let page_id = page_id.to_string();
+        let body_text = body_text.to_string();
+        let expected_root = expected_root.map(str::to_string);
+        let json = self.block_generated(move |client, handle| async move {
+            Pages::pages_update_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                workspace_id,
+                page_id,
+                body_text,
+                expected_root,
+            )
+            .await
+        })?;
+        decode_generated_json(&json)
+    }
+
+    fn pages_publish(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        page_id: &str,
+        expected_root: Option<&str>,
+    ) -> std::result::Result<loom_pages::PagePublishSummary, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = workspace_id.to_string();
+        let page_id = page_id.to_string();
+        let expected_root = expected_root.map(str::to_string);
+        let json = self.block_generated(move |client, handle| async move {
+            Pages::pages_publish_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                workspace_id,
+                page_id,
+                expected_root,
+            )
+            .await
+        })?;
+        decode_generated_json(&json)
+    }
+
+    fn pages_get(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        page_id: &str,
+    ) -> std::result::Result<Option<loom_pages::PageSummary>, loom_types::LoomError> {
+        let workspace = workspace.to_string();
+        let workspace_id = workspace_id.to_string();
+        let page_id = page_id.to_string();
+        let json = self.block_generated(move |client, handle| async move {
+            Pages::pages_get_json(client.as_ref(), handle, workspace, workspace_id, page_id).await
+        })?;
+        decode_generated_json(&json)
     }
 
     fn lanes_create(
@@ -7224,8 +2950,7 @@ where
         workspace: &str,
         lane_id: &str,
         ticket_id: &str,
-        placement: Option<&str>,
-        anchor: Option<&str>,
+        placement: loom_lanes::LaneTicketPlacement<'_>,
         updated_by: &str,
     ) -> std::result::Result<loom_lanes::Lane, loom_types::LoomError> {
         let client = self.client.clone();
@@ -7233,8 +2958,7 @@ where
         let workspace = workspace.to_string();
         let lane_id = lane_id.to_string();
         let ticket_id = ticket_id.to_string();
-        let placement = placement.map(str::to_string);
-        let anchor = anchor.map(str::to_string);
+        let (placement, anchor) = remote_lane_ticket_placement_parts(placement);
         let updated_by = updated_by.to_string();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.runtime.handle().spawn(async move {
@@ -8295,6 +4019,58 @@ where
             );
         });
         rx.recv().map_err(|_| remote_backend_channel_closed())?
+    }
+
+    fn columnar_import_arrow(
+        &self,
+        workspace: &str,
+        name: &str,
+        payload: &[u8],
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        let (workspace, name, payload) =
+            (workspace.to_string(), name.to_string(), payload.to_vec());
+        self.block_generated(move |client, handle| async move {
+            Columnar::columnar_import_arrow(
+                client.as_ref(),
+                handle,
+                workspace,
+                name,
+                payload,
+                target_segment_rows,
+                replace,
+                dry_run,
+            )
+            .await
+        })
+    }
+
+    fn columnar_import_parquet(
+        &self,
+        workspace: &str,
+        name: &str,
+        payload: &[u8],
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        let (workspace, name, payload) =
+            (workspace.to_string(), name.to_string(), payload.to_vec());
+        self.block_generated(move |client, handle| async move {
+            Columnar::columnar_import_parquet(
+                client.as_ref(),
+                handle,
+                workspace,
+                name,
+                payload,
+                target_segment_rows,
+                replace,
+                dry_run,
+            )
+            .await
+        })
     }
 
     fn calendar_create_collection(
@@ -9436,6 +5212,33 @@ where
             );
         });
         rx.recv().map_err(|_| remote_backend_channel_closed())?
+    }
+
+    fn vector_text_upsert(
+        &self,
+        request: &[u8],
+    ) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        let request = request.to_vec();
+        self.block_generated(move |client, handle| async move {
+            Vector::vector_text_upsert(client.as_ref(), handle, request).await
+        })
+    }
+
+    fn vector_workspace_configure_json(
+        &self,
+        workspace: &str,
+        request_json: &str,
+    ) -> std::result::Result<String, loom_types::LoomError> {
+        let (workspace, request_json) = (workspace.to_string(), request_json.to_string());
+        self.block_generated(move |client, handle| async move {
+            Vector::vector_workspace_configure_json(
+                client.as_ref(),
+                handle,
+                workspace,
+                request_json,
+            )
+            .await
+        })
     }
 
     fn vector_create_metadata_index(
@@ -10892,6 +6695,18 @@ where
         rx.recv().map_err(|_| remote_backend_channel_closed())?
     }
 
+    fn sql_exec_result(
+        &self,
+        workspace: &str,
+        db: &str,
+        sql: &str,
+    ) -> std::result::Result<Vec<u8>, loom_types::LoomError> {
+        let (workspace, db, sql) = (workspace.to_string(), db.to_string(), sql.to_string());
+        self.block_generated(move |client, handle| async move {
+            Sql::sql_exec_result(client.as_ref(), handle, workspace, db, sql).await
+        })
+    }
+
     fn ts_latest(
         &self,
         workspace: &str,
@@ -11282,6 +7097,18 @@ mod selector_tests {
         path.to_string_lossy().into_owned()
     }
 
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "loomcli-execution-selector-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
     fn cas_put_operation(workspace: &str, content: Vec<u8>) -> CliGeneratedOperation {
         CliGeneratedOperation::new(
             "Cas",
@@ -11384,6 +7211,13 @@ mod selector_tests {
         generated_binary_response(DAEMON_GENERATED_RESPONSE_MAGIC, &[response])
     }
 
+    fn running_daemon_response(store_path: &str, store_id: &str) -> Vec<u8> {
+        format!(
+            "running\tprotocol=1\ttransport=tcp\tfake-pid\t{store_path}\tidentity={store_id}\tstartup_mode=managed\tstartup_initiator=cli.mcp.local\tsessions=0\tpins=0\n"
+        )
+        .into_bytes()
+    }
+
     #[cfg(feature = "serve")]
     fn success_generated_response(
         request_body: &[u8],
@@ -11401,6 +7235,29 @@ mod selector_tests {
             request.request_id,
             request.session_id,
             value,
+        )
+        .encode()
+        .expect("encode response");
+        generated_binary_response(DAEMON_GENERATED_RESPONSE_MAGIC, &[response])
+    }
+
+    #[cfg(feature = "serve")]
+    fn error_generated_response(
+        request_body: &[u8],
+        session_id: &[u8],
+        interface: &str,
+        method: &str,
+        error: loom_core::error::LoomError,
+    ) -> Vec<u8> {
+        let request =
+            loom_remote_protocol::envelope::Request::decode(request_body).expect("decode request");
+        assert_eq!(request.session_id.as_deref(), Some(session_id));
+        assert_eq!(request.interface, interface);
+        assert_eq!(request.method, method);
+        let response = loom_remote_protocol::envelope::Response::err(
+            request.request_id,
+            request.session_id,
+            loom_remote_protocol::RemoteError::from_loom_error(&error),
         )
         .encode()
         .expect("encode response");
@@ -11468,6 +7325,956 @@ mod selector_tests {
         }
     }
 
+    fn workspace_record(id: [u8; 16], name: &str) -> Vec<u8> {
+        loom_wire::workspace::workspace_info_to_cbor(&loom_core::WorkspaceInfo {
+            id: loom_core::WorkspaceId::from_bytes(id),
+            name: name.to_string(),
+            facets: Vec::new(),
+            head: None,
+        })
+        .expect("encode workspace info")
+    }
+
+    #[test]
+    fn shared_workspace_selector_matches_uuid() {
+        let alpha = loom_core::WorkspaceId::from_bytes([1; 16]);
+        let beta = loom_core::WorkspaceId::from_bytes([2; 16]);
+        let infos = cli_workspace_infos_from_remote_records(&[
+            workspace_record(*alpha.as_bytes(), "alpha"),
+            workspace_record(*beta.as_bytes(), "beta"),
+        ])
+        .expect("decode workspace records");
+
+        assert_eq!(
+            cli_select_workspace_id(&infos, &beta.to_string()).expect("resolve beta"),
+            beta
+        );
+    }
+
+    #[test]
+    fn shared_workspace_selector_matches_name() {
+        let alpha = loom_core::WorkspaceId::from_bytes([3; 16]);
+        let beta = loom_core::WorkspaceId::from_bytes([4; 16]);
+        let infos = cli_workspace_infos_from_remote_records(&[
+            workspace_record(*alpha.as_bytes(), "alpha"),
+            workspace_record(*beta.as_bytes(), "beta"),
+        ])
+        .expect("decode workspace records");
+
+        assert_eq!(
+            cli_select_workspace_id(&infos, "alpha").expect("resolve alpha"),
+            alpha
+        );
+    }
+
+    #[test]
+    fn shared_workspace_selector_reports_missing() {
+        let alpha = loom_core::WorkspaceId::from_bytes([5; 16]);
+        let infos = cli_workspace_infos_from_remote_records(&[workspace_record(
+            *alpha.as_bytes(),
+            "alpha",
+        )])
+        .expect("decode workspace records");
+
+        assert!(cli_select_workspace_id(&infos, "missing").is_none());
+    }
+
+    #[test]
+    fn shared_workspace_generated_decoder_rejects_malformed_record() {
+        let error = cli_workspace_infos_from_generated_records(&[loom_codec::Value::Text(
+            "not-workspace-cbor".to_string(),
+        )])
+        .expect_err("malformed generated record");
+
+        assert!(error.contains("Workspaces.workspace_list returned unexpected record"));
+    }
+
+    #[test]
+    fn cli_generated_client_resolves_workspace_name_and_uuid_to_same_id() {
+        let store = temp_store("generated-workspace-resolver");
+        let generated = open_cli_execution_context(&store)
+            .expect("open execution context")
+            .into_generated_client()
+            .expect("direct local generated client");
+        let workspace_id = workspace_id_from_value(
+            generated
+                .execute_unary(&workspace_create_operation("chatspace"))
+                .expect("workspace create"),
+        );
+
+        assert_eq!(
+            generated
+                .resolve_workspace_id("chatspace")
+                .expect("resolve by name")
+                .to_string(),
+            workspace_id
+        );
+        assert_eq!(
+            generated
+                .resolve_workspace_id(&workspace_id)
+                .expect("resolve by id")
+                .to_string(),
+            workspace_id
+        );
+    }
+
+    #[test]
+    fn mu_6c_generated_pim_mutations_preserve_canonical_payloads() {
+        let store = temp_store("generated-pim-mutations");
+        let generated = open_cli_execution_context(&store)
+            .expect("open execution context")
+            .into_generated_client()
+            .expect("direct local generated client");
+
+        let calendar_meta = loom_core::calendar::CollectionMeta {
+            display_name: "Work".to_string(),
+            component_set: vec![loom_core::calendar::Component::Event],
+        };
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Calendar",
+                    "create_collection",
+                    vec![
+                        "pim".to_value(),
+                        "alice".to_value(),
+                        "work".to_value(),
+                        loom_codec::Value::Bytes(calendar_meta.encode()),
+                    ],
+                )
+                .expect("calendar create operation"),
+            )
+            .expect("calendar create_collection");
+        let calendar_entry =
+            loom_core::calendar::CalendarEntry::event("evt-1", "Standup", "20240115T100000");
+        let calendar_digest = generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Calendar",
+                    "put_entry",
+                    vec![
+                        "pim".to_value(),
+                        "alice".to_value(),
+                        "work".to_value(),
+                        loom_codec::Value::Bytes(calendar_entry.encode()),
+                    ],
+                )
+                .expect("calendar put_entry operation"),
+            )
+            .expect("calendar put_entry");
+        assert!(
+            matches!(calendar_digest, loom_codec::Value::Text(_)),
+            "calendar put_entry returns digest text"
+        );
+        let calendar_ics_digest = generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Calendar",
+                    "put_ics",
+                    vec![
+                        "pim".to_value(),
+                        "alice".to_value(),
+                        "work".to_value(),
+                        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:evt-2\r\nSUMMARY:Review\r\nDTSTART:20240116T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_value(),
+                    ],
+                )
+                .expect("calendar put_ics operation"),
+            )
+            .expect("calendar put_ics");
+        assert!(
+            matches!(calendar_ics_digest, loom_codec::Value::Text(_)),
+            "calendar put_ics returns digest text"
+        );
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Calendar",
+                        "delete_entry",
+                        vec![
+                            "pim".to_value(),
+                            "alice".to_value(),
+                            "work".to_value(),
+                            "evt-1".to_value(),
+                        ],
+                    )
+                    .expect("calendar delete_entry operation"),
+                )
+                .expect("calendar delete_entry"),
+            loom_codec::Value::Bool(true)
+        );
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Calendar",
+                        "delete_collection",
+                        vec!["pim".to_value(), "alice".to_value(), "work".to_value()],
+                    )
+                    .expect("calendar delete_collection operation"),
+                )
+                .expect("calendar delete_collection"),
+            loom_codec::Value::Bool(true)
+        );
+
+        let contacts_meta = loom_core::contacts::BookMeta {
+            display_name: "Friends".to_string(),
+        };
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Contacts",
+                    "create_book",
+                    vec![
+                        "pim".to_value(),
+                        "alice".to_value(),
+                        "friends".to_value(),
+                        loom_codec::Value::Bytes(contacts_meta.encode()),
+                    ],
+                )
+                .expect("contacts create_book operation"),
+            )
+            .expect("contacts create_book");
+        let contact = loom_core::contacts::ContactEntry::new("c-1", "Bob Jones");
+        let contact_digest = generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Contacts",
+                    "put_entry",
+                    vec![
+                        "pim".to_value(),
+                        "alice".to_value(),
+                        "friends".to_value(),
+                        loom_codec::Value::Bytes(contact.encode()),
+                    ],
+                )
+                .expect("contacts put_entry operation"),
+            )
+            .expect("contacts put_entry");
+        assert!(
+            matches!(contact_digest, loom_codec::Value::Text(_)),
+            "contacts put_entry returns digest text"
+        );
+        let vcard_digest = generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Contacts",
+                    "put_vcard",
+                    vec![
+                        "pim".to_value(),
+                        "alice".to_value(),
+                        "friends".to_value(),
+                        "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c-2\r\nFN:Ada Lovelace\r\nEND:VCARD\r\n"
+                            .to_value(),
+                    ],
+                )
+                .expect("contacts put_vcard operation"),
+            )
+            .expect("contacts put_vcard");
+        assert!(
+            matches!(vcard_digest, loom_codec::Value::Text(_)),
+            "contacts put_vcard returns digest text"
+        );
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Contacts",
+                        "delete_entry",
+                        vec![
+                            "pim".to_value(),
+                            "alice".to_value(),
+                            "friends".to_value(),
+                            "c-1".to_value(),
+                        ],
+                    )
+                    .expect("contacts delete_entry operation"),
+                )
+                .expect("contacts delete_entry"),
+            loom_codec::Value::Bool(true)
+        );
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Contacts",
+                        "delete_book",
+                        vec!["pim".to_value(), "alice".to_value(), "friends".to_value()],
+                    )
+                    .expect("contacts delete_book operation"),
+                )
+                .expect("contacts delete_book"),
+            loom_codec::Value::Bool(true)
+        );
+
+        let mail_meta = loom_core::mail::MailboxMeta {
+            display_name: "Inbox".to_string(),
+        };
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Mail",
+                    "create_mailbox",
+                    vec![
+                        "pim".to_value(),
+                        "alice".to_value(),
+                        "inbox".to_value(),
+                        loom_codec::Value::Bytes(mail_meta.encode()),
+                    ],
+                )
+                .expect("mail create_mailbox operation"),
+            )
+            .expect("mail create_mailbox");
+        let message_digest = generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Mail",
+                    "ingest_message",
+                    vec![
+                        "pim".to_value(),
+                        "alice".to_value(),
+                        "inbox".to_value(),
+                        "m-1".to_value(),
+                        loom_codec::Value::Bytes(
+                            b"From: bob@example.com\r\nTo: alice@example.com\r\nSubject: Hello\r\n\r\nHi\r\n"
+                                .to_vec(),
+                        ),
+                    ],
+                )
+                .expect("mail ingest_message operation"),
+            )
+            .expect("mail ingest_message");
+        assert!(
+            matches!(message_digest, loom_codec::Value::Text(_)),
+            "mail ingest_message returns digest text"
+        );
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Mail",
+                    "set_flags",
+                    vec![
+                        "pim".to_value(),
+                        "alice".to_value(),
+                        "inbox".to_value(),
+                        "m-1".to_value(),
+                        loom_codec::Value::Bytes(
+                            loom_wire::string_list_to_cbor(vec!["\\Seen".to_string()])
+                                .expect("flags cbor"),
+                        ),
+                    ],
+                )
+                .expect("mail set_flags operation"),
+            )
+            .expect("mail set_flags");
+        let flags = generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Mail",
+                    "get_flags",
+                    vec![
+                        "pim".to_value(),
+                        "alice".to_value(),
+                        "inbox".to_value(),
+                        "m-1".to_value(),
+                    ],
+                )
+                .expect("mail get_flags operation"),
+            )
+            .expect("mail get_flags");
+        let loom_codec::Value::Bytes(flags) = flags else {
+            panic!("mail get_flags should return cbor bytes");
+        };
+        assert_eq!(
+            loom_wire::string_list_from_cbor(&flags).expect("decode flags"),
+            vec!["\\Seen".to_string()]
+        );
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Mail",
+                        "delete_message",
+                        vec![
+                            "pim".to_value(),
+                            "alice".to_value(),
+                            "inbox".to_value(),
+                            "m-1".to_value(),
+                        ],
+                    )
+                    .expect("mail delete_message operation"),
+                )
+                .expect("mail delete_message"),
+            loom_codec::Value::Bool(true)
+        );
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Mail",
+                        "delete_mailbox",
+                        vec!["pim".to_value(), "alice".to_value(), "inbox".to_value()],
+                    )
+                    .expect("mail delete_mailbox operation"),
+                )
+                .expect("mail delete_mailbox"),
+            loom_codec::Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn mu_6d_generated_graph_vector_search_mutations_preserve_payloads() {
+        let store = temp_store("generated-graph-vector-search-mutations");
+        let generated = open_cli_execution_context(&store)
+            .expect("open execution context")
+            .into_generated_client()
+            .expect("direct local generated client");
+
+        let empty_props = loom_wire::graph::props_to_cbor(&Props::new());
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Graph",
+                    "upsert_node",
+                    vec![
+                        "graphws".to_value(),
+                        "main".to_value(),
+                        "a".to_value(),
+                        loom_codec::Value::Bytes(empty_props.clone()),
+                    ],
+                )
+                .expect("graph upsert_node a operation"),
+            )
+            .expect("graph upsert_node a");
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Graph",
+                    "upsert_node",
+                    vec![
+                        "graphws".to_value(),
+                        "main".to_value(),
+                        "b".to_value(),
+                        loom_codec::Value::Bytes(empty_props.clone()),
+                    ],
+                )
+                .expect("graph upsert_node b operation"),
+            )
+            .expect("graph upsert_node b");
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Graph",
+                    "upsert_edge",
+                    vec![
+                        "graphws".to_value(),
+                        "main".to_value(),
+                        "e1".to_value(),
+                        "a".to_value(),
+                        "b".to_value(),
+                        "knows".to_value(),
+                        loom_codec::Value::Bytes(empty_props.clone()),
+                    ],
+                )
+                .expect("graph upsert_edge operation"),
+            )
+            .expect("graph upsert_edge");
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Graph",
+                        "remove_edge",
+                        vec!["graphws".to_value(), "main".to_value(), "e1".to_value()],
+                    )
+                    .expect("graph remove_edge operation"),
+                )
+                .expect("graph remove_edge"),
+            loom_codec::Value::Bool(true)
+        );
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Graph",
+                    "remove_node",
+                    vec![
+                        "graphws".to_value(),
+                        "main".to_value(),
+                        "a".to_value(),
+                        false.to_value(),
+                    ],
+                )
+                .expect("graph remove_node operation"),
+            )
+            .expect("graph remove_node");
+
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Vector",
+                    "create",
+                    vec![
+                        "vectorws".to_value(),
+                        "embeddings".to_value(),
+                        2_u64.to_value(),
+                        1_i32.to_value(),
+                    ],
+                )
+                .expect("vector create operation"),
+            )
+            .expect("vector create");
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Vector",
+                    "upsert",
+                    vec![
+                        "vectorws".to_value(),
+                        "embeddings".to_value(),
+                        "v1".to_value(),
+                        loom_codec::Value::Bytes(loom_wire::vector::floats_to_bytes(&[1.0, 0.0])),
+                        loom_codec::Value::Bytes(Vec::new()),
+                    ],
+                )
+                .expect("vector upsert operation"),
+            )
+            .expect("vector upsert");
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Vector",
+                    "upsert_source",
+                    vec![
+                        "vectorws".to_value(),
+                        "embeddings".to_value(),
+                        "v2".to_value(),
+                        loom_codec::Value::Bytes(loom_wire::vector::floats_to_bytes(&[0.0, 1.0])),
+                        loom_codec::Value::Bytes(Vec::new()),
+                        loom_codec::Value::Bytes(b"source text".to_vec()),
+                        Some("model-a".to_string()).to_value(),
+                        Some("weights-a".to_string()).to_value(),
+                    ],
+                )
+                .expect("vector upsert_source operation"),
+            )
+            .expect("vector upsert_source");
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Vector",
+                        "create_metadata_index",
+                        vec![
+                            "vectorws".to_value(),
+                            "embeddings".to_value(),
+                            "topic".to_value(),
+                        ],
+                    )
+                    .expect("vector create_metadata_index operation"),
+                )
+                .expect("vector create_metadata_index"),
+            loom_codec::Value::Bool(true)
+        );
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Vector",
+                        "drop_metadata_index",
+                        vec![
+                            "vectorws".to_value(),
+                            "embeddings".to_value(),
+                            "topic".to_value(),
+                        ],
+                    )
+                    .expect("vector drop_metadata_index operation"),
+                )
+                .expect("vector drop_metadata_index"),
+            loom_codec::Value::Bool(true)
+        );
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Vector",
+                        "delete",
+                        vec![
+                            "vectorws".to_value(),
+                            "embeddings".to_value(),
+                            "v1".to_value(),
+                        ],
+                    )
+                    .expect("vector delete operation"),
+                )
+                .expect("vector delete"),
+            loom_codec::Value::Bool(true)
+        );
+
+        let mapping = loom_codec::encode(&loom_codec::Value::Map(vec![(
+            loom_codec::Value::Text("title".to_string()),
+            loom_codec::Value::Array(vec![
+                loom_codec::Value::Uint(0),
+                loom_codec::Value::Bool(true),
+                loom_codec::Value::Bool(false),
+            ]),
+        )]))
+        .expect("search mapping cbor");
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Search",
+                    "create",
+                    vec![
+                        "searchws".to_value(),
+                        "docs".to_value(),
+                        loom_codec::Value::Bytes(mapping.clone()),
+                    ],
+                )
+                .expect("search create operation"),
+            )
+            .expect("search create");
+        let doc = loom_codec::encode(&loom_codec::Value::Map(vec![(
+            loom_codec::Value::Text("title".to_string()),
+            loom_codec::Value::Text("Hello".to_string()),
+        )]))
+        .expect("search document cbor");
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Search",
+                    "index",
+                    vec![
+                        "searchws".to_value(),
+                        "docs".to_value(),
+                        loom_codec::Value::Bytes(b"doc-1".to_vec()),
+                        loom_codec::Value::Bytes(doc),
+                    ],
+                )
+                .expect("search index operation"),
+            )
+            .expect("search index");
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Search",
+                        "delete",
+                        vec![
+                            "searchws".to_value(),
+                            "docs".to_value(),
+                            loom_codec::Value::Bytes(b"doc-1".to_vec()),
+                        ],
+                    )
+                    .expect("search delete operation"),
+                )
+                .expect("search delete"),
+            loom_codec::Value::Bool(true)
+        );
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Search",
+                    "remap",
+                    vec![
+                        "searchws".to_value(),
+                        "docs".to_value(),
+                        loom_codec::Value::Bytes(mapping),
+                    ],
+                )
+                .expect("search remap operation"),
+            )
+            .expect("search remap");
+    }
+
+    #[test]
+    fn mu_6e_generated_columnar_files_vcs_import_fs_mutations_preserve_payloads() {
+        let store = temp_store("generated-columnar-files-vcs-import-fs-mutations");
+        let generated = open_cli_execution_context(&store)
+            .expect("open execution context")
+            .into_generated_client()
+            .expect("direct local generated client");
+
+        let columns = loom_wire::columnar::columns_to_cbor(vec![
+            ("id".to_string(), ColumnType::Int),
+            ("title".to_string(), ColumnType::Text),
+        ]);
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Columnar",
+                    "create",
+                    vec![
+                        "columnarws".to_value(),
+                        "events".to_value(),
+                        loom_codec::Value::Bytes(columns),
+                        2_u64.to_value(),
+                    ],
+                )
+                .expect("columnar create operation"),
+            )
+            .expect("columnar create");
+        let row = loom_wire::columnar::values_to_cbor(vec![
+            loom_core::Value::Int(1),
+            loom_core::Value::Text("created".to_string()),
+        ]);
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Columnar",
+                    "append",
+                    vec![
+                        "columnarws".to_value(),
+                        "events".to_value(),
+                        loom_codec::Value::Bytes(row),
+                    ],
+                )
+                .expect("columnar append operation"),
+            )
+            .expect("columnar append");
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Columnar",
+                    "compact",
+                    vec!["columnarws".to_value(), "events".to_value()],
+                )
+                .expect("columnar compact operation"),
+            )
+            .expect("columnar compact");
+
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "FileSystem",
+                    "create_directory",
+                    vec!["filesws".to_value(), "dir".to_value(), true.to_value()],
+                )
+                .expect("filesystem create_directory operation"),
+            )
+            .expect("filesystem create_directory");
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "FileSystem",
+                    "write_file",
+                    vec![
+                        "filesws".to_value(),
+                        "dir/file.txt".to_value(),
+                        loom_codec::Value::Bytes(b"hello".to_vec()),
+                        0o100644_u64.to_value(),
+                    ],
+                )
+                .expect("filesystem write_file operation"),
+            )
+            .expect("filesystem write_file");
+        let read = generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "FileSystem",
+                    "read_file",
+                    vec!["filesws".to_value(), "dir/file.txt".to_value()],
+                )
+                .expect("filesystem read_file operation"),
+            )
+            .expect("filesystem read_file");
+        assert_eq!(read, loom_codec::Value::Bytes(b"hello".to_vec()));
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "FileSystem",
+                    "remove_file",
+                    vec!["filesws".to_value(), "dir/file.txt".to_value()],
+                )
+                .expect("filesystem remove_file operation"),
+            )
+            .expect("filesystem remove_file");
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "FileSystem",
+                    "remove_directory",
+                    vec!["filesws".to_value(), "dir".to_value(), true.to_value()],
+                )
+                .expect("filesystem remove_directory operation"),
+            )
+            .expect("filesystem remove_directory");
+
+        let commit = generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "VersionControl",
+                    "commit",
+                    vec![
+                        "filesws".to_value(),
+                        "agent".to_value(),
+                        "checkpoint".to_value(),
+                        1_u64.to_value(),
+                    ],
+                )
+                .expect("vcs commit operation"),
+            )
+            .expect("vcs commit");
+        assert!(matches!(commit, loom_codec::Value::Text(_)));
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "VersionControl",
+                    "branch",
+                    vec!["filesws".to_value(), "feature".to_value()],
+                )
+                .expect("vcs branch operation"),
+            )
+            .expect("vcs branch");
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "VersionControl",
+                    "checkout",
+                    vec!["filesws".to_value(), "feature".to_value()],
+                )
+                .expect("vcs checkout operation"),
+            )
+            .expect("vcs checkout");
+        let merge = generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "VersionControl",
+                    "merge",
+                    vec![
+                        "filesws".to_value(),
+                        "feature".to_value(),
+                        "agent".to_value(),
+                        false.to_value(),
+                        2_u64.to_value(),
+                    ],
+                )
+                .expect("vcs merge operation"),
+            )
+            .expect("vcs merge");
+        let loom_codec::Value::Bytes(merge) = merge else {
+            panic!("vcs merge should return cbor bytes");
+        };
+        assert_eq!(
+            loom_wire::vcs::merge_result_from_cbor(&merge).expect("decode vcs merge"),
+            MergeOutcome::UpToDate
+        );
+
+        let source = temp_dir("generated-import-fs-source");
+        std::fs::write(source.join("note.txt"), b"imported").expect("write import source");
+        let report = generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "FileSystem",
+                    "import_fs",
+                    vec![
+                        "importws".to_value(),
+                        source.to_string_lossy().into_owned().to_value(),
+                        Option::<String>::None.to_value(),
+                        Option::<String>::None.to_value(),
+                        false.to_value(),
+                        true.to_value(),
+                    ],
+                )
+                .expect("filesystem import_fs operation"),
+            )
+            .expect("filesystem import_fs");
+        let loom_codec::Value::Bytes(report) = report else {
+            panic!("filesystem import_fs should return cbor bytes");
+        };
+        let report = loom_interchange::ImportReport::decode(&report)
+            .expect("decode generated import report");
+        assert_eq!(report.profile, "fs");
+        assert!(report.dry_run, "dry-run field should remain true");
+    }
+
+    #[test]
+    fn read_only_generated_client_reads_without_store_drift() {
+        let store = temp_store("read-only-generated");
+        let writable = open_cli_execution_context(&store)
+            .expect("open execution context")
+            .into_generated_client()
+            .expect("direct local generated client");
+        writable
+            .execute_unary(&workspace_create_operation("readonly"))
+            .expect("workspace create");
+        drop(writable);
+        let before_bytes = std::fs::read(&store).expect("store bytes before");
+        let before_meta = std::fs::metadata(&store).expect("store metadata before");
+        let before_generation = FileStore::open_read(&store)
+            .expect("open store read-only")
+            .mutable_overlay_generation()
+            .expect("read generation")
+            .as_u64();
+
+        let generated = open_cli_read_only_generated_client(&store, &KeyOpts::default())
+            .expect("read-only generated client");
+        let value = generated
+            .execute_unary(
+                &CliGeneratedOperation::new("Workspaces", "workspace_list", Vec::new())
+                    .expect("workspace list operation"),
+            )
+            .expect("workspace list");
+        drop(generated);
+
+        match value {
+            loom_codec::Value::Array(items) => assert!(!items.is_empty()),
+            other => panic!("unexpected workspace list output {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&store).expect("store bytes after"),
+            before_bytes
+        );
+        let after_meta = std::fs::metadata(&store).expect("store metadata after");
+        assert_eq!(after_meta.len(), before_meta.len());
+        assert_eq!(
+            after_meta.modified().expect("mtime after"),
+            before_meta.modified().expect("mtime before")
+        );
+        let after_generation = FileStore::open_read(&store)
+            .expect("open store read-only after")
+            .mutable_overlay_generation()
+            .expect("read generation after")
+            .as_u64();
+        assert_eq!(after_generation, before_generation);
+    }
+
+    #[test]
+    fn mu_17g_d1_doc_get_text_uses_generated_text_result() {
+        let store = temp_store("doc-get-text-generated");
+        let generated = open_cli_execution_context(&store)
+            .expect("open execution context")
+            .into_generated_client()
+            .expect("direct local generated client");
+        generated
+            .execute_unary(&workspace_create_operation("docs"))
+            .expect("workspace create");
+        let put = generated
+            .doc_put_text("docs", "notes", "one", "hello from text\n", None)
+            .expect("put text");
+
+        let document = generated
+            .doc_get_text("docs", "notes", "one")
+            .expect("get text")
+            .expect("document exists");
+
+        assert_eq!(document.text, "hello from text\n");
+        assert_eq!(document.digest, put.digest);
+        assert_eq!(document.entity_tag, put.entity_tag);
+        let helper_body = function_body(include_str!("remote.rs"), "doc_get_text");
+        assert!(
+            helper_body.contains("\"get_text\""),
+            "doc_get_text must execute Document.get_text"
+        );
+        assert!(
+            helper_body.contains("text_result_from_cbor"),
+            "doc_get_text must decode DocumentTextResult"
+        );
+        assert!(
+            !helper_body.contains("doc_get_binary"),
+            "doc_get_text must not reinterpret Document.get_binary"
+        );
+    }
+
     #[test]
     fn cli_store_administration_classification_is_explicit() {
         assert_eq!(
@@ -11502,6 +8309,104 @@ mod selector_tests {
     }
 
     #[test]
+    fn cli_store_administration_classification_is_complete_and_unique() {
+        for (operation, expected_boundary) in [
+            (
+                CliOperation::Init,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::Copy,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::BundleExport,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::BundleImport,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::Clone,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::Get,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::Hash,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::KeyChange,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::KeyCreate,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::KeyStatus,
+                CliStoreAdministrationBoundary::GeneratedStoreAdmin,
+            ),
+            (
+                CliOperation::KeyVerify,
+                CliStoreAdministrationBoundary::GeneratedStoreAdmin,
+            ),
+            (
+                CliOperation::Policy,
+                CliStoreAdministrationBoundary::GeneratedStoreAdmin,
+            ),
+            (
+                CliOperation::Put,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::Rekey,
+                CliStoreAdministrationBoundary::GeneratedStoreAdmin,
+            ),
+            (
+                CliOperation::Replace,
+                CliStoreAdministrationBoundary::OfflineStoreOwner,
+            ),
+            (
+                CliOperation::Stat,
+                CliStoreAdministrationBoundary::GeneratedStoreAdmin,
+            ),
+        ] {
+            let (boundary, reason) = cli_store_administration_boundary_reason(operation);
+            assert_eq!(boundary, expected_boundary);
+            assert!(
+                !reason.trim().is_empty(),
+                "store administration operation {operation:?} must have an architectural reason"
+            );
+        }
+
+        for (arm, interface, method) in [
+            (
+                "StoreCmd::BundleImport",
+                "StoreAdmin",
+                "store_bundle_import",
+            ),
+            ("StoreCmd::Stat", "StoreAdmin", "store_stat"),
+            ("StoreCmd::Policy", "StoreAdmin", "store_policy_get"),
+            ("StoreCmd::Rekey", "StoreAdmin", "store_rekey"),
+            ("KeyCmd::AddWrap", "KeySource", "key_add_wrap_keyed"),
+            ("KeyCmd::RemoveWrap", "KeySource", "key_remove_wrap"),
+        ] {
+            assert!(!arm.is_empty());
+            assert!(
+                METHODS.iter().any(|candidate| {
+                    candidate.interface == interface && candidate.method == method
+                }),
+                "generated registry must expose {interface}.{method}"
+            );
+        }
+    }
+
+    #[test]
     fn generated_operation_boundary_uses_source_inventory_for_hot_families() {
         for (interface, method) in [
             ("Tickets", "tickets_create_json"),
@@ -11509,6 +8414,29 @@ mod selector_tests {
             ("Pages", "pages_create_json"),
             ("Document", "put_text"),
             ("FileSystem", "write_file"),
+            ("Program", "program_put"),
+            ("Program", "program_inspect"),
+            ("Program", "program_get"),
+            ("Program", "program_list"),
+            ("Program", "program_remove"),
+            ("TimeSeries", "latest"),
+            ("Metrics", "put_descriptor"),
+            ("Metrics", "get_descriptor"),
+            ("Metrics", "put_observation"),
+            ("Metrics", "query"),
+            ("Logs", "put_record"),
+            ("Logs", "get_record"),
+            ("Logs", "query"),
+            ("Traces", "put_span"),
+            ("Traces", "get_span"),
+            ("Traces", "trace_spans"),
+            ("Traces", "query"),
+            ("Dataframe", "create"),
+            ("Dataframe", "collect"),
+            ("Dataframe", "preview"),
+            ("Dataframe", "materialize"),
+            ("Dataframe", "plan_digest"),
+            ("Dataframe", "source_digests"),
         ] {
             assert_eq!(
                 classify_generated_operation(interface, method).expect("hot family operation"),
@@ -11521,6 +8449,6767 @@ mod selector_tests {
                 .expect_err("streaming operation is rejected")
                 .contains("streaming")
         );
+    }
+
+    #[test]
+    fn migrated_ordinary_cli_runners_do_not_open_loom_directly() {
+        let source = include_str!("main.rs");
+        for runner in [
+            "run_time_series",
+            "run_metrics",
+            "run_logs",
+            "run_traces",
+            "run_program",
+            "run_dataframe",
+        ] {
+            let body = function_body(source, runner);
+            for forbidden in [
+                "cli_open_loom(",
+                "cli_open_loom_read(",
+                "FileStore::open",
+                "Loom::new(",
+                "save_loom(",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{runner} must use the generated client boundary, found {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mu_17g_d5_program_metrics_logs_traces_leaves_use_typed_generated_clients() {
+        let source = include_str!("main.rs");
+        for (runner, arm, opener, interface, method) in [
+            (
+                "run_program",
+                "ProgramCmd::PutWasm",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Program",
+                "program_put",
+            ),
+            (
+                "run_program",
+                "ProgramCmd::PutTemplate",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Program",
+                "program_put",
+            ),
+            (
+                "run_program",
+                "ProgramCmd::PutCel",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Program",
+                "program_put",
+            ),
+            (
+                "run_program",
+                "ProgramCmd::Inspect",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Program",
+                "program_inspect",
+            ),
+            (
+                "run_program",
+                "ProgramCmd::Get",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Program",
+                "program_get",
+            ),
+            (
+                "run_program",
+                "ProgramCmd::List",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Program",
+                "program_list",
+            ),
+            (
+                "run_program",
+                "ProgramCmd::Remove",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Program",
+                "program_remove",
+            ),
+            (
+                "run_metrics",
+                "MetricsCmd::PutDescriptor",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Metrics",
+                "put_descriptor",
+            ),
+            (
+                "run_metrics",
+                "MetricsCmd::GetDescriptor",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Metrics",
+                "get_descriptor",
+            ),
+            (
+                "run_metrics",
+                "MetricsCmd::PutObservation",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Metrics",
+                "put_observation",
+            ),
+            (
+                "run_metrics",
+                "MetricsCmd::Query",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Metrics",
+                "query",
+            ),
+            (
+                "run_logs",
+                "LogsCmd::PutRecord",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Logs",
+                "put_record",
+            ),
+            (
+                "run_logs",
+                "LogsCmd::GetRecord",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Logs",
+                "get_record",
+            ),
+            (
+                "run_logs",
+                "LogsCmd::Query",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Logs",
+                "query",
+            ),
+            (
+                "run_traces",
+                "TracesCmd::PutSpan",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Traces",
+                "put_span",
+            ),
+            (
+                "run_traces",
+                "TracesCmd::GetSpan",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Traces",
+                "get_span",
+            ),
+            (
+                "run_traces",
+                "TracesCmd::TraceSpans",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Traces",
+                "trace_spans",
+            ),
+            (
+                "run_traces",
+                "TracesCmd::Query",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Traces",
+                "query",
+            ),
+        ] {
+            let body = match_arm_body(function_body(source, runner), arm);
+            assert!(body.contains(opener), "{runner} {arm} must select {opener}");
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{runner} {arm} must dispatch through generated interface {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{runner} {arm} must dispatch through generated method {method}"
+            );
+            for forbidden in [
+                "remote::open_store_client(",
+                "cli_open_loom(",
+                "cli_open_loom_read(",
+                "FileStore::open",
+                "Loom::new(",
+                "save_loom(",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{runner} {arm} must not use legacy execution helper {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mu_17g_f1_security_admin_leaves_use_typed_generated_clients() {
+        let cli_source = include_str!("cli.rs");
+        assert_eq!(
+            enum_variants(cli_source, "AuditCmd"),
+            ["Compact", "Config", "List", "View"]
+        );
+        assert_eq!(enum_variants(cli_source, "AuditConfigCmd"), ["Show", "Set"]);
+        assert_eq!(
+            enum_variants(cli_source, "CertificateCmd"),
+            ["List", "Import", "Export", "Generate", "Remove", "Audit"]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "CertificateGenerateCmd"),
+            ["SelfSigned"]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "NetworkAccessCmd"),
+            ["List", "Set", "Remove", "Audit"]
+        );
+
+        let audit_source = include_str!("audit_cmd.rs");
+        let audit_config = function_body(audit_source, "run_audit_config");
+        let audit_config_show = match_arm_body(audit_config, "AuditConfigCmd::Show");
+        assert!(audit_config_show.contains("remote::open_cli_generated_client"));
+        assert!(audit_config_show.contains("\"Audit\""));
+        assert!(audit_config_show.contains("\"audit_config_show_json\""));
+        assert!(!audit_config_show.contains("audit_config_set_json"));
+        let audit_config_set = match_arm_body(audit_config, "AuditConfigCmd::Set");
+        assert!(audit_config_set.contains("remote::open_cli_generated_client"));
+        assert!(audit_config_set.contains("\"Audit\""));
+        assert!(audit_config_set.contains("\"audit_config_set_json\""));
+        assert!(!audit_config_set.contains("audit_config_show_json"));
+
+        for (arm, source, runner, interface, method) in [
+            (
+                "AuditCmd::Compact",
+                include_str!("audit_cmd.rs"),
+                "run_audit_compact",
+                "Audit",
+                "audit_compact",
+            ),
+            (
+                "AuditCmd::List",
+                include_str!("audit_cmd.rs"),
+                "run_audit_list",
+                "Audit",
+                "audit_list_json",
+            ),
+            (
+                "AuditCmd::View",
+                include_str!("audit_cmd.rs"),
+                "run_audit_view",
+                "Audit",
+                "audit_view_json",
+            ),
+            (
+                "CertificateCmd::List",
+                include_str!("certificate_cmd.rs"),
+                "run_certificate_list",
+                "Certificate",
+                "certificate_list_json",
+            ),
+            (
+                "CertificateCmd::Import",
+                include_str!("certificate_cmd.rs"),
+                "run_certificate_import",
+                "Certificate",
+                "certificate_import_json",
+            ),
+            (
+                "CertificateCmd::Export",
+                include_str!("certificate_cmd.rs"),
+                "run_certificate_export",
+                "Certificate",
+                "certificate_export",
+            ),
+            (
+                "CertificateGenerateCmd::SelfSigned",
+                include_str!("certificate_cmd.rs"),
+                "run_certificate_generate_self_signed",
+                "Certificate",
+                "certificate_generate_self_signed_json",
+            ),
+            (
+                "CertificateCmd::Remove",
+                include_str!("certificate_cmd.rs"),
+                "run_certificate_remove",
+                "Certificate",
+                "certificate_remove_json",
+            ),
+            (
+                "CertificateCmd::Audit",
+                include_str!("certificate_cmd.rs"),
+                "run_certificate_audit",
+                "Certificate",
+                "certificate_audit_json",
+            ),
+            (
+                "NetworkAccessCmd::List",
+                include_str!("network_access_cmd.rs"),
+                "run_network_access_list",
+                "NetworkAccess",
+                "network_access_list_json",
+            ),
+            (
+                "NetworkAccessCmd::Set",
+                include_str!("network_access_cmd.rs"),
+                "run_network_access_set",
+                "NetworkAccess",
+                "network_access_set_json",
+            ),
+            (
+                "NetworkAccessCmd::Remove",
+                include_str!("network_access_cmd.rs"),
+                "run_network_access_remove",
+                "NetworkAccess",
+                "network_access_remove_json",
+            ),
+            (
+                "NetworkAccessCmd::Audit",
+                include_str!("network_access_cmd.rs"),
+                "run_network_access_audit",
+                "NetworkAccess",
+                "network_access_audit_json",
+            ),
+        ] {
+            assert!(!arm.is_empty());
+            assert_eq!(
+                classify_generated_operation(interface, method).expect("security admin operation"),
+                CliExecutionBoundary::GeneratedClient
+            );
+            let body = function_body(source, runner);
+            assert!(
+                body.contains("remote::open_cli_generated_client"),
+                "{runner} must select the typed generated mutation client"
+            );
+            assert!(
+                body.contains(&format!("\"{interface}\""))
+                    && body.contains(&format!("\"{method}\"")),
+                "{runner} must execute {interface}.{method}"
+            );
+            for forbidden in [
+                "open_store_client",
+                "cli_open_loom(",
+                "cli_open_loom_read(",
+                "FileStore::open",
+                "save_loom(",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{runner} returned to forbidden store authority {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mu_17g_f3_studio_vcs_inference_leaves_have_exhaustive_ownership() {
+        let cli_source = include_str!("cli.rs");
+        let main_source = include_str!("main.rs");
+
+        assert_eq!(
+            enum_variants(cli_source, "StudioCmd"),
+            ["Surfaces", "Reindex", "Revisions"]
+        );
+        assert_eq!(enum_variants(cli_source, "StudioSurfacesCmd"), ["Catalog"]);
+        assert_eq!(enum_variants(cli_source, "StudioRevisionsCmd"), ["Rebuild"]);
+        assert_eq!(
+            enum_variants(cli_source, "VcsCmd"),
+            ["Branch", "Commit", "Checkout", "Diff", "Log", "Merge"]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "InferenceCmd"),
+            [
+                "Model", "Instance", "List", "Status", "Show", "Download", "Cancel", "Remove",
+                "Refresh",
+            ]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "InferenceModelCmd"),
+            [
+                "List", "Show", "Download", "Status", "Cancel", "Remove", "Refresh",
+            ]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "InferenceInstanceCmd"),
+            ["List", "Show", "Create", "Update", "Delete"]
+        );
+
+        let generated = [
+            (
+                "run_studio",
+                "StudioCmd::Reindex",
+                "StudioMaintenance",
+                &["studio_reindex_json"][..],
+                false,
+            ),
+            (
+                "run_studio_revisions",
+                "StudioRevisionsCmd::Rebuild",
+                "StudioMaintenance",
+                &["studio_revisions_rebuild_json"][..],
+                false,
+            ),
+            (
+                "run_vcs",
+                "VcsCmd::Branch",
+                "VersionControl",
+                &["branch"][..],
+                false,
+            ),
+            (
+                "run_vcs",
+                "VcsCmd::Commit",
+                "VersionControl",
+                &["commit"][..],
+                false,
+            ),
+            (
+                "run_vcs",
+                "VcsCmd::Checkout",
+                "VersionControl",
+                &["checkout"][..],
+                false,
+            ),
+            (
+                "run_vcs",
+                "VcsCmd::Diff",
+                "VersionControl",
+                &["diff"][..],
+                true,
+            ),
+            (
+                "run_vcs",
+                "VcsCmd::Log",
+                "VersionControl",
+                &["head_branch", "log"][..],
+                true,
+            ),
+            (
+                "run_vcs",
+                "VcsCmd::Merge",
+                "VersionControl",
+                &["merge"][..],
+                false,
+            ),
+            (
+                "run_inference_instance",
+                "InferenceInstanceCmd::List",
+                "InferenceInstance",
+                &["inference_instance_list_json"][..],
+                true,
+            ),
+            (
+                "run_inference_instance",
+                "InferenceInstanceCmd::Show",
+                "InferenceInstance",
+                &["inference_instance_get_json"][..],
+                true,
+            ),
+            (
+                "run_inference_instance",
+                "InferenceInstanceCmd::Create",
+                "InferenceInstance",
+                &["inference_instance_create_json"][..],
+                false,
+            ),
+            (
+                "run_inference_instance",
+                "InferenceInstanceCmd::Update",
+                "InferenceInstance",
+                &["inference_instance_update_json"][..],
+                false,
+            ),
+            (
+                "run_inference_instance",
+                "InferenceInstanceCmd::Delete",
+                "InferenceInstance",
+                &["inference_instance_delete_json"][..],
+                false,
+            ),
+        ];
+        let generated_methods = [
+            "studio_reindex_json",
+            "studio_revisions_rebuild_json",
+            "branch",
+            "commit",
+            "checkout",
+            "diff",
+            "head_branch",
+            "log",
+            "merge",
+            "inference_instance_list_json",
+            "inference_instance_get_json",
+            "inference_instance_create_json",
+            "inference_instance_update_json",
+            "inference_instance_delete_json",
+        ];
+        let mut owned = std::collections::BTreeSet::new();
+        for (runner, arm, interface, methods, read_only) in generated {
+            assert!(owned.insert(arm), "duplicate ownership for {arm}");
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            let opener = if read_only {
+                "remote::open_cli_read_only_generated_client(&store, keys)?"
+            } else {
+                "remote::open_cli_generated_client(&store, keys)?"
+            };
+            assert!(body.contains(opener), "{arm} must select {opener}");
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must dispatch through {interface}"
+            );
+            for method in methods {
+                assert!(
+                    body.contains(&format!("\"{method}\"")),
+                    "{arm} must dispatch through {interface}.{method}"
+                );
+            }
+            for other in generated_methods {
+                if !methods.contains(&other) {
+                    assert!(
+                        !body.contains(&format!("\"{other}\"")),
+                        "{arm} contains incorrect generated method mapping {other}"
+                    );
+                }
+            }
+            for forbidden in [
+                "remote::open_store_client(",
+                "cli_open_loom(",
+                "cli_open_loom_read(",
+                "FileStore::open",
+                "Loom::new(",
+                "save_loom(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} contains {forbidden}");
+            }
+        }
+        assert_eq!(owned.len(), 13);
+
+        let catalog = match_arm_body(
+            function_body(main_source, "run_studio_surfaces"),
+            "StudioSurfacesCmd::Catalog",
+        );
+        assert!(
+            owned.insert("StudioSurfacesCmd::Catalog"),
+            "duplicate ownership for StudioSurfacesCmd::Catalog"
+        );
+        for required in [
+            "core_surface_catalog",
+            "surface_app_catalog",
+            "meeting_memory_surface_catalog",
+        ] {
+            assert!(catalog.contains(required), "catalog missing {required}");
+        }
+        for forbidden in [
+            "open_cli_generated_client",
+            "open_cli_read_only_generated_client",
+            "open_store_client",
+            "cli_open_loom(",
+            "cli_open_loom_read(",
+            "FileStore::open",
+            "save_loom(",
+        ] {
+            assert!(!catalog.contains(forbidden), "catalog contains {forbidden}");
+        }
+
+        for (runner, arm) in [
+            ("run_inference", "InferenceCmd::List"),
+            ("run_inference", "InferenceCmd::Status"),
+            ("run_inference", "InferenceCmd::Show"),
+            ("run_inference", "InferenceCmd::Download"),
+            ("run_inference", "InferenceCmd::Cancel"),
+            ("run_inference", "InferenceCmd::Remove"),
+            ("run_inference", "InferenceCmd::Refresh"),
+            ("run_inference_model", "InferenceModelCmd::List"),
+            ("run_inference_model", "InferenceModelCmd::Show"),
+            ("run_inference_model", "InferenceModelCmd::Download"),
+            ("run_inference_model", "InferenceModelCmd::Status"),
+            ("run_inference_model", "InferenceModelCmd::Cancel"),
+            ("run_inference_model", "InferenceModelCmd::Remove"),
+            ("run_inference_model", "InferenceModelCmd::Refresh"),
+        ] {
+            assert!(owned.insert(arm), "duplicate ownership for {arm}");
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            for forbidden in [
+                "open_cli_generated_client",
+                "open_cli_read_only_generated_client",
+                "open_store_client",
+                "cli_open_loom(",
+                "cli_open_loom_read(",
+                "FileStore::open",
+                "Loom::new(",
+                "save_loom(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} contains {forbidden}");
+            }
+        }
+        assert_eq!(owned.len(), 28);
+    }
+
+    #[test]
+    fn mu_17g_f4_serve_and_daemon_leaves_have_one_execution_owner() {
+        let cli_source = include_str!("cli.rs");
+        let serve_source = include_str!("serve_cmd.rs");
+        let daemon_source = include_str!("daemon_cmd.rs");
+        let idl_source = include_str!("../../../idl/loom.idl");
+        let service_source = include_str!("../../loom-client/src/service.rs");
+
+        assert_eq!(
+            enum_variants(cli_source, "ServeCmd"),
+            [
+                "Configure",
+                "List",
+                "Enable",
+                "Disable",
+                "Remove",
+                "Route",
+                "Remote",
+            ]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "ServeRouteCmd"),
+            ["List", "Set", "Remove"]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "DaemonCmd"),
+            [
+                "Start",
+                "Stop",
+                "Restart",
+                "Status",
+                "Maintenance",
+                "Session",
+                "Pin",
+                "Run",
+            ]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "DaemonMaintenanceCmd"),
+            ["Status", "Policy", "Run"]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "DaemonSessionCmd"),
+            ["Open", "Close", "Attach", "Detach"]
+        );
+        assert_eq!(enum_variants(cli_source, "DaemonPinCmd"), ["Add", "Remove"]);
+
+        let run_serve = function_body(serve_source, "run_serve");
+        for (arm, helper) in [
+            ("ServeCmd::Configure", "run_serve_configure"),
+            ("ServeCmd::List", "run_serve_list"),
+            ("ServeCmd::Enable", "run_serve_set_enabled"),
+            ("ServeCmd::Disable", "run_serve_set_enabled"),
+            ("ServeCmd::Remove", "run_serve_remove"),
+            ("ServeCmd::Route", "run_serve_route"),
+        ] {
+            let body = match_arm_segment(run_serve, arm, "ServeCmd");
+            assert!(body.contains(helper), "{arm} must delegate to {helper}");
+        }
+        assert!(match_arm_segment(run_serve, "ServeCmd::Enable", "ServeCmd").contains("true"));
+        assert!(match_arm_segment(run_serve, "ServeCmd::Disable", "ServeCmd").contains("false"));
+
+        let run_serve_route = function_body(serve_source, "run_serve_route");
+        for (arm, helper) in [
+            ("ServeRouteCmd::List", "run_serve_route_list"),
+            ("ServeRouteCmd::Set", "run_serve_route_set"),
+            ("ServeRouteCmd::Remove", "run_serve_route_remove"),
+        ] {
+            let body = match_arm_segment(run_serve_route, arm, "ServeRouteCmd");
+            assert!(body.contains(helper), "{arm} must delegate to {helper}");
+        }
+
+        let serve_generated = [
+            ("run_serve_configure", "serve_listener_configure_json"),
+            ("run_serve_list", "serve_listener_list_json"),
+            ("run_serve_set_enabled", "serve_listener_set_enabled_json"),
+            ("run_serve_remove", "serve_listener_remove_json"),
+            ("run_serve_route_list", "serve_web_route_list_json"),
+            ("run_serve_route_set", "serve_web_route_set_json"),
+            ("run_serve_route_remove", "serve_web_route_remove_json"),
+        ];
+        let mut generated_owners = std::collections::BTreeSet::new();
+        for (runner, method) in serve_generated {
+            let body = function_body(serve_source, runner);
+            assert!(body.contains("remote::open_cli_generated_client"));
+            assert!(body.contains("\"ServeConfig\""));
+            assert!(body.contains(&format!("\"{method}\"")));
+            for forbidden in [
+                "open_generated_client",
+                "open_store_client",
+                "StoreClient::",
+                "cli_open_loom(",
+                "cli_open_loom_read(",
+                "FileStore::open",
+                "save_loom(",
+            ] {
+                assert!(!body.contains(forbidden), "{runner} found {forbidden}");
+            }
+            assert!(idl_source.contains(&format!(" {method}(")));
+            assert!(service_source.contains(&format!("fn {method}(")));
+            assert!(
+                generated_owners.insert(("ServeConfig", method)),
+                "duplicate generated owner ServeConfig.{method}"
+            );
+        }
+
+        let run_maintenance = function_body(daemon_source, "run_daemon_maintenance");
+        for (arm, method, opener) in [
+            (
+                "DaemonMaintenanceCmd::Status",
+                "store_maintenance_status",
+                "open_cli_read_only_generated_client",
+            ),
+            (
+                "DaemonMaintenanceCmd::Policy",
+                "store_maintenance_policy_set",
+                "open_cli_generated_client",
+            ),
+            (
+                "DaemonMaintenanceCmd::Run",
+                "store_maintenance_run",
+                "open_cli_generated_client",
+            ),
+        ] {
+            let body = match_arm_segment(run_maintenance, arm, "DaemonMaintenanceCmd");
+            assert!(body.contains(opener), "{arm} must use {opener}");
+            assert!(body.contains("\"StoreAdmin\""));
+            assert!(body.contains(&format!("\"{method}\"")));
+            for forbidden in [
+                "open_store_client",
+                "StoreClient::",
+                "cli_open_loom(",
+                "cli_open_loom_read(",
+                "FileStore::open",
+                "save_loom(",
+                "run_store_maintenance_once(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+            assert!(idl_source.contains(&format!(" {method}(")));
+            assert!(service_source.contains(&format!("fn {method}(")));
+            assert!(
+                generated_owners.insert(("StoreAdmin", method)),
+                "duplicate generated owner StoreAdmin.{method}"
+            );
+        }
+        assert_eq!(generated_owners.len(), 10);
+
+        let run_daemon = function_body(daemon_source, "run_daemon");
+        for (arm, required) in [
+            ("DaemonCmd::Start", "daemon_start_with_transport"),
+            ("DaemonCmd::Stop", "daemon_stop"),
+            ("DaemonCmd::Restart", "daemon_start_with_transport_for"),
+            ("DaemonCmd::Status", "daemon_status"),
+            ("DaemonCmd::Maintenance", "run_daemon_maintenance"),
+            ("DaemonCmd::Session", "daemon_session"),
+            ("DaemonCmd::Pin", "daemon_pin_with_keys"),
+            ("DaemonCmd::Run", "daemon_run"),
+        ] {
+            let body = match_arm_segment(run_daemon, arm, "DaemonCmd");
+            assert!(body.contains(required), "{arm} must retain {required}");
+        }
+        let session = match_arm_segment(run_daemon, "DaemonCmd::Session", "DaemonCmd");
+        assert!(
+            match_arm_segment(session, "DaemonSessionCmd::Open", "DaemonSessionCmd")
+                .contains("daemon_logical_session_open")
+        );
+        assert!(
+            match_arm_segment(session, "DaemonSessionCmd::Close", "DaemonSessionCmd")
+                .contains("daemon_logical_session_close")
+        );
+        assert!(
+            match_arm_segment(session, "DaemonSessionCmd::Attach", "DaemonSessionCmd")
+                .contains("\"attach\"")
+        );
+        assert!(
+            match_arm_segment(session, "DaemonSessionCmd::Detach", "DaemonSessionCmd")
+                .contains("\"detach\"")
+        );
+        let pin = match_arm_segment(run_daemon, "DaemonCmd::Pin", "DaemonCmd");
+        assert!(
+            match_arm_segment(pin, "DaemonPinCmd::Add", "DaemonPinCmd")
+                .contains("daemon_pin_with_keys")
+        );
+        assert!(
+            match_arm_segment(pin, "DaemonPinCmd::Remove", "DaemonPinCmd")
+                .contains("daemon_unpin_with_keys")
+        );
+
+        for arm in [
+            "DaemonCmd::Start",
+            "DaemonCmd::Stop",
+            "DaemonCmd::Restart",
+            "DaemonCmd::Status",
+            "DaemonCmd::Session",
+            "DaemonCmd::Pin",
+            "DaemonCmd::Run",
+        ] {
+            let body = match_arm_segment(run_daemon, arm, "DaemonCmd");
+            assert!(!body.contains("open_store_client"));
+            assert!(!body.contains("open_cli_generated_client"));
+            assert!(!body.contains("cli_open_loom("));
+            assert!(!body.contains("FileStore::open"));
+        }
+        let serve_remote = match_arm_segment(run_serve, "ServeCmd::Remote", "ServeCmd");
+        assert!(serve_remote.contains("run_serve_remote"));
+        assert!(!serve_remote.contains("open_cli_generated_client"));
+        let serve_remote_runner = function_body(serve_source, "run_serve_remote");
+        assert!(serve_remote_runner.contains("bind_remote_endpoint"));
+        assert!(serve_remote_runner.contains("ctrlc::set_handler"));
+
+        for method in [
+            "daemon_start",
+            "daemon_stop",
+            "daemon_restart",
+            "daemon_status",
+            "daemon_session_attach",
+            "daemon_session_detach",
+            "daemon_pin_add",
+            "daemon_pin_remove",
+        ] {
+            assert!(idl_source.contains(&format!(" {method}(")));
+            let owner = function_body(service_source, method);
+            assert!(owner.contains("daemon_unavailable"));
+        }
+    }
+
+    #[test]
+    fn mu_17g_f5_operational_leaves_have_one_execution_owner() {
+        let cli_source = include_str!("cli.rs");
+        let main_source = include_str!("main.rs");
+        let context_source = include_str!("context_cmd.rs");
+        let daemon_source = include_str!("daemon_cmd.rs");
+        let idl_source = include_str!("../../../idl/loom.idl");
+        let service_source = include_str!("../../loom-client/src/service.rs");
+        let mut owned = std::collections::BTreeSet::new();
+
+        assert_eq!(
+            enum_variants(cli_source, "ContextCmd"),
+            [
+                "List", "Get", "Add", "Update", "Remove", "Test", "Use", "Current"
+            ]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "DoctorCmd"),
+            ["All", "Store", "Daemon", "Inference", "InferenceInstance"]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "LockCmd"),
+            ["Acquire", "Refresh", "Release"]
+        );
+        assert_eq!(enum_variants(cli_source, "MountCmd"), ["Fuse", "Nfs"]);
+
+        let run_lock = function_body(daemon_source, "run_lock");
+        for (arm, method) in [
+            ("LockCmd::Acquire", "lock_acquire"),
+            ("LockCmd::Refresh", "lock_refresh"),
+            ("LockCmd::Release", "lock_release"),
+        ] {
+            assert!(owned.insert(arm));
+            let body = match_arm_segment(run_lock, arm, "LockCmd");
+            assert!(body.contains("resume_cli_lock_session"));
+            assert!(body.contains("CliGeneratedOperation::new"));
+            assert!(body.contains(&format!("\"{method}\"")));
+            assert!(idl_source.contains(&format!(" {method}(")));
+            assert!(service_source.contains(&format!("fn {method}(")));
+            for forbidden in [
+                "lock_acquire_auth",
+                "lock_refresh_auth",
+                "lock_release_auth",
+                "open_store_client",
+                "open_cli_generated_client",
+                "StoreClient::",
+                "cli_open_loom(",
+                "cli_open_loom_read(",
+                "FileStore::open",
+                "save_loom(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} contains {forbidden}");
+            }
+        }
+
+        let context = function_body(context_source, "run_context");
+        for (arm, owner) in [
+            ("ContextCmd::List", "resolver"),
+            ("ContextCmd::Get", "resolver"),
+            ("ContextCmd::Add", "write_project_context_file"),
+            ("ContextCmd::Update", "write_project_context_file"),
+            ("ContextCmd::Remove", "write_project_context_file"),
+            ("ContextCmd::Test", "resolve_context"),
+            ("ContextCmd::Use", "write_project_context_file"),
+            ("ContextCmd::Current", "current_context"),
+        ] {
+            assert!(owned.insert(arm));
+            let body = match_arm_segment(context, arm, "ContextCmd");
+            assert!(body.contains(owner), "{arm} must retain {owner}");
+            for forbidden in [
+                "open_store_client",
+                "open_cli_generated_client",
+                "cli_open_loom(",
+                "FileStore::open",
+                "save_loom(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} contains {forbidden}");
+            }
+        }
+        let context_write = function_body(context_source, "write_project_context_file");
+        assert!(context_write.contains("project_context_file"));
+        assert!(context_write.contains("std::fs::write"));
+
+        let doctor = function_body(main_source, "run_doctor");
+        for (arm, owner) in [
+            ("DoctorCmd::All", "run_doctor_all"),
+            ("DoctorCmd::Store", "store_doctor"),
+            ("DoctorCmd::Daemon", "daemon_doctor"),
+            ("DoctorCmd::Inference", "collect_inference_doctor_report"),
+            (
+                "DoctorCmd::InferenceInstance",
+                "run_inference_instance_doctor",
+            ),
+        ] {
+            assert!(owned.insert(arm));
+            let body = match_arm_segment(doctor, arm, "DoctorCmd");
+            assert!(body.contains(owner), "{arm} must retain {owner}");
+            assert!(!body.contains("save_loom("));
+            assert!(!body.contains("open_cli_generated_client"));
+        }
+
+        let run = function_body(main_source, "run");
+        for (arm, owner) in [
+            ("Command::Capabilities", "run_capabilities"),
+            ("Command::Llms", "print_llms_reference"),
+            ("Command::Version", "VERSION"),
+            ("Command::Mcp", "run_mcp"),
+        ] {
+            assert!(owned.insert(arm));
+            let body = match_arm_segment(run, arm, "Command");
+            assert!(body.contains(owner), "{arm} must retain {owner}");
+            assert!(!body.contains("save_loom("));
+        }
+        assert!(match_arm_segment(run, "Command::Mount", "Command").contains("run_mount"));
+        let capabilities = function_body(main_source, "run_capabilities");
+        assert!(capabilities.contains("loom_core::capability::registry"));
+        assert!(!capabilities.contains("FileStore"));
+        let mcp = function_body(daemon_source, "run_mcp");
+        assert!(mcp.contains("serve_http_with_network_access"));
+        assert!(mcp.contains("serve_stdio"));
+        assert!(!mcp.contains("save_loom("));
+        let mount = function_body(main_source, "run_mount");
+        for arm in ["MountCmd::Fuse", "MountCmd::Nfs"] {
+            assert!(owned.insert(arm));
+            let body = match_arm_segment(mount, arm, "MountCmd");
+            assert!(body.contains("mount_"));
+            assert!(!body.contains("save_loom("));
+        }
+
+        assert_eq!(owned.len(), 22);
+    }
+
+    #[test]
+    fn mu_6i_b_data_family_mutations_use_generated_clients() {
+        let source = include_str!("main.rs");
+        for (runner, arm, interface, method) in [
+            ("run_kv", "KvCmd::Put", "Kv", "put"),
+            ("run_kv", "KvCmd::Delete", "Kv", "delete"),
+            ("run_cas", "CasCmd::Put", "Cas", "put"),
+            ("run_cas", "CasCmd::Delete", "Cas", "delete"),
+            ("run_queue", "QueueCmd::Append", "Queue", "append"),
+            (
+                "run_queue",
+                "QueueCmd::Advance",
+                "QueueConsumers",
+                "consumer_advance",
+            ),
+            (
+                "run_queue",
+                "QueueCmd::Reset",
+                "QueueConsumers",
+                "consumer_reset",
+            ),
+            ("run_ledger", "LedgerCmd::Append", "Ledger", "append"),
+            ("run_time_series", "TimeSeriesCmd::Put", "TimeSeries", "put"),
+            ("run_search", "SearchCmd::Create", "Search", "create"),
+            ("run_search", "SearchCmd::Index", "Search", "index"),
+            ("run_search", "SearchCmd::Delete", "Search", "delete"),
+            ("run_search", "SearchCmd::Remap", "Search", "remap"),
+            (
+                "run_calendar",
+                "CalendarCmd::CreateCollection",
+                "Calendar",
+                "create_collection",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::DeleteCollection",
+                "Calendar",
+                "delete_collection",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::DeleteEntry",
+                "Calendar",
+                "delete_entry",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::PutEntry",
+                "Calendar",
+                "put_entry",
+            ),
+            ("run_calendar", "CalendarCmd::PutIcs", "Calendar", "put_ics"),
+            (
+                "run_contacts",
+                "ContactsCmd::CreateBook",
+                "Contacts",
+                "create_book",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::DeleteBook",
+                "Contacts",
+                "delete_book",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::DeleteEntry",
+                "Contacts",
+                "delete_entry",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::PutEntry",
+                "Contacts",
+                "put_entry",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::PutVcard",
+                "Contacts",
+                "put_vcard",
+            ),
+            (
+                "run_mail",
+                "MailCmd::CreateMailbox",
+                "Mail",
+                "create_mailbox",
+            ),
+            (
+                "run_mail",
+                "MailCmd::DeleteMailbox",
+                "Mail",
+                "delete_mailbox",
+            ),
+            (
+                "run_mail",
+                "MailCmd::DeleteMessage",
+                "Mail",
+                "delete_message",
+            ),
+            (
+                "run_mail",
+                "MailCmd::IngestMessage",
+                "Mail",
+                "ingest_message",
+            ),
+            ("run_mail", "MailCmd::SetFlags", "Mail", "set_flags"),
+            ("run_files", "FilesCmd::Write", "FileSystem", "write_file"),
+            (
+                "run_files",
+                "FilesCmd::Mkdir",
+                "FileSystem",
+                "create_directory",
+            ),
+            ("run_files", "FilesCmd::Delete", "FileSystem", "remove_"),
+        ] {
+            let body = match_arm_body(function_body(source, runner), arm);
+            assert!(
+                body.contains("remote::open_cli_generated_client(&store, keys)?"),
+                "{runner} {arm} must select the generated client boundary"
+            );
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{runner} {arm} must dispatch through generated interface {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}")),
+                "{runner} {arm} must dispatch through generated method {method}"
+            );
+            assert!(
+                !body.contains("remote::open_store_client("),
+                "{runner} {arm} must not use legacy StoreClient routing"
+            );
+            assert!(
+                !body.contains("cli_open_loom("),
+                "{runner} {arm} must not open a writable Loom directly"
+            );
+            assert!(
+                !body.contains("FileStore::open("),
+                "{runner} {arm} must not acquire direct FileStore write ownership"
+            );
+            assert!(
+                !body.contains("Loom::new("),
+                "{runner} {arm} must not construct a direct local Loom"
+            );
+            assert!(
+                !body.contains("save_loom("),
+                "{runner} {arm} must not save outside the generated owner"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_generated_cli_read_arms_use_read_only_open_helpers() {
+        let source = include_str!("main.rs");
+        for (runner, arm) in [
+            ("run_document", "DocumentCmd::GetText"),
+            ("run_document", "DocumentCmd::GetBinary"),
+            ("run_document", "DocumentCmd::ListBinary"),
+            ("run_document", "DocumentCmd::Find"),
+            ("run_document", "DocumentCmd::Query"),
+            ("run_document", "DocumentCmd::IndexList"),
+            ("run_document", "DocumentCmd::IndexStatus"),
+            ("run_files", "FilesCmd::Ls"),
+            ("run_files", "FilesCmd::Read"),
+            ("run_tickets", "TicketsCmd::ProjectSettingsGet"),
+            ("run_tickets", "TicketsCmd::Projects"),
+            ("run_tickets", "TicketsCmd::Relations"),
+            ("run_tickets", "TicketsCmd::Fields"),
+            ("run_tickets", "TicketsCmd::BoardGet"),
+            ("run_tickets", "TicketsCmd::BoardList"),
+            ("run_tickets", "TicketsCmd::Comments"),
+            ("run_tickets", "TicketsCmd::List"),
+            ("run_tickets", "TicketsCmd::Get"),
+            ("run_tickets", "TicketsCmd::History"),
+            ("run_lanes", "LanesCmd::Get"),
+            ("run_lanes", "LanesCmd::List"),
+            ("run_pages", "PagesCmd::SpaceList"),
+            ("run_pages", "PagesCmd::SpaceGet"),
+            ("run_pages", "PagesCmd::Get"),
+            ("run_pages", "PagesCmd::History"),
+            ("run_pages", "PagesCmd::StructureGet"),
+            ("run_time_series", "TimeSeriesCmd::Latest"),
+            ("run_metrics", "MetricsCmd::GetDescriptor"),
+            ("run_metrics", "MetricsCmd::Query"),
+            ("run_logs", "LogsCmd::GetRecord"),
+            ("run_logs", "LogsCmd::Query"),
+            ("run_traces", "TracesCmd::GetSpan"),
+            ("run_traces", "TracesCmd::TraceSpans"),
+            ("run_traces", "TracesCmd::Query"),
+            ("run_program", "ProgramCmd::Inspect"),
+            ("run_program", "ProgramCmd::Get"),
+            ("run_program", "ProgramCmd::List"),
+            ("run_dataframe", "DataframeCmd::Collect"),
+            ("run_dataframe", "DataframeCmd::PlanDigest"),
+            ("run_dataframe", "DataframeCmd::Preview"),
+            ("run_dataframe", "DataframeCmd::SourceDigests"),
+            ("run_vector", "VectorCmd::Get"),
+            ("run_vector", "VectorCmd::Source"),
+            ("run_vector", "VectorCmd::Ids"),
+            ("run_vector", "VectorCmd::IndexKeys"),
+            ("run_vector", "VectorCmd::Search"),
+            ("run_graph", "GraphCmd::GetNode"),
+            ("run_graph", "GraphCmd::GetEdge"),
+            ("run_graph", "GraphCmd::Neighbors"),
+            ("run_graph", "GraphCmd::OutEdges"),
+            ("run_graph", "GraphCmd::InEdges"),
+            ("run_graph", "GraphCmd::Reachable"),
+            ("run_graph", "GraphCmd::ShortestPath"),
+            ("run_graph", "GraphCmd::Query"),
+            ("run_graph", "GraphCmd::ExplainQuery"),
+            ("run_columnar", "ColumnarCmd::Scan"),
+            ("run_columnar", "ColumnarCmd::Columns"),
+            ("run_columnar", "ColumnarCmd::Rows"),
+            ("run_columnar", "ColumnarCmd::Inspect"),
+            ("run_columnar", "ColumnarCmd::SourceDigest"),
+            ("run_columnar", "ColumnarCmd::Select"),
+            ("run_columnar", "ColumnarCmd::Aggregate"),
+            ("run_calendar", "CalendarCmd::GetCollection"),
+            ("run_calendar", "CalendarCmd::GetEntry"),
+            ("run_calendar", "CalendarCmd::ListCollections"),
+            ("run_calendar", "CalendarCmd::ListEntries"),
+            ("run_calendar", "CalendarCmd::Range"),
+            ("run_calendar", "CalendarCmd::Search"),
+            ("run_calendar", "CalendarCmd::ToIcs"),
+            ("run_contacts", "ContactsCmd::GetBook"),
+            ("run_contacts", "ContactsCmd::GetEntry"),
+            ("run_contacts", "ContactsCmd::ListBooks"),
+            ("run_contacts", "ContactsCmd::ListEntries"),
+            ("run_contacts", "ContactsCmd::Search"),
+            ("run_contacts", "ContactsCmd::ToVcard"),
+            ("run_mail", "MailCmd::GetFlags"),
+            ("run_mail", "MailCmd::GetMailbox"),
+            ("run_mail", "MailCmd::GetMessage"),
+            ("run_mail", "MailCmd::ListMailboxes"),
+            ("run_mail", "MailCmd::ListMessages"),
+            ("run_mail", "MailCmd::Search"),
+            ("run_mail", "MailCmd::ToEml"),
+            ("run_search", "SearchCmd::Get"),
+            ("run_search", "SearchCmd::Ids"),
+            ("run_search", "SearchCmd::Query"),
+            ("run_search", "SearchCmd::Status"),
+        ] {
+            let body = match_arm_body(function_body(source, runner), arm);
+            assert!(
+                body.contains("remote::open_cli_read_only_generated_client"),
+                "{arm} must use the read-only generated client"
+            );
+            for forbidden in [
+                "remote::open_cli_generated_client(",
+                "cli_open_loom(",
+                "FileStore::open(",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{arm} must not use writable helper {forbidden}"
+                );
+            }
+        }
+
+        let cleanup = match_arm_body(function_body(source, "run_lanes"), "LanesCmd::Cleanup");
+        assert!(
+            cleanup.contains("if apply")
+                && cleanup.contains("remote::open_cli_generated_client")
+                && cleanup.contains("remote::open_cli_read_only_generated_client"),
+            "LanesCmd::Cleanup must keep apply writable and dry-run read-only"
+        );
+    }
+
+    #[test]
+    fn mu_1e_immutable_read_routes_use_read_only_open_helpers() {
+        let main_source = include_str!("main.rs");
+        let remote_source = include_str!("remote.rs");
+        let table_source = include_str!("table_cmd.rs");
+        let unified = function_body(main_source, "run_unified_search");
+        assert!(unified.contains("cli_open_loom_read(&args.store, keys)?"));
+        assert!(!unified.contains("cli_open_loom(&args.store"));
+
+        for arm in [
+            "SearchCmd::Get",
+            "SearchCmd::Ids",
+            "SearchCmd::Query",
+            "SearchCmd::Status",
+        ] {
+            let body = match_arm_body(function_body(main_source, "run_search"), arm);
+            assert!(body.contains("remote::open_cli_read_only_generated_client"));
+            for forbidden in [
+                "remote::open_cli_generated_client(",
+                "cli_open_loom(",
+                "FileStore::open(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+        }
+
+        for method in ["search_get", "search_ids", "search_query", "search_status"] {
+            let body = function_body(remote_source, method);
+            assert!(body.contains("cli_open_loom_read(locator, keys)?"));
+            assert!(!body.contains("cli_open_loom(locator, keys)?"));
+        }
+
+        for arm in ["TableCmd::Blame", "TableCmd::Diff"] {
+            let body = match_arm_body(function_body(table_source, "run_table"), arm);
+            assert!(body.contains("cli_open_loom_read(&store, keys)?"));
+            assert!(!body.contains("cli_open_loom(&store, keys)?"));
+        }
+
+        let catalog = match_arm_body(
+            function_body(main_source, "run_studio_surfaces"),
+            "StudioSurfacesCmd::Catalog",
+        );
+        for forbidden in [
+            "remote::open_cli_generated_client(",
+            "cli_open_loom(",
+            "FileStore::open(",
+        ] {
+            assert!(
+                !catalog.contains(forbidden),
+                "Studio catalog found {forbidden}"
+            );
+        }
+
+        let rebuild = match_arm_body(
+            function_body(main_source, "run_studio_revisions"),
+            "StudioRevisionsCmd::Rebuild",
+        );
+        assert!(rebuild.contains("remote::open_cli_generated_client(&store, keys)?"));
+        assert!(rebuild.contains("\"StudioMaintenance\""));
+        assert!(rebuild.contains("\"studio_revisions_rebuild_json\""));
+        assert!(rebuild.contains("dry_run.to_value()"));
+        assert!(!rebuild.contains("cli_open_loom"));
+    }
+
+    #[test]
+    fn mu_1f_immutable_read_routes_use_read_only_open_helpers() {
+        let main_source = include_str!("main.rs");
+
+        for (runner, arm) in [
+            ("run_meetings", "MeetingsCmd::List"),
+            ("run_meetings", "MeetingsCmd::Get"),
+            ("run_meetings", "MeetingsCmd::Search"),
+            ("run_lifecycle", "LifecycleCmd::Definitions"),
+            ("run_lifecycle", "LifecycleCmd::Definition"),
+            ("run_lifecycle", "LifecycleCmd::Instances"),
+            ("run_lifecycle", "LifecycleCmd::Instance"),
+            ("run_lifecycle", "LifecycleCmd::SnapshotPlan"),
+            ("run_lifecycle", "LifecycleCmd::CurrentSurface"),
+            ("run_lifecycle", "LifecycleCmd::Snapshots"),
+            ("run_lifecycle", "LifecycleCmd::Snapshot"),
+            ("run_lifecycle", "LifecycleCmd::SnapshotContent"),
+            ("run_lifecycle", "LifecycleCmd::OperationLog"),
+            ("run_vector_text", "VectorTextCmd::Query"),
+            ("run_columnar", "ColumnarCmd::ExportArrow"),
+            ("run_columnar", "ColumnarCmd::ExportParquet"),
+            ("run_interchange", "InterchangeCmd::ExportArchive"),
+            ("run_interchange", "InterchangeCmd::ExportFs"),
+            ("run_interchange", "InterchangeCmd::ExportTableCsv"),
+            ("run_interchange", "InterchangeCmd::ExportCar"),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(body.contains("cli_open_loom_read(&store, keys)?"));
+        }
+
+        let meetings_source = match_arm_segment(
+            function_body(main_source, "run_meetings"),
+            "MeetingsCmd::SourceRead",
+            "MeetingsCmd",
+        );
+        assert!(meetings_source.contains("remote::open_cli_read_only_generated_client"));
+        assert!(meetings_source.contains("\"Meetings\""));
+        assert!(meetings_source.contains("\"meetings_source_read\""));
+        assert!(!meetings_source.contains("cli_open_loom_read"));
+
+        for (arm, method) in [
+            ("DriveCmd::List", "drive_list_json"),
+            ("DriveCmd::Stat", "drive_stat_json"),
+            ("DriveCmd::Read", "drive_read_file"),
+            ("DriveCmd::ListVersions", "drive_list_versions_json"),
+            ("DriveCmd::ListConflicts", "drive_list_conflicts_json"),
+            ("DriveCmd::ListShares", "drive_list_shares_json"),
+            ("DriveCmd::ListRetention", "drive_list_retention_json"),
+        ] {
+            let body = match_arm_segment(function_body(main_source, "run_drive"), arm, "DriveCmd");
+            assert!(body.contains("remote::open_cli_read_only_generated_client"));
+            assert!(body.contains("\"Drive\""));
+            assert!(body.contains(&format!("\"{method}\"")));
+            for forbidden in ["open_drive_read", "cli_open_loom_read", "open_store_client"] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+        }
+        assert!(!main_source.contains("fn open_drive_read("));
+    }
+
+    #[test]
+    fn mu_6i_c4_interchange_mutations_use_generated_clients() {
+        let main_source = include_str!("main.rs");
+        let run_interchange = function_body(main_source, "run_interchange");
+
+        let arms = [
+            ("InterchangeCmd::ImportFs", "FileSystem", "import_fs"),
+            ("InterchangeCmd::ImportArchive", "Archive", "archive_import"),
+            (
+                "InterchangeCmd::ImportTableCsv",
+                "InterchangeProfiles",
+                "import_table_csv",
+            ),
+            ("InterchangeCmd::ImportCar", "Car", "car_import"),
+        ];
+        for (arm, interface, method) in arms {
+            let body = match_arm_body(run_interchange, arm);
+            assert!(body.contains("remote::open_cli_generated_client(&store, keys)?"));
+            assert!(body.contains("execute_generated_bytes("));
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must use generated {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{arm} must use generated {interface}.{method}"
+            );
+            assert_interchange_generated_body_has_no_local_mutation_owner(arm, body);
+        }
+
+        let import_fs = match_arm_body(run_interchange, "InterchangeCmd::ImportFs");
+        assert!(import_fs.contains("remote::target_is_remote(&store)?"));
+        let import_archive = match_arm_body(run_interchange, "InterchangeCmd::ImportArchive");
+        assert!(import_archive.contains("remote::target_is_remote(&store)?"));
+        let import_table_csv = match_arm_body(run_interchange, "InterchangeCmd::ImportTableCsv");
+        assert!(import_table_csv.contains("std::fs::read(&csv)"));
+        assert!(import_table_csv.contains("WireValue::Bytes(payload)"));
+
+        for (arm, runner) in [
+            ("InterchangeCmd::ImportRedmine", "run_redmine_import("),
+            ("InterchangeCmd::ImportAsana", "run_asana_import("),
+            ("InterchangeCmd::ImportJira", "run_jira_import("),
+            ("InterchangeCmd::ImportConfluence", "run_confluence_import("),
+            ("InterchangeCmd::ImportSlack", "run_slack_import("),
+            ("InterchangeCmd::ImportDrive", "run_drive_import("),
+            ("InterchangeCmd::ImportMarkdown", "run_markdown_import("),
+            ("InterchangeCmd::ImportNotion", "run_notion_import("),
+        ] {
+            assert!(run_interchange.contains(arm));
+            assert!(run_interchange.contains(runner));
+        }
+
+        for (runner, method, payload_loader) in [
+            (
+                "run_redmine_import",
+                "import_redmine",
+                "std::fs::read(snapshot)",
+            ),
+            (
+                "run_asana_import",
+                "import_asana",
+                "std::fs::read(snapshot)",
+            ),
+            ("run_jira_import", "import_jira", "std::fs::read(snapshot)"),
+            (
+                "run_confluence_import",
+                "import_confluence",
+                "std::fs::read(snapshot)",
+            ),
+            (
+                "run_slack_import",
+                "import_slack",
+                "std::fs::read(snapshot)",
+            ),
+            (
+                "run_drive_import",
+                "import_drive",
+                "std::fs::read(snapshot)",
+            ),
+            (
+                "run_markdown_import",
+                "import_markdown",
+                "markdown_import_archive(src)?",
+            ),
+            (
+                "run_notion_import",
+                "import_notion",
+                "std::fs::read(snapshot)",
+            ),
+        ] {
+            let body = function_body(main_source, runner);
+            assert!(
+                body.contains(payload_loader),
+                "{runner} must preserve host byte loading"
+            );
+            assert!(body.contains("remote::open_cli_generated_client(store, keys)?"));
+            assert!(body.contains("execute_generated_bytes("));
+            assert!(body.contains("\"InterchangeProfiles\""));
+            assert!(body.contains(&format!("\"{method}\"")));
+            assert!(body.contains("WireValue::Bytes(payload)"));
+            assert!(body.contains("generated_import_report_from_cbor(&encoded)?"));
+            assert!(body.contains("print_import_report(&report, format)"));
+            assert_interchange_generated_body_has_no_local_mutation_owner(runner, body);
+        }
+
+        assert!(!main_source.contains("open_profile_import_input"));
+        assert!(!main_source.contains("file_import_bytes"));
+        assert!(!main_source.contains("persist_profile_import_artifacts"));
+        assert!(!main_source.contains("CliImportLoom"));
+    }
+
+    fn assert_interchange_generated_body_has_no_local_mutation_owner(name: &str, body: &str) {
+        for forbidden in [
+            "cli_open_loom(",
+            "cli_open_store_for_write",
+            "FileStore::open",
+            "save_loom(",
+            "CliImportLoom",
+            "import_fs(loom",
+            "import_archive(loom",
+            "import_table_csv(loom",
+            "import_car(loom",
+            "import_redmine_bytes",
+            "import_asana_bytes",
+            "import_jira_bytes",
+            "import_confluence_bytes",
+            "import_slack_bytes",
+            "import_drive_bytes",
+            "import_markdown_path",
+            "import_notion_bytes",
+            "persist_profile_import_artifacts",
+            "retain_import_input",
+            "persist_import_checkpoint",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{name} must not contain {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn mu_1g_inference_instance_reads_use_read_only_open_helpers() {
+        let main_source = include_str!("main.rs");
+        let run_inference_instance = function_body(main_source, "run_inference_instance");
+
+        for (arm, method) in [
+            ("InferenceInstanceCmd::List", "inference_instance_list_json"),
+            ("InferenceInstanceCmd::Show", "inference_instance_get_json"),
+        ] {
+            let body = match_arm_body(run_inference_instance, arm);
+            assert!(body.contains("remote::open_cli_read_only_generated_client(&store, keys)?"));
+            assert!(body.contains("\"InferenceInstance\""));
+            assert!(body.contains(&format!("\"{method}\"")));
+            assert!(!body.contains("cli_open_loom"));
+        }
+
+        for arm in [
+            "InferenceInstanceCmd::Create",
+            "InferenceInstanceCmd::Update",
+            "InferenceInstanceCmd::Delete",
+        ] {
+            let body = match_arm_body(run_inference_instance, arm);
+            assert!(body.contains("remote::open_cli_generated_client(&store, keys)?"));
+            assert!(!body.contains("cli_open_loom(&store, keys)?"));
+        }
+
+        let doctor = function_body(main_source, "run_inference_instance_doctor");
+        assert!(doctor.contains("cli_open_loom_read(store, keys)?"));
+        assert!(!doctor.contains("cli_open_loom(store, keys)?"));
+    }
+
+    #[test]
+    fn mu_1i_reviewed_immutable_read_routes_are_enforced() {
+        let main_source = include_str!("main.rs");
+        let remote_source = include_str!("remote.rs");
+        let context_source = include_str!("context_cmd.rs");
+        let management_source = include_str!("management_cmd.rs");
+        let exec_source = include_str!("exec_cmd.rs");
+
+        for (runner, arm) in [
+            ("run_meetings", "MeetingsCmd::List"),
+            ("run_meetings", "MeetingsCmd::Get"),
+            ("run_meetings", "MeetingsCmd::Search"),
+            ("run_lifecycle", "LifecycleCmd::Definitions"),
+            ("run_lifecycle", "LifecycleCmd::Definition"),
+            ("run_lifecycle", "LifecycleCmd::Instances"),
+            ("run_lifecycle", "LifecycleCmd::Instance"),
+            ("run_lifecycle", "LifecycleCmd::SnapshotPlan"),
+            ("run_lifecycle", "LifecycleCmd::CurrentSurface"),
+            ("run_lifecycle", "LifecycleCmd::Snapshots"),
+            ("run_lifecycle", "LifecycleCmd::Snapshot"),
+            ("run_lifecycle", "LifecycleCmd::SnapshotContent"),
+            ("run_lifecycle", "LifecycleCmd::OperationLog"),
+            ("run_vector_text", "VectorTextCmd::Query"),
+            ("run_columnar", "ColumnarCmd::ExportArrow"),
+            ("run_columnar", "ColumnarCmd::ExportParquet"),
+            ("run_interchange", "InterchangeCmd::ExportArchive"),
+            ("run_interchange", "InterchangeCmd::ExportFs"),
+            ("run_interchange", "InterchangeCmd::ExportTableCsv"),
+            ("run_interchange", "InterchangeCmd::ExportCar"),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(body.contains("cli_open_loom_read(&store, keys)?"));
+            assert!(!body.contains("cli_open_loom(&store, keys)?"));
+        }
+
+        let meetings_source = match_arm_segment(
+            function_body(main_source, "run_meetings"),
+            "MeetingsCmd::SourceRead",
+            "MeetingsCmd",
+        );
+        assert!(meetings_source.contains("remote::open_cli_read_only_generated_client"));
+        assert!(meetings_source.contains("\"Meetings\""));
+        assert!(meetings_source.contains("\"meetings_source_read\""));
+        for forbidden in ["cli_open_loom_read", "open_store_client", "FileStore::open"] {
+            assert!(!meetings_source.contains(forbidden));
+        }
+
+        for (arm, method) in [
+            ("ChatCmd::Channels", "chat_list_channels_json"),
+            ("ChatCmd::Messages", "chat_messages_json"),
+            ("ChatCmd::Events", "chat_fetch_events_json"),
+            ("ChatCmd::Cursor", "chat_cursor_json"),
+            ("ChatCmd::EmojiList", "chat_emoji_list_json"),
+        ] {
+            let body = match_arm_segment(function_body(main_source, "run_chat"), arm, "ChatCmd");
+            assert!(body.contains("remote::open_cli_read_only_generated_client(&store, keys)?"));
+            assert!(body.contains("\"Chat\""));
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{arm} missing {method}"
+            );
+            for forbidden in ["cli_open_loom_read", "open_store_client", "FileStore::open"] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+        }
+
+        for (runner, arm, interface, method) in [
+            (
+                "run_calendar",
+                "CalendarCmd::GetCollection",
+                "Calendar",
+                "get_collection",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::GetEntry",
+                "Calendar",
+                "get_entry",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::ListCollections",
+                "Calendar",
+                "list_collections",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::ListEntries",
+                "Calendar",
+                "list_entries",
+            ),
+            ("run_calendar", "CalendarCmd::Range", "Calendar", "range"),
+            ("run_calendar", "CalendarCmd::Search", "Calendar", "search"),
+            ("run_calendar", "CalendarCmd::ToIcs", "Calendar", "to_ics"),
+            (
+                "run_contacts",
+                "ContactsCmd::GetBook",
+                "Contacts",
+                "get_book",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::GetEntry",
+                "Contacts",
+                "get_entry",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::ListBooks",
+                "Contacts",
+                "list_books",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::ListEntries",
+                "Contacts",
+                "list_entries",
+            ),
+            ("run_contacts", "ContactsCmd::Search", "Contacts", "search"),
+            (
+                "run_contacts",
+                "ContactsCmd::ToVcard",
+                "Contacts",
+                "to_vcard",
+            ),
+            ("run_mail", "MailCmd::GetFlags", "Mail", "get_flags"),
+            ("run_mail", "MailCmd::GetMailbox", "Mail", "get_mailbox"),
+            ("run_mail", "MailCmd::GetMessage", "Mail", "get_message"),
+            (
+                "run_mail",
+                "MailCmd::ListMailboxes",
+                "Mail",
+                "list_mailboxes",
+            ),
+            ("run_mail", "MailCmd::ListMessages", "Mail", "list_messages"),
+            ("run_mail", "MailCmd::Search", "Mail", "search"),
+            ("run_mail", "MailCmd::ToEml", "Mail", "to_eml"),
+        ] {
+            let enum_name = arm.split_once("::").expect("qualified CLI arm").0;
+            let body = match_arm_segment(function_body(main_source, runner), arm, enum_name);
+            assert!(body.contains("remote::open_cli_read_only_generated_client(&store, keys)?"));
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must use generated {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{arm} must use generated {interface}.{method}"
+            );
+            for forbidden in [
+                "remote::open_store_client",
+                "cli_open_loom(",
+                "FileStore::open(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+        }
+
+        for (runner, arm, interface, method) in [
+            ("run_vector", "VectorCmd::Get", "Vector", "get"),
+            ("run_vector", "VectorCmd::Source", "Vector", "source_text"),
+            ("run_vector", "VectorCmd::Ids", "Vector", "ids"),
+            (
+                "run_vector",
+                "VectorCmd::IndexKeys",
+                "Vector",
+                "metadata_index_keys",
+            ),
+            ("run_vector", "VectorCmd::Search", "Vector", "search_policy"),
+            ("run_graph", "GraphCmd::GetNode", "Graph", "get_node"),
+            ("run_graph", "GraphCmd::GetEdge", "Graph", "get_edge"),
+            ("run_graph", "GraphCmd::Neighbors", "Graph", "neighbors"),
+            ("run_graph", "GraphCmd::OutEdges", "Graph", "out_edges"),
+            ("run_graph", "GraphCmd::InEdges", "Graph", "in_edges"),
+            ("run_graph", "GraphCmd::Reachable", "Graph", "reachable"),
+            (
+                "run_graph",
+                "GraphCmd::ShortestPath",
+                "Graph",
+                "shortest_path",
+            ),
+            ("run_graph", "GraphCmd::Query", "Graph", "query"),
+            (
+                "run_graph",
+                "GraphCmd::ExplainQuery",
+                "Graph",
+                "explain_query",
+            ),
+            ("run_columnar", "ColumnarCmd::Scan", "Columnar", "scan"),
+            (
+                "run_columnar",
+                "ColumnarCmd::Columns",
+                "Columnar",
+                "columns",
+            ),
+            ("run_columnar", "ColumnarCmd::Rows", "Columnar", "rows"),
+            (
+                "run_columnar",
+                "ColumnarCmd::Inspect",
+                "Columnar",
+                "inspect",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::SourceDigest",
+                "Columnar",
+                "source_digest",
+            ),
+            ("run_columnar", "ColumnarCmd::Select", "Columnar", "select"),
+            (
+                "run_columnar",
+                "ColumnarCmd::Aggregate",
+                "Columnar",
+                "aggregate",
+            ),
+            ("run_vcs", "VcsCmd::Diff", "VersionControl", "diff"),
+            ("run_vcs", "VcsCmd::Log", "VersionControl", "log"),
+        ] {
+            let enum_name = arm.split_once("::").expect("qualified CLI arm").0;
+            let body = match_arm_segment(function_body(main_source, runner), arm, enum_name);
+            assert!(body.contains("remote::open_cli_read_only_generated_client(&store, keys)?"));
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must use generated {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{arm} must use generated {interface}.{method}"
+            );
+            for forbidden in [
+                "remote::open_store_client",
+                "cli_open_loom(",
+                "FileStore::open(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+        }
+
+        for (arm, required) in [
+            ("ContextCmd::List", "locator_cx::current().resolver()?"),
+            ("ContextCmd::Get", "locator_cx::current().resolver()?"),
+            ("ContextCmd::Test", "locator_cx::current().resolver()?"),
+            ("ContextCmd::Current", "locator_cx::current().resolver()?"),
+        ] {
+            let body = match_arm_body(function_body(context_source, "run_context"), arm);
+            assert!(body.contains(required));
+            assert!(!body.contains("cli_open_loom("));
+            assert!(!body.contains("FileStore::open("));
+        }
+
+        let inspect = match_arm_body(
+            function_body(exec_source, "run_exec_cmd"),
+            "ExecCmd::Inspect",
+        );
+        assert!(inspect.contains("std::fs::read(&request)"));
+        assert!(!inspect.contains("cli_open_loom("));
+        assert!(!inspect.contains("save_loom("));
+
+        let capabilities = function_body(main_source, "run_capabilities");
+        assert!(!capabilities.contains("cli_open_loom("));
+        assert!(!capabilities.contains("FileStore::open("));
+        for arm in ["Command::Llms", "Command::Version"] {
+            let body = match_arm_body(function_body(main_source, "run"), arm);
+            assert!(!body.contains("cli_open_loom("));
+            assert!(!body.contains("FileStore::open("));
+        }
+
+        for (runner, arm) in [
+            ("run_identity", "IdentityCmd::List"),
+            ("run_identity_public_key", "IdentityPublicKeyCmd::List"),
+            ("run_acl", "AclCmd::List"),
+            ("run_protected_ref", "ProtectedRefCmd::List"),
+            ("run_protected_ref", "ProtectedRefCmd::Get"),
+        ] {
+            let body = match_arm_body(function_body(management_source, runner), arm);
+            assert!(
+                body.contains("crate::remote::open_cli_read_only_generated_client(&store, keys)?")
+            );
+            assert!(!body.contains("crate::remote::open_store_client"));
+            assert!(!body.contains("cli_open_loom("));
+            assert!(!body.contains("FileStore::open("));
+        }
+
+        for (runner, arm, enum_name, interface, method) in [
+            (
+                "run_identity",
+                "IdentityCmd::AuthorityWitness",
+                "IdentityCmd",
+                "Identity",
+                "identity_authority_witness",
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::ListAuthorityReplication",
+                "IdentityCmd",
+                "Identity",
+                "identity_list_authority_replication",
+            ),
+            (
+                "run_management_kv_config",
+                "ManagementKvConfigCmd::Get",
+                "ManagementKvConfigCmd",
+                "ManagementKv",
+                "get_config",
+            ),
+        ] {
+            let body = match_arm_segment(function_body(management_source, runner), arm, enum_name);
+            assert!(body.contains("open_cli_read_only_generated_client(&store, keys)?"));
+            assert!(body.contains(&format!("\"{interface}\"")));
+            assert!(body.contains(&format!("\"{method}\"")));
+            assert!(!body.contains("open_store_client"));
+            assert!(!body.contains("cli_open_loom("));
+            assert!(!body.contains("FileStore::open("));
+        }
+
+        let workspace_list = match_arm_body(
+            function_body(management_source, "run_management_workspace"),
+            "WorkspaceCmd::List",
+        );
+        assert!(workspace_list.contains("open_cli_read_only_generated_client(&store, keys)?"));
+        assert!(workspace_list.contains("client.workspace_list()?"));
+        let workspace_owner = function_body(remote_source, "workspace_list");
+        assert!(workspace_owner.contains("\"Workspaces\""));
+        assert!(workspace_owner.contains("\"workspace_list\""));
+
+        let identity_owner = function_body(management_source, "generated_identity_snapshot");
+        assert!(identity_owner.contains("\"Identity\""));
+        assert!(identity_owner.contains("\"identity_list\""));
+        for (runner, arm) in [
+            ("run_identity", "IdentityCmd::List"),
+            ("run_identity_public_key", "IdentityPublicKeyCmd::List"),
+        ] {
+            let body = match_arm_body(function_body(management_source, runner), arm);
+            assert!(body.contains("open_cli_read_only_generated_client(&store, keys)?"));
+            assert!(body.contains("generated_identity_snapshot(&client)?"));
+        }
+
+        for (runner, arm, interface, method) in [
+            ("run_acl", "AclCmd::List", "Acl", "acl_list"),
+            (
+                "run_protected_ref",
+                "ProtectedRefCmd::List",
+                "ProtectedRefs",
+                "protected_ref_list",
+            ),
+            (
+                "run_protected_ref",
+                "ProtectedRefCmd::Get",
+                "ProtectedRefs",
+                "protected_ref_get",
+            ),
+        ] {
+            let body = match_arm_body(function_body(management_source, runner), arm);
+            assert!(body.contains("open_cli_read_only_generated_client(&store, keys)?"));
+            assert!(body.contains(&format!("\"{interface}\"")));
+            assert!(body.contains(&format!("\"{method}\"")));
+            assert!(!body.contains("open_store_client"));
+        }
+
+        for (runner, arm) in [
+            ("run_inference", "InferenceCmd::List"),
+            ("run_inference", "InferenceCmd::Status"),
+            ("run_inference", "InferenceCmd::Show"),
+            ("run_inference_model", "InferenceModelCmd::List"),
+            ("run_inference_model", "InferenceModelCmd::Show"),
+            ("run_inference_model", "InferenceModelCmd::Status"),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(!body.contains("cli_open_loom("));
+            assert!(!body.contains("FileStore::open("));
+        }
+
+        for (runner, arm) in [
+            ("run_inference", "InferenceCmd::Remove"),
+            ("run_inference_model", "InferenceModelCmd::Remove"),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(body.contains("dry_run"));
+            assert!(!body.contains("cli_open_loom("));
+            assert!(!body.contains("FileStore::open("));
+        }
+
+        for arm in ["InferenceInstanceCmd::List", "InferenceInstanceCmd::Show"] {
+            let body = match_arm_body(function_body(main_source, "run_inference_instance"), arm);
+            assert!(body.contains("remote::open_cli_read_only_generated_client(&store, keys)?"));
+            assert!(!body.contains("cli_open_loom"));
+        }
+
+        let doctor_instance = function_body(main_source, "run_inference_instance_doctor");
+        assert!(doctor_instance.contains("cli_open_loom_read(store, keys)?"));
+        assert!(!doctor_instance.contains("cli_open_loom(store, keys)?"));
+
+        for arm in [
+            "StoreCmd::BundleExport",
+            "StoreCmd::Get",
+            "StoreCmd::Hash",
+            "StoreCmd::Stat",
+            "StoreCmd::Attribution",
+            "StoreCmd::PreflightReplacement",
+        ] {
+            let body = match_arm_body(function_body(main_source, "run_store"), arm);
+            assert!(!body.contains("cli_open_loom(&store, keys)?"));
+            assert!(!body.contains("FileStore::open(&store)"));
+        }
+        assert!(
+            match_arm_body(
+                function_body(main_source, "run_store"),
+                "StoreCmd::BundleExport"
+            )
+            .contains("cli_open_loom_read(&store, keys)?")
+        );
+        assert!(
+            match_arm_body(function_body(main_source, "run_store"), "StoreCmd::Get")
+                .contains("FileStore::open_read(&store)")
+        );
+        let stat = match_arm_body(function_body(main_source, "run_store"), "StoreCmd::Stat");
+        assert!(stat.contains("open_cli_execution_context(&store)?"));
+        assert!(stat.contains("generated_store_stat_json(context, keys)?"));
+        assert!(!stat.contains("FileStore::open_read(&store)"));
+        assert!(
+            function_body(main_source, "run_store_attribution")
+                .contains("cli_open_loom_read(store, keys)?")
+        );
+        assert!(
+            function_body(main_source, "build_store_replacement_preflight_report")
+                .contains("FileStore::open_read(store)")
+        );
+        assert!(
+            function_body(main_source, "build_store_replacement_preflight_report")
+                .contains("cli_open_loom_read(store, keys)")
+        );
+
+        for (arm, read_helper, write_helper) in [
+            (
+                "StoreCmd::Copy",
+                "cli_open_loom_read(&src, keys)?",
+                "cli_open_loom(&dst, keys)?",
+            ),
+            (
+                "LanesCmd::Cleanup",
+                "remote::open_cli_read_only_generated_client",
+                "remote::open_cli_generated_client",
+            ),
+        ] {
+            let runner = match arm {
+                "LanesCmd::Cleanup" => "run_lanes",
+                _ => "run_store",
+            };
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(body.contains(read_helper));
+            assert!(body.contains(write_helper));
+        }
+        let policy = match_arm_body(function_body(main_source, "run_store"), "StoreCmd::Policy");
+        assert!(policy.contains("remote::open_cli_generated_client(&store, keys)?"));
+        assert!(policy.contains("remote::open_cli_read_only_generated_client(&store, keys)?"));
+        assert!(policy.contains("\"StoreAdmin\""));
+        assert!(policy.contains("\"store_policy_get\""));
+        assert!(policy.contains("\"store_policy_set\""));
+        assert!(policy.contains("store_policy_update_to_cbor(&update)"));
+        assert!(!policy.contains("remote::open_store_client"));
+        assert!(!policy.contains("cli_open_store_for_write(&store)?"));
+        assert!(!policy.contains("FileStore::open_read(&store)"));
+        assert!(!policy.contains("durability updates are not available"));
+        let rekey = match_arm_body(function_body(main_source, "run_store"), "StoreCmd::Rekey");
+        assert!(rekey.contains("remote::open_cli_generated_client(&store, keys)?"));
+        assert!(rekey.contains("\"StoreAdmin\""));
+        assert!(rekey.contains("\"store_rekey\""));
+        assert!(rekey.contains("store_rekey_request_to_cbor(&request)"));
+        assert!(!rekey.contains("remote::open_store_client"));
+        assert!(!rekey.contains("FileStore::open(&store)"));
+        assert!(!rekey.contains("raw KEK rekey has no generated contract"));
+        let run_store = function_body(main_source, "run_store");
+        assert!(run_store.contains("StoreCmd::Replace"));
+        assert!(run_store.contains("=> run_store_replacement_activation("));
+        let replace_activation = function_body(main_source, "run_store_replacement_activation");
+        assert!(replace_activation.contains("if dry_run"));
+        assert!(replace_activation.contains("std::fs::copy(active_path, backup_path)"));
+        assert!(replace_activation.contains("std::fs::rename(&temp_store, active_path)"));
+    }
+
+    #[test]
+    fn mu_6b_existing_interface_mutations_use_generated_client() {
+        let main_source = include_str!("main.rs");
+
+        for (runner, arm, interface, method) in [
+            ("run_cas", "CasCmd::Delete", "Cas", "delete"),
+            ("run_cas", "CasCmd::Put", "Cas", "put"),
+            ("run_kv", "KvCmd::Delete", "Kv", "delete"),
+            ("run_kv", "KvCmd::Put", "Kv", "put"),
+            ("run_queue", "QueueCmd::Append", "Queue", "append"),
+            (
+                "run_queue",
+                "QueueCmd::Advance",
+                "QueueConsumers",
+                "consumer_advance",
+            ),
+            (
+                "run_queue",
+                "QueueCmd::Reset",
+                "QueueConsumers",
+                "consumer_reset",
+            ),
+            ("run_time_series", "TimeSeriesCmd::Put", "TimeSeries", "put"),
+            ("run_ledger", "LedgerCmd::Append", "Ledger", "append"),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(
+                body.contains("remote::open_cli_generated_client"),
+                "{arm} must use the generated client"
+            );
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must dispatch through generated interface {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{arm} must dispatch through generated method {method}"
+            );
+            assert!(
+                !body.contains("remote::open_store_client"),
+                "{arm} must not bypass generated dispatch through StoreClient"
+            );
+            assert!(
+                !body.contains("cli_open_loom("),
+                "{arm} must not open a writable Loom directly"
+            );
+            assert!(
+                !body.contains("FileStore::open("),
+                "{arm} must not open a writable FileStore directly"
+            );
+        }
+    }
+
+    #[test]
+    fn mu_17g_a_foundational_data_cli_leaves_use_generated_clients() {
+        let main_source = include_str!("main.rs");
+
+        for (runner, arm, helper, interface, method) in [
+            (
+                "run_cas",
+                "CasCmd::Delete",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Cas",
+                "delete",
+            ),
+            (
+                "run_cas",
+                "CasCmd::Get",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Cas",
+                "get",
+            ),
+            (
+                "run_cas",
+                "CasCmd::Has",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Cas",
+                "has",
+            ),
+            (
+                "run_cas",
+                "CasCmd::List",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Cas",
+                "list",
+            ),
+            (
+                "run_cas",
+                "CasCmd::Put",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Cas",
+                "put",
+            ),
+            (
+                "run_kv",
+                "KvCmd::Delete",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Kv",
+                "delete",
+            ),
+            (
+                "run_kv",
+                "KvCmd::Get",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Kv",
+                "get",
+            ),
+            (
+                "run_kv",
+                "KvCmd::List",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Kv",
+                "list",
+            ),
+            (
+                "run_kv",
+                "KvCmd::Put",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Kv",
+                "put",
+            ),
+            (
+                "run_kv",
+                "KvCmd::Range",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Kv",
+                "range",
+            ),
+            (
+                "run_queue",
+                "QueueCmd::Append",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Queue",
+                "append",
+            ),
+            (
+                "run_queue",
+                "QueueCmd::Advance",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "QueueConsumers",
+                "consumer_advance",
+            ),
+            (
+                "run_queue",
+                "QueueCmd::Get",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Queue",
+                "get",
+            ),
+            (
+                "run_queue",
+                "QueueCmd::Len",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Queue",
+                "len",
+            ),
+            (
+                "run_queue",
+                "QueueCmd::Position",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "QueueConsumers",
+                "consumer_position",
+            ),
+            (
+                "run_queue",
+                "QueueCmd::Range",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Queue",
+                "range",
+            ),
+            (
+                "run_queue",
+                "QueueCmd::Read",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "QueueConsumers",
+                "consumer_read",
+            ),
+            (
+                "run_queue",
+                "QueueCmd::Reset",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "QueueConsumers",
+                "consumer_reset",
+            ),
+            (
+                "run_time_series",
+                "TimeSeriesCmd::Get",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "TimeSeries",
+                "get",
+            ),
+            (
+                "run_time_series",
+                "TimeSeriesCmd::Latest",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "TimeSeries",
+                "latest",
+            ),
+            (
+                "run_time_series",
+                "TimeSeriesCmd::Put",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "TimeSeries",
+                "put",
+            ),
+            (
+                "run_time_series",
+                "TimeSeriesCmd::Range",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "TimeSeries",
+                "range",
+            ),
+            (
+                "run_ledger",
+                "LedgerCmd::Append",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Ledger",
+                "append",
+            ),
+            (
+                "run_ledger",
+                "LedgerCmd::Get",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Ledger",
+                "get",
+            ),
+            (
+                "run_ledger",
+                "LedgerCmd::Head",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Ledger",
+                "head",
+            ),
+            (
+                "run_ledger",
+                "LedgerCmd::Len",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Ledger",
+                "len",
+            ),
+            (
+                "run_ledger",
+                "LedgerCmd::Verify",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Ledger",
+                "verify",
+            ),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(body.contains(helper), "{arm} must use {helper}");
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must dispatch through generated interface {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{arm} must dispatch through generated method {method}"
+            );
+            assert!(
+                !body.contains("remote::open_store_client"),
+                "{arm} must not bypass generated dispatch through StoreClient"
+            );
+            assert!(
+                !body.contains("cli_open_loom("),
+                "{arm} must not open a writable Loom directly"
+            );
+            assert!(
+                !body.contains("FileStore::open("),
+                "{arm} must not open a writable FileStore directly"
+            );
+        }
+    }
+
+    #[test]
+    fn mu_17g_b_analytical_data_cli_leaves_use_generated_clients() {
+        let main_source = include_str!("main.rs");
+
+        for (runner, arm, helper, interface, method) in [
+            (
+                "run_graph",
+                "GraphCmd::UpsertNode",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Graph",
+                "upsert_node",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::GetNode",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Graph",
+                "get_node",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::RemoveNode",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Graph",
+                "remove_node",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::UpsertEdge",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Graph",
+                "upsert_edge",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::GetEdge",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Graph",
+                "get_edge",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::RemoveEdge",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Graph",
+                "remove_edge",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::Neighbors",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Graph",
+                "neighbors",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::OutEdges",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Graph",
+                "out_edges",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::InEdges",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Graph",
+                "in_edges",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::Reachable",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Graph",
+                "reachable",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::ShortestPath",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Graph",
+                "shortest_path",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::Query",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Graph",
+                "query",
+            ),
+            (
+                "run_graph",
+                "GraphCmd::ExplainQuery",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Graph",
+                "explain_query",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::Create",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Vector",
+                "create",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::Upsert",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Vector",
+                "upsert",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::UpsertSource",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Vector",
+                "upsert_source",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::Get",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Vector",
+                "get",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::Source",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Vector",
+                "source_text",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::Ids",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Vector",
+                "ids",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::IndexKeys",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Vector",
+                "metadata_index_keys",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::CreateIndex",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Vector",
+                "create_metadata_index",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::DropIndex",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Vector",
+                "drop_metadata_index",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::Delete",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Vector",
+                "delete",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::Search",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Vector",
+                "search_policy",
+            ),
+            (
+                "run_vector_workspace",
+                "VectorWorkspaceCmd::Configure",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Vector",
+                "vector_workspace_configure_json",
+            ),
+            (
+                "run_vector_text",
+                "VectorTextCmd::Upsert",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Vector",
+                "vector_text_upsert",
+            ),
+            (
+                "run_search",
+                "SearchCmd::Create",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Search",
+                "create",
+            ),
+            (
+                "run_search",
+                "SearchCmd::Index",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Search",
+                "index",
+            ),
+            (
+                "run_search",
+                "SearchCmd::Get",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Search",
+                "get",
+            ),
+            (
+                "run_search",
+                "SearchCmd::Delete",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Search",
+                "delete",
+            ),
+            (
+                "run_search",
+                "SearchCmd::Ids",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Search",
+                "ids",
+            ),
+            (
+                "run_search",
+                "SearchCmd::Remap",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Search",
+                "remap",
+            ),
+            (
+                "run_search",
+                "SearchCmd::Query",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Search",
+                "query",
+            ),
+            (
+                "run_search",
+                "SearchCmd::Status",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Search",
+                "status",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Create",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Columnar",
+                "create",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Append",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Columnar",
+                "append",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Scan",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Columnar",
+                "scan",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Columns",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Columnar",
+                "columns",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Rows",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Columnar",
+                "rows",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Compact",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Columnar",
+                "compact",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Inspect",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Columnar",
+                "inspect",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::SourceDigest",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Columnar",
+                "source_digest",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Select",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Columnar",
+                "select",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Aggregate",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Columnar",
+                "aggregate",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::ImportArrow",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Columnar",
+                "columnar_import_arrow",
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::ImportParquet",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Columnar",
+                "columnar_import_parquet",
+            ),
+            (
+                "run_dataframe",
+                "DataframeCmd::Create",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Dataframe",
+                "create",
+            ),
+            (
+                "run_dataframe",
+                "DataframeCmd::Collect",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Dataframe",
+                "collect",
+            ),
+            (
+                "run_dataframe",
+                "DataframeCmd::Materialize",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Dataframe",
+                "materialize",
+            ),
+            (
+                "run_dataframe",
+                "DataframeCmd::PlanDigest",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Dataframe",
+                "plan_digest",
+            ),
+            (
+                "run_dataframe",
+                "DataframeCmd::Preview",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Dataframe",
+                "preview",
+            ),
+            (
+                "run_dataframe",
+                "DataframeCmd::SourceDigests",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Dataframe",
+                "source_digests",
+            ),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(body.contains(helper), "{arm} must use {helper}");
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must dispatch through generated interface {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{arm} must dispatch through generated method {method}"
+            );
+            assert!(
+                !body.contains("remote::open_store_client"),
+                "{arm} must not bypass generated dispatch through StoreClient"
+            );
+            assert!(
+                !body.contains("FileStore::open("),
+                "{arm} must not acquire direct FileStore ownership"
+            );
+            assert!(
+                !body.contains("save_loom("),
+                "{arm} must not save outside the generated owner"
+            );
+        }
+
+        let vector_text_query = match_arm_body(
+            function_body(main_source, "run_vector_text"),
+            "VectorTextCmd::Query",
+        );
+        assert!(vector_text_query.contains("remote::target_is_remote(&store)?"));
+        assert!(vector_text_query.contains("\"Vector\""));
+        assert!(vector_text_query.contains("\"search\""));
+        assert!(vector_text_query.contains("\"source_text\""));
+        assert!(vector_text_query.contains("cli_open_loom_read(&store, keys)?"));
+        assert!(!vector_text_query.contains("remote::open_store_client"));
+
+        for (runner, arm) in [
+            ("run_columnar", "ColumnarCmd::ExportArrow"),
+            ("run_columnar", "ColumnarCmd::ExportParquet"),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(body.contains("cli_open_loom_read(&store, keys)?"));
+            assert!(!body.contains("remote::open_store_client"));
+            assert!(!body.contains("remote::open_cli_generated_client"));
+        }
+
+        let run_search = function_body(main_source, "run_search");
+        assert!(run_search.contains("SearchCmd::Rebuild"));
+        assert!(run_search.contains("=> rebuild_search_tantivy_index"));
+
+        let unified = function_body(main_source, "run_unified_search");
+        assert!(unified.contains("cli_open_loom_read(&args.store, keys)?"));
+        assert!(!unified.contains("remote::open_store_client"));
+    }
+
+    #[test]
+    fn mu_6c_pim_mutations_use_generated_client() {
+        let main_source = include_str!("main.rs");
+
+        for (runner, arm, interface, method) in [
+            (
+                "run_calendar",
+                "CalendarCmd::CreateCollection",
+                "Calendar",
+                "create_collection",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::DeleteCollection",
+                "Calendar",
+                "delete_collection",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::DeleteEntry",
+                "Calendar",
+                "delete_entry",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::PutEntry",
+                "Calendar",
+                "put_entry",
+            ),
+            ("run_calendar", "CalendarCmd::PutIcs", "Calendar", "put_ics"),
+            (
+                "run_contacts",
+                "ContactsCmd::CreateBook",
+                "Contacts",
+                "create_book",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::DeleteBook",
+                "Contacts",
+                "delete_book",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::DeleteEntry",
+                "Contacts",
+                "delete_entry",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::PutEntry",
+                "Contacts",
+                "put_entry",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::PutVcard",
+                "Contacts",
+                "put_vcard",
+            ),
+            (
+                "run_mail",
+                "MailCmd::CreateMailbox",
+                "Mail",
+                "create_mailbox",
+            ),
+            (
+                "run_mail",
+                "MailCmd::DeleteMailbox",
+                "Mail",
+                "delete_mailbox",
+            ),
+            (
+                "run_mail",
+                "MailCmd::DeleteMessage",
+                "Mail",
+                "delete_message",
+            ),
+            (
+                "run_mail",
+                "MailCmd::IngestMessage",
+                "Mail",
+                "ingest_message",
+            ),
+            ("run_mail", "MailCmd::SetFlags", "Mail", "set_flags"),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(
+                body.contains("remote::open_cli_generated_client(&store, keys)?"),
+                "{arm} must use the generated client"
+            );
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must dispatch through generated interface {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{arm} must dispatch through generated method {method}"
+            );
+            assert!(
+                !body.contains("remote::open_store_client"),
+                "{arm} must not bypass generated dispatch through StoreClient"
+            );
+            assert!(
+                !body.contains("cli_open_loom("),
+                "{arm} must not open a writable Loom directly"
+            );
+            assert!(
+                !body.contains("FileStore::open("),
+                "{arm} must not open a writable FileStore directly"
+            );
+        }
+    }
+
+    #[test]
+    fn mu_17g_c_pim_cli_leaves_use_typed_generated_clients() {
+        let main_source = include_str!("main.rs");
+
+        for (runner, arm, opener, interface, method) in [
+            (
+                "run_calendar",
+                "CalendarCmd::CreateCollection",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Calendar",
+                "create_collection",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::GetCollection",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Calendar",
+                "get_collection",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::ListCollections",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Calendar",
+                "list_collections",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::DeleteCollection",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Calendar",
+                "delete_collection",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::PutIcs",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Calendar",
+                "put_ics",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::PutEntry",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Calendar",
+                "put_entry",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::GetEntry",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Calendar",
+                "get_entry",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::DeleteEntry",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Calendar",
+                "delete_entry",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::ListEntries",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Calendar",
+                "list_entries",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::Range",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Calendar",
+                "range",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::Search",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Calendar",
+                "search",
+            ),
+            (
+                "run_calendar",
+                "CalendarCmd::ToIcs",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Calendar",
+                "to_ics",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::CreateBook",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Contacts",
+                "create_book",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::GetBook",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Contacts",
+                "get_book",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::ListBooks",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Contacts",
+                "list_books",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::DeleteBook",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Contacts",
+                "delete_book",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::PutVcard",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Contacts",
+                "put_vcard",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::PutEntry",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Contacts",
+                "put_entry",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::GetEntry",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Contacts",
+                "get_entry",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::DeleteEntry",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Contacts",
+                "delete_entry",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::ListEntries",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Contacts",
+                "list_entries",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::Search",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Contacts",
+                "search",
+            ),
+            (
+                "run_contacts",
+                "ContactsCmd::ToVcard",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Contacts",
+                "to_vcard",
+            ),
+            (
+                "run_mail",
+                "MailCmd::CreateMailbox",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Mail",
+                "create_mailbox",
+            ),
+            (
+                "run_mail",
+                "MailCmd::GetMailbox",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Mail",
+                "get_mailbox",
+            ),
+            (
+                "run_mail",
+                "MailCmd::ListMailboxes",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Mail",
+                "list_mailboxes",
+            ),
+            (
+                "run_mail",
+                "MailCmd::DeleteMailbox",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Mail",
+                "delete_mailbox",
+            ),
+            (
+                "run_mail",
+                "MailCmd::IngestMessage",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Mail",
+                "ingest_message",
+            ),
+            (
+                "run_mail",
+                "MailCmd::GetMessage",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Mail",
+                "get_message",
+            ),
+            (
+                "run_mail",
+                "MailCmd::ToEml",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Mail",
+                "to_eml",
+            ),
+            (
+                "run_mail",
+                "MailCmd::DeleteMessage",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Mail",
+                "delete_message",
+            ),
+            (
+                "run_mail",
+                "MailCmd::ListMessages",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Mail",
+                "list_messages",
+            ),
+            (
+                "run_mail",
+                "MailCmd::GetFlags",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Mail",
+                "get_flags",
+            ),
+            (
+                "run_mail",
+                "MailCmd::SetFlags",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "Mail",
+                "set_flags",
+            ),
+            (
+                "run_mail",
+                "MailCmd::Search",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Mail",
+                "search",
+            ),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(body.contains(opener), "{runner} {arm} must use {opener}");
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{runner} {arm} must dispatch through generated interface {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{runner} {arm} must dispatch through generated method {method}"
+            );
+            assert!(
+                !body.contains("remote::open_store_client"),
+                "{runner} {arm} must not use legacy StoreClient routing"
+            );
+            assert!(
+                !body.contains("cli_open_loom("),
+                "{runner} {arm} must not open a writable Loom directly"
+            );
+            assert!(
+                !body.contains("save_loom("),
+                "{runner} {arm} must not save outside the generated owner"
+            );
+        }
+    }
+
+    #[test]
+    fn mu_17g_d2_identity_acl_protected_ref_leaves_use_typed_generated_clients() {
+        let cli_source = include_str!("cli.rs");
+        let management_source = include_str!("management_cmd.rs");
+        let generated_api_source = include_str!("../../loom-remote-protocol/src/generated_api.rs");
+        let service_source = include_str!("../../loom-client/src/service.rs");
+
+        let inventory = [
+            ("IdentityCmd::List", true),
+            ("IdentityCmd::Add", true),
+            ("IdentityCmd::RenameHandle", true),
+            ("IdentityCmd::SetPassphrase", true),
+            ("IdentityCmd::CreateAppCredential", true),
+            ("IdentityCmd::RevokeAppCredential", true),
+            ("IdentityCmd::CreateExternalCredential", true),
+            ("IdentityCmd::RevokeExternalCredential", true),
+            ("IdentityPublicKeyCmd::Add", true),
+            ("IdentityPublicKeyCmd::List", true),
+            ("IdentityPublicKeyCmd::Revoke", true),
+            ("IdentityCmd::ForceDetachAuthority", true),
+            ("IdentityCmd::AuthorityWitness", true),
+            ("IdentityCmd::ReplicateAuthority", true),
+            ("IdentityCmd::ConfigureAuthorityReplication", true),
+            ("IdentityCmd::ListAuthorityReplication", true),
+            ("IdentityCmd::RemoveAuthorityReplication", true),
+            ("IdentityCmd::Remove", true),
+            ("IdentityCmd::AssignRole", true),
+            ("IdentityCmd::RevokeRole", true),
+            ("AclCmd::List", true),
+            ("AclCmd::Grant", true),
+            ("AclCmd::Revoke", true),
+            ("ProtectedRefCmd::List", true),
+            ("ProtectedRefCmd::Get", true),
+            ("ProtectedRefCmd::Set", true),
+            ("ProtectedRefCmd::Remove", true),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (leaf, _) in inventory {
+            assert!(seen.insert(leaf), "{leaf} is duplicated");
+        }
+        assert_eq!(seen.len(), 27);
+        assert_eq!(
+            inventory.iter().filter(|(_, generated)| *generated).count(),
+            27
+        );
+        assert_eq!(
+            inventory
+                .iter()
+                .filter(|(_, generated)| !*generated)
+                .count(),
+            0
+        );
+        for enum_name in [
+            "IdentityCmd",
+            "IdentityPublicKeyCmd",
+            "AclCmd",
+            "ProtectedRefCmd",
+        ] {
+            assert!(cli_source.contains(&format!("enum {enum_name}")));
+        }
+
+        for method in [
+            "identity_list",
+            "identity_add_principal",
+            "identity_rename_principal_handle",
+            "identity_set_passphrase",
+            "identity_remove_principal",
+            "identity_assign_role",
+            "identity_revoke_role",
+            "identity_create_external_credential",
+            "identity_revoke_external_credential",
+            "identity_add_public_key",
+            "identity_revoke_public_key",
+            "identity_create_app_credential",
+            "identity_revoke_app_credential",
+            "identity_authority_witness",
+            "identity_force_detach_authority_json",
+            "identity_replicate_authority_json",
+            "identity_configure_authority_replication_json",
+            "identity_list_authority_replication",
+            "identity_remove_authority_replication_json",
+            "acl_list",
+            "acl_grant",
+            "acl_revoke",
+            "protected_ref_list",
+            "protected_ref_get",
+            "protected_ref_set",
+            "protected_ref_remove",
+        ] {
+            assert!(generated_api_source.contains(&format!("fn {method}")));
+        }
+        for owner in [
+            "impl Identity for LocalLoomClient",
+            "impl Acl for LocalLoomClient",
+            "impl ProtectedRefs for LocalLoomClient",
+        ] {
+            assert!(service_source.contains(owner));
+        }
+
+        for (runner, arm, opener, interface, methods) in [
+            (
+                "run_identity",
+                "IdentityCmd::List",
+                "crate::remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_list"][..],
+            ),
+            (
+                "run_identity_public_key",
+                "IdentityPublicKeyCmd::List",
+                "crate::remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_list"],
+            ),
+            (
+                "run_acl",
+                "AclCmd::List",
+                "crate::remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Acl",
+                &["acl_list"],
+            ),
+            (
+                "run_protected_ref",
+                "ProtectedRefCmd::List",
+                "crate::remote::open_cli_read_only_generated_client(&store, keys)?",
+                "ProtectedRefs",
+                &["protected_ref_list"],
+            ),
+            (
+                "run_protected_ref",
+                "ProtectedRefCmd::Get",
+                "crate::remote::open_cli_read_only_generated_client(&store, keys)?",
+                "ProtectedRefs",
+                &["protected_ref_get"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::Add",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_add_principal"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::RenameHandle",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_rename_principal_handle"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::SetPassphrase",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_set_passphrase"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::Remove {",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_remove_principal"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::AssignRole",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_assign_role"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::RevokeRole",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_revoke_role"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::ForceDetachAuthority",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_force_detach_authority_json"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::AuthorityWitness",
+                "crate::remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_authority_witness"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::ReplicateAuthority",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_replicate_authority_json"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::ConfigureAuthorityReplication",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_configure_authority_replication_json"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::ListAuthorityReplication",
+                "crate::remote::open_cli_read_only_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_list_authority_replication"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::RemoveAuthorityReplication",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Identity",
+                &["identity_remove_authority_replication_json"],
+            ),
+            (
+                "run_acl",
+                "AclCmd::Grant",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Acl",
+                &["acl_grant"],
+            ),
+            (
+                "run_acl",
+                "AclCmd::Revoke",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "Acl",
+                &["acl_revoke"],
+            ),
+            (
+                "run_protected_ref",
+                "ProtectedRefCmd::Set",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "ProtectedRefs",
+                &["protected_ref_set"],
+            ),
+            (
+                "run_protected_ref",
+                "ProtectedRefCmd::Remove",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "ProtectedRefs",
+                &["protected_ref_remove"],
+            ),
+        ] {
+            let body = match_arm_body(function_body(management_source, runner), arm);
+            let helper_body = if methods.contains(&"identity_list") {
+                function_body(management_source, "generated_identity_snapshot")
+            } else {
+                ""
+            };
+            assert!(body.contains(opener), "{runner} {arm} must use {opener}");
+            assert!(
+                body.contains(&format!("\"{interface}\""))
+                    || helper_body.contains(&format!("\"{interface}\"")),
+                "{runner} {arm} must use generated interface {interface}"
+            );
+            for method in methods {
+                assert!(
+                    body.contains(&format!("\"{method}\""))
+                        || helper_body.contains(&format!("\"{method}\"")),
+                    "{runner} {arm} must use generated method {method}"
+                );
+            }
+            for forbidden in [
+                "crate::remote::open_store_client",
+                "cli_open_loom_read(",
+                "cli_open_loom(",
+                "FileStore::open(",
+                "save_loom(",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{runner} {arm} found {forbidden}"
+                );
+            }
+        }
+
+        for (runner, arm, helper, methods) in [
+            (
+                "run_identity",
+                "IdentityCmd::CreateAppCredential",
+                "generated_app_credential_create",
+                &["identity_create_app_credential"][..],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::RevokeAppCredential",
+                "generated_app_credential_revoke",
+                &["identity_revoke_app_credential"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::CreateExternalCredential",
+                "generated_external_credential_create",
+                &["identity_create_external_credential"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::RevokeExternalCredential",
+                "generated_external_credential_revoke",
+                &["identity_revoke_external_credential"],
+            ),
+            (
+                "run_identity_public_key",
+                "IdentityPublicKeyCmd::Add",
+                "generated_public_key_add",
+                &["identity_add_public_key"],
+            ),
+            (
+                "run_identity_public_key",
+                "IdentityPublicKeyCmd::Revoke",
+                "generated_public_key_revoke",
+                &["identity_revoke_public_key"],
+            ),
+        ] {
+            let body = match_arm_body(function_body(management_source, runner), arm);
+            assert!(body.contains("crate::remote::open_cli_generated_client(&store, keys)?"));
+            assert!(body.contains(helper));
+            let helper_body = function_body(management_source, helper);
+            assert!(helper_body.contains("\"Identity\""));
+            for method in methods {
+                assert!(helper_body.contains(&format!("\"{method}\"")));
+            }
+            for forbidden in [
+                "crate::remote::open_store_client",
+                "cli_open_loom_read(",
+                "cli_open_loom(",
+                "FileStore::open(",
+                "save_loom(",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{runner} {arm} found {forbidden}"
+                );
+            }
+        }
+        assert!(generated_boundary_classifications().iter().any(|entry| {
+            entry.path == "management kv config set"
+                && entry.ownership
+                    == (LeafOwnership::Generated {
+                        interface: "ManagementKv",
+                        method: "set_config",
+                    })
+        }));
+    }
+
+    #[test]
+    fn mu_17g_d1_core_cli_leaves_use_typed_generated_clients() {
+        let main_source = include_str!("main.rs");
+        let management_source = include_str!("management_cmd.rs");
+        let remote_source = include_str!("remote.rs");
+
+        for (arm, opener, methods) in [
+            (
+                "FilesCmd::Delete",
+                "remote::open_cli_generated_client(&store, keys)?",
+                &["stat", "remove_directory", "remove_file"][..],
+            ),
+            (
+                "FilesCmd::Ls",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                &["list_directory"],
+            ),
+            (
+                "FilesCmd::Mkdir",
+                "remote::open_cli_generated_client(&store, keys)?",
+                &["create_directory"],
+            ),
+            (
+                "FilesCmd::Read",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                &["read_file"],
+            ),
+            (
+                "FilesCmd::Write",
+                "remote::open_cli_generated_client(&store, keys)?",
+                &["create_directory", "write_file"],
+            ),
+        ] {
+            let body = match_arm_body(function_body(main_source, "run_files"), arm);
+            assert!(body.contains(opener), "{arm} must use {opener}");
+            assert!(
+                body.contains("\"FileSystem\"") || body.contains("generated_files_list"),
+                "{arm} must dispatch through FileSystem generated methods"
+            );
+            for method in methods {
+                let present = body.contains(&format!("\"{method}\""))
+                    || function_body(main_source, "generated_files_list")
+                        .contains(&format!("\"{method}\""));
+                assert!(
+                    present,
+                    "{arm} must dispatch through generated FileSystem.{method}"
+                );
+            }
+            for forbidden in [
+                "remote::open_store_client",
+                "cli_open_loom(",
+                "FileStore::open(",
+                "save_loom(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+        }
+
+        for (arm, opener, method) in [
+            (
+                "WorkspaceCmd::Create",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "workspace_create",
+            ),
+            (
+                "WorkspaceCmd::List",
+                "crate::remote::open_cli_read_only_generated_client(&store, keys)?",
+                "workspace_list",
+            ),
+            (
+                "WorkspaceCmd::Rename",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "workspace_rename",
+            ),
+            (
+                "WorkspaceCmd::Delete",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "workspace_delete",
+            ),
+        ] {
+            let body = match_arm_body(
+                function_body(management_source, "run_management_workspace"),
+                arm,
+            );
+            assert!(body.contains(opener), "{arm} must use {opener}");
+            assert!(
+                body.contains("\"Workspaces\"") || body.contains("workspace_list()"),
+                "{arm} must dispatch through generated Workspaces authority"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\""))
+                    || function_body(remote_source, "workspace_list")
+                        .contains(&format!("\"{method}\"")),
+                "{arm} must dispatch through generated Workspaces.{method}"
+            );
+            for forbidden in [
+                "crate::remote::open_store_client",
+                "cli_open_loom(",
+                "FileStore::open(",
+                "save_loom(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+        }
+
+        for (arm, opener, helper, method) in [
+            (
+                "DocumentCmd::Delete",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "doc_delete",
+                "delete",
+            ),
+            (
+                "DocumentCmd::DeleteCollection",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "doc_delete_collection",
+                "delete_collection",
+            ),
+            (
+                "DocumentCmd::GetText",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "doc_get_text",
+                "get_text",
+            ),
+            (
+                "DocumentCmd::PutText",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "doc_put_text",
+                "put_text",
+            ),
+            (
+                "DocumentCmd::GetBinary",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "doc_get_binary",
+                "get_binary",
+            ),
+            (
+                "DocumentCmd::PutBinary",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "doc_put_binary",
+                "put_binary",
+            ),
+            (
+                "DocumentCmd::ListBinary",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "doc_list_binary",
+                "list_binary",
+            ),
+            (
+                "DocumentCmd::Find",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "doc_find",
+                "find_json",
+            ),
+            (
+                "DocumentCmd::Query",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "doc_query",
+                "query_json",
+            ),
+            (
+                "DocumentCmd::IndexCreate",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "doc_index_create",
+                "index_create",
+            ),
+            (
+                "DocumentCmd::IndexCreateJson",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "doc_index_create_json",
+                "index_create_json",
+            ),
+            (
+                "DocumentCmd::IndexDrop",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "doc_index_drop",
+                "index_drop",
+            ),
+            (
+                "DocumentCmd::IndexList",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "doc_index_list",
+                "index_list_json",
+            ),
+            (
+                "DocumentCmd::IndexRebuild",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "doc_index_rebuild",
+                "index_rebuild",
+            ),
+            (
+                "DocumentCmd::IndexStatus",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "doc_index_statuses",
+                "index_status_json",
+            ),
+        ] {
+            let body = match_arm_body(function_body(main_source, "run_document"), arm);
+            assert!(body.contains(opener), "{arm} must use {opener}");
+            assert!(body.contains(helper), "{arm} must use {helper}");
+            let helper_body = function_body(remote_source, helper);
+            assert!(
+                helper_body.contains(&format!("\"{method}\"")),
+                "{helper} must dispatch through generated Document.{method}"
+            );
+            if helper == "doc_get_text" {
+                assert!(
+                    !helper_body.contains("doc_get_binary"),
+                    "DocumentCmd::GetText must not route through Document.get_binary"
+                );
+                assert!(
+                    !helper_body.contains("\"get_binary\""),
+                    "DocumentCmd::GetText must not dispatch Document.get_binary"
+                );
+            }
+            for forbidden in [
+                "remote::open_store_client",
+                "cli_open_loom(",
+                "FileStore::open(",
+                "save_loom(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+        }
+        for helper in [
+            "document_bool",
+            "document_bytes",
+            "document_void",
+            "doc_put_binary_value",
+        ] {
+            assert!(
+                function_body(remote_source, helper).contains("\"Document\""),
+                "{helper} must use the generated Document interface"
+            );
+        }
+
+        for (arm, opener, method) in [
+            (
+                "PagesCmd::SpaceCreate",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "spaces_create_json",
+            ),
+            (
+                "PagesCmd::SpaceList",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "spaces_list_json",
+            ),
+            (
+                "PagesCmd::SpaceGet",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "spaces_get_json",
+            ),
+            (
+                "PagesCmd::Create",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "pages_create_json",
+            ),
+            (
+                "PagesCmd::Update",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "pages_update_json",
+            ),
+            (
+                "PagesCmd::Publish",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "pages_publish_json",
+            ),
+            (
+                "PagesCmd::Get",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "pages_get_json",
+            ),
+            (
+                "PagesCmd::History",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "pages_history_json",
+            ),
+            (
+                "PagesCmd::StructureCreate",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "structures_create_json",
+            ),
+            (
+                "PagesCmd::StructureGet",
+                "remote::open_cli_read_only_generated_client(&store, keys)?",
+                "structures_get_json",
+            ),
+            (
+                "PagesCmd::StructureAddNode",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "structures_add_node_json",
+            ),
+            (
+                "PagesCmd::StructureUpdateNode",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "structures_update_node_json",
+            ),
+            (
+                "PagesCmd::StructureBind",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "structures_bind_json",
+            ),
+            (
+                "PagesCmd::StructureMoveNode",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "structures_move_node_json",
+            ),
+            (
+                "PagesCmd::StructureLinkNode",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "structures_link_node_json",
+            ),
+            (
+                "PagesCmd::StructureDecomposeToTickets",
+                "remote::open_cli_generated_client(&store, keys)?",
+                "structures_decompose_to_tickets_json",
+            ),
+        ] {
+            let body = match_arm_body(function_body(main_source, "run_pages"), arm);
+            assert!(body.contains(opener), "{arm} must use {opener}");
+            assert!(body.contains("\"Pages\""), "{arm} must use Pages");
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{arm} must dispatch through generated Pages.{method}"
+            );
+            for forbidden in [
+                "remote::open_store_client",
+                "cli_open_loom(",
+                "FileStore::open(",
+                "save_loom(",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn mu_17g_d3_tickets_lanes_cli_leaves_use_typed_generated_clients() {
+        let cli_source = include_str!("cli.rs");
+        let main_source = include_str!("main.rs");
+        let generated_api_source = include_str!("../../loom-remote-protocol/src/generated_api.rs");
+        let service_source = include_str!("../../loom-client/src/service.rs");
+
+        struct Leaf<'a> {
+            runner: &'a str,
+            arm: &'a str,
+            opener: &'a str,
+            interface: &'a str,
+            methods: &'a [&'a str],
+        }
+
+        let ticket_leaves = [
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::ProjectCreate",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_project_create_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::ProjectRekey",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_project_rekey_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::ProjectSettingsGet",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_project_settings_get_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::ProjectSettingsSet",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_project_settings_set_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::Projects",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_projects_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::Relations",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_relation_list_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::Fields",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_fields_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::FieldPut",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_field_put_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::FieldRetire",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_field_retire_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::Create",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_projects_json", "tickets_create_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::Update",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_update_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::Delete",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_delete_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::Comments",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_comments_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::CommentAdd",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_comment_add_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::CommentUpdate",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_comment_update_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::CommentDelete",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_comment_delete_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::BoardCreate",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["boards_create_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::BoardGet",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["boards_get_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::BoardList",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["boards_list_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::BoardUpdate",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["boards_update_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::BoardDelete",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["boards_delete_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::BoardConfigureColumns",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["boards_configure_columns_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::BoardMoveCard",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["boards_move_card_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::RelationSet",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_relation_set_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::RelationRemove",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_relation_remove_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::List",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_list_json"],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::Get",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &[
+                    "tickets_get_json",
+                    "tickets_history_json",
+                    "tickets_comments_json",
+                ],
+            },
+            Leaf {
+                runner: "run_tickets",
+                arm: "TicketsCmd::History",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Tickets",
+                methods: &["tickets_history_json"],
+            },
+        ];
+
+        let lane_leaves = [
+            Leaf {
+                runner: "run_lanes",
+                arm: "LanesCmd::Create",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Lanes",
+                methods: &["lanes_create"],
+            },
+            Leaf {
+                runner: "run_lanes",
+                arm: "LanesCmd::Get",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Lanes",
+                methods: &["lanes_get", "lanes_get_view_json"],
+            },
+            Leaf {
+                runner: "run_lanes",
+                arm: "LanesCmd::List",
+                opener: "remote::open_cli_read_only_generated_client(&store, keys)?",
+                interface: "Lanes",
+                methods: &["lanes_list_views_json"],
+            },
+            Leaf {
+                runner: "run_lanes",
+                arm: "LanesCmd::Update",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Lanes",
+                methods: &["lanes_update"],
+            },
+            Leaf {
+                runner: "run_lanes",
+                arm: "LanesCmd::Closeout",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Lanes",
+                methods: &["lanes_closeout"],
+            },
+            Leaf {
+                runner: "run_lanes",
+                arm: "LanesCmd::TicketAdd",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Lanes",
+                methods: &["lanes_ticket_add"],
+            },
+            Leaf {
+                runner: "run_lanes",
+                arm: "LanesCmd::TicketRemove",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Lanes",
+                methods: &["lanes_ticket_remove"],
+            },
+            Leaf {
+                runner: "run_lanes",
+                arm: "LanesCmd::TicketTransfer",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Lanes",
+                methods: &["lanes_ticket_transfer"],
+            },
+            Leaf {
+                runner: "run_lanes",
+                arm: "LanesCmd::Delete",
+                opener: "remote::open_cli_generated_client(&store, keys)?",
+                interface: "Lanes",
+                methods: &["lanes_delete"],
+            },
+            Leaf {
+                runner: "run_lanes",
+                arm: "LanesCmd::Cleanup",
+                opener: "cleanup_dual_generated_client",
+                interface: "Lanes",
+                methods: &["cleanup_json"],
+            },
+        ];
+
+        assert_eq!(
+            enum_variants(cli_source, "TicketsCmd"),
+            ticket_leaves
+                .iter()
+                .map(|leaf| leaf.arm.trim_start_matches("TicketsCmd::").to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            enum_variants(cli_source, "LanesCmd"),
+            lane_leaves
+                .iter()
+                .map(|leaf| leaf.arm.trim_start_matches("LanesCmd::").to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ticket_leaves.len(), 28);
+        assert_eq!(lane_leaves.len(), 10);
+
+        for method in ticket_leaves
+            .iter()
+            .filter(|leaf| leaf.interface == "Tickets")
+            .flat_map(|leaf| leaf.methods.iter())
+        {
+            assert!(
+                generated_api_source.contains(&format!("fn {method}")),
+                "generated Tickets trait must expose {method}"
+            );
+        }
+        for method in [
+            "create",
+            "get",
+            "list",
+            "update",
+            "ticket_add",
+            "ticket_remove",
+            "ticket_transfer",
+            "delete",
+            "closeout",
+            "get_view_json",
+            "list_views_json",
+            "cleanup_json",
+        ] {
+            assert!(
+                generated_api_source.contains(&format!("fn {method}")),
+                "generated Lanes trait must expose {method}"
+            );
+        }
+        for owner in [
+            "impl Tickets for LocalLoomClient",
+            "impl Lanes for LocalLoomClient",
+        ] {
+            assert!(
+                service_source.contains(owner),
+                "LocalLoomClient must own {owner}"
+            );
+        }
+
+        let forbidden = [
+            "remote::open_store_client",
+            "StoreClient::",
+            "cli_open_loom(",
+            "cli_open_loom_read(",
+            "FileStore::open",
+            "Loom::new(",
+            "save_loom(",
+            "loom_tickets::create_ticket",
+            "loom_tickets::update_ticket",
+            "loom_tickets::delete_ticket",
+            "loom_lanes::create_lane",
+            "loom_lanes::put_lane",
+            "loom_lanes::delete_lane",
+        ];
+        for leaf in ticket_leaves.iter().chain(lane_leaves.iter()) {
+            let body = match_arm_body(function_body(main_source, leaf.runner), leaf.arm);
+            if leaf.opener == "cleanup_dual_generated_client" {
+                assert!(body.contains("remote::open_cli_generated_client(&store, keys)?"));
+                assert!(
+                    body.contains("remote::open_cli_read_only_generated_client(&store, keys)?")
+                );
+            } else {
+                assert!(
+                    body.contains(leaf.opener),
+                    "{} {} must use {}",
+                    leaf.runner,
+                    leaf.arm,
+                    leaf.opener
+                );
+            }
+            if leaf.interface == "Tickets" {
+                assert!(body.contains("\"Tickets\""), "{} {}", leaf.runner, leaf.arm);
+            }
+            for method in leaf.methods {
+                assert!(
+                    body.contains(method),
+                    "{} {} must dispatch through {method}",
+                    leaf.runner,
+                    leaf.arm
+                );
+            }
+            for forbidden in forbidden {
+                assert!(
+                    !body.contains(forbidden),
+                    "{} {} must not use legacy execution helper {forbidden}",
+                    leaf.runner,
+                    leaf.arm
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mu_17g_e1_sql_meetings_cli_leaves_use_typed_generated_clients() {
+        let cli_source = include_str!("cli.rs");
+        let main_source = include_str!("main.rs");
+        let generated_api_source = include_str!("../../loom-remote-protocol/src/generated_api.rs");
+        let remote_client_source = include_str!("../../loom-remote-client/src/generated_client.rs");
+        let hosted_dispatch_source =
+            include_str!("../../loom-hosted-core/src/generated_dispatch.rs");
+        let service_source = include_str!("../../loom-client/src/service.rs");
+
+        assert_eq!(enum_variants(cli_source, "SqlCmd"), vec!["Exec", "Table"]);
+        assert_eq!(
+            enum_variants(cli_source, "MeetingsCmd"),
+            vec!["List", "Get", "Search", "SourceRead", "Import"]
+        );
+
+        struct Leaf<'a> {
+            runner: &'a str,
+            arm: &'a str,
+            interface: &'a str,
+            method: &'a str,
+            result: &'a str,
+        }
+
+        let leaves = [
+            Leaf {
+                runner: "run_sql_cmd",
+                arm: "SqlCmd::Exec",
+                interface: "Sql",
+                method: "sql_exec_result",
+                result: "execute_generated_bytes",
+            },
+            Leaf {
+                runner: "run_meetings",
+                arm: "MeetingsCmd::Import",
+                interface: "Meetings",
+                method: "meetings_import_snapshot",
+                result: "execute_generated_string",
+            },
+        ];
+
+        for leaf in leaves {
+            let body = match_arm_body(function_body(main_source, leaf.runner), leaf.arm);
+            assert!(
+                body.contains("remote::open_cli_generated_client(&store, keys)?"),
+                "{} {} must open the generated CLI client",
+                leaf.runner,
+                leaf.arm
+            );
+            assert!(
+                body.contains(&format!("\"{}\"", leaf.interface)),
+                "{} {} must route through {}",
+                leaf.runner,
+                leaf.arm,
+                leaf.interface
+            );
+            assert!(
+                body.contains(&format!("\"{}\"", leaf.method)),
+                "{} {} must call {}",
+                leaf.runner,
+                leaf.arm,
+                leaf.method
+            );
+            assert!(
+                body.contains(leaf.result),
+                "{} {} must use the typed generated result adapter",
+                leaf.runner,
+                leaf.arm
+            );
+            for forbidden in [
+                "remote::open_store_client",
+                "StoreClient::",
+                "cli_open_loom(",
+                "cli_open_loom_read(",
+                "FileStore::open",
+                "Loom::new(",
+                "LoomSqlStore::open_write(",
+                "Glue::new(",
+                "save_loom(",
+                "ensure_facet_workspace(",
+                "import_meetings_bytes(",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{} {} must not use legacy execution helper {forbidden}",
+                    leaf.runner,
+                    leaf.arm
+                );
+            }
+            assert!(
+                generated_api_source.contains(&format!("fn {}(", leaf.method)),
+                "generated API must expose {}.{}",
+                leaf.interface,
+                leaf.method
+            );
+            assert!(
+                remote_client_source.contains(&format!("fn {}(", leaf.method)),
+                "remote client must expose {}.{}",
+                leaf.interface,
+                leaf.method
+            );
+            assert!(
+                hosted_dispatch_source
+                    .contains(&format!("(\"{}\", \"{}\")", leaf.interface, leaf.method)),
+                "hosted dispatch must expose {}.{}",
+                leaf.interface,
+                leaf.method
+            );
+            assert!(
+                service_source.contains(&format!("impl {} for LocalLoomClient", leaf.interface)),
+                "LocalLoomClient must implement {}",
+                leaf.interface
+            );
+        }
+
+        let run_sql = function_body(main_source, "run_sql_cmd");
+        assert!(
+            run_sql.contains("SqlCmd::Table { action } => run_table(action, keys),"),
+            "SqlCmd::Table remains delegated outside MU-17g-e1 SQL execution scope"
+        );
+
+        let meetings_read_only = [
+            "MeetingsCmd::List",
+            "MeetingsCmd::Get",
+            "MeetingsCmd::Search",
+        ];
+        for arm in meetings_read_only {
+            let body = match_arm_body(function_body(main_source, "run_meetings"), arm);
+            assert!(
+                body.contains("cli_open_loom_read(&store, keys)?"),
+                "{arm} remains a read-only presentation path outside MU-17g-e1 import scope"
+            );
+            assert!(
+                !body.contains("remote::open_cli_generated_client(&store, keys)?"),
+                "{arm} must not be counted as a migrated Meetings import leaf"
+            );
+            assert!(
+                !body.contains("save_loom("),
+                "{arm} must not own a durable mutation"
+            );
+        }
+        let source_read = match_arm_segment(
+            function_body(main_source, "run_meetings"),
+            "MeetingsCmd::SourceRead",
+            "MeetingsCmd",
+        );
+        assert!(source_read.contains("remote::open_cli_read_only_generated_client"));
+        assert!(source_read.contains("\"Meetings\""));
+        assert!(source_read.contains("\"meetings_source_read\""));
+        assert!(source_read.contains("execute_generated_bytes"));
+        for forbidden in ["cli_open_loom_read", "open_store_client", "FileStore::open"] {
+            assert!(!source_read.contains(forbidden));
+        }
+        assert!(generated_boundary_classifications().iter().any(|entry| {
+            entry.path == "meetings source-read"
+                && entry.ownership
+                    == (LeafOwnership::Generated {
+                        interface: "Meetings",
+                        method: "meetings_source_read",
+                    })
+        }));
+    }
+
+    #[test]
+    fn mu_17g_e2_chat_drive_mutation_leaves_use_typed_generated_clients() {
+        let cli_source = include_str!("cli.rs");
+        let main_source = include_str!("main.rs");
+        let generated_api_source = include_str!("../../loom-remote-protocol/src/generated_api.rs");
+        let remote_client_source = include_str!("../../loom-remote-client/src/generated_client.rs");
+        let hosted_dispatch_source =
+            include_str!("../../loom-hosted-core/src/generated_dispatch.rs");
+        let service_source = include_str!("../../loom-client/src/service.rs");
+
+        assert_eq!(
+            enum_variants(cli_source, "ChatCmd"),
+            vec![
+                "Channels",
+                "CreateChannel",
+                "RenameChannel",
+                "Messages",
+                "Events",
+                "Cursor",
+                "UpdateCursor",
+                "Post",
+                "Edit",
+                "Redact",
+                "CreateThread",
+                "CreateTask",
+                "ClaimTask",
+                "CompleteTask",
+                "InvokeAgent",
+                "AgentReply",
+                "RequestHandoff",
+                "AddReaction",
+                "RemoveReaction",
+                "EmojiList",
+                "EmojiRegister",
+                "EmojiUnregister",
+            ]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "DriveCmd"),
+            vec![
+                "List",
+                "Stat",
+                "Read",
+                "ListVersions",
+                "ListConflicts",
+                "ListShares",
+                "GrantShare",
+                "RevokeShare",
+                "ApplyShareExpiry",
+                "ListRetention",
+                "PinRetention",
+                "UnpinRetention",
+                "ApplyRetention",
+                "CreateFolder",
+                "CreateUpload",
+                "UploadChunk",
+                "CommitUpload",
+                "Rename",
+                "Move",
+                "Delete",
+                "ResolveConflict",
+            ]
+        );
+
+        struct Leaf<'a> {
+            arm: &'a str,
+            interface: &'a str,
+            method: &'a str,
+        }
+
+        let chat = [
+            Leaf {
+                arm: "ChatCmd::CreateChannel",
+                interface: "Chat",
+                method: "chat_create_channel_json",
+            },
+            Leaf {
+                arm: "ChatCmd::RenameChannel",
+                interface: "Chat",
+                method: "chat_rename_channel_json",
+            },
+            Leaf {
+                arm: "ChatCmd::UpdateCursor",
+                interface: "Chat",
+                method: "chat_update_cursor_json",
+            },
+            Leaf {
+                arm: "ChatCmd::Post",
+                interface: "Chat",
+                method: "chat_post_message_bytes_json",
+            },
+            Leaf {
+                arm: "ChatCmd::Edit",
+                interface: "Chat",
+                method: "chat_edit_message_bytes_json",
+            },
+            Leaf {
+                arm: "ChatCmd::Redact",
+                interface: "Chat",
+                method: "chat_redact_message_json",
+            },
+            Leaf {
+                arm: "ChatCmd::CreateThread",
+                interface: "Chat",
+                method: "chat_create_thread_json",
+            },
+            Leaf {
+                arm: "ChatCmd::CreateTask",
+                interface: "Chat",
+                method: "chat_create_task_json",
+            },
+            Leaf {
+                arm: "ChatCmd::ClaimTask",
+                interface: "Chat",
+                method: "chat_claim_task_json",
+            },
+            Leaf {
+                arm: "ChatCmd::CompleteTask",
+                interface: "Chat",
+                method: "chat_complete_task_json",
+            },
+            Leaf {
+                arm: "ChatCmd::InvokeAgent",
+                interface: "Chat",
+                method: "chat_invoke_agent_bytes_json",
+            },
+            Leaf {
+                arm: "ChatCmd::AgentReply",
+                interface: "Chat",
+                method: "chat_agent_reply_json",
+            },
+            Leaf {
+                arm: "ChatCmd::RequestHandoff",
+                interface: "Chat",
+                method: "chat_request_handoff_json",
+            },
+            Leaf {
+                arm: "ChatCmd::AddReaction",
+                interface: "Chat",
+                method: "chat_add_reaction_json",
+            },
+            Leaf {
+                arm: "ChatCmd::RemoveReaction",
+                interface: "Chat",
+                method: "chat_remove_reaction_json",
+            },
+            Leaf {
+                arm: "ChatCmd::EmojiRegister",
+                interface: "Chat",
+                method: "chat_emoji_register_json",
+            },
+            Leaf {
+                arm: "ChatCmd::EmojiUnregister",
+                interface: "Chat",
+                method: "chat_emoji_unregister_json",
+            },
+        ];
+        let drive = [
+            Leaf {
+                arm: "DriveCmd::GrantShare",
+                interface: "Drive",
+                method: "drive_grant_share_json",
+            },
+            Leaf {
+                arm: "DriveCmd::RevokeShare",
+                interface: "Drive",
+                method: "drive_revoke_share_json",
+            },
+            Leaf {
+                arm: "DriveCmd::ApplyShareExpiry",
+                interface: "Drive",
+                method: "drive_apply_share_expiry_json",
+            },
+            Leaf {
+                arm: "DriveCmd::PinRetention",
+                interface: "Drive",
+                method: "drive_pin_retention_json",
+            },
+            Leaf {
+                arm: "DriveCmd::UnpinRetention",
+                interface: "Drive",
+                method: "drive_unpin_retention_json",
+            },
+            Leaf {
+                arm: "DriveCmd::ApplyRetention",
+                interface: "Drive",
+                method: "drive_apply_retention_json",
+            },
+            Leaf {
+                arm: "DriveCmd::CreateFolder",
+                interface: "Drive",
+                method: "drive_create_folder_json",
+            },
+            Leaf {
+                arm: "DriveCmd::CreateUpload",
+                interface: "Drive",
+                method: "drive_create_upload_json",
+            },
+            Leaf {
+                arm: "DriveCmd::UploadChunk",
+                interface: "Drive",
+                method: "drive_upload_chunk_json",
+            },
+            Leaf {
+                arm: "DriveCmd::CommitUpload",
+                interface: "Drive",
+                method: "drive_commit_upload_json",
+            },
+            Leaf {
+                arm: "DriveCmd::Rename",
+                interface: "Drive",
+                method: "drive_rename_json",
+            },
+            Leaf {
+                arm: "DriveCmd::Move",
+                interface: "Drive",
+                method: "drive_move_json",
+            },
+            Leaf {
+                arm: "DriveCmd::Delete",
+                interface: "Drive",
+                method: "drive_delete_json",
+            },
+            Leaf {
+                arm: "DriveCmd::ResolveConflict",
+                interface: "Drive",
+                method: "drive_resolve_conflict_json",
+            },
+        ];
+        assert_eq!(chat.len(), 17);
+        assert_eq!(drive.len(), 14);
+
+        let forbidden = [
+            "remote::open_store_client",
+            "StoreClient::",
+            "cli_open_loom(",
+            "cli_open_loom_read(",
+            "FileStore::open",
+            "Loom::new(",
+            "save_loom(",
+        ];
+        for leaf in chat.iter().chain(drive.iter()) {
+            let runner = if leaf.interface == "Chat" {
+                "run_chat"
+            } else {
+                "run_drive"
+            };
+            let body = match_arm_body(function_body(main_source, runner), leaf.arm);
+            assert!(
+                body.contains("generated_workspace_context(&store, &workspace, keys)?"),
+                "{} must open the typed generated client context",
+                leaf.arm
+            );
+            assert!(body.contains(&format!("\"{}\"", leaf.interface)));
+            assert!(body.contains(&format!("\"{}\"", leaf.method)));
+            assert!(body.contains("execute_generated_json::<"));
+            for forbidden in forbidden {
+                assert!(
+                    !body.contains(forbidden),
+                    "{} must not use legacy execution helper {forbidden}",
+                    leaf.arm
+                );
+            }
+            for (source, label) in [
+                (generated_api_source, "generated API"),
+                (remote_client_source, "remote client"),
+            ] {
+                assert!(
+                    source.contains(&format!("fn {}(", leaf.method)),
+                    "{label} must expose {}.{}",
+                    leaf.interface,
+                    leaf.method
+                );
+            }
+            assert!(
+                hosted_dispatch_source
+                    .contains(&format!("(\"{}\", \"{}\")", leaf.interface, leaf.method)),
+                "hosted dispatch must expose {}.{}",
+                leaf.interface,
+                leaf.method
+            );
+            assert!(
+                service_source.contains(&format!("async fn {}(", leaf.method)),
+                "LocalLoomClient must implement {}.{}",
+                leaf.interface,
+                leaf.method
+            );
+        }
+
+        for arm in [
+            "ChatCmd::Channels",
+            "ChatCmd::Messages",
+            "ChatCmd::Events",
+            "ChatCmd::Cursor",
+            "ChatCmd::EmojiList",
+            "DriveCmd::List",
+            "DriveCmd::Stat",
+            "DriveCmd::Read",
+            "DriveCmd::ListVersions",
+            "DriveCmd::ListConflicts",
+            "DriveCmd::ListShares",
+            "DriveCmd::ListRetention",
+        ] {
+            let runner = if arm.starts_with("Chat") {
+                "run_chat"
+            } else {
+                "run_drive"
+            };
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(!body.contains("save_loom("), "{arm} must remain read-only");
+        }
+
+        for (arm, method) in [
+            ("DriveCmd::List", "drive_list_json"),
+            ("DriveCmd::Stat", "drive_stat_json"),
+            ("DriveCmd::Read", "drive_read_file"),
+            ("DriveCmd::ListVersions", "drive_list_versions_json"),
+            ("DriveCmd::ListConflicts", "drive_list_conflicts_json"),
+            ("DriveCmd::ListShares", "drive_list_shares_json"),
+            ("DriveCmd::ListRetention", "drive_list_retention_json"),
+        ] {
+            let body = match_arm_segment(function_body(main_source, "run_drive"), arm, "DriveCmd");
+            assert!(body.contains("remote::open_cli_read_only_generated_client"));
+            assert!(body.contains("\"Drive\""));
+            assert!(body.contains(&format!("\"{method}\"")));
+            for forbidden in [
+                "open_drive_read",
+                "cli_open_loom_read",
+                "open_store_client",
+                "FileStore::open",
+            ] {
+                assert!(!body.contains(forbidden), "{arm} found {forbidden}");
+            }
+        }
+        assert!(!main_source.contains("fn open_drive_read("));
+    }
+
+    #[test]
+    fn mu_17g_f2_lifecycle_refs_exec_interchange_leaves_are_exhaustive() {
+        let cli_source = include_str!("cli.rs");
+        let main_source = include_str!("main.rs");
+        let refs_source = include_str!("refs_cmd.rs");
+        let exec_source = include_str!("exec_cmd.rs");
+        let idl_source = include_str!("../../../idl/loom.idl");
+        let generated_api_source = include_str!("../../loom-remote-protocol/src/generated_api.rs");
+        let remote_client_source = include_str!("../../loom-remote-client/src/generated_client.rs");
+        let hosted_dispatch_source =
+            include_str!("../../loom-hosted-core/src/generated_dispatch.rs");
+        let service_source = include_str!("../../loom-client/src/service.rs");
+
+        assert_eq!(
+            enum_variants(cli_source, "LifecycleCmd"),
+            vec![
+                "DefineStandard",
+                "Define",
+                "Definitions",
+                "Definition",
+                "Instantiate",
+                "Instances",
+                "Instance",
+                "Transition",
+                "SnapshotPlan",
+                "CurrentSurface",
+                "Snapshots",
+                "Snapshot",
+                "SnapshotContent",
+                "OperationLog",
+            ]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "RefsCmd"),
+            vec!["Reconcile", "Status"]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "ExecCmd"),
+            vec!["Run", "Inspect", "Apply"]
+        );
+        assert_eq!(
+            enum_variants(cli_source, "InterchangeCmd"),
+            vec![
+                "ImportFs",
+                "ImportArchive",
+                "ImportTableCsv",
+                "ImportRedmine",
+                "ImportAsana",
+                "ImportJira",
+                "ImportConfluence",
+                "ImportSlack",
+                "ImportDrive",
+                "ImportMarkdown",
+                "ImportNotion",
+                "ExportArchive",
+                "ExportFs",
+                "ExportTableCsv",
+                "ExportCar",
+                "ImportCar",
+            ]
+        );
+
+        struct Leaf<'a> {
+            source: &'a str,
+            runner: &'a str,
+            arm: &'a str,
+            interface: &'a str,
+            method: &'a str,
+        }
+
+        let lifecycle = [
+            Leaf {
+                source: main_source,
+                runner: "run_lifecycle",
+                arm: "LifecycleCmd::DefineStandard",
+                interface: "Lifecycle",
+                method: "lifecycle_define_standard_json",
+            },
+            Leaf {
+                source: main_source,
+                runner: "run_lifecycle",
+                arm: "LifecycleCmd::Define {",
+                interface: "Lifecycle",
+                method: "lifecycle_define_json",
+            },
+            Leaf {
+                source: main_source,
+                runner: "run_lifecycle",
+                arm: "LifecycleCmd::Instantiate",
+                interface: "Lifecycle",
+                method: "lifecycle_instantiate_json",
+            },
+            Leaf {
+                source: main_source,
+                runner: "run_lifecycle",
+                arm: "LifecycleCmd::Transition",
+                interface: "Lifecycle",
+                method: "lifecycle_transition_json",
+            },
+        ];
+        let refs = [Leaf {
+            source: refs_source,
+            runner: "run_refs",
+            arm: "RefsCmd::Reconcile",
+            interface: "Refs",
+            method: "refs_reconcile_json",
+        }];
+        let exec = [
+            Leaf {
+                source: exec_source,
+                runner: "run_exec_cmd",
+                arm: "ExecCmd::Run",
+                interface: "Exec",
+                method: "exec_cbor",
+            },
+            Leaf {
+                source: exec_source,
+                runner: "run_exec_cmd",
+                arm: "ExecCmd::Apply",
+                interface: "Exec",
+                method: "apply_cbor",
+            },
+        ];
+        let interchange = [
+            Leaf {
+                source: main_source,
+                runner: "run_interchange",
+                arm: "InterchangeCmd::ImportFs",
+                interface: "FileSystem",
+                method: "import_fs",
+            },
+            Leaf {
+                source: main_source,
+                runner: "run_interchange",
+                arm: "InterchangeCmd::ImportArchive",
+                interface: "Archive",
+                method: "archive_import",
+            },
+            Leaf {
+                source: main_source,
+                runner: "run_interchange",
+                arm: "InterchangeCmd::ImportTableCsv",
+                interface: "InterchangeProfiles",
+                method: "import_table_csv",
+            },
+            Leaf {
+                source: main_source,
+                runner: "run_interchange",
+                arm: "InterchangeCmd::ImportCar",
+                interface: "Car",
+                method: "car_import",
+            },
+        ];
+        let helper_imports = [
+            (
+                "InterchangeCmd::ImportRedmine",
+                "run_redmine_import",
+                "import_redmine",
+            ),
+            (
+                "InterchangeCmd::ImportAsana",
+                "run_asana_import",
+                "import_asana",
+            ),
+            (
+                "InterchangeCmd::ImportJira",
+                "run_jira_import",
+                "import_jira",
+            ),
+            (
+                "InterchangeCmd::ImportConfluence",
+                "run_confluence_import",
+                "import_confluence",
+            ),
+            (
+                "InterchangeCmd::ImportSlack",
+                "run_slack_import",
+                "import_slack",
+            ),
+            (
+                "InterchangeCmd::ImportDrive",
+                "run_drive_import",
+                "import_drive",
+            ),
+            (
+                "InterchangeCmd::ImportMarkdown",
+                "run_markdown_import",
+                "import_markdown",
+            ),
+            (
+                "InterchangeCmd::ImportNotion",
+                "run_notion_import",
+                "import_notion",
+            ),
+        ];
+
+        let forbidden = [
+            "open_store_client",
+            "StoreClient::",
+            "cli_open_loom(",
+            "cli_open_loom_read(",
+            "FileStore::open",
+            "Loom::new(",
+            "save_loom(",
+        ];
+        for leaf in lifecycle
+            .iter()
+            .chain(refs.iter())
+            .chain(exec.iter())
+            .chain(interchange.iter())
+        {
+            let body = match_arm_body(function_body(leaf.source, leaf.runner), leaf.arm);
+            assert!(
+                body.contains("open_cli_generated_client"),
+                "{} must open a generated client",
+                leaf.arm
+            );
+            assert!(
+                body.contains(leaf.method),
+                "{} must call {}",
+                leaf.arm,
+                leaf.method
+            );
+            assert!(body.contains(&format!("\"{}\"", leaf.interface)));
+            for forbidden in forbidden {
+                assert!(
+                    !body.contains(forbidden),
+                    "{} found legacy owner {forbidden}",
+                    leaf.arm
+                );
+            }
+            assert!(idl_source.contains(&format!(" {}(", leaf.method)));
+            assert!(generated_api_source.contains(&format!("fn {}(", leaf.method)));
+            assert!(remote_client_source.contains(&format!("fn {}(", leaf.method)));
+            assert!(
+                hosted_dispatch_source
+                    .contains(&format!("(\"{}\", \"{}\")", leaf.interface, leaf.method))
+            );
+            assert!(service_source.contains(&format!("fn {}(", leaf.method)));
+        }
+        for leaf in &interchange {
+            let body = match_arm_body(function_body(leaf.source, leaf.runner), leaf.arm);
+            assert!(
+                body.contains(
+                    "remote::open_cli_generated_client_for_dry_run(&store, keys, dry_run)?"
+                )
+            );
+        }
+
+        let run_interchange = function_body(main_source, "run_interchange");
+        let expression_arm = |arm: &str| {
+            let start = run_interchange.find(arm).expect("interchange arm");
+            let tail = &run_interchange[start..];
+            let end = tail[arm.len()..]
+                .find("\n        InterchangeCmd::")
+                .map(|offset| arm.len() + offset)
+                .unwrap_or(tail.len());
+            &tail[..end]
+        };
+        for (arm, helper, method) in helper_imports {
+            let arm_body = expression_arm(arm);
+            assert!(arm_body.contains(helper), "{arm} must delegate to {helper}");
+            for forbidden in forbidden {
+                assert!(
+                    !arm_body.contains(forbidden),
+                    "{arm} found legacy owner {forbidden}"
+                );
+            }
+            let helper_body = function_body(main_source, helper);
+            assert!(helper_body.contains("remote::open_cli_generated_client(store, keys)?"));
+            assert!(helper_body.contains("\"InterchangeProfiles\""));
+            assert!(helper_body.contains(&format!("\"{method}\"")));
+            assert!(helper_body.contains("WireValue::Bytes"));
+            for forbidden in forbidden {
+                assert!(
+                    !helper_body.contains(forbidden),
+                    "{helper} found legacy owner {forbidden}"
+                );
+            }
+            assert!(idl_source.contains(&format!(" {method}(")));
+            assert!(generated_api_source.contains(&format!("fn {method}(")));
+            assert!(remote_client_source.contains(&format!("fn {method}(")));
+            assert!(
+                hosted_dispatch_source
+                    .contains(&format!("(\"InterchangeProfiles\", \"{method}\")"))
+            );
+            assert!(service_source.contains(&format!("fn {method}(")));
+        }
+
+        for arm in [
+            "LifecycleCmd::Definitions",
+            "LifecycleCmd::Definition",
+            "LifecycleCmd::Instances",
+            "LifecycleCmd::Instance",
+            "LifecycleCmd::SnapshotPlan",
+            "LifecycleCmd::CurrentSurface",
+            "LifecycleCmd::Snapshots",
+            "LifecycleCmd::Snapshot",
+            "LifecycleCmd::SnapshotContent",
+            "LifecycleCmd::OperationLog",
+        ] {
+            let body = match_arm_body(function_body(main_source, "run_lifecycle"), arm);
+            assert!(body.contains("cli_open_loom_read(&store, keys)?"));
+            assert!(!body.contains("save_loom("));
+        }
+        let refs_status = match_arm_body(function_body(refs_source, "run_refs"), "RefsCmd::Status");
+        assert!(refs_status.contains("mcp_for_store(&store, keys)?"));
+        assert!(!refs_status.contains("save_loom("));
+        let exec_inspect = match_arm_body(
+            function_body(exec_source, "run_exec_cmd"),
+            "ExecCmd::Inspect",
+        );
+        assert!(exec_inspect.contains("decode(&raw)"));
+        for forbidden in ["store", "open_generated_client", "save_loom"] {
+            assert!(
+                !exec_inspect.contains(forbidden),
+                "Exec inspect must remain a pure local decoder"
+            );
+        }
+
+        let export_archive = match_arm_body(run_interchange, "InterchangeCmd::ExportArchive");
+        assert!(export_archive.contains("client.transfer_export("));
+        assert!(export_archive.contains("export_archive(&loom"));
+        let export_fs = match_arm_body(run_interchange, "InterchangeCmd::ExportFs");
+        assert!(export_fs.contains("remote::target_is_remote(&store)?"));
+        assert!(export_fs.contains("export_fs(&loom"));
+        let export_table = match_arm_body(run_interchange, "InterchangeCmd::ExportTableCsv");
+        assert!(export_table.contains("export_table_csv(&loom"));
+        let export_car = match_arm_body(run_interchange, "InterchangeCmd::ExportCar");
+        assert!(export_car.contains("client.transfer_export("));
+        assert!(export_car.contains("export_car(&loom"));
+    }
+
+    #[test]
+    fn mu_17g_g_post_migration_cli_inventory_and_legacy_boundary_are_exhaustive() {
+        let cli_source = include_str!("cli.rs");
+        let main_source = include_str!("main.rs");
+        let remote_source = include_str!("remote.rs");
+
+        assert_eq!(
+            enum_variants(cli_source, "Command"),
+            vec![
+                "Audit",
+                "Calendar",
+                "Cas",
+                "Capabilities",
+                "Chat",
+                "Certificate",
+                "NetworkAccess",
+                "Columnar",
+                "Contacts",
+                "Dataframe",
+                "Daemon",
+                "Context",
+                "Document",
+                "Refs",
+                "Doctor",
+                "Exec",
+                "Program",
+                "Files",
+                "Drive",
+                "Graph",
+                "Kv",
+                "Ledger",
+                "Metrics",
+                "Logs",
+                "Traces",
+                "Lifecycle",
+                "Lock",
+                "Mail",
+                "Meetings",
+                "Pages",
+                "Tickets",
+                "Lanes",
+                "Management",
+                "Inference",
+                "Acl",
+                "Identity",
+                "Interchange",
+                "Workspace",
+                "ProtectedRef",
+                "Mcp",
+                "McpDaemonCliTestHoldSession",
+                "Mount",
+                "Queue",
+                "Search",
+                "Fts",
+                "Serve",
+                "Studio",
+                "Sql",
+                "Store",
+                "TimeSeries",
+                "Vcs",
+                "Vector",
+                "Llms",
+                "Version",
+            ]
+        );
+
+        let command_leaves = command_leaves(cli_source, "Command", "");
+        let leaves = command_leaf_paths(cli_source, "Command", "");
+        assert_eq!(leaves.len(), 466);
+        let unique = leaves.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), leaves.len());
+        let production = leaves
+            .iter()
+            .filter(|leaf| leaf.as_str() != "mcp-daemon-cli-test-hold-session")
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(production.len(), 465);
+        assert_eq!(
+            leaves
+                .iter()
+                .filter(|leaf| leaf.as_str() == "mcp-daemon-cli-test-hold-session")
+                .count(),
+            1
+        );
+        let carrier_lifecycle = ["daemon session open", "daemon session close"];
+        for leaf in carrier_lifecycle {
+            assert_eq!(
+                leaves.iter().filter(|candidate| *candidate == leaf).count(),
+                1
+            );
+        }
+        let prior_production = leaves
+            .iter()
+            .filter(|leaf| leaf.as_str() != "mcp-daemon-cli-test-hold-session")
+            .filter(|leaf| !carrier_lifecycle.contains(&leaf.as_str()))
+            .count();
+        assert_eq!(prior_production, 463);
+
+        let guard_source = ownership_guard_source(remote_source);
+        let classifications = authoritative_leaf_classifications(
+            &command_leaves
+                .into_iter()
+                .filter(|leaf| leaf.path != "mcp-daemon-cli-test-hold-session")
+                .collect::<Vec<_>>(),
+            &guard_source,
+        );
+        let sets = validate_leaf_classifications(&production, &classifications)
+            .unwrap_or_else(|error| panic!("invalid CLI ownership manifest: {error}"));
+        assert_eq!(sets.generated.len(), 382);
+        assert_eq!(sets.exceptions.len(), 83);
+
+        let store_client = impl_body(remote_source, "StoreClient");
+        assert_eq!(
+            impl_method_names(store_client),
+            vec!["is_remote", "transfer_export"]
+        );
+        assert_eq!(main_source.matches("remote::open_store_client(").count(), 2);
+        let interchange = function_body(main_source, "run_interchange");
+        for arm in ["InterchangeCmd::ExportArchive", "InterchangeCmd::ExportCar"] {
+            let body = match_arm_body(interchange, arm);
+            assert!(body.contains("remote::open_store_client(&store)?"));
+            assert!(body.contains("client.transfer_export("));
+            assert!(!body.contains("save_loom("));
+        }
+    }
+
+    #[test]
+    fn mu_17g_g_classification_validation_rejects_omitted_duplicate_and_both() {
+        let production = ["alpha".to_string(), "beta".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let generated = |path: &str| LeafClassification {
+            path: path.to_string(),
+            ownership: LeafOwnership::Generated {
+                interface: "Example",
+                method: "read",
+            },
+        };
+        let exception = |path: &str| LeafClassification {
+            path: path.to_string(),
+            ownership: LeafOwnership::Exception {
+                category: "runtime",
+                owner_anchor: "example.rs:1",
+            },
+        };
+
+        let omitted = validate_leaf_classifications(&production, &[generated("alpha")])
+            .expect_err("omitted classification must fail");
+        assert!(omitted.contains("missing=[\"beta\"]"));
+
+        let duplicate = validate_leaf_classifications(
+            &production,
+            &[generated("alpha"), generated("alpha"), exception("beta")],
+        )
+        .expect_err("duplicate classification must fail");
+        assert!(duplicate.contains("duplicates={\"alpha\"}"));
+
+        let both = validate_leaf_classifications(
+            &production,
+            &[generated("alpha"), exception("alpha"), exception("beta")],
+        )
+        .expect_err("dual classification must fail");
+        assert!(both.contains("both={\"alpha\"}"));
+    }
+
+    #[test]
+    fn mu_6d_graph_vector_search_mutations_use_generated_client() {
+        let main_source = include_str!("main.rs");
+
+        for (runner, arm, interface, method) in [
+            ("run_graph", "GraphCmd::UpsertNode", "Graph", "upsert_node"),
+            ("run_graph", "GraphCmd::RemoveNode", "Graph", "remove_node"),
+            ("run_graph", "GraphCmd::UpsertEdge", "Graph", "upsert_edge"),
+            ("run_graph", "GraphCmd::RemoveEdge", "Graph", "remove_edge"),
+            ("run_vector", "VectorCmd::Create", "Vector", "create"),
+            ("run_vector", "VectorCmd::Upsert", "Vector", "upsert"),
+            (
+                "run_vector",
+                "VectorCmd::UpsertSource",
+                "Vector",
+                "upsert_source",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::CreateIndex",
+                "Vector",
+                "create_metadata_index",
+            ),
+            (
+                "run_vector",
+                "VectorCmd::DropIndex",
+                "Vector",
+                "drop_metadata_index",
+            ),
+            ("run_vector", "VectorCmd::Delete", "Vector", "delete"),
+            ("run_search", "SearchCmd::Create", "Search", "create"),
+            ("run_search", "SearchCmd::Index", "Search", "index"),
+            ("run_search", "SearchCmd::Delete", "Search", "delete"),
+            ("run_search", "SearchCmd::Remap", "Search", "remap"),
+        ] {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(
+                body.contains("remote::open_cli_generated_client(&store, keys)?"),
+                "{arm} must use the generated client"
+            );
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must dispatch through generated interface {interface}"
+            );
+            assert!(
+                body.contains(&format!("\"{method}\"")),
+                "{arm} must dispatch through generated method {method}"
+            );
+            assert!(
+                !body.contains("remote::open_store_client"),
+                "{arm} must not bypass generated dispatch through StoreClient"
+            );
+            assert!(
+                !body.contains("cli_open_loom("),
+                "{arm} must not open a writable Loom directly"
+            );
+            assert!(
+                !body.contains("FileStore::open("),
+                "{arm} must not open a writable FileStore directly"
+            );
+        }
+    }
+
+    #[test]
+    fn mu_6e_columnar_files_vcs_interchange_mutations_use_generated_client() {
+        let main_source = include_str!("main.rs");
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            (
+                "run_columnar",
+                "ColumnarCmd::Create",
+                "Columnar",
+                &["create"],
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Append",
+                "Columnar",
+                &["append"],
+            ),
+            (
+                "run_columnar",
+                "ColumnarCmd::Compact",
+                "Columnar",
+                &["compact"],
+            ),
+            (
+                "run_files",
+                "FilesCmd::Delete",
+                "FileSystem",
+                &["stat", "remove_directory", "remove_file"],
+            ),
+            (
+                "run_files",
+                "FilesCmd::Mkdir",
+                "FileSystem",
+                &["create_directory"],
+            ),
+            (
+                "run_files",
+                "FilesCmd::Write",
+                "FileSystem",
+                &["create_directory", "write_file"],
+            ),
+            ("run_vcs", "VcsCmd::Branch", "VersionControl", &["branch"]),
+            ("run_vcs", "VcsCmd::Commit", "VersionControl", &["commit"]),
+            (
+                "run_vcs",
+                "VcsCmd::Checkout",
+                "VersionControl",
+                &["checkout"],
+            ),
+            ("run_vcs", "VcsCmd::Merge", "VersionControl", &["merge"]),
+            (
+                "run_interchange",
+                "InterchangeCmd::ImportFs",
+                "FileSystem",
+                &["import_fs"],
+            ),
+            (
+                "run_interchange",
+                "InterchangeCmd::ImportCar",
+                "Car",
+                &["car_import"],
+            ),
+        ];
+
+        for (runner, arm, interface, methods) in cases {
+            let body = match_arm_body(function_body(main_source, runner), arm);
+            assert!(
+                body.contains("remote::open_cli_generated_client(&store, keys)?"),
+                "{arm} must use the generated client"
+            );
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must dispatch through generated interface {interface}"
+            );
+            for method in *methods {
+                assert!(
+                    body.contains(&format!("\"{method}\"")),
+                    "{arm} must dispatch through generated method {method}"
+                );
+            }
+            assert!(
+                !body.contains("remote::open_store_client"),
+                "{arm} must not bypass generated dispatch through StoreClient"
+            );
+            assert!(
+                !body.contains("cli_open_loom("),
+                "{arm} must not open a writable Loom directly"
+            );
+            assert!(
+                !body.contains("FileStore::open("),
+                "{arm} must not open a writable FileStore directly"
+            );
+        }
+    }
+
+    #[test]
+    fn mu_6e_interchange_import_options_remain_on_generated_paths() {
+        let main_source = include_str!("main.rs");
+        let run_interchange = function_body(main_source, "run_interchange");
+
+        let import_fs = match_arm_body(run_interchange, "InterchangeCmd::ImportFs");
+        assert!(import_fs.contains("\"FileSystem\""));
+        assert!(import_fs.contains("\"import_fs\""));
+        assert!(import_fs.contains("Some(author).to_value()"));
+        assert!(import_fs.contains("Some(message).to_value()"));
+        assert!(!import_fs.contains("FsImportOptions::new(&src)"));
+        assert!(!import_fs.contains("import_fs(loom.loom_mut()"));
+        assert!(!import_fs.contains("CliImportLoom"));
+
+        let import_archive = match_arm_body(run_interchange, "InterchangeCmd::ImportArchive");
+        assert!(import_archive.contains("\"Archive\""));
+        assert!(import_archive.contains("\"archive_import\""));
+        assert!(import_archive.contains("gzip_output_path.to_value()"));
+        assert!(import_archive.contains("commit.to_value()"));
+        assert!(import_archive.contains("Some(author).to_value()"));
+        assert!(import_archive.contains("Some(message).to_value()"));
+        assert!(import_archive.contains("print_archive_import_result(&result, &format)"));
+        assert!(!import_archive.contains("ArchiveImportOptions::new(&archive)"));
+        assert!(!import_archive.contains("client.transfer_import("));
+        assert!(!import_archive.contains("import_archive(loom.loom_mut()"));
+    }
+
+    #[test]
+    fn mu_6e_custom_import_options_execute_on_existing_paths() {
+        let store = temp_store("custom-import-options");
+        let fs = FileStore::create_with_profile(&store, Algo::Blake3).expect("create store");
+        let mut loom = open_loom_from(fs, &KeyOpts::default(), false).expect("open store");
+        ensure_facet_workspace(&mut loom, "files", FacetKind::Files).expect("create workspace");
+        save_loom(&mut loom).expect("save workspace");
+        drop(loom);
+
+        let source = temp_dir("custom-import-fs-source");
+        std::fs::write(source.join("note.txt"), b"hello").expect("write source file");
+        run_interchange(
+            InterchangeCmd::ImportFs {
+                store: store.clone(),
+                workspace: "files".to_string(),
+                src: source.to_string_lossy().into_owned(),
+                commit: true,
+                dry_run: true,
+                author: "custom-author".to_string(),
+                message: "custom message".to_string(),
+                format: "json".to_string(),
+            },
+            &KeyOpts::default(),
+        )
+        .expect("custom filesystem import options should execute");
+
+        let archive = source.join("note.txt.gz");
+        std::fs::write(
+            &archive,
+            hex_bytes("1f8b08000000000002ff4bcecf2d284a2d2e4e4d01001e4b56970a000000"),
+        )
+        .expect("write gzip archive");
+        run_interchange(
+            InterchangeCmd::ImportArchive {
+                store,
+                workspace: "files".to_string(),
+                archive: archive.to_string_lossy().into_owned(),
+                kind: "gzip".to_string(),
+                gzip_output_path: Some("custom/out.txt".to_string()),
+                commit: true,
+                dry_run: true,
+                author: "custom-author".to_string(),
+                message: "custom archive message".to_string(),
+                format: "json".to_string(),
+            },
+            &KeyOpts::default(),
+        )
+        .expect("custom archive import options should execute");
+    }
+
+    #[test]
+    fn mu_6f_management_identity_acl_protected_ref_mutations_use_generated_client() {
+        let management_source = include_str!("management_cmd.rs");
+        let main_source = include_str!("main.rs");
+
+        assert!(
+            function_body(main_source, "run")
+                .contains("Command::Identity { action } => run_identity(action, keys)")
+        );
+        assert!(
+            function_body(management_source, "run_management")
+                .contains("ManagementCmd::Identity { action } => run_identity(action, keys)")
+        );
+
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            (
+                "run_management_workspace",
+                "WorkspaceCmd::Create",
+                "Workspaces",
+                &["workspace_create"],
+            ),
+            (
+                "run_management_workspace",
+                "WorkspaceCmd::Rename",
+                "Workspaces",
+                &["workspace_rename"],
+            ),
+            (
+                "run_management_workspace",
+                "WorkspaceCmd::Delete",
+                "Workspaces",
+                &["workspace_delete"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::Add",
+                "Identity",
+                &["identity_add_principal"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::RenameHandle",
+                "Identity",
+                &["identity_rename_principal_handle"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::SetPassphrase",
+                "Identity",
+                &["identity_set_passphrase"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::Remove {",
+                "Identity",
+                &["identity_remove_principal"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::AssignRole",
+                "Identity",
+                &["identity_assign_role"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::RevokeRole",
+                "Identity",
+                &["identity_revoke_role"],
+            ),
+            ("run_acl", "AclCmd::Grant", "Acl", &["acl_grant"]),
+            ("run_acl", "AclCmd::Revoke", "Acl", &["acl_revoke"]),
+            (
+                "run_protected_ref",
+                "ProtectedRefCmd::Set",
+                "ProtectedRefs",
+                &["protected_ref_set"],
+            ),
+            (
+                "run_protected_ref",
+                "ProtectedRefCmd::Remove",
+                "ProtectedRefs",
+                &["protected_ref_remove"],
+            ),
+            (
+                "run_management_kv_config",
+                "ManagementKvConfigCmd::Set",
+                "ManagementKv",
+                &["set_config"],
+            ),
+        ];
+
+        for (runner, arm, interface, methods) in cases {
+            let body = match_arm_body(function_body(management_source, runner), arm);
+            assert!(
+                body.contains("crate::remote::open_cli_generated_client(&store, keys)?"),
+                "{arm} must use the generated client"
+            );
+            assert!(
+                body.contains(&format!("\"{interface}\"")),
+                "{arm} must dispatch through generated interface {interface}"
+            );
+            for method in *methods {
+                assert!(
+                    body.contains(&format!("\"{method}\"")),
+                    "{arm} must dispatch through generated method {method}"
+                );
+            }
+            assert!(
+                !body.contains("crate::remote::open_store_client"),
+                "{arm} must not bypass generated dispatch through StoreClient"
+            );
+            assert!(
+                !body.contains("cli_open_loom("),
+                "{arm} must not open a writable Loom directly"
+            );
+            assert!(
+                !body.contains("FileStore::open("),
+                "{arm} must not open a writable FileStore directly"
+            );
+        }
+
+        for (runner, arm, helper, methods) in [
+            (
+                "run_identity",
+                "IdentityCmd::CreateAppCredential",
+                "generated_app_credential_create",
+                &["identity_create_app_credential"][..],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::RevokeAppCredential",
+                "generated_app_credential_revoke",
+                &["identity_revoke_app_credential"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::CreateExternalCredential",
+                "generated_external_credential_create",
+                &["identity_create_external_credential"],
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::RevokeExternalCredential",
+                "generated_external_credential_revoke",
+                &["identity_revoke_external_credential"],
+            ),
+            (
+                "run_identity_public_key",
+                "IdentityPublicKeyCmd::Add",
+                "generated_public_key_add",
+                &["identity_add_public_key"],
+            ),
+            (
+                "run_identity_public_key",
+                "IdentityPublicKeyCmd::Revoke",
+                "generated_public_key_revoke",
+                &["identity_revoke_public_key"],
+            ),
+        ] {
+            let body = match_arm_body(function_body(management_source, runner), arm);
+            assert!(body.contains("crate::remote::open_cli_generated_client(&store, keys)?"));
+            assert!(body.contains(helper));
+            let helper_body = function_body(management_source, helper);
+            assert!(helper_body.contains("\"Identity\""));
+            for method in methods {
+                assert!(
+                    helper_body.contains(&format!("\"{method}\"")),
+                    "{helper} must dispatch through generated method {method}"
+                );
+            }
+            assert!(!body.contains("crate::remote::open_store_client"));
+            assert!(!body.contains("cli_open_loom("));
+            assert!(!body.contains("FileStore::open("));
+        }
+
+        let identity_snapshot = function_body(management_source, "generated_identity_snapshot");
+        assert!(identity_snapshot.contains("\"Identity\""));
+        assert!(identity_snapshot.contains("\"identity_list\""));
+
+        let workspace_resolver = function_body(management_source, "generated_workspace_id");
+        assert!(workspace_resolver.contains("\"Workspaces\""));
+        assert!(workspace_resolver.contains("\"workspace_list\""));
+
+        for (runner, arm, method) in [
+            (
+                "run_identity",
+                "IdentityCmd::ForceDetachAuthority",
+                "identity_force_detach_authority_json",
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::ReplicateAuthority",
+                "identity_replicate_authority_json",
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::ConfigureAuthorityReplication",
+                "identity_configure_authority_replication_json",
+            ),
+            (
+                "run_identity",
+                "IdentityCmd::RemoveAuthorityReplication",
+                "identity_remove_authority_replication_json",
+            ),
+        ] {
+            let body = match_arm_body(function_body(management_source, runner), arm);
+            assert!(body.contains("crate::remote::open_cli_generated_client(&store, keys)?"));
+            assert!(body.contains("\"Identity\""));
+            assert!(body.contains(&format!("\"{method}\"")));
+            assert!(!body.contains("cli_open_loom("));
+            assert!(!body.contains("FileStore::authority_replication_policy("));
+            assert!(!body.contains("save_identity_store_audited("));
+            assert!(!body.contains("save_authority_replication_policy_audited("));
+            assert!(!body.contains("remove_authority_replication_policy_audited("));
+        }
+
+        for (arm, helper, method) in [
+            (
+                "ManagementKvConfigCmd::Set",
+                "crate::remote::open_cli_generated_client(&store, keys)?",
+                "set_config",
+            ),
+            (
+                "ManagementKvConfigCmd::Get",
+                "crate::remote::open_cli_read_only_generated_client(&store, keys)?",
+                "get_config",
+            ),
+        ] {
+            let body = match_arm_body(
+                function_body(management_source, "run_management_kv_config"),
+                arm,
+            );
+            assert!(body.contains(helper));
+            assert!(body.contains("\"ManagementKv\""));
+            assert!(body.contains(&format!("\"{method}\"")));
+            assert!(!body.contains("cli_open_loom("));
+            assert!(!body.contains("cli_open_loom_read("));
+            assert!(!body.contains("FileStore::open("));
+        }
+    }
+
+    #[test]
+    fn mu_6h_i_c_exec_apply_and_meetings_import_use_generated_clients() {
+        let exec_source = include_str!("exec_cmd.rs");
+        let main_source = include_str!("main.rs");
+        let remote_source = include_str!("remote.rs");
+        let local_source = include_str!("../../loom-client/src/local.rs");
+        let service_source = include_str!("../../loom-client/src/service.rs");
+        let hosted_dispatch_source =
+            include_str!("../../loom-hosted-core/src/generated_dispatch.rs");
+        let remote_client_source = include_str!("../../loom-remote-client/src/generated_client.rs");
+        let generated_api_source = include_str!("../../loom-remote-protocol/src/generated_api.rs");
+        let generated_registry_source = include_str!("../../loom-remote-protocol/src/generated.rs");
+
+        let exec_run = match_arm_body(function_body(exec_source, "run_exec_cmd"), "ExecCmd::Run");
+        assert!(exec_run.contains("remote::open_cli_generated_client(&store, keys)?"));
+        assert!(exec_run.contains("\"Exec\""));
+        assert!(exec_run.contains("\"exec_cbor\""));
+        assert!(!exec_run.contains("cli_open_loom(&store, keys)?"));
+        assert!(!exec_run.contains("loom_compute::execute_cbor("));
+        assert!(!exec_run.contains("save_loom("));
+
+        let exec_apply =
+            match_arm_body(function_body(exec_source, "run_exec_cmd"), "ExecCmd::Apply");
+        assert!(exec_apply.contains("remote::open_cli_generated_client(&store, keys)?"));
+        assert!(exec_apply.contains("\"Exec\""));
+        assert!(exec_apply.contains("\"apply_cbor\""));
+        assert!(!exec_apply.contains("cli_open_loom(&store, keys)?"));
+        assert!(!exec_apply.contains("loom_compute::apply("));
+        assert!(!exec_apply.contains("save_loom("));
+
+        let sql_exec = match_arm_body(function_body(main_source, "run_sql_cmd"), "SqlCmd::Exec");
+        assert!(sql_exec.contains("remote::open_cli_generated_client(&store, keys)?"));
+        assert!(sql_exec.contains("\"Sql\""));
+        assert!(sql_exec.contains("\"sql_exec_result\""));
+        assert!(sql_exec.contains("print_sql_exec_result_cbor(&encoded)"));
+        assert!(!sql_exec.contains("cli_open_loom"));
+        assert!(!sql_exec.contains("cli_open_loom_read"));
+        assert!(!sql_exec.contains("LoomSqlStore::open_write("));
+        assert!(!sql_exec.contains("Glue::new("));
+        assert!(!sql_exec.contains("save_loom("));
+        let sql_presenter = function_body(main_source, "print_sql_exec_result_cbor");
+        assert!(sql_presenter.contains("loom_result::result_view::decode(bytes)"));
+        assert!(sql_presenter.contains("ResultPayload::Statements"));
+        assert!(sql_presenter.contains("print_sql_payload_value(payload)?"));
+        assert!(sql_presenter.contains("returned corrupt reader payload"));
+        let sql_payload_presenter = function_body(main_source, "print_sql_payload_value");
+        assert!(sql_payload_presenter.contains("sql_payload_from_result_statement"));
+        assert!(sql_payload_presenter.contains("print_payload(&payload)"));
+        let sql_value_bridge = function_body(main_source, "sql_gluesql_value_from_tabular");
+        assert!(sql_value_bridge.contains("loom_sql::value_from_tabular(value)"));
+        let sql_statement_bridge = function_body(main_source, "sql_payload_from_result_statement");
+        assert!(sql_statement_bridge.contains("Statement::SelectMap"));
+        assert!(sql_statement_bridge.contains("Statement::ShowColumns"));
+        assert!(sql_statement_bridge.contains("loom_sql::data_type_from_result_label"));
+        assert!(!sql_statement_bridge.contains("other =>"));
+        assert!(!sql_statement_bridge.contains("println!(\"{other:?}\")"));
+
+        let import_fs = match_arm_body(
+            function_body(main_source, "run_interchange"),
+            "InterchangeCmd::ImportFs",
+        );
+        assert!(
+            import_fs
+                .contains("remote::open_cli_generated_client_for_dry_run(&store, keys, dry_run)?")
+        );
+        assert!(import_fs.contains("\"FileSystem\""));
+        assert!(import_fs.contains("\"import_fs\""));
+        assert!(import_fs.contains("Some(author).to_value()"));
+        assert!(import_fs.contains("Some(message).to_value()"));
+        assert!(!import_fs.contains("FsImportOptions::new"));
+        assert!(!import_fs.contains("import_fs("));
+
+        let import_archive = match_arm_body(
+            function_body(main_source, "run_interchange"),
+            "InterchangeCmd::ImportArchive",
+        );
+        assert!(
+            import_archive
+                .contains("remote::open_cli_generated_client_for_dry_run(&store, keys, dry_run)?")
+        );
+        assert!(import_archive.contains("\"Archive\""));
+        assert!(import_archive.contains("\"archive_import\""));
+        assert!(import_archive.contains("gzip_output_path.to_value()"));
+        assert!(import_archive.contains("Some(author).to_value()"));
+        assert!(import_archive.contains("Some(message).to_value()"));
+        assert!(import_archive.contains("generated_archive_import_result_from_cbor"));
+        assert!(!import_archive.contains("ArchiveImportOptions::new"));
+        assert!(!import_archive.contains("import_archive("));
+
+        let meetings_import = match_arm_body(
+            function_body(main_source, "run_meetings"),
+            "MeetingsCmd::Import",
+        );
+        assert!(meetings_import.contains("remote::open_cli_generated_client(&store, keys)?"));
+        assert!(meetings_import.contains("\"Meetings\""));
+        assert!(meetings_import.contains("\"meetings_import_snapshot\""));
+        assert!(meetings_import.contains("input_profile_label(input_profile).to_value()"));
+        assert!(meetings_import.contains("WireValue::Bytes(bytes)"));
+        assert!(!meetings_import.contains("cli_open_loom(&store, keys)?"));
+        assert!(!meetings_import.contains("ensure_facet_workspace("));
+        assert!(!meetings_import.contains("import_meetings_bytes("));
+        assert!(!meetings_import.contains("save_loom("));
+
+        let local_apply = function_body(local_source, "apply_cbor");
+        assert!(local_apply.contains("decode_exec_apply_request(request)?"));
+        assert!(local_apply.contains("fork_state_into(loom_core::provider::PlanningObjectStore"));
+        assert!(local_apply.contains("apply("));
+        assert!(local_apply.contains("save_exec_apply_candidate("));
+        assert!(local_apply.contains("import_engine_state_preserving_mutable_overlay("));
+        assert!(!local_apply.contains("cli_open_loom("));
+        assert!(!local_apply.contains("save_loom("));
+
+        let local_meetings = function_body(local_source, "meetings_import_snapshot");
+        assert!(local_meetings.contains("PlanningObjectStore::new(loom.store())"));
+        assert!(local_meetings.contains("ensure_generated_facet_workspace("));
+        assert!(
+            local_meetings.contains("authorize(workspace_id, FacetKind::Vcs, AclRight::Write)")
+        );
+        assert!(local_meetings.contains("plan_meetings_import("));
+        assert!(local_meetings.contains("commit_workflow_transaction(WorkflowTransaction"));
+        assert!(local_meetings.contains("import_engine_state_preserving_mutable_overlay("));
+        assert!(!local_meetings.contains("cli_open_loom("));
+        assert!(!local_meetings.contains("import_meetings_bytes("));
+        assert!(!local_meetings.contains("save_loom("));
+
+        let generated_execute = function_body(remote_source, "execute_unary");
+        assert!(generated_execute.contains("Self::DirectLocal { client, handle }"));
+        assert!(generated_execute.contains("loom_hosted_core::generated_dispatch::dispatch"));
+        assert!(generated_execute.contains("Self::DaemonLocal(store)"));
+        assert!(generated_execute.contains("store.generated_unary("));
+        assert!(generated_execute.contains("Self::Remote(remote)"));
+        assert!(generated_execute.contains("remote.client.call("));
+        let generated_resolve = function_body(remote_source, "resolve_workspace_id");
+        assert!(generated_resolve.contains("\"Workspaces\""));
+        assert!(generated_resolve.contains("\"workspace_list\""));
+        assert!(generated_resolve.contains("self.execute_unary("));
+
+        assert_eq!(
+            service_source
+                .matches("impl Exec for LocalLoomClient")
+                .count(),
+            1
+        );
+        assert_eq!(
+            service_source
+                .matches("impl Meetings for LocalLoomClient")
+                .count(),
+            1
+        );
+        assert_eq!(generated_api_source.matches("fn apply_cbor(").count(), 1);
+        assert_eq!(
+            generated_api_source
+                .matches("fn meetings_import_snapshot(")
+                .count(),
+            1
+        );
+        assert_eq!(remote_client_source.matches("fn apply_cbor(").count(), 1);
+        assert_eq!(
+            remote_client_source
+                .matches("fn meetings_import_snapshot(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            remote_client_source
+                .matches(".call(\"Exec\", \"apply_cbor\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            remote_client_source
+                .matches(".call(\n                    \"Meetings\",\n                    \"meetings_import_snapshot\",")
+                .count(),
+            1
+        );
+        assert_eq!(
+            hosted_dispatch_source
+                .matches("(\"Exec\", \"apply_cbor\")")
+                .count(),
+            1
+        );
+        assert_eq!(
+            hosted_dispatch_source
+                .matches("(\"Meetings\", \"meetings_import_snapshot\")")
+                .count(),
+            1
+        );
+        assert_eq!(
+            generated_registry_source
+                .matches("Self::ExecApplyCbor => (\"Exec\", \"apply_cbor\")")
+                .count(),
+            1
+        );
+        assert_eq!(
+            generated_registry_source
+                .matches(
+                    "Self::MeetingsMeetingsImportSnapshot => (\"Meetings\", \"meetings_import_snapshot\")"
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            generated_registry_source
+                .matches("method: \"apply_cbor\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            generated_registry_source
+                .matches("method: \"meetings_import_snapshot\"")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mu_6i_c2_chat_mutations_use_generated_clients() {
+        let main_source = include_str!("main.rs");
+        let remote_source = include_str!("remote.rs");
+        let run_chat = function_body(main_source, "run_chat");
+        let mutations = [
+            ("ChatCmd::CreateChannel", "chat_create_channel_json"),
+            ("ChatCmd::RenameChannel", "chat_rename_channel_json"),
+            ("ChatCmd::UpdateCursor", "chat_update_cursor_json"),
+            ("ChatCmd::Post", "chat_post_message_bytes_json"),
+            ("ChatCmd::Edit", "chat_edit_message_bytes_json"),
+            ("ChatCmd::Redact", "chat_redact_message_json"),
+            ("ChatCmd::CreateThread", "chat_create_thread_json"),
+            ("ChatCmd::CreateTask", "chat_create_task_json"),
+            ("ChatCmd::ClaimTask", "chat_claim_task_json"),
+            ("ChatCmd::CompleteTask", "chat_complete_task_json"),
+            ("ChatCmd::InvokeAgent", "chat_invoke_agent_bytes_json"),
+            ("ChatCmd::AgentReply", "chat_agent_reply_json"),
+            ("ChatCmd::RequestHandoff", "chat_request_handoff_json"),
+            ("ChatCmd::AddReaction", "chat_add_reaction_json"),
+            ("ChatCmd::RemoveReaction", "chat_remove_reaction_json"),
+            ("ChatCmd::EmojiRegister", "chat_emoji_register_json"),
+            ("ChatCmd::EmojiUnregister", "chat_emoji_unregister_json"),
+        ];
+        for (arm, method) in mutations {
+            let body = match_arm_body(run_chat, arm);
+            assert!(body.contains("generated_workspace_context(&store, &workspace, keys)?"));
+            assert!(body.contains("chat_workspace_id.to_value()"));
+            assert!(body.contains(method), "{arm} missing {method}");
+            if arm == "ChatCmd::Edit" {
+                assert!(body.contains("expected_entity_tag.to_value()"));
+            } else {
+                assert!(body.contains("WireValue::Null"));
+            }
+            assert!(!body.contains("cli_open_loom"));
+            assert!(!body.contains("resolve_ns"));
+            for direct_mutation in [
+                "loom_chat::ensure_channel",
+                "loom_chat::rename_channel",
+                "loom_chat::update_cursor",
+                "loom_chat::post_message",
+                "loom_chat::edit_message",
+                "loom_chat::redact_message",
+                "loom_chat::create_thread",
+                "loom_chat::create_task",
+                "loom_chat::claim_task",
+                "loom_chat::complete_task",
+                "loom_chat::invoke_agent",
+                "loom_chat::agent_reply",
+                "loom_chat::request_handoff",
+                "loom_chat::add_reaction",
+                "loom_chat::remove_reaction",
+                "loom_chat::register_emoji",
+                "loom_chat::unregister_emoji",
+            ] {
+                assert!(!body.contains(direct_mutation));
+            }
+            assert!(!body.contains("save_loom("));
+        }
+
+        let post = match_arm_body(run_chat, "ChatCmd::Post");
+        assert!(post.contains("\"chat_post_message_bytes_json\""));
+        assert!(!post.contains("\"chat_post_message_json\""));
+        assert!(post.contains("WireValue::Bytes(body)"));
+        let edit = match_arm_body(run_chat, "ChatCmd::Edit");
+        assert!(edit.contains("\"chat_edit_message_bytes_json\""));
+        assert!(!edit.contains("\"chat_edit_message_json\""));
+        assert!(edit.contains("WireValue::Bytes(body)"));
+        assert!(edit.contains("expected_entity_tag.to_value()"));
+        let invoke = match_arm_body(run_chat, "ChatCmd::InvokeAgent");
+        assert!(invoke.contains("\"chat_invoke_agent_bytes_json\""));
+        assert!(!invoke.contains("\"chat_invoke_agent_json\""));
+        assert!(invoke.contains("WireValue::Bytes(prompt)"));
+        assert!(invoke.contains("serde_json::to_string(&source_message_ids)"));
+
+        assert!(!main_source.contains("fn chat_write"));
+        let context = function_body(main_source, "generated_workspace_context");
+        assert!(context.contains("remote::open_cli_generated_client(store, keys)?"));
+        assert!(context.contains("client.resolve_workspace_id(workspace)?.to_string()"));
+        let decoder = function_body(main_source, "execute_generated_json");
+        assert!(decoder.contains("execute_generated_string(client, interface, method, args)?"));
+        assert!(decoder.contains("serde_json::from_str(&json)"));
+        let resolver = function_body(remote_source, "resolve_workspace_id");
+        assert!(resolver.contains("\"Workspaces\""));
+        assert!(resolver.contains("\"workspace_list\""));
+        assert!(resolver.contains("cli_workspace_infos_from_generated_records(&records)?"));
+        assert!(resolver.contains("cli_select_workspace_id(&infos, workspace)"));
+        assert!(remote_source.contains("fn cli_workspace_infos_from_remote_records"));
+        assert!(remote_source.contains("fn cli_select_workspace_id"));
+    }
+
+    #[test]
+    fn mu_6i_c3_drive_mutations_use_generated_clients() {
+        let main_source = include_str!("main.rs");
+        let run_drive = function_body(main_source, "run_drive");
+        let mutations = [
+            ("DriveCmd::GrantShare", "drive_grant_share_json"),
+            ("DriveCmd::RevokeShare", "drive_revoke_share_json"),
+            (
+                "DriveCmd::ApplyShareExpiry",
+                "drive_apply_share_expiry_json",
+            ),
+            ("DriveCmd::PinRetention", "drive_pin_retention_json"),
+            ("DriveCmd::UnpinRetention", "drive_unpin_retention_json"),
+            ("DriveCmd::ApplyRetention", "drive_apply_retention_json"),
+            ("DriveCmd::CreateFolder", "drive_create_folder_json"),
+            ("DriveCmd::CreateUpload", "drive_create_upload_json"),
+            ("DriveCmd::UploadChunk", "drive_upload_chunk_json"),
+            ("DriveCmd::CommitUpload", "drive_commit_upload_json"),
+            ("DriveCmd::Rename", "drive_rename_json"),
+            ("DriveCmd::Move", "drive_move_json"),
+            ("DriveCmd::Delete", "drive_delete_json"),
+            ("DriveCmd::ResolveConflict", "drive_resolve_conflict_json"),
+        ];
+        for (arm, method) in mutations {
+            let body = match_arm_body(run_drive, arm);
+            assert!(body.contains("generated_workspace_context(&store, &workspace, keys)?"));
+            assert!(body.contains("drive_workspace_id.to_value()"));
+            assert!(body.contains("execute_generated_json::<loom_drive::"));
+            assert!(body.contains("\"Drive\""));
+            assert!(body.contains(method), "{arm} missing {method}");
+            assert!(!body.contains("open_drive_write"));
+            assert!(!body.contains("cli_open_loom"));
+            assert!(!body.contains("resolve_ns"));
+            for direct_mutation in [
+                "loom_drive::grant_share",
+                "loom_drive::revoke_share",
+                "loom_drive::apply_share_expiry",
+                "loom_drive::pin_retention",
+                "loom_drive::unpin_retention",
+                "loom_drive::apply_retention",
+                "loom_drive::create_folder",
+                "loom_drive::create_upload",
+                "loom_drive::upload_chunk",
+                "loom_drive::commit_upload",
+                "loom_drive::rename_node",
+                "loom_drive::move_node",
+                "loom_drive::delete_node",
+                "loom_drive::resolve_conflict",
+            ] {
+                assert!(!body.contains(direct_mutation));
+            }
+            assert!(!body.contains("save_loom("));
+        }
+
+        let upload_chunk = match_arm_body(run_drive, "DriveCmd::UploadChunk");
+        assert!(upload_chunk.contains("read_input(&input)"));
+        assert!(upload_chunk.contains("WireValue::Bytes(bytes)"));
+        let resolve = match_arm_body(run_drive, "DriveCmd::ResolveConflict");
+        assert!(resolve.contains("parse_drive_conflict_resolution(&resolution)?"));
+        assert!(resolve.contains("resolution.to_value()"));
+        assert!(!main_source.contains("fn open_drive_write"));
+        let context = function_body(main_source, "generated_workspace_context");
+        assert!(context.contains("remote::open_cli_generated_client(store, keys)?"));
+        assert!(context.contains("client.resolve_workspace_id(workspace)?.to_string()"));
+        let decoder = function_body(main_source, "execute_generated_json");
+        assert!(decoder.contains("execute_generated_string(client, interface, method, args)?"));
+        assert!(decoder.contains("serde_json::from_str(&json)"));
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        assert!(hex.len().is_multiple_of(2));
+        (0..hex.len())
+            .step_by(2)
+            .map(|offset| u8::from_str_radix(&hex[offset..offset + 2], 16).expect("hex byte"))
+            .collect()
+    }
+
+    fn enum_variants(source: &str, enum_name: &str) -> Vec<String> {
+        enum_body(source, enum_name)
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                if !trimmed
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_uppercase)
+                {
+                    return None;
+                }
+                let name = trimmed
+                    .split(|ch: char| ch == '{' || ch == '(' || ch == ',' || ch.is_whitespace())
+                    .next()
+                    .expect("variant name");
+                Some(name.to_string())
+            })
+            .collect()
+    }
+
+    fn enum_variant_blocks<'a>(source: &'a str, enum_name: &str) -> Vec<(&'a str, &'a str)> {
+        let body = enum_body(source, enum_name);
+        let mut starts = Vec::new();
+        let mut offset = 0usize;
+        for line in body.split_inclusive('\n') {
+            if line.starts_with("    ")
+                && !line.starts_with("        ")
+                && line.as_bytes().get(4).is_some_and(u8::is_ascii_uppercase)
+            {
+                let name_end = line[4..]
+                    .find(|ch: char| ch == '{' || ch == '(' || ch == ',' || ch.is_whitespace())
+                    .expect("variant name end");
+                starts.push((offset, &line[4..4 + name_end]));
+            }
+            offset += line.len();
+        }
+        starts
+            .iter()
+            .enumerate()
+            .map(|(index, (start, name))| {
+                let end = starts
+                    .get(index + 1)
+                    .map_or(body.len(), |(next_start, _)| *next_start);
+                (*name, &body[*start..end])
+            })
+            .collect()
+    }
+
+    fn command_leaf_paths(source: &str, enum_name: &str, prefix: &str) -> Vec<String> {
+        command_leaves(source, enum_name, prefix)
+            .into_iter()
+            .map(|leaf| leaf.path)
+            .collect()
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CommandLeaf<'a> {
+        path: String,
+        enum_name: &'a str,
+        variant: &'a str,
+    }
+
+    fn command_leaves<'a>(
+        source: &'a str,
+        enum_name: &'a str,
+        prefix: &str,
+    ) -> Vec<CommandLeaf<'a>> {
+        let mut leaves = Vec::new();
+        for (variant, block) in enum_variant_blocks(source, enum_name) {
+            let command_name =
+                variant
+                    .char_indices()
+                    .fold(String::new(), |mut output, (index, ch)| {
+                        if index > 0
+                            && ch.is_ascii_uppercase()
+                            && variant[..index]
+                                .chars()
+                                .next_back()
+                                .is_some_and(|previous| {
+                                    previous.is_ascii_lowercase() || previous.is_ascii_digit()
+                                })
+                        {
+                            output.push('-');
+                        }
+                        output.push(ch.to_ascii_lowercase());
+                        output
+                    });
+            let path = if prefix.is_empty() {
+                command_name
+            } else {
+                format!("{prefix} {command_name}")
+            };
+            if block.contains("#[command(subcommand)]") {
+                let action = block
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("action:"))
+                    .expect("subcommand action")
+                    .trim()
+                    .trim_end_matches(',');
+                leaves.extend(command_leaves(source, action, &path));
+            } else {
+                leaves.push(CommandLeaf {
+                    path,
+                    enum_name,
+                    variant,
+                });
+            }
+        }
+        leaves
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LeafOwnership<'a> {
+        Generated {
+            interface: &'a str,
+            method: &'a str,
+        },
+        Exception {
+            category: &'a str,
+            owner_anchor: &'a str,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LeafClassification<'a> {
+        path: String,
+        ownership: LeafOwnership<'a>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ClassificationSets {
+        generated: std::collections::BTreeSet<String>,
+        exceptions: std::collections::BTreeSet<String>,
+    }
+
+    fn exception_classifications() -> Vec<LeafClassification<'static>> {
+        let analytical = [
+            (
+                "vector text upsert",
+                "external-runtime",
+                "main.rs:9012-9190",
+            ),
+            ("vector text query", "external-runtime", "main.rs:9012-9190"),
+            ("fts rebuild", "external-cache", "main.rs:11887-12219"),
+            ("search", "read-only-diagnostic", "main.rs:12509-12535"),
+            (
+                "columnar export-arrow",
+                "physical-file",
+                "main.rs:11575-11647",
+            ),
+            (
+                "columnar export-parquet",
+                "physical-file",
+                "main.rs:11575-11647",
+            ),
+        ];
+        let store = [
+            (
+                "store bundle-export",
+                "physical-file",
+                "main.rs:12622-13096",
+            ),
+            ("store clone", "physical-file", "main.rs:12622-13096"),
+            ("store copy", "physical-file", "main.rs:12622-13096"),
+            ("store get", "read-only-diagnostic", "main.rs:12810-12831"),
+            ("store hash", "physical-file", "main.rs:12622-13096"),
+            ("store init", "physical-file", "main.rs:12622-13096"),
+            ("store put", "physical-file", "main.rs:12994-13017"),
+            (
+                "store attribution",
+                "read-only-diagnostic",
+                "main.rs:13046-13052",
+            ),
+            (
+                "store preflight-replacement",
+                "physical-file",
+                "main.rs:13053-13070",
+            ),
+            ("store replace", "physical-file", "main.rs:13071-13096"),
+        ];
+        let sql_meetings = [
+            ("sql table blame", "read-only-diagnostic", "table_cmd.rs"),
+            ("sql table diff", "read-only-diagnostic", "table_cmd.rs"),
+            ("meetings list", "read-only-diagnostic", "main.rs:2472-2549"),
+            ("meetings get", "read-only-diagnostic", "main.rs:2472-2549"),
+            (
+                "meetings search",
+                "read-only-diagnostic",
+                "main.rs:2472-2549",
+            ),
+        ];
+        let workflow = [
+            (
+                "lifecycle definitions",
+                "read-only-diagnostic",
+                "main.rs:4564-4799",
+            ),
+            (
+                "lifecycle definition",
+                "read-only-diagnostic",
+                "main.rs:4564-4799",
+            ),
+            (
+                "lifecycle instances",
+                "read-only-diagnostic",
+                "main.rs:4564-4799",
+            ),
+            (
+                "lifecycle instance",
+                "read-only-diagnostic",
+                "main.rs:4564-4799",
+            ),
+            (
+                "lifecycle snapshot-plan",
+                "read-only-diagnostic",
+                "main.rs:4564-4799",
+            ),
+            (
+                "lifecycle current-surface",
+                "read-only-diagnostic",
+                "main.rs:4564-4799",
+            ),
+            (
+                "lifecycle snapshots",
+                "read-only-diagnostic",
+                "main.rs:4564-4799",
+            ),
+            (
+                "lifecycle snapshot",
+                "read-only-diagnostic",
+                "main.rs:4564-4799",
+            ),
+            (
+                "lifecycle snapshot-content",
+                "read-only-diagnostic",
+                "main.rs:4564-4799",
+            ),
+            (
+                "lifecycle operation-log",
+                "read-only-diagnostic",
+                "main.rs:4564-4799",
+            ),
+            ("refs status", "read-only-diagnostic", "refs_cmd.rs"),
+            ("exec inspect", "pure-input", "exec_cmd.rs"),
+            (
+                "interchange export-archive",
+                "streaming-output",
+                "main.rs:16580-16677",
+            ),
+            (
+                "interchange export-fs",
+                "physical-file",
+                "main.rs:16580-16677",
+            ),
+            (
+                "interchange export-table-csv",
+                "physical-file",
+                "main.rs:16580-16677",
+            ),
+            (
+                "interchange export-car",
+                "streaming-output",
+                "main.rs:16580-16677",
+            ),
+        ];
+        let operational = [
+            (
+                "studio surfaces catalog",
+                "read-only-diagnostic",
+                "main.rs:10032-10101",
+            ),
+            ("inference list", "external-cache", "main.rs:6905-7242"),
+            ("inference status", "external-cache", "main.rs:6905-7242"),
+            ("inference show", "external-cache", "main.rs:6905-7242"),
+            (
+                "inference download",
+                "external-runtime",
+                "main.rs:6905-7242",
+            ),
+            ("inference cancel", "external-runtime", "main.rs:6905-7242"),
+            ("inference remove", "external-cache", "main.rs:6905-7242"),
+            ("inference refresh", "external-runtime", "main.rs:6905-7242"),
+            (
+                "inference model list",
+                "external-cache",
+                "main.rs:6905-7242",
+            ),
+            (
+                "inference model show",
+                "external-cache",
+                "main.rs:6905-7242",
+            ),
+            (
+                "inference model download",
+                "external-runtime",
+                "main.rs:6905-7242",
+            ),
+            (
+                "inference model status",
+                "external-cache",
+                "main.rs:6905-7242",
+            ),
+            (
+                "inference model cancel",
+                "external-runtime",
+                "main.rs:6905-7242",
+            ),
+            (
+                "inference model remove",
+                "external-cache",
+                "main.rs:6905-7242",
+            ),
+            (
+                "inference model refresh",
+                "external-runtime",
+                "main.rs:6905-7242",
+            ),
+            ("serve remote", "runtime", "serve_cmd.rs:209-385"),
+            ("daemon start", "runtime", "daemon_cmd.rs:5-68"),
+            ("daemon stop", "runtime", "daemon_cmd.rs:5-68"),
+            ("daemon restart", "runtime", "daemon_cmd.rs:5-68"),
+            ("daemon status", "runtime", "daemon_cmd.rs:5-68"),
+            (
+                "daemon session open",
+                "carrier-lifecycle",
+                "daemon_cmd.rs:409-445",
+            ),
+            (
+                "daemon session close",
+                "carrier-lifecycle",
+                "daemon_cmd.rs:447-479",
+            ),
+            ("daemon session attach", "runtime", "daemon_cmd.rs:5-68"),
+            ("daemon session detach", "runtime", "daemon_cmd.rs:5-68"),
+            ("daemon pin add", "runtime", "daemon_cmd.rs:5-68"),
+            ("daemon pin remove", "runtime", "daemon_cmd.rs:5-68"),
+            ("daemon run", "runtime", "daemon_cmd.rs:5-68"),
+            ("context list", "physical-file", "context_cmd.rs:8-184"),
+            ("context get", "physical-file", "context_cmd.rs:8-184"),
+            ("context add", "physical-file", "context_cmd.rs:8-184"),
+            ("context update", "physical-file", "context_cmd.rs:8-184"),
+            ("context remove", "physical-file", "context_cmd.rs:8-184"),
+            ("context test", "physical-file", "context_cmd.rs:8-184"),
+            ("context use", "physical-file", "context_cmd.rs:8-184"),
+            ("context current", "physical-file", "context_cmd.rs:8-184"),
+            ("doctor all", "read-only-diagnostic", "main.rs:8523-8590"),
+            ("doctor store", "read-only-diagnostic", "main.rs:8523-8590"),
+            ("doctor daemon", "read-only-diagnostic", "main.rs:8523-8590"),
+            (
+                "doctor inference",
+                "read-only-diagnostic",
+                "main.rs:8523-8590",
+            ),
+            (
+                "doctor inference-instance",
+                "read-only-diagnostic",
+                "main.rs:7357-7415",
+            ),
+            (
+                "capabilities",
+                "read-only-diagnostic",
+                "main.rs:13009-13034",
+            ),
+            ("llms", "read-only-diagnostic", "main.rs:13165-13173"),
+            ("mcp", "runtime", "main.rs:13112-13127"),
+            ("mount fuse", "runtime", "main.rs:13187-13238"),
+            ("mount nfs", "runtime", "main.rs:13187-13238"),
+            ("version", "read-only-diagnostic", "main.rs:13165-13173"),
+        ];
+        analytical
+            .into_iter()
+            .chain(store)
+            .chain(sql_meetings)
+            .chain(workflow)
+            .chain(operational)
+            .map(|(path, category, owner_anchor)| LeafClassification {
+                path: path.to_string(),
+                ownership: LeafOwnership::Exception {
+                    category,
+                    owner_anchor,
+                },
+            })
+            .collect()
+    }
+
+    fn ownership_guard_source(source: &str) -> String {
+        [
+            "cli_store_administration_classification_is_complete_and_unique",
+            "mu_17g_d5_program_metrics_logs_traces_leaves_use_typed_generated_clients",
+            "mu_17g_f1_security_admin_leaves_use_typed_generated_clients",
+            "mu_17g_f3_studio_vcs_inference_leaves_have_exhaustive_ownership",
+            "mu_17g_f4_serve_and_daemon_leaves_have_one_execution_owner",
+            "mu_17g_f5_operational_leaves_have_one_execution_owner",
+            "mu_1f_immutable_read_routes_use_read_only_open_helpers",
+            "mu_1i_reviewed_immutable_read_routes_are_enforced",
+            "mu_17g_a_foundational_data_cli_leaves_use_generated_clients",
+            "mu_17g_b_analytical_data_cli_leaves_use_generated_clients",
+            "mu_17g_c_pim_cli_leaves_use_typed_generated_clients",
+            "mu_17g_d2_identity_acl_protected_ref_leaves_use_typed_generated_clients",
+            "mu_17g_d1_core_cli_leaves_use_typed_generated_clients",
+            "mu_17g_d3_tickets_lanes_cli_leaves_use_typed_generated_clients",
+            "mu_17g_e1_sql_meetings_cli_leaves_use_typed_generated_clients",
+            "mu_17g_e2_chat_drive_mutation_leaves_use_typed_generated_clients",
+            "mu_17g_f2_lifecycle_refs_exec_interchange_leaves_are_exhaustive",
+        ]
+        .into_iter()
+        .map(|guard| {
+            let marker = format!("fn {guard}");
+            let start = source.find(&marker).expect("ownership guard");
+            let tail = &source[start..];
+            let end = tail.find("\n    #[test]").unwrap_or(tail.len());
+            &tail[..end]
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    fn generated_boundary_classifications() -> [LeafClassification<'static>; 2] {
+        [
+            LeafClassification {
+                path: "management kv config set".to_string(),
+                ownership: LeafOwnership::Generated {
+                    interface: "ManagementKv",
+                    method: "set_config",
+                },
+            },
+            LeafClassification {
+                path: "meetings source-read".to_string(),
+                ownership: LeafOwnership::Generated {
+                    interface: "Meetings",
+                    method: "meetings_source_read",
+                },
+            },
+        ]
+    }
+
+    fn allowed_generated_interfaces(path: &str) -> &'static [&'static str] {
+        let parts = path.split_whitespace().collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["cas", ..] => &["Cas"],
+            ["kv", ..] => &["Kv"],
+            ["queue", ..] => &["Queue", "QueueConsumers"],
+            ["time-series", ..] => &["TimeSeries"],
+            ["ledger", ..] => &["Ledger"],
+            ["graph", ..] => &["Graph"],
+            ["vector", ..] => &["Vector"],
+            ["fts", ..] => &["Search"],
+            ["columnar", ..] => &["Columnar"],
+            ["dataframe", ..] => &["Dataframe"],
+            ["calendar", ..] => &["Calendar"],
+            ["contacts", ..] => &["Contacts"],
+            ["mail", ..] => &["Mail"],
+            ["files", ..] => &["FileSystem"],
+            ["workspace", ..] | ["management", "workspace", ..] => &["Workspaces"],
+            ["document", ..] => &["Document"],
+            ["pages", ..] => &["Pages"],
+            ["identity", ..] | ["management", "identity", ..] => &["Identity"],
+            ["acl", ..] | ["management", "acl", ..] => &["Acl"],
+            ["protected-ref", ..] | ["management", "protected-ref", ..] => &["ProtectedRefs"],
+            ["management", "kv", ..] => &["ManagementKv"],
+            ["store", ..] => &["StoreAdmin", "KeySource"],
+            ["tickets", ..] => &["Tickets"],
+            ["lanes", ..] => &["Lanes"],
+            ["program", ..] => &["Program"],
+            ["metrics", ..] => &["Metrics"],
+            ["logs", ..] => &["Logs"],
+            ["traces", ..] => &["Traces"],
+            ["sql", ..] => &["Sql"],
+            ["meetings", ..] => &["Meetings"],
+            ["chat", ..] => &["Chat"],
+            ["drive", ..] => &["Drive"],
+            ["audit", ..] => &["Audit"],
+            ["certificate", ..] => &["Certificate"],
+            ["network-access", ..] => &["NetworkAccess"],
+            ["lifecycle", ..] => &["Lifecycle"],
+            ["refs", ..] => &["Refs"],
+            ["exec", ..] => &["Exec"],
+            ["interchange", ..] => &["FileSystem", "Archive", "InterchangeProfiles", "Car"],
+            ["studio", ..] => &["StudioMaintenance", "StudioSurfaces"],
+            ["vcs", ..] => &["VersionControl"],
+            ["inference", "instance", ..] => &["InferenceInstance"],
+            ["serve", ..] => &["ServeConfig"],
+            ["daemon", "maintenance", ..] => &["StoreAdmin"],
+            ["lock", ..] => &["Locks"],
+            _ => &[],
+        }
+    }
+
+    fn generated_owner_from_guards<'a>(
+        leaf: &CommandLeaf<'_>,
+        guard_source: &'a str,
+    ) -> Option<(&'a str, &'a str)> {
+        let interfaces = allowed_generated_interfaces(&leaf.path);
+        if interfaces.is_empty() {
+            return None;
+        }
+        let marker = format!("\"{}::{}", leaf.enum_name, leaf.variant);
+        let mut best: Option<(usize, &'a str, &'a str)> = None;
+        let mut search_start = 0usize;
+        while let Some(relative) = guard_source[search_start..].find(&marker) {
+            let marker_end = search_start + relative + marker.len();
+            let owner_start = guard_source[marker_end..]
+                .find('"')
+                .map(|offset| marker_end + offset + 1)
+                .unwrap_or(marker_end);
+            let end = (owner_start + 6_000).min(guard_source.len());
+            let owner_source = &guard_source[owner_start..end];
+            for interface in interfaces {
+                for candidate in METHODS
+                    .iter()
+                    .filter(|candidate| candidate.interface == *interface)
+                {
+                    let quoted_method = format!("\"{}\"", candidate.method);
+                    if let Some(distance) = owner_source.find(&quoted_method)
+                        && best.is_none_or(|(best_distance, _, _)| distance < best_distance)
+                    {
+                        best = Some((distance, interface, candidate.method));
+                    }
+                }
+            }
+            search_start = marker_end;
+        }
+        best.map(|(_, interface, method)| (interface, method))
+    }
+
+    fn authoritative_leaf_classifications<'a>(
+        leaves: &[CommandLeaf<'_>],
+        guard_source: &'a str,
+    ) -> Vec<LeafClassification<'a>> {
+        let exceptions = exception_classifications();
+        let exception_paths = exceptions
+            .iter()
+            .map(|classification| classification.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut classifications = exceptions
+            .into_iter()
+            .map(|classification| LeafClassification {
+                path: classification.path,
+                ownership: match classification.ownership {
+                    LeafOwnership::Exception {
+                        category,
+                        owner_anchor,
+                    } => LeafOwnership::Exception {
+                        category,
+                        owner_anchor,
+                    },
+                    LeafOwnership::Generated { .. } => unreachable!(),
+                },
+            })
+            .collect::<Vec<_>>();
+        classifications.extend(generated_boundary_classifications());
+        let classified_paths = classifications
+            .iter()
+            .map(|classification| classification.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for leaf in leaves {
+            if exception_paths.contains(&leaf.path) || classified_paths.contains(&leaf.path) {
+                continue;
+            }
+            if let Some((interface, method)) = generated_owner_from_guards(leaf, guard_source) {
+                classifications.push(LeafClassification {
+                    path: leaf.path.clone(),
+                    ownership: LeafOwnership::Generated { interface, method },
+                });
+            }
+        }
+        classifications
+    }
+
+    fn validate_leaf_classifications(
+        production: &std::collections::BTreeSet<String>,
+        classifications: &[LeafClassification<'_>],
+    ) -> Result<ClassificationSets, String> {
+        let mut generated = std::collections::BTreeSet::new();
+        let mut exceptions = std::collections::BTreeSet::new();
+        let mut duplicates = std::collections::BTreeSet::new();
+        let mut both = std::collections::BTreeSet::new();
+        for classification in classifications {
+            match classification.ownership {
+                LeafOwnership::Generated { interface, method } => {
+                    if interface.is_empty() || method.is_empty() {
+                        return Err(format!("blank generated owner for {}", classification.path));
+                    }
+                    if !generated.insert(classification.path.clone()) {
+                        duplicates.insert(classification.path.clone());
+                    }
+                    if exceptions.contains(&classification.path) {
+                        both.insert(classification.path.clone());
+                    }
+                }
+                LeafOwnership::Exception {
+                    category,
+                    owner_anchor,
+                } => {
+                    if category.is_empty() || owner_anchor.is_empty() {
+                        return Err(format!("blank exception owner for {}", classification.path));
+                    }
+                    if !exceptions.insert(classification.path.clone()) {
+                        duplicates.insert(classification.path.clone());
+                    }
+                    if generated.contains(&classification.path) {
+                        both.insert(classification.path.clone());
+                    }
+                }
+            }
+        }
+        let union = generated
+            .union(&exceptions)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let missing = production.difference(&union).cloned().collect::<Vec<_>>();
+        let extra = union.difference(production).cloned().collect::<Vec<_>>();
+        if !duplicates.is_empty() || !both.is_empty() || !missing.is_empty() || !extra.is_empty() {
+            return Err(format!(
+                "duplicates={duplicates:?} both={both:?} missing={missing:?} extra={extra:?}"
+            ));
+        }
+        Ok(ClassificationSets {
+            generated,
+            exceptions,
+        })
+    }
+
+    fn impl_body<'a>(source: &'a str, type_name: &str) -> &'a str {
+        let marker = format!("impl {type_name}");
+        let impl_start = source.find(&marker).expect("impl marker");
+        let body_start = source[impl_start..].find('{').expect("impl body") + impl_start;
+        let mut depth = 0usize;
+        for (offset, byte) in source[body_start..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..=body_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unclosed impl body for {type_name}");
+    }
+
+    fn impl_method_names(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                let rest = trimmed
+                    .strip_prefix("pub(crate) fn ")
+                    .or_else(|| trimmed.strip_prefix("fn "))?;
+                rest.split(|ch: char| ch == '(' || ch == '<' || ch.is_whitespace())
+                    .next()
+            })
+            .collect()
+    }
+
+    fn enum_body<'a>(source: &'a str, enum_name: &str) -> &'a str {
+        let marker = format!("enum {enum_name}");
+        let enum_start = source.find(&marker).expect("enum marker");
+        let body_start = source[enum_start..].find('{').expect("enum body") + enum_start;
+        let mut depth = 0usize;
+        for (offset, byte) in source[body_start..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start + 1..body_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unclosed enum body for {enum_name}");
+    }
+
+    fn function_body<'a>(source: &'a str, function: &str) -> &'a str {
+        let marker = format!("fn {function}");
+        let mut search_start = 0usize;
+        let function_start = loop {
+            let relative = source[search_start..]
+                .find(&marker)
+                .unwrap_or_else(|| panic!("function marker {marker}"));
+            let candidate = search_start + relative;
+            if matches!(
+                source.as_bytes().get(candidate + marker.len()),
+                Some(b'(' | b'<')
+            ) {
+                break candidate;
+            }
+            search_start = candidate + marker.len();
+        };
+        let body_start =
+            source[function_start..].find('{').expect("function body") + function_start;
+        let mut depth = 0usize;
+        for (offset, byte) in source[body_start..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..=body_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unclosed function body for {function}");
+    }
+
+    fn match_arm_body<'a>(source: &'a str, arm: &str) -> &'a str {
+        let arm_start = source.find(arm).expect("arm marker");
+        let arrow = source[arm_start..].find("=>").expect("arm arrow") + arm_start;
+        let body_start = source[arrow..].find('{').expect("arm body") + arrow;
+        let mut depth = 0usize;
+        for (offset, byte) in source[body_start..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..=body_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unclosed match arm body for {arm}");
+    }
+
+    fn match_arm_segment<'a>(source: &'a str, arm: &str, enum_name: &str) -> &'a str {
+        let arm_start = source.find(arm).expect("arm marker");
+        let tail = &source[arm_start..];
+        let next_marker = format!("{enum_name}::");
+        let end = tail[arm.len()..]
+            .find(&next_marker)
+            .map(|offset| arm.len() + offset)
+            .unwrap_or(tail.len());
+        &tail[..end]
     }
 
     #[cfg(feature = "serve")]
@@ -11538,10 +15227,7 @@ mod selector_tests {
                 let mut request = Vec::new();
                 stream.read_to_end(&mut request).unwrap();
                 let response = if request_index < 2 {
-                    format!(
-                        "running\tprotocol=1\ttransport=tcp\tfake-pid\t{store_path}\tidentity={store_id}\tsessions=0\tpins=0\n"
-                    )
-                    .into_bytes()
+                    running_daemon_response(&store_path, &store_id)
                 } else {
                     b"not-a-generated-session-response".to_vec()
                 };
@@ -11584,16 +15270,11 @@ mod selector_tests {
                 let mut request = Vec::new();
                 stream.read_to_end(&mut request).unwrap();
                 let response = match request_index {
-                    0 | 1 => format!(
-                        "running\tprotocol=1\ttransport=tcp\tfake-pid\t{store_path}\tidentity={store_id}\tsessions=0\tpins=0\n"
-                    )
-                    .into_bytes(),
+                    0 | 1 => running_daemon_response(&store_path, &store_id),
                     2 => {
-                        let body = generated_binary_body(
-                            &request,
-                            DAEMON_GENERATED_SESSION_OPEN_MAGIC,
-                        )
-                        .expect("session open frame");
+                        let body =
+                            generated_binary_body(&request, DAEMON_GENERATED_SESSION_OPEN_MAGIC)
+                                .expect("session open frame");
                         let auth = loom_remote_protocol::session::parse_open_request(body)
                             .expect("session auth");
                         assert_eq!(
@@ -11606,6 +15287,7 @@ mod selector_tests {
                         let reply = loom_remote_protocol::session::SessionOpenReply::Ok {
                             session_id: session_id.clone(),
                             lease_expires_ms: 123,
+                            credential: None,
                         };
                         generated_binary_response(
                             DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
@@ -11647,37 +15329,56 @@ mod selector_tests {
         let store_id = paths.store_id.clone();
         let server = std::thread::spawn(move || {
             let session_id = vec![9, 7, 5, 3];
-            for request_index in 0..3 {
+            let credential = b"logical-session-credential".to_vec();
+            for request_index in 0..4 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 stream.read_to_end(&mut request).unwrap();
                 let response = match request_index {
-                    0 => format!(
-                        "running\tprotocol=1\ttransport=tcp\tfake-pid\t{store_path}\tidentity={store_id}\tsessions=0\tpins=0\n"
-                    )
-                    .into_bytes(),
+                    0 => running_daemon_response(&store_path, &store_id),
                     1 => {
-                        let body = generated_binary_body(
-                            &request,
-                            DAEMON_GENERATED_SESSION_OPEN_MAGIC,
-                        )
-                        .expect("session open frame");
+                        let body =
+                            generated_binary_body(&request, DAEMON_GENERATED_SESSION_OPEN_MAGIC)
+                                .expect("session open frame");
                         let auth = loom_remote_protocol::session::parse_open_request(body)
                             .expect("session auth");
                         assert_eq!(auth, SessionAuth::Unauthenticated);
                         let reply = loom_remote_protocol::session::SessionOpenReply::Ok {
                             session_id: session_id.clone(),
                             lease_expires_ms: 123,
+                            credential: Some(credential.clone()),
                         };
                         generated_binary_response(
                             DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
                             &[loom_remote_protocol::session::open_reply_bytes(&reply)],
                         )
                     }
-                    _ => {
+                    2 => {
                         let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
                             .expect("store open frame");
                         success_store_open_response(body, &session_id)
+                    }
+                    _ => {
+                        let body =
+                            generated_binary_body(&request, DAEMON_GENERATED_SESSION_OPEN_MAGIC)
+                                .expect("session close frame");
+                        assert_eq!(
+                            loom_remote_protocol::session::parse_session_request(body)
+                                .expect("session close request"),
+                            loom_remote_protocol::session::SessionRequest::Close {
+                                auth: SessionAuth::Unauthenticated,
+                                credential: credential.clone(),
+                            }
+                        );
+                        let reply = loom_remote_protocol::session::SessionOpenReply::Ok {
+                            session_id: session_id.clone(),
+                            lease_expires_ms: 0,
+                            credential: None,
+                        };
+                        generated_binary_response(
+                            DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+                            &[loom_remote_protocol::session::open_reply_bytes(&reply)],
+                        )
                     }
                 };
                 stream.write_all(&response).unwrap();
@@ -11688,6 +15389,9 @@ mod selector_tests {
             .expect("local daemon MCP backend");
 
         assert_eq!(backend.handle.0.owner_session, vec![9, 7, 5, 3]);
+        backend
+            .close_logical_session()
+            .expect("close local daemon MCP logical session");
         server.join().unwrap();
         let _ = std::fs::remove_file(&paths.addr_file);
     }
@@ -11714,14 +15418,12 @@ mod selector_tests {
                 let mut request = Vec::new();
                 stream.read_to_end(&mut request).unwrap();
                 let response = match request_index {
-                    0 | 1 => format!(
-                        "running\tprotocol=1\ttransport=tcp\tfake-pid\t{store_path}\tidentity={store_id}\tsessions=0\tpins=0\n"
-                    )
-                    .into_bytes(),
+                    0 | 1 => running_daemon_response(&store_path, &store_id),
                     2 => {
                         let reply = loom_remote_protocol::session::SessionOpenReply::Ok {
                             session_id: session_id.clone(),
                             lease_expires_ms: 123,
+                            credential: None,
                         };
                         generated_binary_response(
                             DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
@@ -11814,6 +15516,253 @@ mod selector_tests {
         let _ = std::fs::remove_file(&paths.addr_file);
     }
 
+    #[cfg(all(feature = "serve", feature = "mcp", feature = "remote-client"))]
+    #[test]
+    fn local_mcp_backend_executes_generated_read_and_mutation_through_daemon() {
+        let store = temp_store("mcp-daemon-generated-execute");
+        let paths = daemon::paths(&store).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(&paths.addr_file, listener.local_addr().unwrap().to_string()).unwrap();
+        let store_path = paths.store.clone();
+        let store_id = paths.store_id.clone();
+        let server = std::thread::spawn(move || {
+            let session_id = vec![6, 5, 4, 3];
+            for request_index in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                let response = match request_index {
+                    0 => running_daemon_response(&store_path, &store_id),
+                    1 => {
+                        let reply = loom_remote_protocol::session::SessionOpenReply::Ok {
+                            session_id: session_id.clone(),
+                            lease_expires_ms: 123,
+                            credential: Some(b"mcp-generated-credential".to_vec()),
+                        };
+                        generated_binary_response(
+                            DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+                            &[loom_remote_protocol::session::open_reply_bytes(&reply)],
+                        )
+                    }
+                    2 => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("store open frame");
+                        success_store_open_response(body, &session_id)
+                    }
+                    3 => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("store version frame");
+                        let decoded = loom_remote_protocol::envelope::Request::decode(body)
+                            .expect("decode version request");
+                        assert_eq!(decoded.args, Vec::<loom_codec::Value>::new());
+                        success_generated_response(
+                            body,
+                            &session_id,
+                            "Store",
+                            "version",
+                            loom_codec::Value::Text("daemon-mcp-version".to_string()),
+                        )
+                    }
+                    _ => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("graph remove edge frame");
+                        let decoded = loom_remote_protocol::envelope::Request::decode(body)
+                            .expect("decode graph request");
+                        assert_eq!(
+                            decoded.args,
+                            vec![
+                                LoomSession(loom_remote_protocol::api_types::HandleId {
+                                    kind: "session".to_string(),
+                                    id: vec![9, 8, 7],
+                                    generation: 1,
+                                    owner_session: session_id.clone(),
+                                })
+                                .to_value(),
+                                loom_codec::Value::Text("repo".to_string()),
+                                loom_codec::Value::Text("graph".to_string()),
+                                loom_codec::Value::Text("edge-1".to_string()),
+                            ]
+                        );
+                        success_generated_response(
+                            body,
+                            &session_id,
+                            "Graph",
+                            "remove_edge",
+                            loom_codec::Value::Bool(true),
+                        )
+                    }
+                };
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let backend = McpRemoteBackend::connect_local_daemon(&store, &KeyOpts::default())
+            .expect("local daemon MCP backend");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let version = rt
+            .block_on(
+                uldren_loom_mcp::RemoteMcpBackend::execute_generated_operation(
+                    &backend,
+                    uldren_loom_mcp::GeneratedMcpCall {
+                        operation: GeneratedOperationId::StoreVersion,
+                        args_without_handle: Vec::new(),
+                    },
+                ),
+            )
+            .expect("generated read through local daemon MCP");
+        assert_eq!(
+            version,
+            loom_codec::Value::Text("daemon-mcp-version".to_string())
+        );
+        let removed = rt
+            .block_on(
+                uldren_loom_mcp::RemoteMcpBackend::execute_generated_operation(
+                    &backend,
+                    uldren_loom_mcp::GeneratedMcpCall {
+                        operation: GeneratedOperationId::GraphRemoveEdge,
+                        args_without_handle: vec![
+                            loom_codec::Value::Text("repo".to_string()),
+                            loom_codec::Value::Text("graph".to_string()),
+                            loom_codec::Value::Text("edge-1".to_string()),
+                        ],
+                    },
+                ),
+            )
+            .expect("generated mutation through local daemon MCP");
+        assert_eq!(removed, loom_codec::Value::Bool(true));
+
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&paths.addr_file);
+    }
+
+    #[cfg(all(feature = "serve", feature = "mcp", feature = "remote-client"))]
+    #[test]
+    fn mu17_local_mcp_backend_fails_closed_when_session_open_is_rejected() {
+        let store = temp_store("mu17-mcp-daemon-session-reject");
+        let paths = daemon::paths(&store).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(&paths.addr_file, listener.local_addr().unwrap().to_string()).unwrap();
+        let store_path = paths.store.clone();
+        let store_id = paths.store_id.clone();
+        let server = std::thread::spawn(move || {
+            for request_index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                let response = match request_index {
+                    0 => running_daemon_response(&store_path, &store_id),
+                    _ => {
+                        let _body =
+                            generated_binary_body(&request, DAEMON_GENERATED_SESSION_OPEN_MAGIC)
+                                .expect("session open frame");
+                        let reply = loom_remote_protocol::session::SessionOpenReply::Err(
+                            loom_remote_protocol::RemoteError::from_loom_error(
+                                &loom_core::error::LoomError::new(
+                                    loom_core::error::Code::PermissionDenied,
+                                    "session rejected",
+                                ),
+                            ),
+                        );
+                        generated_binary_response(
+                            DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+                            &[loom_remote_protocol::session::open_reply_bytes(&reply)],
+                        )
+                    }
+                };
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let error = match McpRemoteBackend::connect_local_daemon(&store, &KeyOpts::default()) {
+            Ok(_) => panic!("session-open rejection must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("session rejected"));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&paths.addr_file);
+    }
+
+    #[cfg(all(feature = "serve", feature = "mcp", feature = "remote-client"))]
+    #[test]
+    fn mu17_local_mcp_generated_call_error_preserves_code_without_direct_fallback() {
+        let store = temp_store("mu17-mcp-daemon-call-error");
+        let paths = daemon::paths(&store).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(&paths.addr_file, listener.local_addr().unwrap().to_string()).unwrap();
+        let store_path = paths.store.clone();
+        let store_id = paths.store_id.clone();
+        let server = std::thread::spawn(move || {
+            let session_id = vec![7, 1, 7, 1];
+            for request_index in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                let response = match request_index {
+                    0 => running_daemon_response(&store_path, &store_id),
+                    1 => {
+                        let reply = loom_remote_protocol::session::SessionOpenReply::Ok {
+                            session_id: session_id.clone(),
+                            lease_expires_ms: 123,
+                            credential: Some(b"mcp-error-credential".to_vec()),
+                        };
+                        generated_binary_response(
+                            DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+                            &[loom_remote_protocol::session::open_reply_bytes(&reply)],
+                        )
+                    }
+                    2 => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("store open frame");
+                        success_store_open_response(body, &session_id)
+                    }
+                    3 => {
+                        let body = generated_binary_body(&request, DAEMON_GENERATED_CALL_MAGIC)
+                            .expect("store version frame");
+                        error_generated_response(
+                            body,
+                            &session_id,
+                            "Store",
+                            "version",
+                            loom_core::error::LoomError::new(
+                                loom_core::error::Code::NotFound,
+                                "version unavailable",
+                            ),
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let backend = McpRemoteBackend::connect_local_daemon(&store, &KeyOpts::default())
+            .expect("local daemon MCP backend");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let error = rt
+            .block_on(
+                uldren_loom_mcp::RemoteMcpBackend::execute_generated_operation(
+                    &backend,
+                    uldren_loom_mcp::GeneratedMcpCall {
+                        operation: GeneratedOperationId::StoreVersion,
+                        args_without_handle: Vec::new(),
+                    },
+                ),
+            )
+            .expect_err("generated call error");
+
+        assert_eq!(error.code, loom_core::error::Code::NotFound);
+        assert!(error.message.contains("version unavailable"));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&paths.addr_file);
+    }
+
     #[cfg(all(feature = "serve", feature = "remote-client"))]
     #[test]
     fn cli_generated_client_executes_same_operation_through_remote_boundary() {
@@ -11900,7 +15849,484 @@ mod selector_tests {
             loom_codec::Value::Text(json) => assert!(json.contains("selector-project"), "{json}"),
             other => panic!("unexpected output {other:?}"),
         }
+
+        let key_a = loom_core::kv::key_to_cbor(&loom_core::Value::Text("a".to_string()));
+        let key_z = loom_core::kv::key_to_cbor(&loom_core::Value::Text("z".to_string()));
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "Kv",
+                    "put",
+                    vec![
+                        loom_codec::Value::Text("mu17g-kv".to_string()),
+                        loom_codec::Value::Text("settings".to_string()),
+                        loom_codec::Value::Bytes(key_a.clone()),
+                        loom_codec::Value::Bytes(b"alpha".to_vec()),
+                    ],
+                )
+                .expect("kv put operation"),
+            )
+            .expect("kv put");
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Kv",
+                        "get",
+                        vec![
+                            loom_codec::Value::Text("mu17g-kv".to_string()),
+                            loom_codec::Value::Text("settings".to_string()),
+                            loom_codec::Value::Bytes(key_a.clone()),
+                        ],
+                    )
+                    .expect("kv get operation"),
+                )
+                .expect("kv get"),
+            loom_codec::Value::Bytes(b"alpha".to_vec())
+        );
+        assert!(matches!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Kv",
+                        "list",
+                        vec![
+                            loom_codec::Value::Text("mu17g-kv".to_string()),
+                            loom_codec::Value::Text("settings".to_string()),
+                        ],
+                    )
+                    .expect("kv list operation"),
+                )
+                .expect("kv list"),
+            loom_codec::Value::Bytes(bytes) if !bytes.is_empty()
+        ));
+        assert!(matches!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Kv",
+                        "range",
+                        vec![
+                            loom_codec::Value::Text("mu17g-kv".to_string()),
+                            loom_codec::Value::Text("settings".to_string()),
+                            loom_codec::Value::Bytes(key_a.clone()),
+                            loom_codec::Value::Bytes(key_z),
+                        ],
+                    )
+                    .expect("kv range operation"),
+                )
+                .expect("kv range"),
+            loom_codec::Value::Bytes(bytes) if !bytes.is_empty()
+        ));
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Kv",
+                        "delete",
+                        vec![
+                            loom_codec::Value::Text("mu17g-kv".to_string()),
+                            loom_codec::Value::Text("settings".to_string()),
+                            loom_codec::Value::Bytes(key_a),
+                        ],
+                    )
+                    .expect("kv delete operation"),
+                )
+                .expect("kv delete"),
+            loom_codec::Value::Bool(true)
+        );
+
+        let queue_append = |entry: &[u8]| {
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Queue",
+                        "append",
+                        vec![
+                            loom_codec::Value::Text("mu17g-queue".to_string()),
+                            loom_codec::Value::Text("events".to_string()),
+                            loom_codec::Value::Bytes(entry.to_vec()),
+                        ],
+                    )
+                    .expect("queue append operation"),
+                )
+                .expect("queue append")
+        };
+        assert_eq!(queue_append(b"alpha"), loom_codec::Value::Uint(0));
+        assert_eq!(queue_append(b"beta"), loom_codec::Value::Uint(1));
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Queue",
+                        "get",
+                        vec![
+                            loom_codec::Value::Text("mu17g-queue".to_string()),
+                            loom_codec::Value::Text("events".to_string()),
+                            loom_codec::Value::Uint(0),
+                        ],
+                    )
+                    .expect("queue get operation"),
+                )
+                .expect("queue get"),
+            loom_codec::Value::Bytes(b"alpha".to_vec())
+        );
+        assert!(matches!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Queue",
+                        "range",
+                        vec![
+                            loom_codec::Value::Text("mu17g-queue".to_string()),
+                            loom_codec::Value::Text("events".to_string()),
+                            loom_codec::Value::Uint(0),
+                            loom_codec::Value::Uint(2),
+                        ],
+                    )
+                    .expect("queue range operation"),
+                )
+                .expect("queue range"),
+            loom_codec::Value::Array(entries) if entries.len() == 2
+        ));
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "QueueConsumers",
+                    "consumer_advance",
+                    vec![
+                        loom_codec::Value::Text("mu17g-queue".to_string()),
+                        loom_codec::Value::Text("events".to_string()),
+                        loom_codec::Value::Text("worker".to_string()),
+                        loom_codec::Value::Uint(1),
+                    ],
+                )
+                .expect("queue consumer advance operation"),
+            )
+            .expect("queue consumer advance");
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "QueueConsumers",
+                        "consumer_position",
+                        vec![
+                            loom_codec::Value::Text("mu17g-queue".to_string()),
+                            loom_codec::Value::Text("events".to_string()),
+                            loom_codec::Value::Text("worker".to_string()),
+                        ],
+                    )
+                    .expect("queue consumer position operation"),
+                )
+                .expect("queue consumer position"),
+            loom_codec::Value::Uint(1)
+        );
+
+        generated
+            .execute_unary(
+                &CliGeneratedOperation::new(
+                    "TimeSeries",
+                    "put",
+                    vec![
+                        loom_codec::Value::Text("mu17g-ts".to_string()),
+                        loom_codec::Value::Text("cpu".to_string()),
+                        loom_codec::Value::Uint(100),
+                        loom_codec::Value::Bytes(b"alpha".to_vec()),
+                    ],
+                )
+                .expect("time-series put operation"),
+            )
+            .expect("time-series put");
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "TimeSeries",
+                        "get",
+                        vec![
+                            loom_codec::Value::Text("mu17g-ts".to_string()),
+                            loom_codec::Value::Text("cpu".to_string()),
+                            loom_codec::Value::Uint(100),
+                        ],
+                    )
+                    .expect("time-series get operation"),
+                )
+                .expect("time-series get"),
+            loom_codec::Value::Bytes(b"alpha".to_vec())
+        );
+        assert!(matches!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "TimeSeries",
+                        "range",
+                        vec![
+                            loom_codec::Value::Text("mu17g-ts".to_string()),
+                            loom_codec::Value::Text("cpu".to_string()),
+                            loom_codec::Value::Uint(0),
+                            loom_codec::Value::Uint(200),
+                        ],
+                    )
+                    .expect("time-series range operation"),
+                )
+                .expect("time-series range"),
+            loom_codec::Value::Bytes(bytes) if !bytes.is_empty()
+        ));
+
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Ledger",
+                        "append",
+                        vec![
+                            loom_codec::Value::Text("mu17g-ledger".to_string()),
+                            loom_codec::Value::Text("audit".to_string()),
+                            loom_codec::Value::Bytes(b"alpha".to_vec()),
+                        ],
+                    )
+                    .expect("ledger append operation"),
+                )
+                .expect("ledger append"),
+            loom_codec::Value::Uint(0)
+        );
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Ledger",
+                        "get",
+                        vec![
+                            loom_codec::Value::Text("mu17g-ledger".to_string()),
+                            loom_codec::Value::Text("audit".to_string()),
+                            loom_codec::Value::Uint(0),
+                        ],
+                    )
+                    .expect("ledger get operation"),
+                )
+                .expect("ledger get"),
+            loom_codec::Value::Bytes(b"alpha".to_vec())
+        );
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Ledger",
+                        "len",
+                        vec![
+                            loom_codec::Value::Text("mu17g-ledger".to_string()),
+                            loom_codec::Value::Text("audit".to_string()),
+                        ],
+                    )
+                    .expect("ledger len operation"),
+                )
+                .expect("ledger len"),
+            loom_codec::Value::Uint(1)
+        );
+        assert!(matches!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Ledger",
+                        "head",
+                        vec![
+                            loom_codec::Value::Text("mu17g-ledger".to_string()),
+                            loom_codec::Value::Text("audit".to_string()),
+                        ],
+                    )
+                    .expect("ledger head operation"),
+                )
+                .expect("ledger head"),
+            loom_codec::Value::Text(digest) if digest.starts_with("blake3:")
+        ));
+        assert_eq!(
+            generated
+                .execute_unary(
+                    &CliGeneratedOperation::new(
+                        "Ledger",
+                        "verify",
+                        vec![
+                            loom_codec::Value::Text("mu17g-ledger".to_string()),
+                            loom_codec::Value::Text("audit".to_string()),
+                        ],
+                    )
+                    .expect("ledger verify operation"),
+                )
+                .expect("ledger verify"),
+            loom_codec::Value::Null
+        );
         server.shutdown();
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[cfg(all(feature = "serve", feature = "remote-client"))]
+    #[test]
+    fn identity_authority_policy_generated_remote_persists_and_audits() {
+        use loom_core::WorkspaceId;
+        use loom_core::identity::IdentityStore;
+
+        let root = WorkspaceId::v4_from_bytes([7; 16]);
+        let source_store = temp_store("authority-policy-source");
+        let remote_store = temp_store("authority-policy-remote");
+        let source = cli_open_loom(&source_store, &KeyOpts::default()).expect("open source seed");
+        source
+            .store()
+            .save_identity_store(&IdentityStore::new(root))
+            .expect("save source identity");
+        let destination =
+            cli_open_loom(&remote_store, &KeyOpts::default()).expect("open destination seed");
+        let mut identity = IdentityStore::new(root);
+        identity
+            .set_passphrase(root, "rootpw", b"root-salt-bytes")
+            .expect("seed root passphrase");
+        destination
+            .store()
+            .save_identity_store(&identity)
+            .expect("save destination identity");
+        let mut acl = loom_core::AclStore::new();
+        acl.allow(
+            loom_core::AclSubject::Principal(root),
+            None,
+            None,
+            [loom_core::AclRight::Admin],
+        )
+        .expect("grant root global admin");
+        destination
+            .store()
+            .save_acl_store(&acl)
+            .expect("save destination acl");
+        drop(source);
+        drop(destination);
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("loomcli-idpolicy-{}.crt", std::process::id()));
+        let key_path = dir.join(format!("loomcli-idpolicy-{}.key", std::process::id()));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
+            &cert_path.to_string_lossy(),
+            &key_path.to_string_lossy(),
+        )
+        .expect("server tls");
+        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
+            "127.0.0.1:0".to_string(),
+            "https://localhost/apps/loom".to_string(),
+            None,
+            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
+            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
+            60_000,
+            1 << 20,
+            None,
+        );
+        let server_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_rt
+            .block_on(crate::serve_cmd::bind_remote_endpoint(
+                &remote_store,
+                &options,
+                tls.server_config(),
+            ))
+            .expect("bind remote endpoint");
+        let target = RemoteTarget {
+            url: format!("https://127.0.0.1:{}/apps/loom", server.local_addr().port()),
+            auth: None,
+            tls: Some("insecure-dev".to_string()),
+            discovery: LocatorDiscovery::Default,
+            discovery_path: None,
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
+        };
+
+        let denied = CliGeneratedClient::Remote(Box::new(
+            RemoteStore::connect(&target).expect("unauthenticated connect"),
+        ));
+        let denied_err = denied
+            .generated_json(
+                "Identity",
+                "identity_configure_authority_replication_json",
+                vec![
+                    "not allowed".to_value(),
+                    "".to_value(),
+                    false.to_value(),
+                    true.to_value(),
+                    loom_codec::Value::Null,
+                    0u64.to_value(),
+                    0u64.to_value(),
+                    true.to_value(),
+                ],
+            )
+            .expect_err("unauthenticated generated configure must fail");
+        assert!(denied_err.contains("AUTHENTICATION_FAILED"));
+
+        let remote = CliGeneratedClient::Remote(Box::new(
+            RemoteStore::connect_with_auth(
+                &target,
+                SessionAuth::Passphrase {
+                    principal: *root.as_bytes(),
+                    passphrase: b"rootpw".to_vec(),
+                },
+            )
+            .expect("authenticated connect"),
+        ));
+        let configured = remote
+            .generated_json(
+                "Identity",
+                "identity_configure_authority_replication_json",
+                vec![
+                    "primary".to_value(),
+                    source_store.clone().to_value(),
+                    false.to_value(),
+                    true.to_value(),
+                    250u64.to_value(),
+                    5u64.to_value(),
+                    60_000u64.to_value(),
+                    true.to_value(),
+                ],
+            )
+            .expect("configure over generated remote");
+        assert!(configured.contains("\"id\":\"primary\""));
+        let detached = remote
+            .generated_json(
+                "Identity",
+                "identity_force_detach_authority_json",
+                vec![
+                    loom_codec::Value::Bytes(root.as_bytes().to_vec()),
+                    7u64.to_value(),
+                    "authority unreachable".to_value(),
+                ],
+            )
+            .expect("detach over generated remote");
+        assert!(detached.contains("\"generation\":7"));
+        let removed = remote
+            .generated_json(
+                "Identity",
+                "identity_remove_authority_replication_json",
+                vec!["primary".to_value()],
+            )
+            .expect("remove over generated remote");
+        assert!(removed.contains("\"id\":\"primary\""));
+
+        server.shutdown();
+        drop(server_rt);
+
+        let reopened = FileStore::open(&remote_store).expect("reopen remote store");
+        assert!(
+            reopened
+                .authority_replication_policy_by_id("primary")
+                .expect("policy lookup")
+                .is_none()
+        );
+        let audit = reopened.audit_records().expect("audit records");
+        assert_eq!(audit[0].action, "authority.replication.configure");
+        assert_eq!(audit[1].action, "identity.authority.force_detach");
+        assert_eq!(audit[2].action, "authority.replication.remove");
+
+        let _ = std::fs::remove_file(&source_store);
+        let _ = std::fs::remove_file(&remote_store);
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&key_path);
     }
@@ -12069,6 +16495,8 @@ impl rustls::client::danger::ServerCertVerifier for InsecureServerVerifier {
 mod live_tests {
     use super::*;
     use loom_locator::Discovery as LocatorDiscovery;
+    use loom_remote_protocol::api_types::Uuid;
+    use loom_remote_protocol::generated_api::Sessions;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_store(tag: &str) -> String {
@@ -13412,1114 +17840,6 @@ mod live_tests {
         drop(server_rt);
     }
 
-    /// The KV and queue commands round-trip through the `StoreClient::Remote` facade against a
-    /// live `loom serve remote` endpoint. The client obtains its session over the carrier session route
-    /// inside `RemoteStore::connect` (via `RemoteLoomClient::open_session`) - the test never calls
-    /// `runtime.open_session` and never binds a session manually.
-    #[test]
-    fn kv_and_queue_round_trip_through_remote_facade() {
-        let store = temp_store("rt");
-
-        // Seed a calendar collection + event directly through the local engine so the local and remote
-        // facade arms later read identical data (for the byte-for-byte output comparison below). The store
-        // file is saved and released here, before the server binds it.
-        {
-            let keys = KeyOpts::default();
-            let mut loom = cli_open_loom(&store, &keys).expect("open store for calendar seed");
-            let ns =
-                ensure_facet_workspace(&mut loom, "cal", FacetKind::Calendar).expect("calendar ws");
-            loom_core::calendar::create_collection(
-                &mut loom,
-                ns,
-                "alice",
-                "work",
-                &loom_core::calendar::CollectionMeta {
-                    display_name: "Work".to_string(),
-                    component_set: vec![loom_core::calendar::Component::Event],
-                },
-            )
-            .expect("seed create_collection");
-            let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:evt-1\r\nSUMMARY:Standup\r\nDTSTART:20240115T100000Z\r\nDTEND:20240115T103000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-            loom_core::calendar::put_ics(&mut loom, ns, "alice", "work", ics)
-                .expect("seed put_ics");
-
-            // Seed a contacts book + entry the same way (read-only fixtures for the local vs remote byte
-            // comparison below).
-            let con_ns =
-                ensure_facet_workspace(&mut loom, "con", FacetKind::Contacts).expect("contacts ws");
-            loom_core::contacts::create_book(
-                &mut loom,
-                con_ns,
-                "alice",
-                "personal",
-                &loom_core::contacts::BookMeta {
-                    display_name: "Personal".to_string(),
-                },
-            )
-            .expect("seed create_book");
-            let vcard = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:imported\r\nFN:Imported Person\r\nEMAIL:i@x.io\r\nEND:VCARD\r\n";
-            loom_core::contacts::put_vcard(&mut loom, con_ns, "alice", "personal", vcard)
-                .expect("seed put_vcard");
-
-            // Seed a mailbox + ingested message (read-only fixtures for the local vs remote byte
-            // comparison below).
-            let mail_ns =
-                ensure_facet_workspace(&mut loom, "mail", FacetKind::Mail).expect("mail ws");
-            loom_core::mail::create_mailbox(
-                &mut loom,
-                mail_ns,
-                "alice",
-                "inbox",
-                &loom_core::mail::MailboxMeta {
-                    display_name: "Inbox".to_string(),
-                },
-            )
-            .expect("seed create_mailbox");
-            let rfc822 = b"From: a@x.io\r\nTo: b@y.io\r\nSubject: Standup\r\nDate: Mon, 15 Jan 2024 10:00:00 +0000\r\nMessage-ID: <msg-1@x.io>\r\n\r\nBody of the message.\r\n";
-            loom_core::mail::ingest_message(&mut loom, mail_ns, "alice", "inbox", "msg-1", rfc822)
-                .expect("seed ingest_message");
-
-            // A workspace for the protected-ref policy tests to target (the ref-policy methods resolve an
-            // existing workspace; they do not create one).
-            ensure_facet_workspace(&mut loom, "refs", FacetKind::Vcs).expect("refs ws");
-
-            save_loom(&mut loom).expect("save seed");
-        }
-
-        // A self-signed localhost cert for the server, loaded through the same TLS path `loom serve
-        // remote` uses.
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let dir = std::env::temp_dir();
-        let cert_path = dir.join(format!("loomcli-remote-facade-{}.crt", std::process::id()));
-        let key_path = dir.join(format!("loomcli-remote-facade-{}.key", std::process::id()));
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
-        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
-            &cert_path.to_string_lossy(),
-            &key_path.to_string_lossy(),
-        )
-        .expect("server tls");
-
-        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
-            "127.0.0.1:0".to_string(),
-            "https://localhost/apps/loom".to_string(),
-            None,
-            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
-            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
-            60_000,
-            1 << 20,
-            None,
-        );
-
-        // Stand up the server on its own runtime; the accept loop runs on it while the client connects.
-        let server_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = server_rt
-            .block_on(crate::serve_cmd::bind_remote_endpoint(
-                &store,
-                &options,
-                tls.server_config(),
-            ))
-            .expect("bind remote endpoint");
-        let addr = server.local_addr();
-
-        // The remote target the CLI resolves from a context: the live endpoint, trusting the
-        // self-signed cert via the loopback `insecure-dev` selector.
-        let target = RemoteTarget {
-            url: format!("https://127.0.0.1:{}/apps/loom", addr.port()),
-            auth: None,
-            tls: Some("insecure-dev".to_string()),
-            discovery: LocatorDiscovery::Default,
-            discovery_path: None,
-            connect_timeout_ms: None,
-            request_timeout_ms: None,
-        };
-        let client = StoreClient::Remote(Box::new(RemoteStore::connect(&target).expect("connect")));
-        let keys = KeyOpts::default();
-
-        // KV: unary write then unary read, plus range and delete.
-        let key = loom_core::Value::Text("k".to_string());
-        client
-            .kv_put(&keys, "app", "c", key.clone(), b"v".to_vec())
-            .expect("kv put");
-        assert_eq!(
-            client
-                .kv_get(&keys, "app", "c", key.clone())
-                .expect("kv get"),
-            Some(b"v".to_vec())
-        );
-        // Range over the single key returns a non-empty canonical `[key, value]` map.
-        assert!(
-            !client
-                .kv_range(
-                    &keys,
-                    "app",
-                    "c",
-                    loom_core::Value::Text(String::new()),
-                    loom_core::Value::Text("~".to_string()),
-                )
-                .expect("kv range")
-                .is_empty()
-        );
-        // Delete removes it (present -> true), and a second delete reports absent.
-        assert!(
-            client
-                .kv_delete(&keys, "app", "c", key.clone())
-                .expect("kv delete")
-        );
-        assert!(
-            !client
-                .kv_delete(&keys, "app", "c", key)
-                .expect("kv delete absent")
-        );
-
-        // Queue: append, range, get, len, and consumer position/read/advance/reset.
-        client
-            .queue_append(&keys, "jobs", "in", b"a".to_vec())
-            .expect("queue append a");
-        client
-            .queue_append(&keys, "jobs", "in", b"b".to_vec())
-            .expect("queue append b");
-        assert_eq!(
-            client
-                .queue_range(&keys, "jobs", "in", 0, 2)
-                .expect("queue range"),
-            vec![b"a".to_vec(), b"b".to_vec()]
-        );
-        assert_eq!(
-            client.queue_get(&keys, "jobs", "in", 0).expect("queue get"),
-            Some(b"a".to_vec())
-        );
-        assert_eq!(client.queue_len(&keys, "jobs", "in").expect("queue len"), 2);
-        // A fresh consumer starts at 0, reads both entries without advancing, then advance/reset move it.
-        assert_eq!(
-            client
-                .queue_consumer_position(&keys, "jobs", "in", "worker")
-                .expect("queue position"),
-            0
-        );
-        assert_eq!(
-            client
-                .queue_consumer_read(&keys, "jobs", "in", "worker", 10)
-                .expect("queue read"),
-            vec![b"a".to_vec(), b"b".to_vec()]
-        );
-        client
-            .queue_consumer_advance(&keys, "jobs", "in", "worker", 2)
-            .expect("queue advance");
-        assert_eq!(
-            client
-                .queue_consumer_position(&keys, "jobs", "in", "worker")
-                .expect("queue position after advance"),
-            2
-        );
-        client
-            .queue_consumer_reset(&keys, "jobs", "in", "worker", 1)
-            .expect("queue reset");
-        assert_eq!(
-            client
-                .queue_consumer_position(&keys, "jobs", "in", "worker")
-                .expect("queue position after reset"),
-            1
-        );
-
-        // CAS: put, then get/has/list/delete through the facade.
-        let digest = client
-            .cas_put(&keys, "blobs", b"hello".to_vec())
-            .expect("cas put");
-        assert_eq!(
-            client.cas_get(&keys, "blobs", &digest).expect("cas get"),
-            Some(b"hello".to_vec())
-        );
-        assert!(client.cas_has(&keys, "blobs", &digest).expect("cas has"));
-        assert!(
-            client
-                .cas_list(&keys, "blobs")
-                .expect("cas list")
-                .contains(&digest)
-        );
-        assert!(
-            client
-                .cas_delete(&keys, "blobs", &digest)
-                .expect("cas delete")
-        );
-
-        // Document: put, then get/list/delete through the facade.
-        let document_client =
-            CliGeneratedClient::Remote(Box::new(RemoteStore::connect(&target).expect("connect")));
-        document_client
-            .doc_put_text("docs", "notes", "d1", "{\"x\":1}", None)
-            .expect("doc put");
-        assert_eq!(
-            document_client
-                .doc_get_text("docs", "notes", "d1")
-                .expect("doc get")
-                .map(|document| document.text),
-            Some("{\"x\":1}".to_string())
-        );
-        assert!(
-            !document_client
-                .doc_list_binary("docs", "notes")
-                .expect("doc list")
-                .is_empty()
-        );
-        assert!(
-            document_client
-                .doc_delete("docs", "notes", "d1")
-                .expect("doc delete")
-        );
-
-        // Document indexing over the wire: create an index, find/query by it, inspect, rebuild, drop.
-        document_client
-            .doc_put_text("docs", "people", "p1", "{\"age\":30}", None)
-            .expect("doc put p1");
-        document_client
-            .doc_index_create("docs", "people", "by_age", "age", false)
-            .expect("doc index create");
-        let idx_list = document_client
-            .doc_index_list("docs", "people")
-            .expect("doc index list");
-        assert!(idx_list.to_string().contains("by_age"));
-        let idx_status = document_client
-            .doc_index_statuses("docs", "people")
-            .expect("doc index status");
-        assert!(idx_status.to_string().contains("by_age"));
-        assert_eq!(
-            document_client
-                .doc_find("docs", "people", "by_age", "30")
-                .expect("doc find"),
-            vec!["p1".to_string()]
-        );
-        let query = br#"{"collection":"people"}"#;
-        let query_result = document_client
-            .doc_query("docs", "people", query.to_vec())
-            .expect("doc query");
-        assert!(query_result.get("items").is_some());
-        document_client
-            .doc_index_rebuild("docs", "people", "by_age")
-            .expect("doc index rebuild");
-        assert!(
-            document_client
-                .doc_index_drop("docs", "people", "by_age")
-                .expect("doc index drop")
-        );
-
-        // Ledger: append, then get/len/head/verify.
-        let seq = client
-            .ledger_append(&keys, "audit", "log", b"e0".to_vec())
-            .expect("ledger append");
-        assert_eq!(
-            client
-                .ledger_get(&keys, "audit", "log", seq)
-                .expect("ledger get"),
-            Some(b"e0".to_vec())
-        );
-        assert_eq!(
-            client
-                .ledger_len(&keys, "audit", "log")
-                .expect("ledger len"),
-            1
-        );
-        assert!(
-            client
-                .ledger_head(&keys, "audit", "log")
-                .expect("ledger head")
-                .is_some()
-        );
-        client
-            .ledger_verify(&keys, "audit", "log")
-            .expect("ledger verify");
-
-        // TimeSeries: put, then get/range.
-        client
-            .ts_put(&keys, "metrics", "cpu", 100, b"0.5".to_vec())
-            .expect("ts put");
-        assert_eq!(
-            client.ts_get(&keys, "metrics", "cpu", 100).expect("ts get"),
-            Some(b"0.5".to_vec())
-        );
-        assert!(
-            !client
-                .ts_range(&keys, "metrics", "cpu", 0, 200)
-                .expect("ts range")
-                .is_empty()
-        );
-
-        // Search: create an index, index a document, then get/ids/delete/query through the facade.
-        // Inputs are canonical CBOR built the same way the CLI would read them from a file: the mapping
-        // is a field -> [type_tag, stored, faceted] map, the document is a field -> value map, and the
-        // request is a [query_node, limit, offset] array.
-        use loom_codec::Value as WireValue;
-        let mapping = loom_codec::encode(&WireValue::Map(vec![(
-            WireValue::Text("body".to_string()),
-            WireValue::Array(vec![
-                WireValue::Uint(0),
-                WireValue::Bool(true),
-                WireValue::Bool(false),
-            ]),
-        )]))
-        .unwrap();
-        client
-            .search_create(&keys, "search", "notes", mapping)
-            .expect("search create");
-        let doc = loom_codec::encode(&WireValue::Map(vec![(
-            WireValue::Text("body".to_string()),
-            WireValue::Text("hello world".to_string()),
-        )]))
-        .unwrap();
-        client
-            .search_index(&keys, "search", "notes", b"doc-1".to_vec(), doc.clone())
-            .expect("search index");
-        assert_eq!(
-            client
-                .search_get(&keys, "search", "notes", b"doc-1".to_vec())
-                .expect("search get"),
-            Some(doc)
-        );
-        assert!(
-            !client
-                .search_ids(&keys, "search", "notes", None)
-                .expect("search ids")
-                .is_empty()
-        );
-        let request = loom_codec::encode(&WireValue::Array(vec![
-            WireValue::Array(vec![
-                WireValue::Uint(0),
-                WireValue::Text("body".to_string()),
-                WireValue::Text("hello".to_string()),
-            ]),
-            WireValue::Uint(10),
-            WireValue::Uint(0),
-        ]))
-        .unwrap();
-        assert!(
-            !client
-                .search_query(&keys, "search", "notes", request)
-                .expect("search query")
-                .is_empty()
-        );
-        assert!(
-            client
-                .search_delete(&keys, "search", "notes", b"doc-1".to_vec())
-                .expect("search delete")
-        );
-
-        // Calendar: capture the CLI-presentation output of the divergent read methods over the wire (these
-        // exercise the remote bridge re-encoders), read a clean method, and cover the clean create/delete
-        // write path. The reads target the seeded read-only "work" collection so they stay stable for the
-        // local vs remote byte comparison after shutdown.
-        let remote_cal_list = client
-            .cal_list_entries(&keys, "cal", "alice", "work")
-            .expect("remote cal list_entries");
-        let remote_cal_range = client
-            .cal_range(&keys, "cal", "alice", "work", "20240101", "20241231")
-            .expect("remote cal range");
-        let remote_cal_collection = client
-            .cal_get_collection(&keys, "cal", "alice", "work")
-            .expect("remote cal get_collection");
-        let remote_cal_collections = client
-            .cal_list_collections(&keys, "cal", "alice")
-            .expect("remote cal list_collections");
-        assert!(
-            client
-                .cal_get_entry(&keys, "cal", "alice", "work", "evt-1")
-                .expect("remote cal get_entry")
-                .is_some()
-        );
-        assert!(
-            !remote_cal_list.is_empty(),
-            "seeded event should appear in list_entries"
-        );
-        // Clean write coverage over the wire: create then delete a scratch collection.
-        client
-            .cal_create_collection(
-                &keys,
-                "cal",
-                "alice",
-                "scratch",
-                "Scratch".to_string(),
-                vec![loom_core::calendar::Component::Event],
-            )
-            .expect("remote cal create_collection");
-        assert!(
-            client
-                .cal_delete_collection(&keys, "cal", "alice", "scratch")
-                .expect("remote cal delete_collection")
-        );
-
-        // Contacts: capture the divergent read output over the wire (bridge re-encoders), a clean read,
-        // and clean create/delete write coverage.
-        let remote_con_list = client
-            .con_list_entries(&keys, "con", "alice", "personal")
-            .expect("remote con list_entries");
-        let remote_con_search = client
-            .con_search(&keys, "con", "alice", "personal", "Imported")
-            .expect("remote con search");
-        let remote_con_book = client
-            .con_get_book(&keys, "con", "alice", "personal")
-            .expect("remote con get_book");
-        let remote_con_books = client
-            .con_list_books(&keys, "con", "alice")
-            .expect("remote con list_books");
-        assert!(
-            client
-                .con_get_entry(&keys, "con", "alice", "personal", "imported")
-                .expect("remote con get_entry")
-                .is_some()
-        );
-        assert!(
-            !remote_con_list.is_empty(),
-            "seeded contact should appear in list_entries"
-        );
-        client
-            .con_create_book(&keys, "con", "alice", "scratchbook", "Scratch".to_string())
-            .expect("remote con create_book");
-        assert!(
-            client
-                .con_delete_book(&keys, "con", "alice", "scratchbook")
-                .expect("remote con delete_book")
-        );
-
-        // Mail: do the mutating writes first (set flags on the seeded message; create+delete a scratch
-        // mailbox) so both the remote captures and the post-shutdown local reads observe the same final
-        // state, then capture the divergent/clean reads for the byte comparison.
-        client
-            .mail_set_flags(
-                &keys,
-                "mail",
-                "alice",
-                "inbox",
-                "msg-1",
-                vec!["\\Seen".to_string()],
-            )
-            .expect("remote mail set_flags");
-        client
-            .mail_create_mailbox(&keys, "mail", "alice", "archive", "Archive".to_string())
-            .expect("remote mail create_mailbox");
-        assert!(
-            client
-                .mail_delete_mailbox(&keys, "mail", "alice", "archive")
-                .expect("remote mail delete_mailbox")
-        );
-        let remote_mail_list = client
-            .mail_list_messages(&keys, "mail", "alice", "inbox")
-            .expect("remote mail list_messages");
-        let remote_mail_search = client
-            .mail_search(&keys, "mail", "alice", "inbox", "Standup")
-            .expect("remote mail search");
-        let remote_mail_mailbox = client
-            .mail_get_mailbox(&keys, "mail", "alice", "inbox")
-            .expect("remote mail get_mailbox");
-        let remote_mail_mailboxes = client
-            .mail_list_mailboxes(&keys, "mail", "alice")
-            .expect("remote mail list_mailboxes");
-        let remote_mail_flags = client
-            .mail_get_flags(&keys, "mail", "alice", "inbox", "msg-1")
-            .expect("remote mail get_flags");
-        assert!(
-            client
-                .mail_get_message(&keys, "mail", "alice", "inbox", "msg-1")
-                .expect("remote mail get_message")
-                .is_some()
-        );
-        assert!(
-            !remote_mail_list.is_empty(),
-            "seeded message should appear in list_messages"
-        );
-        assert!(
-            !remote_mail_flags.is_empty(),
-            "set_flags should persist a flag on the message"
-        );
-
-        // Files: write then read a top-level path over the wire.
-        client
-            .fs_write_file(&keys, "fsapp", "notes.txt", b"hello files".to_vec())
-            .expect("remote fs write_file");
-        let remote_fs_read = client
-            .fs_read_file(&keys, "fsapp", "notes.txt")
-            .expect("remote fs read_file");
-        assert_eq!(remote_fs_read, b"hello files".to_vec());
-
-        // ProtectedRefs: mutations first (set "main"; set+remove a scratch ref) so remote captures and the
-        // post-shutdown local reads observe the same final state, then capture get/list for the JSON
-        // output-equivalence comparison.
-        let policy = loom_core::vcs::ProtectedRefPolicy {
-            fast_forward_only: true,
-            signed_commits_required: false,
-            signed_ref_advance_required: true,
-            required_review_count: 2,
-            retention_lock: false,
-            governance_lock: true,
-        };
-        client
-            .pr_set(&keys, "refs", "branch/main", policy.clone())
-            .expect("remote pr set main");
-        client
-            .pr_set(&keys, "refs", "branch/scratch", policy.clone())
-            .expect("remote pr set scratch");
-        assert!(
-            client
-                .pr_remove(&keys, "refs", "branch/scratch")
-                .expect("remote pr remove scratch")
-        );
-        let remote_pr_get = client
-            .pr_get(&keys, "refs", "branch/main")
-            .expect("remote pr get");
-        let remote_pr_list = client.pr_list(&keys, "refs").expect("remote pr list");
-        assert!(remote_pr_get.is_some(), "the set policy should be readable");
-        assert!(!remote_pr_list.is_empty());
-
-        // Workspaces: create/list/rename/delete over the wire (session-level management), exercising the
-        // round-trip and the remote id resolution that reproduces the rename/delete output. Local
-        // `workspace *` gates on a configured identity store that this bare test store lacks, so this
-        // section does not byte-compare against a local run: authz runs server-side on the remote arm.
-        let ws_id = client
-            .ws_create(&keys, "wsnew", None)
-            .expect("remote ws create");
-        assert!(!ws_id.is_empty());
-        assert!(
-            !client.ws_list(&keys).expect("remote ws list").is_empty(),
-            "the created workspace should appear in the list"
-        );
-        assert_eq!(
-            client
-                .ws_rename(&keys, "wsnew", "wsrenamed")
-                .expect("remote ws rename"),
-            ws_id,
-            "rename should resolve to the created workspace id"
-        );
-        assert_eq!(
-            client
-                .ws_delete(&keys, "wsrenamed")
-                .expect("remote ws delete"),
-            ws_id
-        );
-
-        // Acl: grant/list/revoke over the wire (global-admin management). Output-equivalence for the group
-        // is covered by protected-refs above; local `acl *` gates on a configured identity store this bare
-        // test lacks, so this is remote-only (the accepted local-admin-vs-server-authz split).
-        let acl_rights = vec!["read".to_string()];
-        let acl_scopes: Vec<String> = Vec::new();
-        let acl_args = || AclGrantArgs {
-            effect: "allow",
-            subject: "everyone",
-            workspace: None,
-            domain: None,
-            rights: &acl_rights,
-            ref_glob: None,
-            scopes: &acl_scopes,
-            predicate_cel: None,
-        };
-        client
-            .acl_grant(&keys, acl_args())
-            .expect("remote acl grant");
-        assert!(
-            !client.acl_list(&keys).expect("remote acl list").is_empty(),
-            "the granted rule should appear in acl list"
-        );
-        assert!(
-            client
-                .acl_revoke(&keys, acl_args())
-                .expect("remote acl revoke"),
-            "the granted rule should be revocable"
-        );
-
-        // Columnar: create + append then read every accessor over the wire, and compact. The CLI codecs
-        // are the same wire format as the server's, so this is a clean bytes pass-through - verified by the
-        // scan byte-equality (local vs remote) after shutdown.
-        let col_columns =
-            columnar_columns_cbor(vec![("v".to_string(), loom_core::ColumnType::Int)]).unwrap();
-        let col_row = columnar_values_cbor(vec![loom_core::Value::Int(7)]).unwrap();
-        client
-            .col_create(&keys, "cols", "t", col_columns, 1024)
-            .expect("remote col create");
-        client
-            .col_append(&keys, "cols", "t", col_row)
-            .expect("remote col append");
-        assert_eq!(
-            client
-                .col_rows(&keys, "cols", "t")
-                .expect("remote col rows"),
-            1
-        );
-        let remote_col_scan = client
-            .col_scan(&keys, "cols", "t")
-            .expect("remote col scan");
-        assert!(!remote_col_scan.is_empty());
-        assert!(
-            !client
-                .col_columns(&keys, "cols", "t")
-                .expect("remote col columns")
-                .is_empty()
-        );
-        assert!(
-            !client
-                .col_inspect(&keys, "cols", "t")
-                .expect("remote col inspect")
-                .is_empty()
-        );
-        assert!(
-            !client
-                .col_source_digest(&keys, "cols", "t")
-                .expect("remote col source_digest")
-                .is_empty()
-        );
-        let select_cols =
-            loom_codec::encode(&loom_codec::Value::Array(vec![loom_codec::Value::Text(
-                "v".to_string(),
-            )]))
-            .unwrap();
-        assert!(
-            !client
-                .col_select(&keys, "cols", "t", select_cols, Vec::new())
-                .expect("remote col select")
-                .is_empty()
-        );
-        let aggregates =
-            loom_codec::encode(&loom_codec::Value::Array(vec![loom_codec::Value::Array(
-                vec![loom_codec::Value::Uint(0)],
-            )]))
-            .unwrap();
-        assert!(
-            !client
-                .col_aggregate(&keys, "cols", "t", aggregates, Vec::new())
-                .expect("remote col aggregate")
-                .is_empty()
-        );
-        client
-            .col_compact(&keys, "cols", "t")
-            .expect("remote col compact");
-
-        // Graph: upsert two nodes + an edge, then read every accessor over the wire; get_node
-        // byte-equality (local vs remote) after shutdown confirms the shared graph wire format.
-        let node_props = loom_codec::encode(&loom_codec::Value::Map(vec![(
-            loom_codec::Value::Text("k".to_string()),
-            loom_codec::Value::Bytes(b"v".to_vec()),
-        )]))
-        .unwrap();
-        client
-            .g_upsert_node(&keys, "graph", "g", "n1", node_props)
-            .expect("remote g upsert_node n1");
-        client
-            .g_upsert_node(&keys, "graph", "g", "n2", Vec::new())
-            .expect("remote g upsert_node n2");
-        client
-            .g_upsert_edge(&keys, "graph", "g", "e1", "n1", "n2", "links", Vec::new())
-            .expect("remote g upsert_edge");
-        let remote_g_node = client
-            .g_get_node(&keys, "graph", "g", "n1")
-            .expect("remote g get_node");
-        assert!(remote_g_node.is_some());
-        assert!(
-            client
-                .g_get_edge(&keys, "graph", "g", "e1")
-                .expect("remote g get_edge")
-                .is_some()
-        );
-        assert!(
-            !client
-                .g_neighbors(&keys, "graph", "g", "n1")
-                .expect("remote g neighbors")
-                .is_empty()
-        );
-        assert!(
-            !client
-                .g_out_edges(&keys, "graph", "g", "n1")
-                .expect("remote g out_edges")
-                .is_empty()
-        );
-        assert!(
-            !client
-                .g_in_edges(&keys, "graph", "g", "n2")
-                .expect("remote g in_edges")
-                .is_empty()
-        );
-        assert!(
-            !client
-                .g_reachable(&keys, "graph", "g", "n1", -1, None)
-                .expect("remote g reachable")
-                .is_empty()
-        );
-        assert!(
-            client
-                .g_shortest_path(&keys, "graph", "g", "n1", "n2", None)
-                .expect("remote g shortest_path")
-                .is_some()
-        );
-        assert!(
-            !client
-                .g_query(
-                    &keys,
-                    "graph",
-                    "g",
-                    "MATCH p = (a)-[r:links]->(b) RETURN p, r, a, b",
-                )
-                .expect("remote g query")
-                .is_empty()
-        );
-        assert!(
-            !client
-                .g_explain_query(&keys, "graph", "g", "MATCH (n) RETURN n")
-                .expect("remote g explain_query")
-                .is_empty()
-        );
-        // A bounded reachable works over the wire too (the IDL carries max_depth).
-        assert!(
-            !client
-                .g_reachable(&keys, "graph", "g", "n1", 2, None)
-                .expect("remote g reachable bounded")
-                .is_empty()
-        );
-        // Write coverage: remove the edge and a node (n1 is left intact for the byte comparison).
-        assert!(
-            client
-                .g_remove_edge(&keys, "graph", "g", "e1")
-                .expect("remote g remove_edge")
-        );
-        client
-            .g_remove_node(&keys, "graph", "g", "n2", false)
-            .expect("remote g remove_node");
-
-        // Vector: create + upsert then exercise every accessor over the wire (get/ids/index keys/source/
-        // search/delete); get byte-equality (local vs remote) after shutdown confirms the shared format.
-        let vec_bytes = vector_floats_to_bytes(&[1.0f32, 2.0]);
-        client
-            .v_create(&keys, "vec", "v", 2, "cosine")
-            .expect("remote v create");
-        client
-            .v_upsert(&keys, "vec", "v", "a", vec_bytes.clone(), Vec::new())
-            .expect("remote v upsert");
-        let remote_v_get = client.v_get(&keys, "vec", "v", "a").expect("remote v get");
-        assert!(remote_v_get.is_some());
-        assert_eq!(
-            client.v_ids(&keys, "vec", "v", None).expect("remote v ids"),
-            vec!["a".to_string()]
-        );
-        assert!(
-            client
-                .v_create_index(&keys, "vec", "v", "kind")
-                .expect("remote v create_index")
-        );
-        assert!(
-            client
-                .v_index_keys(&keys, "vec", "v")
-                .expect("remote v index_keys")
-                .contains(&"kind".to_string())
-        );
-        assert!(
-            client
-                .v_drop_index(&keys, "vec", "v", "kind")
-                .expect("remote v drop_index")
-        );
-        client
-            .v_upsert_source(
-                &keys,
-                "vec",
-                "v",
-                "b",
-                vec_bytes.clone(),
-                Vec::new(),
-                b"hello".to_vec(),
-                None,
-                None,
-            )
-            .expect("remote v upsert_source");
-        assert_eq!(
-            client
-                .v_source_text(&keys, "vec", "v", "b")
-                .expect("remote v source_text"),
-            Some(b"hello".to_vec())
-        );
-        assert!(
-            !client
-                .v_search(
-                    &keys,
-                    "vec",
-                    "v",
-                    vec_bytes,
-                    5,
-                    Vec::new(),
-                    "exact",
-                    4096,
-                    0,
-                    1,
-                    16,
-                    8,
-                )
-                .expect("remote v search")
-                .is_empty()
-        );
-        assert!(
-            client
-                .v_delete(&keys, "vec", "v", "b")
-                .expect("remote v delete")
-        );
-
-        // VersionControl: a commit workflow over the wire (commit/branch/checkout/diff/merge). Commit
-        // digests embed a server-side timestamp so they are not locally reproducible, but the structural
-        // diff between two committed digests is - checked by the diff byte-equality after shutdown.
-        client
-            .kv_put(
-                &keys,
-                "vcsws",
-                "c",
-                loom_core::Value::Text("k1".to_string()),
-                b"v1".to_vec(),
-            )
-            .expect("vcs seed kv 1");
-        let c1 = client
-            .vcs_commit(&keys, "vcsws", "tester", "first")
-            .expect("remote vcs commit 1");
-        assert!(!c1.is_empty());
-        client
-            .kv_put(
-                &keys,
-                "vcsws",
-                "c",
-                loom_core::Value::Text("k2".to_string()),
-                b"v2".to_vec(),
-            )
-            .expect("vcs seed kv 2");
-        let c2 = client
-            .vcs_commit(&keys, "vcsws", "tester", "second")
-            .expect("remote vcs commit 2");
-        assert_ne!(c1, c2, "the two commits should differ");
-        let remote_vcs_diff = client
-            .vcs_diff(&keys, "vcsws", &c1, &c2)
-            .expect("remote vcs diff");
-        assert!(!remote_vcs_diff.is_empty());
-        client
-            .vcs_branch(&keys, "vcsws", "feature")
-            .expect("remote vcs branch");
-        client
-            .vcs_checkout(&keys, "vcsws", "feature")
-            .expect("remote vcs checkout feature");
-        client
-            .vcs_checkout(&keys, "vcsws", "main")
-            .expect("remote vcs checkout main");
-        let outcome = client
-            .vcs_merge(&keys, "vcsws", "feature", "tester", false)
-            .expect("remote vcs merge");
-        assert!(
-            !matches!(outcome, loom_core::MergeOutcome::Conflicts(_)),
-            "merging a non-divergent branch should not conflict"
-        );
-
-        // Identity runs against its own store + endpoint: an `identity add` introduces a second principal
-        // and flips the store into authenticated mode, which would make the shared store's post-shutdown
-        // local reads require auth. Isolating it keeps the other families' fixtures untouched.
-        {
-            let id_store = temp_store("id");
-            {
-                let id_keys = KeyOpts::default();
-                let loom = cli_open_loom(&id_store, &id_keys).expect("open identity store");
-                // Root-only identity store: the control plane the remote identity commands mutate.
-                let identity = loom_core::IdentityStore::new(WorkspaceId::v4_from_bytes([7; 16]));
-                loom.store()
-                    .save_identity_store(&identity)
-                    .expect("seed identity store");
-            }
-            let id_server = server_rt
-                .block_on(crate::serve_cmd::bind_remote_endpoint(
-                    &id_store,
-                    &options,
-                    tls.server_config(),
-                ))
-                .expect("bind identity endpoint");
-            let id_addr = id_server.local_addr();
-            let id_target = RemoteTarget {
-                url: format!("https://127.0.0.1:{}/apps/loom", id_addr.port()),
-                auth: None,
-                tls: Some("insecure-dev".to_string()),
-                discovery: LocatorDiscovery::Default,
-                discovery_path: None,
-                connect_timeout_ms: None,
-                request_timeout_ms: None,
-            };
-            let id_client = StoreClient::Remote(Box::new(
-                RemoteStore::connect(&id_target).expect("id connect"),
-            ));
-
-            // list, add, rename-handle, revoke-role, and public-key list over the wire.
-            let id_list_before = id_client.id_list(&keys).expect("remote identity list");
-            assert!(id_list_before.contains("\"authenticated_mode\""));
-            let new_principal = id_client
-                .id_add(
-                    &keys,
-                    "svc-bot",
-                    "Service Bot",
-                    loom_core::PrincipalKind::Service,
-                )
-                .expect("remote identity add");
-            assert!(!new_principal.is_empty());
-            let renamed = id_client
-                .id_rename_handle(&keys, &new_principal, "svc-bot-2")
-                .expect("remote identity rename-handle");
-            assert_eq!(renamed, new_principal);
-            // The snapshot carries the new principal with its renamed handle, the field the wire form
-            // round-trips.
-            let id_list_after = id_client
-                .id_list(&keys)
-                .expect("remote identity list after");
-            assert!(id_list_after.contains(&new_principal));
-            assert!(id_list_after.contains("\"handle\":\"svc-bot-2\""));
-            // Revoking a role the principal never had removes nothing.
-            let unheld_role = loom_core::WorkspaceId::v4_from_bytes([88; 16]).to_string();
-            assert!(
-                !id_client
-                    .id_revoke_role(&keys, &new_principal, &unheld_role)
-                    .expect("remote identity revoke-role")
-            );
-            // The public-key list renders from the snapshot (no keys seeded here).
-            assert_eq!(
-                id_client
-                    .id_public_key_list(&keys)
-                    .expect("remote identity public-key list"),
-                "[]"
-            );
-            id_server.shutdown();
-        }
-
-        server.shutdown();
-        drop(server_rt);
-
-        // The same calendar commands through the local facade produce byte-for-byte identical
-        // output to the remote arm.
-        {
-            let keys = KeyOpts::default();
-            let local = StoreClient::Local {
-                locator: store.clone(),
-            };
-            assert_eq!(
-                local
-                    .cal_list_entries(&keys, "cal", "alice", "work")
-                    .expect("local cal list_entries"),
-                remote_cal_list
-            );
-            assert_eq!(
-                local
-                    .cal_range(&keys, "cal", "alice", "work", "20240101", "20241231")
-                    .expect("local cal range"),
-                remote_cal_range
-            );
-            assert_eq!(
-                local
-                    .cal_get_collection(&keys, "cal", "alice", "work")
-                    .expect("local cal get_collection"),
-                remote_cal_collection
-            );
-            assert_eq!(
-                local
-                    .cal_list_collections(&keys, "cal", "alice")
-                    .expect("local cal list_collections"),
-                remote_cal_collections
-            );
-            assert_eq!(
-                local
-                    .con_list_entries(&keys, "con", "alice", "personal")
-                    .expect("local con list_entries"),
-                remote_con_list
-            );
-            assert_eq!(
-                local
-                    .con_search(&keys, "con", "alice", "personal", "Imported")
-                    .expect("local con search"),
-                remote_con_search
-            );
-            assert_eq!(
-                local
-                    .con_get_book(&keys, "con", "alice", "personal")
-                    .expect("local con get_book"),
-                remote_con_book
-            );
-            assert_eq!(
-                local
-                    .con_list_books(&keys, "con", "alice")
-                    .expect("local con list_books"),
-                remote_con_books
-            );
-            assert_eq!(
-                local
-                    .mail_list_messages(&keys, "mail", "alice", "inbox")
-                    .expect("local mail list_messages"),
-                remote_mail_list
-            );
-            assert_eq!(
-                local
-                    .mail_search(&keys, "mail", "alice", "inbox", "Standup")
-                    .expect("local mail search"),
-                remote_mail_search
-            );
-            assert_eq!(
-                local
-                    .mail_get_mailbox(&keys, "mail", "alice", "inbox")
-                    .expect("local mail get_mailbox"),
-                remote_mail_mailbox
-            );
-            assert_eq!(
-                local
-                    .mail_list_mailboxes(&keys, "mail", "alice")
-                    .expect("local mail list_mailboxes"),
-                remote_mail_mailboxes
-            );
-            assert_eq!(
-                local
-                    .mail_get_flags(&keys, "mail", "alice", "inbox", "msg-1")
-                    .expect("local mail get_flags"),
-                remote_mail_flags
-            );
-            assert_eq!(
-                local
-                    .fs_read_file(&keys, "fsapp", "notes.txt")
-                    .expect("local fs read_file"),
-                remote_fs_read
-            );
-            // Output-equivalence: the CLI JSON printers produce byte-for-byte identical text for the local
-            // and remote protected-ref reads.
-            let local_pr_list = local.pr_list(&keys, "refs").expect("local pr list");
-            assert_eq!(
-                crate::helpers::protected_ref_policies_json(&local_pr_list),
-                crate::helpers::protected_ref_policies_json(&remote_pr_list)
-            );
-            let local_pr_get = local
-                .pr_get(&keys, "refs", "branch/main")
-                .expect("local pr get");
-            let local_get_json = local_pr_get
-                .map(|policy| crate::helpers::protected_ref_policy_json("main", &policy));
-            let remote_get_json = remote_pr_get
-                .map(|policy| crate::helpers::protected_ref_policy_json("main", &policy));
-            assert_eq!(local_get_json, remote_get_json);
-            // Columnar scan output must be byte-for-byte identical local vs remote (confirms the CLI and
-            // server share the columnar wire format).
-            assert_eq!(
-                local.col_scan(&keys, "cols", "t").expect("local col scan"),
-                remote_col_scan
-            );
-            assert_eq!(
-                local
-                    .g_get_node(&keys, "graph", "g", "n1")
-                    .expect("local g get_node"),
-                remote_g_node
-            );
-            assert_eq!(
-                local.v_get(&keys, "vec", "v", "a").expect("local v get"),
-                remote_v_get
-            );
-            assert_eq!(
-                local
-                    .vcs_diff(&keys, "vcsws", &c1, &c2)
-                    .expect("local vcs diff"),
-                remote_vcs_diff
-            );
-        }
-
-        let _ = std::fs::remove_file(&store);
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
-    }
-
     /// A [`ParityDriver`](loom_protocol_conformance::client_parity::ParityDriver) over a live
     /// `loom serve remote` endpoint. It drives the *generated* `LoomClient` surface (`Kv`, `Cas`, `Queue`,
     /// `Document`, `TimeSeries`, `VersionControl`, `Store`) on a connected [`RemoteLoomClient`], blocking on
@@ -15193,13 +18513,313 @@ mod live_tests {
         let _ = std::fs::remove_file(&key_path);
     }
 
-    /// Exercises `files mkdir`/`write`/`ls`/`read`/`delete` through the `StoreClient` facade against a
-    /// live `loom serve remote` endpoint over self-signed TLS, asserting the remote path produces the same
-    /// observable results as a local store.
+    #[cfg(feature = "remote-client")]
+    fn generated_block<F, T>(runtime: &tokio::runtime::Runtime, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, loom_types::LoomError>>,
+    {
+        runtime.block_on(future).map_err(|err| err.to_string())
+    }
+
+    #[cfg(feature = "remote-client")]
+    fn generated_transfer_export_bytes<C>(
+        runtime: &tokio::runtime::Runtime,
+        client: &C,
+        handle: LoomSession,
+        workspace: &str,
+        kind: &str,
+    ) -> Result<Vec<u8>, String>
+    where
+        C: Transfer,
+    {
+        runtime
+            .block_on(async {
+                use futures::StreamExt;
+                let mut stream = Transfer::transfer_export(
+                    client,
+                    handle,
+                    workspace.to_string(),
+                    kind.to_string(),
+                    None,
+                    Vec::new(),
+                )
+                .await?;
+                let mut out = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    out.extend(chunk?);
+                }
+                Ok::<Vec<u8>, loom_types::LoomError>(out)
+            })
+            .map_err(|err| err.to_string())
+    }
+
+    #[cfg(feature = "remote-client")]
+    fn generated_transfer_import<C>(
+        runtime: &tokio::runtime::Runtime,
+        client: &C,
+        handle: LoomSession,
+        workspace: &str,
+        kind: &str,
+        payload: &[u8],
+        final_digest: WireDigest,
+    ) -> Result<Vec<u8>, String>
+    where
+        C: Transfer,
+    {
+        let transfer = generated_block(
+            runtime,
+            Transfer::transfer_import_open(
+                client,
+                handle.clone(),
+                workspace.to_string(),
+                kind.to_string(),
+                Vec::new(),
+            ),
+        )?;
+        generated_block(
+            runtime,
+            Transfer::transfer_import_write(
+                client,
+                handle.clone(),
+                transfer.clone(),
+                payload.to_vec(),
+                0,
+                None,
+            ),
+        )?;
+        generated_block(
+            runtime,
+            Transfer::transfer_import_finish(client, handle, transfer, true, false, final_digest),
+        )
+    }
+
+    #[cfg(feature = "remote-client")]
+    fn assert_stable_import_report_parity(kind: &str, local: &[u8], remote: &[u8]) {
+        let local = generated_import_report_from_cbor(local).expect("decode local import report");
+        let remote =
+            generated_import_report_from_cbor(remote).expect("decode remote import report");
+        assert!(local.commit.is_some(), "{kind}: local commit identity");
+        assert!(remote.commit.is_some(), "{kind}: remote commit identity");
+        assert_eq!(local.profile, remote.profile, "{kind}: profile");
+        assert_eq!(
+            local.source_scope, remote.source_scope,
+            "{kind}: source scope"
+        );
+        assert_eq!(local.objects_added, remote.objects_added, "{kind}: objects");
+        assert_eq!(local.bytes_in, remote.bytes_in, "{kind}: bytes in");
+        assert_eq!(
+            local.bytes_stored, remote.bytes_stored,
+            "{kind}: bytes stored"
+        );
+        assert_eq!(local.rows_imported, remote.rows_imported, "{kind}: rows");
+        assert_eq!(local.skipped, remote.skipped, "{kind}: skipped");
+        assert_eq!(
+            local.operations_planned, remote.operations_planned,
+            "{kind}: planned"
+        );
+        assert_eq!(
+            local.operations_applied, remote.operations_applied,
+            "{kind}: applied"
+        );
+        assert_eq!(local.dry_run, remote.dry_run, "{kind}: dry run");
+        assert_eq!(local.warnings, remote.warnings, "{kind}: warnings");
+        assert_eq!(
+            local.fidelity_issues, remote.fidelity_issues,
+            "{kind}: fidelity issues"
+        );
+    }
+
+    #[cfg(feature = "remote-client")]
+    fn generated_file_directory_flow<C>(
+        label: &str,
+        runtime: &tokio::runtime::Runtime,
+        client: &C,
+        handle: LoomSession,
+    ) where
+        C: FileSystem,
+    {
+        generated_block(
+            runtime,
+            FileSystem::write_file(
+                client,
+                handle.clone(),
+                "w".to_string(),
+                "docs/readme.txt".to_string(),
+                b"hello".to_vec(),
+                0o100644,
+            ),
+        )
+        .unwrap_or_else(|err| panic!("{label} write nested: {err}"));
+        generated_block(
+            runtime,
+            FileSystem::write_file(
+                client,
+                handle.clone(),
+                "w".to_string(),
+                "top.txt".to_string(),
+                b"top".to_vec(),
+                0o100644,
+            ),
+        )
+        .unwrap_or_else(|err| panic!("{label} write top: {err}"));
+        assert_eq!(
+            generated_block(
+                runtime,
+                FileSystem::read_file(
+                    client,
+                    handle.clone(),
+                    "w".to_string(),
+                    "docs/readme.txt".to_string(),
+                ),
+            )
+            .expect("read"),
+            b"hello",
+            "{label} read"
+        );
+        let root_listing = generated_block(
+            runtime,
+            FileSystem::list_directory(client, handle.clone(), "w".to_string(), "".to_string()),
+        )
+        .expect("list root");
+        let root_names: Vec<_> = loom_wire::fs::dir_listing_from_cbor(&root_listing)
+            .expect("decode root listing")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(
+            root_names,
+            vec!["docs".to_string(), "top.txt".to_string()],
+            "{label} root listing"
+        );
+        let docs_listing = generated_block(
+            runtime,
+            FileSystem::list_directory(client, handle.clone(), "w".to_string(), "docs".to_string()),
+        )
+        .expect("list docs");
+        let docs_names: Vec<_> = loom_wire::fs::dir_listing_from_cbor(&docs_listing)
+            .expect("decode docs listing")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(docs_names, vec!["readme.txt".to_string()], "{label} docs");
+        assert!(
+            generated_block(
+                runtime,
+                FileSystem::remove_directory(
+                    client,
+                    handle.clone(),
+                    "w".to_string(),
+                    "docs".to_string(),
+                    false,
+                ),
+            )
+            .is_err(),
+            "{label}: non-recursive non-empty delete must fail"
+        );
+        generated_block(
+            runtime,
+            FileSystem::remove_directory(
+                client,
+                handle.clone(),
+                "w".to_string(),
+                "docs".to_string(),
+                true,
+            ),
+        )
+        .unwrap_or_else(|err| panic!("{label} recursive delete: {err}"));
+        generated_block(
+            runtime,
+            FileSystem::remove_file(
+                client,
+                handle.clone(),
+                "w".to_string(),
+                "top.txt".to_string(),
+            ),
+        )
+        .unwrap_or_else(|err| panic!("{label} file delete: {err}"));
+        let empty = generated_block(
+            runtime,
+            FileSystem::list_directory(client, handle, "w".to_string(), "".to_string()),
+        )
+        .expect("list after delete");
+        assert!(
+            loom_wire::fs::dir_listing_from_cbor(&empty)
+                .expect("decode empty listing")
+                .is_empty(),
+            "{label}: all entries removed"
+        );
+    }
+
+    #[cfg(feature = "remote-client")]
+    fn generated_seed_transfer_source<C>(
+        label: &str,
+        runtime: &tokio::runtime::Runtime,
+        client: &C,
+        handle: LoomSession,
+        content: &[u8],
+    ) where
+        C: FileSystem + VersionControl,
+    {
+        generated_block(
+            runtime,
+            FileSystem::write_file(
+                client,
+                handle.clone(),
+                "src".to_string(),
+                "hello.txt".to_string(),
+                content.to_vec(),
+                0o100644,
+            ),
+        )
+        .unwrap_or_else(|err| panic!("{label} seed: {err}"));
+        generated_block(
+            runtime,
+            VersionControl::commit(
+                client,
+                handle,
+                "src".to_string(),
+                "MU-6j-b1d".to_string(),
+                "seed transfer source".to_string(),
+                0,
+            ),
+        )
+        .unwrap_or_else(|err| panic!("{label} commit seed: {err}"));
+    }
+
+    #[cfg(feature = "remote-client")]
+    fn generated_assert_imported_tar<C>(
+        label: &str,
+        runtime: &tokio::runtime::Runtime,
+        client: &C,
+        handle: LoomSession,
+        content: &[u8],
+    ) where
+        C: FileSystem,
+    {
+        assert_eq!(
+            generated_block(
+                runtime,
+                FileSystem::read_file(
+                    client,
+                    handle,
+                    "dst_tar".to_string(),
+                    "hello.txt".to_string(),
+                ),
+            )
+            .expect("read imported tar"),
+            content,
+            "{label}: imported tar content"
+        );
+    }
+
+    /// Restores the file-directory remote coverage through the generated `FileSystem` surface. The local
+    /// and remote clients execute the same generated calls and must expose the same file, directory,
+    /// non-recursive delete, recursive delete, and read behavior.
+    #[cfg(feature = "remote-client")]
     #[test]
     fn files_dir_surface_local_and_remote_over_tls() {
-        let store = temp_store("files-remote");
-
+        let remote_store = temp_store("files-remote");
+        let local_store = temp_store("files-local");
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let dir = std::env::temp_dir();
         let cert_path = dir.join(format!("loomcli-files-{}.crt", std::process::id()));
@@ -15211,7 +18831,6 @@ mod live_tests {
             &key_path.to_string_lossy(),
         )
         .expect("server tls");
-
         let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
             "127.0.0.1:0".to_string(),
             "https://localhost/apps/loom".to_string(),
@@ -15222,128 +18841,6 @@ mod live_tests {
             1 << 20,
             None,
         );
-
-        let server_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = server_rt
-            .block_on(crate::serve_cmd::bind_remote_endpoint(
-                &store,
-                &options,
-                tls.server_config(),
-            ))
-            .expect("bind remote endpoint");
-        let addr = server.local_addr();
-
-        let target = RemoteTarget {
-            url: format!("https://127.0.0.1:{}/apps/loom", addr.port()),
-            auth: None,
-            // insecure-dev accepts the self-signed loopback cert (see the TLS-trust test below).
-            tls: Some("insecure-dev".to_string()),
-            discovery: LocatorDiscovery::Default,
-            discovery_path: None,
-            connect_timeout_ms: None,
-            request_timeout_ms: None,
-        };
-
-        let keys = KeyOpts::default();
-        let remote_client =
-            StoreClient::Remote(Box::new(RemoteStore::connect(&target).expect("connect")));
-        let local_store = temp_store("files-local");
-        let local_client = StoreClient::Local {
-            locator: local_store.clone(),
-        };
-
-        // Run the identical sequence against the local store and the remote (TLS) store; both must agree.
-        for (label, client) in [("local", &local_client), ("remote", &remote_client)] {
-            client
-                .fs_mkdir(&keys, "w", "docs", false)
-                .unwrap_or_else(|e| panic!("{label} mkdir: {e}"));
-            client
-                .fs_write_file(&keys, "w", "docs/readme.txt", b"hello".to_vec())
-                .unwrap_or_else(|e| panic!("{label} write nested: {e}"));
-            client
-                .fs_write_file(&keys, "w", "top.txt", b"top".to_vec())
-                .unwrap_or_else(|e| panic!("{label} write top: {e}"));
-
-            assert_eq!(
-                client
-                    .fs_read_file(&keys, "w", "docs/readme.txt")
-                    .expect("read"),
-                b"hello",
-                "{label} read"
-            );
-            assert_eq!(
-                client.fs_ls(&keys, "w").expect("ls"),
-                vec!["docs/readme.txt".to_string(), "top.txt".to_string()],
-                "{label} ls (sorted file paths)"
-            );
-
-            // A non-empty directory cannot be deleted without `recursive`.
-            assert!(
-                client.fs_delete(&keys, "w", "docs", false).is_err(),
-                "{label}: non-empty dir delete without recursive must error"
-            );
-            // Recursive delete removes the directory and its contents; a plain file deletes directly.
-            client
-                .fs_delete(&keys, "w", "docs", true)
-                .unwrap_or_else(|e| panic!("{label} recursive delete: {e}"));
-            client
-                .fs_delete(&keys, "w", "top.txt", false)
-                .unwrap_or_else(|e| panic!("{label} file delete: {e}"));
-            assert!(
-                client
-                    .fs_ls(&keys, "w")
-                    .expect("ls after delete")
-                    .is_empty(),
-                "{label}: all entries removed"
-            );
-        }
-
-        drop(server);
-        server_rt.shutdown_background();
-        let _ = std::fs::remove_file(&store);
-        let _ = std::fs::remove_file(&local_store);
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
-    }
-
-    /// Task 555: byte-transfer interchange parity + conformance over a served self-signed-TLS endpoint
-    /// (`specs/0067` §17). Part A runs the identical export -> import -> read-back sequence against a
-    /// local store and the remote (TLS) store for the archive family and asserts local-vs-remote byte
-    /// parity of the exported payload, import-report summary parity, and content round-trip. CAR
-    /// restores are checked separately because CAR carries the source workspace identity. Part B
-    /// drives the raw `Transfer` client against the endpoint to prove backpressure credit, idempotent
-    /// `write` replay, finalize-once `finish`, bad-`final_digest` rejection, and unsupported-kind
-    /// rejection.
-    #[test]
-    fn transfer_interchange_local_and_remote_parity_over_tls() {
-        let remote_store = temp_store("transfer-remote");
-
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let dir = std::env::temp_dir();
-        let cert_path = dir.join(format!("loomcli-transfer-{}.crt", std::process::id()));
-        let key_path = dir.join(format!("loomcli-transfer-{}.key", std::process::id()));
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
-        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
-            &cert_path.to_string_lossy(),
-            &key_path.to_string_lossy(),
-        )
-        .expect("server tls");
-
-        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
-            "127.0.0.1:0".to_string(),
-            "https://localhost/apps/loom".to_string(),
-            None,
-            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
-            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
-            60_000,
-            1 << 20,
-            None,
-        );
-
         let server_rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -15355,10 +18852,8 @@ mod live_tests {
                 tls.server_config(),
             ))
             .expect("bind remote endpoint");
-        let addr = server.local_addr();
-
         let target = RemoteTarget {
-            url: format!("https://127.0.0.1:{}/apps/loom", addr.port()),
+            url: format!("https://127.0.0.1:{}/apps/loom", server.local_addr().port()),
             auth: None,
             tls: Some("insecure-dev".to_string()),
             discovery: LocatorDiscovery::Default,
@@ -15366,266 +18861,910 @@ mod live_tests {
             connect_timeout_ms: None,
             request_timeout_ms: None,
         };
+        let remote = RemoteStore::connect(&target).expect("connect");
+        let local_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = loom_client::LocalLoomClient::new(&local_store);
+        local.create().expect("create local store");
+        let local_handle = local.open().expect("open local store");
 
-        let keys = KeyOpts::default();
-        let remote_client =
-            StoreClient::Remote(Box::new(RemoteStore::connect(&target).expect("connect")));
+        generated_block(
+            &local_runtime,
+            FileSystem::create_directory(
+                &local,
+                local_handle.clone(),
+                "w".to_string(),
+                "docs".to_string(),
+                false,
+            ),
+        )
+        .expect("local mkdir");
+        generated_block(
+            &remote.runtime,
+            FileSystem::create_directory(
+                &remote.client,
+                remote.handle.clone(),
+                "w".to_string(),
+                "docs".to_string(),
+                false,
+            ),
+        )
+        .expect("remote mkdir");
+        generated_file_directory_flow("local", &local_runtime, &local, local_handle.clone());
+        generated_file_directory_flow(
+            "remote",
+            &remote.runtime,
+            &remote.client,
+            remote.handle.clone(),
+        );
+
+        server.shutdown();
+        drop(server_rt);
+        let _ = std::fs::remove_file(&remote_store);
+        let _ = std::fs::remove_file(&local_store);
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// Restores byte-transfer coverage through generated `Transfer` methods. The fixture drives local and
+    /// remote import/export directly through `LocalLoomClient` and `RemoteLoomClient` and preserves the raw
+    /// staging invariants for credit, idempotent write replay, finalize-once, digest rejection, unsupported
+    /// kind rejection, and imported content.
+    #[cfg(feature = "remote-client")]
+    #[test]
+    fn transfer_interchange_local_and_remote_parity_over_tls() {
+        let remote_store = temp_store("transfer-remote");
         let local_store = temp_store("transfer-local");
-        let local_client = StoreClient::Local {
-            locator: local_store.clone(),
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("loomcli-transfer-{}.crt", std::process::id()));
+        let key_path = dir.join(format!("loomcli-transfer-{}.key", std::process::id()));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
+            &cert_path.to_string_lossy(),
+            &key_path.to_string_lossy(),
+        )
+        .expect("server tls");
+        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
+            "127.0.0.1:0".to_string(),
+            "https://localhost/apps/loom".to_string(),
+            None,
+            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
+            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
+            60_000,
+            1 << 20,
+            None,
+        );
+        let server_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_rt
+            .block_on(crate::serve_cmd::bind_remote_endpoint(
+                &remote_store,
+                &options,
+                tls.server_config(),
+            ))
+            .expect("bind remote endpoint");
+        let target = RemoteTarget {
+            url: format!("https://127.0.0.1:{}/apps/loom", server.local_addr().port()),
+            auth: None,
+            tls: Some("insecure-dev".to_string()),
+            discovery: LocatorDiscovery::Default,
+            discovery_path: None,
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
         };
-
+        let remote = RemoteStore::connect(&target).expect("connect");
+        let local_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = loom_client::LocalLoomClient::new(&local_store);
+        local.create().expect("create local store");
+        let local_handle = local.open().expect("open local store");
         let content = b"hello transfer parity payload".to_vec();
-        // Seed an identical Files tree in "src" on both stores.
-        for (label, client) in [("local", &local_client), ("remote", &remote_client)] {
-            client
-                .fs_write_file(&keys, "src", "hello.txt", content.clone())
-                .unwrap_or_else(|e| panic!("{label} seed: {e}"));
-        }
-
-        // Part A: archive-family export/import parity + content round-trip. `gzip` is excluded because
-        // single-file gzip export is unsupported; `car` is checked separately (it derives its own
-        // workspace from the manifest, so a `dst`-workspace read-back does not apply).
-        for kind in ["tar", "tar-zstd", "tar-gzip", "zip"] {
-            let export_path = |label: &str| {
-                dir.join(format!(
-                    "loom-transfer-{label}-{kind}-{}.bin",
-                    std::process::id()
-                ))
-            };
-            let dst = format!("dst_{}", kind.replace('-', "_"));
-
-            let mut summaries = Vec::new();
-            let mut payloads = Vec::new();
-            for (label, client) in [("local", &local_client), ("remote", &remote_client)] {
-                let path = export_path(label);
-                let path_str = path.to_string_lossy().into_owned();
-                client
-                    .transfer_export(&keys, "src", kind, None, &path_str)
-                    .unwrap_or_else(|e| panic!("{label} export {kind}: {e}"));
-                let payload = std::fs::read(&path).expect("read exported payload");
-                assert!(!payload.is_empty(), "{label} {kind}: empty export");
-
-                let summary = client
-                    .transfer_import(&keys, &dst, kind, &path_str, true, false)
-                    .unwrap_or_else(|e| panic!("{label} import {kind}: {e}"));
-
-                assert_eq!(
-                    client
-                        .fs_read_file(&keys, &dst, "hello.txt")
-                        .expect("read back"),
-                    content,
-                    "{label} {kind}: content round-trip"
-                );
-
-                summaries.push(summary);
-                payloads.push(payload);
-                let _ = std::fs::remove_file(&path);
-            }
-            // Local-vs-remote parity: byte-identical export payload and identical import-report summary
-            // for the same deterministic codec.
-            assert_eq!(payloads[0], payloads[1], "{kind}: export byte parity");
-            assert_eq!(
-                summaries[0], summaries[1],
-                "{kind}: import-report summary parity"
-            );
-        }
-
-        // `car` restores the manifest workspace over both arms. The CAR payload includes the source
-        // workspace id, so local and remote stores with independently-created workspaces are not
-        // byte-identical.
-        {
-            for (label, client) in [("local", &local_client), ("remote", &remote_client)] {
-                let path = dir.join(format!(
-                    "loom-transfer-{label}-car-{}.car",
-                    std::process::id()
-                ));
-                let path_str = path.to_string_lossy().into_owned();
-                client
-                    .transfer_export(&keys, "src", "car", None, &path_str)
-                    .unwrap_or_else(|e| panic!("{label} export car: {e}"));
-                let payload = std::fs::read(&path).expect("read car");
-                assert!(!payload.is_empty(), "{label} car: empty export");
-                client
-                    .ws_delete(&keys, "src")
-                    .unwrap_or_else(|e| panic!("{label} delete src before car import: {e}"));
-                client
-                    .transfer_import(&keys, "", "car", &path_str, false, false)
-                    .unwrap_or_else(|e| panic!("{label} import car: {e}"));
-                assert_eq!(
-                    client
-                        .fs_read_file(&keys, "src", "hello.txt")
-                        .expect("read car-restored src"),
-                    content,
-                    "{label} car: content restored"
-                );
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-
-        // A facade import of an unsupported kind is rejected on both arms.
-        for (label, client) in [("local", &local_client), ("remote", &remote_client)] {
-            let path = dir.join(format!(
-                "loom-transfer-{label}-none-{}.bin",
-                std::process::id()
-            ));
-            std::fs::write(&path, b"unused").unwrap();
-            assert!(
-                client
-                    .transfer_import(&keys, "w", "parquet", &path.to_string_lossy(), false, false)
-                    .is_err(),
-                "{label}: parquet import must be rejected (unsupported kind)"
-            );
-            let _ = std::fs::remove_file(&path);
-        }
-
-        // Part B: raw `Transfer` client conformance against the remote endpoint. Uses a fresh tar
-        // export of "src" as the payload.
-        let StoreClient::Remote(remote) = &remote_client else {
-            unreachable!("remote client is remote");
-        };
-        let raw_path = dir.join(format!("loom-transfer-raw-{}.tar", std::process::id()));
-        let raw_path_str = raw_path.to_string_lossy().into_owned();
-        remote_client
-            .transfer_export(&keys, "src", "tar", None, &raw_path_str)
-            .expect("raw export");
-        let payload = std::fs::read(&raw_path).expect("read raw payload");
+        generated_seed_transfer_source(
+            "local",
+            &local_runtime,
+            &local,
+            local_handle.clone(),
+            &content,
+        );
+        generated_seed_transfer_source(
+            "remote",
+            &remote.runtime,
+            &remote.client,
+            remote.handle.clone(),
+            &content,
+        );
 
         let algo = loom_core::Algo::from_name(
-            &remote
-                .block(Store::digest_algo(&remote.client))
-                .expect("digest_algo"),
+            &generated_block(&local_runtime, Store::digest_algo(&local)).expect("digest algo"),
         )
         .expect("algo");
+        for kind in ["tar", "tar-zstd", "tar-gzip", "zip"] {
+            let local_payload = generated_transfer_export_bytes(
+                &local_runtime,
+                &local,
+                local_handle.clone(),
+                "src",
+                kind,
+            )
+            .unwrap_or_else(|err| panic!("local export {kind}: {err}"));
+            let remote_payload = generated_transfer_export_bytes(
+                &remote.runtime,
+                &remote.client,
+                remote.handle.clone(),
+                "src",
+                kind,
+            )
+            .unwrap_or_else(|err| panic!("remote export {kind}: {err}"));
+            assert_eq!(local_payload, remote_payload, "{kind}: export parity");
+            let digest = WireDigest(loom_core::Digest::hash(algo, &local_payload).to_string());
+            let local_report = generated_transfer_import(
+                &local_runtime,
+                &local,
+                local_handle.clone(),
+                &format!("dst_{}", kind.replace('-', "_")),
+                kind,
+                &local_payload,
+                digest.clone(),
+            )
+            .unwrap_or_else(|err| panic!("local import {kind}: {err}"));
+            let remote_report = generated_transfer_import(
+                &remote.runtime,
+                &remote.client,
+                remote.handle.clone(),
+                &format!("dst_{}", kind.replace('-', "_")),
+                kind,
+                &remote_payload,
+                digest,
+            )
+            .unwrap_or_else(|err| panic!("remote import {kind}: {err}"));
+            assert_stable_import_report_parity(kind, &local_report, &remote_report);
+        }
+
+        assert!(
+            generated_block(
+                &local_runtime,
+                Transfer::transfer_import_open(
+                    &local,
+                    local_handle.clone(),
+                    "w".to_string(),
+                    "parquet".to_string(),
+                    Vec::new(),
+                ),
+            )
+            .is_err(),
+            "local: unsupported kind must be rejected"
+        );
+        assert!(
+            generated_block(
+                &remote.runtime,
+                Transfer::transfer_import_open(
+                    &remote.client,
+                    remote.handle.clone(),
+                    "w".to_string(),
+                    "parquet".to_string(),
+                    Vec::new(),
+                ),
+            )
+            .is_err(),
+            "remote: unsupported kind must be rejected"
+        );
+        generated_assert_imported_tar(
+            "local",
+            &local_runtime,
+            &local,
+            local_handle.clone(),
+            &content,
+        );
+        generated_assert_imported_tar(
+            "remote",
+            &remote.runtime,
+            &remote.client,
+            remote.handle.clone(),
+            &content,
+        );
+
+        let payload = generated_transfer_export_bytes(
+            &remote.runtime,
+            &remote.client,
+            remote.handle.clone(),
+            "src",
+            "tar",
+        )
+        .expect("raw export");
         let good_digest = WireDigest(loom_core::Digest::hash(algo, &payload).to_string());
         let bad_digest = WireDigest(loom_core::Digest::hash(algo, b"tampered").to_string());
-
-        let transfer = remote
-            .block(Transfer::transfer_import_open(
+        let transfer = generated_block(
+            &remote.runtime,
+            Transfer::transfer_import_open(
                 &remote.client,
                 remote.handle.clone(),
                 "rawdst".to_string(),
                 "tar".to_string(),
                 Vec::new(),
-            ))
-            .expect("raw open");
-
-        let accept0 = remote
-            .block(Transfer::transfer_import_write(
+            ),
+        )
+        .expect("raw open");
+        let accept0 = generated_block(
+            &remote.runtime,
+            Transfer::transfer_import_write(
                 &remote.client,
                 remote.handle.clone(),
                 transfer.clone(),
                 payload.clone(),
                 0,
                 None,
-            ))
-            .expect("raw write");
+            ),
+        )
+        .expect("raw write");
         let (accepted0, credit0) =
             loom_wire::transfer::transfer_accept_from_cbor(&accept0).expect("decode accept");
-        assert_eq!(
-            accepted0,
-            payload.len() as u64,
-            "accepted-bytes tracks the write"
-        );
+        assert_eq!(accepted0, payload.len() as u64);
         assert_eq!(
             accepted0 + credit0,
-            loom_interchange_io::transfer::StagingLimits::DEFAULT_MAX_TOTAL_BYTES,
-            "accepted + credit equals the staging allowance (backpressure)"
+            loom_interchange_io::transfer::StagingLimits::DEFAULT_MAX_TOTAL_BYTES
         );
-
-        // Idempotent replay of an already-accepted seq is a no-op with unchanged counters.
-        let accept_replay = remote
-            .block(Transfer::transfer_import_write(
+        let replay = generated_block(
+            &remote.runtime,
+            Transfer::transfer_import_write(
                 &remote.client,
                 remote.handle.clone(),
                 transfer.clone(),
                 payload.clone(),
                 0,
                 None,
-            ))
-            .expect("raw replay write");
+            ),
+        )
+        .expect("raw replay");
         assert_eq!(
-            loom_wire::transfer::transfer_accept_from_cbor(&accept_replay).unwrap(),
-            (accepted0, credit0),
-            "replayed write is a no-op"
+            loom_wire::transfer::transfer_accept_from_cbor(&replay).expect("decode replay"),
+            (accepted0, credit0)
         );
-
-        let report1 = remote
-            .block(Transfer::transfer_import_finish(
+        let report1 = generated_block(
+            &remote.runtime,
+            Transfer::transfer_import_finish(
                 &remote.client,
                 remote.handle.clone(),
                 transfer.clone(),
                 true,
                 false,
                 good_digest.clone(),
-            ))
-            .expect("raw finish");
-        // Finalize-once: a replayed finish returns the same report without reapplying.
-        let report2 = remote
-            .block(Transfer::transfer_import_finish(
+            ),
+        )
+        .expect("raw finish");
+        let report2 = generated_block(
+            &remote.runtime,
+            Transfer::transfer_import_finish(
                 &remote.client,
                 remote.handle.clone(),
-                transfer.clone(),
+                transfer,
                 true,
                 false,
-                good_digest.clone(),
-            ))
-            .expect("raw finish replay");
+                good_digest,
+            ),
+        )
+        .expect("raw finish replay");
         assert_eq!(report1, report2, "finish is finalize-once");
-
-        // A bad final digest is rejected at finish.
-        let bad_transfer = remote
-            .block(Transfer::transfer_import_open(
+        let bad_transfer = generated_block(
+            &remote.runtime,
+            Transfer::transfer_import_open(
                 &remote.client,
                 remote.handle.clone(),
                 "rawbad".to_string(),
                 "tar".to_string(),
                 Vec::new(),
-            ))
-            .expect("raw open bad");
-        remote
-            .block(Transfer::transfer_import_write(
+            ),
+        )
+        .expect("bad open");
+        generated_block(
+            &remote.runtime,
+            Transfer::transfer_import_write(
                 &remote.client,
                 remote.handle.clone(),
                 bad_transfer.clone(),
-                payload.clone(),
+                payload,
                 0,
                 None,
-            ))
-            .expect("raw write bad");
+            ),
+        )
+        .expect("bad write");
         assert!(
-            remote
-                .block(Transfer::transfer_import_finish(
+            generated_block(
+                &remote.runtime,
+                Transfer::transfer_import_finish(
                     &remote.client,
                     remote.handle.clone(),
                     bad_transfer,
                     true,
                     false,
                     bad_digest,
-                ))
-                .is_err(),
-            "a mismatched final digest must be rejected at finish"
+                ),
+            )
+            .is_err(),
+            "mismatched final digest must be rejected"
         );
 
-        // An unsupported kind is rejected at open over the wire.
-        assert!(
-            remote
-                .block(Transfer::transfer_import_open(
-                    &remote.client,
-                    remote.handle.clone(),
-                    "w".to_string(),
-                    "parquet".to_string(),
-                    Vec::new(),
-                ))
-                .is_err(),
-            "open of an unsupported kind must be rejected server-side"
-        );
-
-        let _ = std::fs::remove_file(&raw_path);
-        drop(server);
-        server_rt.shutdown_background();
+        server.shutdown();
+        drop(server_rt);
         let _ = std::fs::remove_file(&remote_store);
         let _ = std::fs::remove_file(&local_store);
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// Two generated remote sessions connected to one TLS endpoint share committed state without relying
+    /// on the deleted local/remote `StoreClient` mutation adapter split.
+    #[cfg(feature = "remote-client")]
+    #[test]
+    fn multi_connection_over_tls_sees_committed_writes() {
+        let store = temp_store("multi-conn");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("loomcli-mc-{}.crt", std::process::id()));
+        let key_path = dir.join(format!("loomcli-mc-{}.key", std::process::id()));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
+            &cert_path.to_string_lossy(),
+            &key_path.to_string_lossy(),
+        )
+        .expect("server tls");
+        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
+            "127.0.0.1:0".to_string(),
+            "https://localhost/apps/loom".to_string(),
+            None,
+            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
+            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
+            60_000,
+            1 << 20,
+            None,
+        );
+        let server_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_rt
+            .block_on(crate::serve_cmd::bind_remote_endpoint(
+                &store,
+                &options,
+                tls.server_config(),
+            ))
+            .expect("bind remote endpoint");
+        let target = || RemoteTarget {
+            url: format!("https://127.0.0.1:{}/apps/loom", server.local_addr().port()),
+            auth: None,
+            tls: Some("insecure-dev".to_string()),
+            discovery: LocatorDiscovery::Default,
+            discovery_path: None,
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
+        };
+        let conn_a = RemoteStore::connect(&target()).expect("connect A");
+        let conn_b = RemoteStore::connect(&target()).expect("connect B");
+        let key = loom_core::kv::key_to_cbor(&loom_core::Value::Text("k".to_string()));
+        let key2 = loom_core::kv::key_to_cbor(&loom_core::Value::Text("k2".to_string()));
+
+        let malformed = generated_block(
+            &conn_a.runtime,
+            Kv::put(
+                &conn_a.client,
+                conn_a.handle.clone(),
+                "w".to_string(),
+                "malformed".to_string(),
+                b"k".to_vec(),
+                b"raw".to_vec(),
+            ),
+        )
+        .expect_err("raw key is rejected");
+        assert!(malformed.contains("CORRUPT_OBJECT"));
+        assert!(malformed.contains("unexpected end of input"));
+        assert_eq!(
+            generated_block(
+                &conn_b.runtime,
+                Kv::get(
+                    &conn_b.client,
+                    conn_b.handle.clone(),
+                    "w".to_string(),
+                    "malformed".to_string(),
+                    key.clone(),
+                ),
+            )
+            .expect("malformed collection remains absent"),
+            None
+        );
+
+        generated_block(
+            &conn_a.runtime,
+            Kv::put(
+                &conn_a.client,
+                conn_a.handle.clone(),
+                "w".to_string(),
+                "shared".to_string(),
+                key.clone(),
+                b"from-a".to_vec(),
+            ),
+        )
+        .expect("A write");
+        assert_eq!(
+            generated_block(
+                &conn_b.runtime,
+                Kv::get(
+                    &conn_b.client,
+                    conn_b.handle.clone(),
+                    "w".to_string(),
+                    "shared".to_string(),
+                    key,
+                ),
+            )
+            .expect("B read"),
+            Some(b"from-a".to_vec())
+        );
+        generated_block(
+            &conn_b.runtime,
+            Kv::put(
+                &conn_b.client,
+                conn_b.handle.clone(),
+                "w".to_string(),
+                "shared".to_string(),
+                key2.clone(),
+                b"from-b".to_vec(),
+            ),
+        )
+        .expect("B write");
+        assert_eq!(
+            generated_block(
+                &conn_a.runtime,
+                Kv::get(
+                    &conn_a.client,
+                    conn_a.handle.clone(),
+                    "w".to_string(),
+                    "shared".to_string(),
+                    key2,
+                ),
+            )
+            .expect("A read"),
+            Some(b"from-b".to_vec())
+        );
+
+        server.shutdown();
+        drop(server_rt);
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[cfg(feature = "remote-client")]
+    fn seed_identity_store(store: &str, root: loom_core::WorkspaceId) {
+        let keys = KeyOpts::default();
+        let loom = cli_open_loom(store, &keys).expect("open store for identity seed");
+        let mut identity = loom_core::identity::IdentityStore::new(root);
+        identity
+            .set_passphrase(root, "rootpw", b"root-salt-bytes")
+            .expect("seed root passphrase");
+        loom.store()
+            .save_identity_store(&identity)
+            .expect("save identity seed");
+        let mut acl = loom_core::AclStore::new();
+        acl.allow(
+            loom_core::AclSubject::Principal(root),
+            None,
+            None,
+            [loom_core::AclRight::Admin],
+        )
+        .expect("grant root global admin");
+        loom.store().save_acl_store(&acl).expect("save acl seed");
+    }
+
+    /// Restores audited identity coverage through generated `Identity` methods and generated session
+    /// authentication. The revoke calls return the same audit records over local and remote clients, and
+    /// identity snapshots prove the returned ids refer to disabled records.
+    #[cfg(feature = "remote-client")]
+    #[test]
+    fn identity_audited_commands_match_local_and_remote() {
+        let root = loom_core::WorkspaceId::v4_from_bytes([7; 16]);
+        let local_store = temp_store("id-audit-local");
+        let remote_store = temp_store("id-audit-remote");
+        seed_identity_store(&local_store, root);
+        seed_identity_store(&remote_store, root);
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("loomcli-idaudit-{}.crt", std::process::id()));
+        let key_path = dir.join(format!("loomcli-idaudit-{}.key", std::process::id()));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
+            &cert_path.to_string_lossy(),
+            &key_path.to_string_lossy(),
+        )
+        .expect("server tls");
+        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
+            "127.0.0.1:0".to_string(),
+            "https://localhost/apps/loom".to_string(),
+            None,
+            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
+            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
+            60_000,
+            1 << 20,
+            None,
+        );
+        let server_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_rt
+            .block_on(crate::serve_cmd::bind_remote_endpoint(
+                &remote_store,
+                &options,
+                tls.server_config(),
+            ))
+            .expect("bind remote endpoint");
+        let target = RemoteTarget {
+            url: format!("https://127.0.0.1:{}/apps/loom", server.local_addr().port()),
+            auth: None,
+            tls: Some("insecure-dev".to_string()),
+            discovery: LocatorDiscovery::Default,
+            discovery_path: None,
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
+        };
+        assert!(
+            RemoteStore::connect_with_auth(
+                &target,
+                SessionAuth::Passphrase {
+                    principal: *root.as_bytes(),
+                    passphrase: b"wrong".to_vec(),
+                },
+            )
+            .is_err(),
+            "bad passphrase must fail session open"
+        );
+        let remote = RemoteStore::connect_with_auth(
+            &target,
+            SessionAuth::Passphrase {
+                principal: *root.as_bytes(),
+                passphrase: b"rootpw".to_vec(),
+            },
+        )
+        .expect("authenticated connect");
+        let local_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = loom_client::LocalLoomClient::new(&local_store);
+        let local_handle = local.open().expect("open local");
+        generated_block(
+            &local_runtime,
+            Sessions::authenticate_passphrase(
+                &local,
+                local_handle.clone(),
+                Uuid(*root.as_bytes()),
+                b"rootpw".to_vec(),
+            ),
+        )
+        .expect("authenticate local");
+
+        let ext_spec = loom_core::ExternalCredentialSpec {
+            id: loom_core::WorkspaceId::from_bytes([0; 16]),
+            kind: loom_core::ExternalCredentialKind::OidcSubject,
+            label: "ci".to_string(),
+            issuer: "https://issuer".to_string(),
+            subject: "svc-bot".to_string(),
+            material_digest: None,
+        };
+        let ext_wire = loom_wire::identity::external_credential_spec_to_wire(&ext_spec)
+            .expect("external credential wire");
+        let local_ext = generated_block(
+            &local_runtime,
+            Identity::identity_create_external_credential(
+                &local,
+                local_handle.clone(),
+                Uuid(*root.as_bytes()),
+                ext_wire.clone(),
+            ),
+        )
+        .expect("local external create");
+        let remote_ext = generated_block(
+            &remote.runtime,
+            Identity::identity_create_external_credential(
+                &remote.client,
+                remote.handle.clone(),
+                Uuid(*root.as_bytes()),
+                ext_wire,
+            ),
+        )
+        .expect("remote external create");
+        let local_ext_result =
+            loom_wire::identity::identity_audit_result_from_cbor(&local_ext).expect("local ext");
+        let remote_ext_result =
+            loom_wire::identity::identity_audit_result_from_cbor(&remote_ext).expect("remote ext");
+        assert_eq!(local_ext_result.audit_seq, remote_ext_result.audit_seq);
+        assert_eq!(local_ext_result.action, remote_ext_result.action);
+        assert!(local_ext_result.id.is_some());
+        assert!(remote_ext_result.id.is_some());
+
+        let local_key = generated_block(
+            &local_runtime,
+            Identity::identity_add_public_key(
+                &local,
+                local_handle.clone(),
+                Uuid(*root.as_bytes()),
+                "ci-key".to_string(),
+                "Ed25519".to_string(),
+                vec![9u8; 32],
+            ),
+        )
+        .expect("local key create");
+        let remote_key = generated_block(
+            &remote.runtime,
+            Identity::identity_add_public_key(
+                &remote.client,
+                remote.handle.clone(),
+                Uuid(*root.as_bytes()),
+                "ci-key".to_string(),
+                "Ed25519".to_string(),
+                vec![9u8; 32],
+            ),
+        )
+        .expect("remote key create");
+        let local_key_result =
+            loom_wire::identity::identity_audit_result_from_cbor(&local_key).expect("local key");
+        let remote_key_result =
+            loom_wire::identity::identity_audit_result_from_cbor(&remote_key).expect("remote key");
+        assert_eq!(local_key_result.audit_seq, remote_key_result.audit_seq);
+        assert_eq!(local_key_result.action, remote_key_result.action);
+        let local_key_id = local_key_result.id.expect("local key id");
+        let remote_key_id = remote_key_result.id.expect("remote key id");
+
+        let local_revoke = loom_wire::identity::identity_audit_result_from_cbor(
+            &generated_block(
+                &local_runtime,
+                Identity::identity_revoke_public_key(
+                    &local,
+                    local_handle.clone(),
+                    Uuid(*local_key_id.as_bytes()),
+                ),
+            )
+            .expect("local key revoke"),
+        )
+        .expect("decode local revoke");
+        let remote_revoke = loom_wire::identity::identity_audit_result_from_cbor(
+            &generated_block(
+                &remote.runtime,
+                Identity::identity_revoke_public_key(
+                    &remote.client,
+                    remote.handle.clone(),
+                    Uuid(*remote_key_id.as_bytes()),
+                ),
+            )
+            .expect("remote key revoke"),
+        )
+        .expect("decode remote revoke");
+        assert_eq!(local_revoke.audit_seq, remote_revoke.audit_seq);
+        assert_eq!(local_revoke.action, remote_revoke.action);
+        let local_snapshot = loom_wire::identity::identity_snapshot_from_cbor(
+            &generated_block(
+                &local_runtime,
+                Identity::identity_list(&local, local_handle.clone()),
+            )
+            .expect("local list"),
+        )
+        .expect("decode local snapshot");
+        let remote_snapshot = loom_wire::identity::identity_snapshot_from_cbor(
+            &generated_block(
+                &remote.runtime,
+                Identity::identity_list(&remote.client, remote.handle.clone()),
+            )
+            .expect("remote list"),
+        )
+        .expect("decode remote snapshot");
+        assert!(
+            !local_snapshot
+                .public_keys
+                .iter()
+                .any(|key| key.id == local_key_id),
+            "local revoked key must be absent"
+        );
+        assert!(
+            !remote_snapshot
+                .public_keys
+                .iter()
+                .any(|key| key.id == remote_key_id),
+            "remote revoked key must be absent"
+        );
+
+        server.shutdown();
+        drop(server_rt);
+        let _ = std::fs::remove_file(&local_store);
+        let _ = std::fs::remove_file(&remote_store);
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// Restores app-credential coverage through generated `Identity` methods. Create returns the secret
+    /// once, list remains secret-free, and revoke returns audit records over both generated client paths.
+    #[cfg(feature = "remote-client")]
+    #[test]
+    fn app_credential_commands_match_local_and_remote() {
+        let root = loom_core::WorkspaceId::v4_from_bytes([7; 16]);
+        let local_store = temp_store("appcred-local");
+        let remote_store = temp_store("appcred-remote");
+        seed_identity_store(&local_store, root);
+        seed_identity_store(&remote_store, root);
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("loomcli-appcred-{}.crt", std::process::id()));
+        let key_path = dir.join(format!("loomcli-appcred-{}.key", std::process::id()));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
+            &cert_path.to_string_lossy(),
+            &key_path.to_string_lossy(),
+        )
+        .expect("server tls");
+        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
+            "127.0.0.1:0".to_string(),
+            "https://localhost/apps/loom".to_string(),
+            None,
+            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
+            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
+            60_000,
+            1 << 20,
+            None,
+        );
+        let server_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_rt
+            .block_on(crate::serve_cmd::bind_remote_endpoint(
+                &remote_store,
+                &options,
+                tls.server_config(),
+            ))
+            .expect("bind remote endpoint");
+        let target = RemoteTarget {
+            url: format!("https://127.0.0.1:{}/apps/loom", server.local_addr().port()),
+            auth: None,
+            tls: Some("insecure-dev".to_string()),
+            discovery: LocatorDiscovery::Default,
+            discovery_path: None,
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
+        };
+        assert!(
+            RemoteStore::connect_with_auth(
+                &target,
+                SessionAuth::Passphrase {
+                    principal: *root.as_bytes(),
+                    passphrase: b"wrong".to_vec(),
+                },
+            )
+            .is_err(),
+            "bad passphrase must fail session open"
+        );
+        let remote = RemoteStore::connect_with_auth(
+            &target,
+            SessionAuth::Passphrase {
+                principal: *root.as_bytes(),
+                passphrase: b"rootpw".to_vec(),
+            },
+        )
+        .expect("authenticated connect");
+        let local_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = loom_client::LocalLoomClient::new(&local_store);
+        let local_handle = local.open().expect("open local");
+        generated_block(
+            &local_runtime,
+            Sessions::authenticate_passphrase(
+                &local,
+                local_handle.clone(),
+                Uuid(*root.as_bytes()),
+                b"rootpw".to_vec(),
+            ),
+        )
+        .expect("authenticate local");
+
+        let local_created = loom_wire::identity::app_credential_create_result_from_cbor(
+            &generated_block(
+                &local_runtime,
+                Identity::identity_create_app_credential(
+                    &local,
+                    local_handle.clone(),
+                    Uuid(*root.as_bytes()),
+                    "ci-runner".to_string(),
+                ),
+            )
+            .expect("local app credential create"),
+        )
+        .expect("decode local app create");
+        let remote_created = loom_wire::identity::app_credential_create_result_from_cbor(
+            &generated_block(
+                &remote.runtime,
+                Identity::identity_create_app_credential(
+                    &remote.client,
+                    remote.handle.clone(),
+                    Uuid(*root.as_bytes()),
+                    "ci-runner".to_string(),
+                ),
+            )
+            .expect("remote app credential create"),
+        )
+        .expect("decode remote app create");
+        assert!(local_created.secret_token.starts_with("loom_app_"));
+        assert!(remote_created.secret_token.starts_with("loom_app_"));
+        assert_eq!(local_created.audit_seq, remote_created.audit_seq);
+        assert_eq!(local_created.label, remote_created.label);
+        let local_list = generated_block(
+            &local_runtime,
+            Identity::identity_list(&local, local_handle.clone()),
+        )
+        .expect("local list");
+        let remote_list = generated_block(
+            &remote.runtime,
+            Identity::identity_list(&remote.client, remote.handle.clone()),
+        )
+        .expect("remote list");
+        assert!(!String::from_utf8_lossy(&local_list).contains(&local_created.secret_token));
+        assert!(!String::from_utf8_lossy(&remote_list).contains(&remote_created.secret_token));
+        let local_snapshot =
+            loom_wire::identity::identity_snapshot_from_cbor(&local_list).expect("local snapshot");
+        let remote_snapshot = loom_wire::identity::identity_snapshot_from_cbor(&remote_list)
+            .expect("remote snapshot");
+        assert!(local_snapshot.app_credentials.iter().any(|credential| {
+            credential.id == local_created.id
+                && credential.principal == root
+                && credential.label == "ci-runner"
+                && credential.enabled
+        }));
+        assert!(remote_snapshot.app_credentials.iter().any(|credential| {
+            credential.id == remote_created.id
+                && credential.principal == root
+                && credential.label == "ci-runner"
+                && credential.enabled
+        }));
+        let local_revoke = loom_wire::identity::identity_audit_result_from_cbor(
+            &generated_block(
+                &local_runtime,
+                Identity::identity_revoke_app_credential(
+                    &local,
+                    local_handle.clone(),
+                    Uuid(*local_created.id.as_bytes()),
+                ),
+            )
+            .expect("local revoke"),
+        )
+        .expect("decode local revoke");
+        let remote_revoke = loom_wire::identity::identity_audit_result_from_cbor(
+            &generated_block(
+                &remote.runtime,
+                Identity::identity_revoke_app_credential(
+                    &remote.client,
+                    remote.handle.clone(),
+                    Uuid(*remote_created.id.as_bytes()),
+                ),
+            )
+            .expect("remote revoke"),
+        )
+        .expect("decode remote revoke");
+        assert_eq!(local_revoke.action, remote_revoke.action);
+        assert_eq!(local_revoke.audit_seq, remote_revoke.audit_seq);
+
+        server.shutdown();
+        drop(server_rt);
+        let _ = std::fs::remove_file(&local_store);
+        let _ = std::fs::remove_file(&remote_store);
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&key_path);
     }
@@ -15714,434 +19853,6 @@ mod live_tests {
         let _ = std::fs::remove_file(&untrusted_bundle);
     }
 
-    /// Verifies coordination across two independent `RemoteStore` connections to the same served
-    /// self-signed-TLS endpoint. A write on connection A is visible to a read on connection B, and both
-    /// connections stay usable concurrently.
-    #[test]
-    fn multi_connection_over_tls_sees_committed_writes() {
-        let store = temp_store("multi-conn");
-
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let dir = std::env::temp_dir();
-        let cert_path = dir.join(format!("loomcli-mc-{}.crt", std::process::id()));
-        let key_path = dir.join(format!("loomcli-mc-{}.key", std::process::id()));
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
-        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
-            &cert_path.to_string_lossy(),
-            &key_path.to_string_lossy(),
-        )
-        .expect("server tls");
-
-        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
-            "127.0.0.1:0".to_string(),
-            "https://localhost/apps/loom".to_string(),
-            None,
-            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
-            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
-            60_000,
-            1 << 20,
-            None,
-        );
-
-        let server_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = server_rt
-            .block_on(crate::serve_cmd::bind_remote_endpoint(
-                &store,
-                &options,
-                tls.server_config(),
-            ))
-            .expect("bind remote endpoint");
-        let port = server.local_addr().port();
-        let target = || RemoteTarget {
-            url: format!("https://127.0.0.1:{port}/apps/loom"),
-            auth: None,
-            tls: Some("insecure-dev".to_string()),
-            discovery: LocatorDiscovery::Default,
-            discovery_path: None,
-            connect_timeout_ms: None,
-            request_timeout_ms: None,
-        };
-
-        let keys = KeyOpts::default();
-        // Two independent connections (separate sessions) to the same served endpoint.
-        let conn_a = StoreClient::Remote(Box::new(
-            RemoteStore::connect(&target()).expect("connect A"),
-        ));
-        let conn_b = StoreClient::Remote(Box::new(
-            RemoteStore::connect(&target()).expect("connect B"),
-        ));
-
-        // A writes; B (a different connection) sees the committed write.
-        conn_a
-            .fs_write_file(&keys, "w", "shared.txt", b"from-a".to_vec())
-            .expect("A write");
-        assert_eq!(
-            conn_b
-                .fs_read_file(&keys, "w", "shared.txt")
-                .expect("B read"),
-            b"from-a",
-            "connection B must see connection A's committed write"
-        );
-
-        // The reverse direction works too, and A remains usable after B has written - both connections
-        // stay live concurrently over the one TLS endpoint.
-        conn_b
-            .fs_write_file(&keys, "w", "shared2.txt", b"from-b".to_vec())
-            .expect("B write");
-        assert_eq!(
-            conn_a
-                .fs_read_file(&keys, "w", "shared2.txt")
-                .expect("A read"),
-            b"from-b",
-            "connection A must see connection B's committed write"
-        );
-
-        drop(server);
-        server_rt.shutdown_background();
-        let _ = std::fs::remove_file(&store);
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
-    }
-
-    /// The four audited identity commands print byte-identical CLI output through the local facade and the
-    /// remote facade. Two stores are seeded identically (fixed ids) so the deterministic revoke output
-    /// matches (same record, same audit sequence); the remote revoke reconstructs the record by reading it
-    /// before revoking, and `revoke_*` returns the record unchanged, so the two agree. Create is
-    /// shape-checked over remote because it mints a fresh id.
-    #[cfg(feature = "remote-client")]
-    #[test]
-    fn identity_audited_commands_match_local_and_remote() {
-        use loom_core::{
-            ExternalCredentialKind, ExternalCredentialSpec, IdentityPublicKeySpec, IdentityStore,
-            WorkspaceId,
-        };
-
-        let root = WorkspaceId::v4_from_bytes([7; 16]);
-        let cred_id = WorkspaceId::v4_from_bytes([0x21; 16]);
-        let key_id = WorkspaceId::v4_from_bytes([0x22; 16]);
-        let seed = |store: &str| {
-            let keys = KeyOpts::default();
-            let loom = cli_open_loom(store, &keys).expect("open store for identity seed");
-            let mut identity = IdentityStore::new(root);
-            identity
-                .set_passphrase(root, "rootpw", b"root-salt-bytes")
-                .expect("seed root passphrase");
-            identity
-                .create_external_credential(
-                    root,
-                    ExternalCredentialSpec {
-                        id: cred_id,
-                        kind: ExternalCredentialKind::OidcSubject,
-                        label: "ci".to_string(),
-                        issuer: "https://issuer".to_string(),
-                        subject: "svc-bot".to_string(),
-                        material_digest: None,
-                    },
-                )
-                .expect("seed external credential");
-            identity
-                .add_public_key(
-                    root,
-                    IdentityPublicKeySpec {
-                        id: key_id,
-                        label: "laptop".to_string(),
-                        algorithm: "Ed25519".to_string(),
-                        public_key: vec![7u8; 32],
-                    },
-                )
-                .expect("seed public key");
-            loom.store()
-                .save_identity_store(&identity)
-                .expect("save identity seed");
-            let mut acl = loom_core::AclStore::new();
-            acl.allow(
-                loom_core::AclSubject::Principal(root),
-                None,
-                None,
-                [loom_core::AclRight::Admin],
-            )
-            .expect("grant root global admin");
-            loom.store().save_acl_store(&acl).expect("save acl seed");
-        };
-
-        let local_store = temp_store("id-audit-local");
-        let remote_store = temp_store("id-audit-remote");
-        seed(&local_store);
-        seed(&remote_store);
-
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let dir = std::env::temp_dir();
-        let cert_path = dir.join(format!("loomcli-idaudit-{}.crt", std::process::id()));
-        let key_path = dir.join(format!("loomcli-idaudit-{}.key", std::process::id()));
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
-        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
-            &cert_path.to_string_lossy(),
-            &key_path.to_string_lossy(),
-        )
-        .expect("server tls");
-        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
-            "127.0.0.1:0".to_string(),
-            "https://localhost/apps/loom".to_string(),
-            None,
-            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
-            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
-            60_000,
-            1 << 20,
-            None,
-        );
-        let server_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = server_rt
-            .block_on(crate::serve_cmd::bind_remote_endpoint(
-                &remote_store,
-                &options,
-                tls.server_config(),
-            ))
-            .expect("bind remote endpoint");
-        let addr = server.local_addr();
-        let target = RemoteTarget {
-            url: format!("https://127.0.0.1:{}/apps/loom", addr.port()),
-            auth: None,
-            tls: Some("insecure-dev".to_string()),
-            discovery: LocatorDiscovery::Default,
-            discovery_path: None,
-            connect_timeout_ms: None,
-            request_timeout_ms: None,
-        };
-        // A bad passphrase must fail at session open, not later at mutation time.
-        assert!(
-            RemoteStore::connect_with_auth(
-                &target,
-                SessionAuth::Passphrase {
-                    principal: *root.as_bytes(),
-                    passphrase: b"wrong".to_vec(),
-                },
-            )
-            .is_err(),
-            "a bad passphrase must fail session open"
-        );
-
-        let remote = StoreClient::Remote(Box::new(
-            RemoteStore::connect_with_auth(
-                &target,
-                SessionAuth::Passphrase {
-                    principal: *root.as_bytes(),
-                    passphrase: b"rootpw".to_vec(),
-                },
-            )
-            .expect("authenticated connect"),
-        ));
-        let local = StoreClient::Local {
-            locator: local_store.clone(),
-        };
-        // The local arm authenticates as root through the passphrase-file key source.
-        let pw_path = dir.join(format!("loomcli-idaudit-pw-{}.txt", std::process::id()));
-        std::fs::write(&pw_path, "rootpw").unwrap();
-        let keys = KeyOpts {
-            auth_principal: Some(root.to_string()),
-            auth_source: crate::KeySource::File(pw_path.to_string_lossy().into_owned()),
-            ..KeyOpts::default()
-        };
-
-        let remote_cred = remote
-            .id_external_credential_revoke(&keys, cred_id)
-            .expect("remote revoke external credential");
-        let local_cred = local
-            .id_external_credential_revoke(&keys, cred_id)
-            .expect("local revoke external credential");
-        assert_eq!(remote_cred, local_cred);
-        assert!(remote_cred.contains("\"seq\":0"));
-
-        let remote_key = remote
-            .id_revoke_public_key(&keys, key_id)
-            .expect("remote revoke public key");
-        let local_key = local
-            .id_revoke_public_key(&keys, key_id)
-            .expect("local revoke public key");
-        assert_eq!(remote_key, local_key);
-        assert!(remote_key.contains("\"seq\":1"));
-
-        let created = remote
-            .id_add_public_key(
-                &keys,
-                root,
-                "ci-key".to_string(),
-                "Ed25519".to_string(),
-                vec![9u8; 32],
-            )
-            .expect("remote add public key");
-        assert!(created.contains("\"seq\":") && created.contains("\"public_key\":"));
-        assert!(created.contains("\"algorithm\":\"Ed25519\""));
-
-        server.shutdown();
-        drop(server_rt);
-        let _ = std::fs::remove_file(&local_store);
-        let _ = std::fs::remove_file(&remote_store);
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
-        let _ = std::fs::remove_file(&pw_path);
-    }
-
-    /// The app-credential commands print byte-identical CLI output through the local and remote facades.
-    /// Two stores are seeded with the same fixed-id credential, so revoke output matches exactly. Create
-    /// mints a fresh secret server-side (fresh id, so not byte-compared); the test proves the one-time
-    /// secret token is returned by create and never echoed by a subsequent identity list.
-    #[cfg(feature = "remote-client")]
-    #[test]
-    fn app_credential_commands_match_local_and_remote() {
-        use loom_core::WorkspaceId;
-        use loom_core::identity::IdentityStore;
-
-        let root = WorkspaceId::v4_from_bytes([7; 16]);
-        let cred_id = WorkspaceId::v4_from_bytes([0x41; 16]);
-        let seed = |store: &str| {
-            let keys = KeyOpts::default();
-            let loom = cli_open_loom(store, &keys).expect("open store for seed");
-            let mut identity = IdentityStore::new(root);
-            identity
-                .set_passphrase(root, "rootpw", b"root-salt-bytes")
-                .expect("seed root passphrase");
-            identity
-                .create_app_credential(root, cred_id, "seeded", &[9u8; 32], &[8u8; 16])
-                .expect("seed app credential");
-            loom.store()
-                .save_identity_store(&identity)
-                .expect("save seed");
-            let mut acl = loom_core::AclStore::new();
-            acl.allow(
-                loom_core::AclSubject::Principal(root),
-                None,
-                None,
-                [loom_core::AclRight::Admin],
-            )
-            .expect("grant root global admin");
-            loom.store().save_acl_store(&acl).expect("save acl seed");
-        };
-        let local_store = temp_store("appcred-local");
-        let remote_store = temp_store("appcred-remote");
-        seed(&local_store);
-        seed(&remote_store);
-
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let dir = std::env::temp_dir();
-        let cert_path = dir.join(format!("loomcli-appcred-{}.crt", std::process::id()));
-        let key_path = dir.join(format!("loomcli-appcred-{}.key", std::process::id()));
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
-        let tls = loom_hosted_core::HostedTlsConfig::from_pem_files(
-            &cert_path.to_string_lossy(),
-            &key_path.to_string_lossy(),
-        )
-        .expect("server tls");
-        let options = loom_hosted_core::remote::RemoteServeOptions::from_cli(
-            "127.0.0.1:0".to_string(),
-            "https://localhost/apps/loom".to_string(),
-            None,
-            vec![loom_hosted_core::remote::RemoteAuthMode::Interactive],
-            vec![loom_hosted_core::remote::RemoteTlsTrust::System],
-            60_000,
-            1 << 20,
-            None,
-        );
-        let server_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = server_rt
-            .block_on(crate::serve_cmd::bind_remote_endpoint(
-                &remote_store,
-                &options,
-                tls.server_config(),
-            ))
-            .expect("bind remote endpoint");
-        let addr = server.local_addr();
-        let target = RemoteTarget {
-            url: format!("https://127.0.0.1:{}/apps/loom", addr.port()),
-            auth: None,
-            tls: Some("insecure-dev".to_string()),
-            discovery: LocatorDiscovery::Default,
-            discovery_path: None,
-            connect_timeout_ms: None,
-            request_timeout_ms: None,
-        };
-        assert!(
-            RemoteStore::connect_with_auth(
-                &target,
-                SessionAuth::Passphrase {
-                    principal: *root.as_bytes(),
-                    passphrase: b"wrong".to_vec(),
-                },
-            )
-            .is_err(),
-            "a bad passphrase must fail session open"
-        );
-        let remote = StoreClient::Remote(Box::new(
-            RemoteStore::connect_with_auth(
-                &target,
-                SessionAuth::Passphrase {
-                    principal: *root.as_bytes(),
-                    passphrase: b"rootpw".to_vec(),
-                },
-            )
-            .expect("authenticated connect"),
-        ));
-        let local = StoreClient::Local {
-            locator: local_store.clone(),
-        };
-        let pw_path = dir.join(format!("loomcli-appcred-pw-{}.txt", std::process::id()));
-        std::fs::write(&pw_path, "rootpw").unwrap();
-        let keys = KeyOpts {
-            auth_principal: Some(root.to_string()),
-            auth_source: crate::KeySource::File(pw_path.to_string_lossy().into_owned()),
-            ..KeyOpts::default()
-        };
-
-        let remote_rev = remote
-            .id_app_credential_revoke(&keys, cred_id)
-            .expect("remote revoke app credential");
-        let local_rev = local
-            .id_app_credential_revoke(&keys, cred_id)
-            .expect("local revoke app credential");
-        assert_eq!(remote_rev, local_rev);
-        assert!(remote_rev.contains("\"seq\":0"));
-        assert!(!remote_rev.contains("secret"));
-
-        let created = remote
-            .id_app_credential_create(&keys, root, "ci-runner".to_string())
-            .expect("remote create app credential");
-        assert!(
-            created.contains("\"seq\":")
-                && created.contains("\"credential\":")
-                && created.contains("\"secret\":\"loom_app_"),
-            "create output: {created}"
-        );
-        let token = created
-            .rsplit("\"secret\":\"")
-            .next()
-            .unwrap()
-            .trim_end_matches("\"}");
-        let listed = remote.id_list(&keys).expect("remote identity list");
-        assert!(
-            !listed.contains(token),
-            "one-time secret token leaked into the identity list"
-        );
-
-        server.shutdown();
-        drop(server_rt);
-        let _ = std::fs::remove_file(&local_store);
-        let _ = std::fs::remove_file(&remote_store);
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
-        let _ = std::fs::remove_file(&pw_path);
-    }
-
     /// Task 640: StoreAdmin over a served self-signed-TLS endpoint. Proves the server-owned
     /// store-administration surface works over the wire under an authenticated global admin
     /// (`store_policy_set`/`get`/`store_stat`), and fails closed for an unauthenticated session. The
@@ -16220,36 +19931,58 @@ mod live_tests {
         };
 
         // Unauthenticated session: StoreAdmin fails closed (authenticated global admin required).
-        let anon = StoreClient::Remote(Box::new(
-            RemoteStore::connect(&target).expect("anon connect"),
-        ));
+        let anon = RemoteStore::connect(&target).expect("anon connect");
         assert!(
-            anon.admin_policy_get_json().is_err(),
+            anon.block(StoreAdmin::store_policy_get(
+                &anon.client,
+                anon.handle.clone()
+            ))
+            .is_err(),
             "unauthenticated StoreAdmin must fail closed over the wire"
         );
 
         // Authenticated global admin: stat and policy set succeed over the wire.
-        let admin = StoreClient::Remote(Box::new(
-            RemoteStore::connect_with_auth(
-                &target,
-                SessionAuth::Passphrase {
-                    principal: *root.as_bytes(),
-                    passphrase: b"rootpw".to_vec(),
-                },
-            )
-            .expect("authenticated connect"),
-        ));
-        let _stat = admin.admin_stat_json().expect("remote stat as admin");
+        let admin = RemoteStore::connect_with_auth(
+            &target,
+            SessionAuth::Passphrase {
+                principal: *root.as_bytes(),
+                passphrase: b"rootpw".to_vec(),
+            },
+        )
+        .expect("authenticated connect");
+        let _stat = admin
+            .block(StoreAdmin::store_stat(&admin.client, admin.handle.clone()))
+            .expect("remote stat as admin");
         let set = admin
-            .admin_policy_set_json(true)
+            .block(StoreAdmin::store_policy_set(
+                &admin.client,
+                admin.handle.clone(),
+                loom_wire::store_admin::store_policy_update_to_cbor(
+                    &loom_wire::store_admin::StorePolicyUpdate {
+                        fips_required: Some(true),
+                        default_durability: None,
+                        facet_durability_assignments: Vec::new(),
+                        clear_facet_durability: Vec::new(),
+                    },
+                ),
+            ))
+            .and_then(|cbor| {
+                loom_wire::store_admin::store_policy_result_from_cbor(&cbor)
+                    .map_err(|error| error.to_string())
+            })
             .expect("remote policy set");
-        assert!(set.contains("\"fips_required\":true"));
-        let get = admin.admin_policy_get_json();
+        assert!(set.fips_required);
+        let get = admin
+            .block(StoreAdmin::store_policy_get(
+                &admin.client,
+                admin.handle.clone(),
+            ))
+            .and_then(|cbor| {
+                loom_wire::store_admin::store_policy_result_from_cbor(&cbor)
+                    .map_err(|error| error.to_string())
+            });
         if runtime_profile().fips_capable {
-            assert!(
-                get.expect("remote policy get")
-                    .contains("\"fips_required\":true")
-            );
+            assert!(get.expect("remote policy get").fips_required);
         } else {
             assert!(
                 get.expect_err("non-FIPS runtime must reject FIPS-required store")

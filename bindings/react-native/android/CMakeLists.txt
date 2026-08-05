@@ -6,6 +6,7 @@ project(uldren_loom_rn CXX)
 add_library(uldren_loom_rn SHARED
     src/main/cpp/UldrenLoom_common.cpp
     src/main/cpp/UldrenLoom_lifecycle.cpp
+    src/main/cpp/UldrenLoom_operational.cpp
     src/main/cpp/UldrenLoom_workspace.cpp
     src/main/cpp/UldrenLoom_identity.cpp
     src/main/cpp/UldrenLoom_sql.cpp
@@ -18,6 +19,7 @@ add_library(uldren_loom_rn SHARED
     src/main/cpp/UldrenLoom_pages.cpp
     src/main/cpp/UldrenLoom_lanes.cpp
     src/main/cpp/UldrenLoom_chat.cpp
+    src/main/cpp/UldrenLoom_security_admin.cpp
     src/main/cpp/UldrenLoom_archive.cpp
     src/main/cpp/UldrenLoom_kv.cpp
     src/main/cpp/UldrenLoom_document.cpp

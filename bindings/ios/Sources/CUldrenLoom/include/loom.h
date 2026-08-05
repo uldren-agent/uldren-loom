@@ -213,6 +213,8 @@ typedef struct LoomSqlSession LoomSqlSession;
  */
 typedef struct LoomTask LoomTask;
 
+typedef int32_t LoomLaneTicketPlacement;
+
 /**
  * One decoded scalar. Only the field(s) the `tag` selects are meaningful; the rest are zero. `data` is
  * a borrowed pointer (valid until [`loom_result_close`]): UTF-8 for `TEXT`, raw bytes for `BYTES`, and
@@ -235,6 +237,14 @@ typedef struct {
     const unsigned char *data;
     uintptr_t data_len;
 } LoomValue;
+
+#define LOOM_LANE_TICKET_PLACEMENT_FIRST 1
+
+#define LOOM_LANE_TICKET_PLACEMENT_LAST 2
+
+#define LOOM_LANE_TICKET_PLACEMENT_BEFORE 3
+
+#define LOOM_LANE_TICKET_PLACEMENT_AFTER 4
 
 #ifdef __cplusplus
 extern "C" {
@@ -1206,6 +1216,59 @@ int32_t loom_identity_add_public_key(LoomSession *handle,
 int32_t loom_identity_revoke_public_key(LoomSession *handle, const char *key);
 
 /**
+ * Force-detach the identity authority and return the JSON mutation report.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `principal` and `reason` must be valid C strings; `out` null
+ * or writable.
+ */
+int32_t loom_identity_force_detach_authority_json(LoomSession *handle,
+                                                  const char *principal,
+                                                  uint64_t generation,
+                                                  const char *reason,
+                                                  char **out);
+
+/**
+ * Replicate identity authority from a local source store and return the JSON mutation report.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `source` must be a valid C string; `out` null or writable.
+ */
+int32_t loom_identity_replicate_authority_json(LoomSession *handle,
+                                               const char *source,
+                                               int32_t become_authority,
+                                               char **out);
+
+/**
+ * Configure an authority replication policy and return the JSON mutation report.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `id` and `source` must be valid C strings; `out` null or
+ * writable.
+ */
+int32_t loom_identity_configure_authority_replication_json(LoomSession *handle,
+                                                           const char *id,
+                                                           const char *source,
+                                                           int32_t disabled,
+                                                           int32_t pull_on_start,
+                                                           uint64_t interval_ms,
+                                                           int32_t interval_ms_present,
+                                                           uint64_t jitter_ms,
+                                                           uint64_t backoff_ms,
+                                                           int32_t publish_witness,
+                                                           char **out);
+
+/**
+ * Remove an authority replication policy and return the JSON mutation report.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `id` must be a valid C string; `out` null or writable.
+ */
+int32_t loom_identity_remove_authority_replication_json(LoomSession *handle,
+                                                        const char *id,
+                                                        char **out);
+
+/**
  * List direct ACL grants as JSON. Requires global `Admin` after authentication is enabled.
  *
  * # Safety
@@ -1451,6 +1514,8 @@ int32_t loom_workspace_delete(LoomSession *handle, const char *workspace);
 int32_t loom_fs_import(LoomSession *handle,
                        const char *workspace,
                        const char *src_path,
+                       const char *author,
+                       const char *message,
                        int32_t commit,
                        int32_t dry_run,
                        unsigned char **out_ptr,
@@ -1483,6 +1548,10 @@ int32_t loom_archive_import(LoomSession *handle,
                             const char *workspace,
                             const char *src_path,
                             const char *kind,
+                            const char *gzip_output_path,
+                            int32_t commit,
+                            const char *author,
+                            const char *message,
                             int32_t dry_run,
                             unsigned char **out_ptr,
                             uintptr_t *out_len);
@@ -1541,6 +1610,8 @@ int32_t loom_car_export(LoomSession *handle,
 int32_t loom_fs_import_async(LoomSession *handle,
                              const char *workspace,
                              const char *src_path,
+                             const char *author,
+                             const char *message,
                              int32_t commit,
                              int32_t dry_run,
                              LoomTask **out_task);
@@ -1570,6 +1641,10 @@ int32_t loom_archive_import_async(LoomSession *handle,
                                   const char *workspace,
                                   const char *src_path,
                                   const char *kind,
+                                  const char *gzip_output_path,
+                                  int32_t commit,
+                                  const char *author,
+                                  const char *message,
                                   int32_t dry_run,
                                   LoomTask **out_task);
 
@@ -1870,6 +1945,7 @@ int32_t loom_chat_create_channel_json(LoomSession *handle,
                                       const char *channel_id,
                                       const char *channel_handle,
                                       const char *name,
+                                      const char *expected_entity_tag,
                                       char **out);
 
 int32_t loom_chat_rename_channel_json(LoomSession *handle,
@@ -1877,6 +1953,7 @@ int32_t loom_chat_rename_channel_json(LoomSession *handle,
                                       const char *chat_workspace_id,
                                       const char *selector,
                                       const char *channel_handle,
+                                      const char *expected_entity_tag,
                                       char **out);
 
 int32_t loom_chat_list_channels_json(LoomSession *handle,
@@ -1891,7 +1968,19 @@ int32_t loom_chat_post_message_json(LoomSession *handle,
                                     const char *message_id,
                                     const char *thread_id,
                                     const char *body_text,
+                                    const char *expected_entity_tag,
                                     char **out);
+
+int32_t loom_chat_post_message_bytes_json(LoomSession *handle,
+                                          const char *workspace,
+                                          const char *chat_workspace_id,
+                                          const char *channel_id,
+                                          const char *message_id,
+                                          const char *thread_id,
+                                          const unsigned char *body,
+                                          uintptr_t body_len,
+                                          const char *expected_entity_tag,
+                                          char **out);
 
 int32_t loom_chat_edit_message_json(LoomSession *handle,
                                     const char *workspace,
@@ -1899,7 +1988,18 @@ int32_t loom_chat_edit_message_json(LoomSession *handle,
                                     const char *channel_id,
                                     const char *message_id,
                                     const char *body_text,
+                                    const char *expected_entity_tag,
                                     char **out);
+
+int32_t loom_chat_edit_message_bytes_json(LoomSession *handle,
+                                          const char *workspace,
+                                          const char *chat_workspace_id,
+                                          const char *channel_id,
+                                          const char *message_id,
+                                          const unsigned char *body,
+                                          uintptr_t body_len,
+                                          const char *expected_entity_tag,
+                                          char **out);
 
 int32_t loom_chat_redact_message_json(LoomSession *handle,
                                       const char *workspace,
@@ -1907,6 +2007,7 @@ int32_t loom_chat_redact_message_json(LoomSession *handle,
                                       const char *channel_id,
                                       const char *message_id,
                                       const char *reason,
+                                      const char *expected_entity_tag,
                                       char **out);
 
 int32_t loom_chat_create_thread_json(LoomSession *handle,
@@ -1915,6 +2016,7 @@ int32_t loom_chat_create_thread_json(LoomSession *handle,
                                      const char *channel_id,
                                      const char *thread_id,
                                      const char *parent_message_id,
+                                     const char *expected_entity_tag,
                                      char **out);
 
 int32_t loom_chat_create_task_json(LoomSession *handle,
@@ -1924,6 +2026,7 @@ int32_t loom_chat_create_task_json(LoomSession *handle,
                                    const char *task_id,
                                    const char *message_id,
                                    const char *title,
+                                   const char *expected_entity_tag,
                                    char **out);
 
 int32_t loom_chat_claim_task_json(LoomSession *handle,
@@ -1933,6 +2036,7 @@ int32_t loom_chat_claim_task_json(LoomSession *handle,
                                   const char *task_id,
                                   const char *claim_id,
                                   const char *lease_token,
+                                  const char *expected_entity_tag,
                                   char **out);
 
 int32_t loom_chat_complete_task_json(LoomSession *handle,
@@ -1942,6 +2046,7 @@ int32_t loom_chat_complete_task_json(LoomSession *handle,
                                      const char *task_id,
                                      const char *claim_id,
                                      const char *result_message_id,
+                                     const char *expected_entity_tag,
                                      char **out);
 
 int32_t loom_chat_invoke_agent_json(LoomSession *handle,
@@ -1952,7 +2057,20 @@ int32_t loom_chat_invoke_agent_json(LoomSession *handle,
                                     const char *agent_principal,
                                     const char *source_message_ids_json,
                                     const char *prompt_text,
+                                    const char *expected_entity_tag,
                                     char **out);
+
+int32_t loom_chat_invoke_agent_bytes_json(LoomSession *handle,
+                                          const char *workspace,
+                                          const char *chat_workspace_id,
+                                          const char *channel_id,
+                                          const char *invocation_id,
+                                          const char *agent_principal,
+                                          const char *source_message_ids_json,
+                                          const unsigned char *prompt,
+                                          uintptr_t prompt_len,
+                                          const char *expected_entity_tag,
+                                          char **out);
 
 int32_t loom_chat_agent_reply_json(LoomSession *handle,
                                    const char *workspace,
@@ -1960,6 +2078,7 @@ int32_t loom_chat_agent_reply_json(LoomSession *handle,
                                    const char *channel_id,
                                    const char *invocation_id,
                                    const char *message_id,
+                                   const char *expected_entity_tag,
                                    char **out);
 
 int32_t loom_chat_request_handoff_json(LoomSession *handle,
@@ -1970,6 +2089,7 @@ int32_t loom_chat_request_handoff_json(LoomSession *handle,
                                        const char *from_agent_principal,
                                        const char *to_principal,
                                        const char *reason,
+                                       const char *expected_entity_tag,
                                        char **out);
 
 int32_t loom_chat_add_reaction_json(LoomSession *handle,
@@ -1978,6 +2098,7 @@ int32_t loom_chat_add_reaction_json(LoomSession *handle,
                                     const char *channel_id,
                                     const char *message_id,
                                     const char *kind,
+                                    const char *expected_entity_tag,
                                     char **out);
 
 int32_t loom_chat_remove_reaction_json(LoomSession *handle,
@@ -1986,6 +2107,7 @@ int32_t loom_chat_remove_reaction_json(LoomSession *handle,
                                        const char *channel_id,
                                        const char *message_id,
                                        const char *kind,
+                                       const char *expected_entity_tag,
                                        char **out);
 
 int32_t loom_chat_emoji_list_json(LoomSession *handle,
@@ -1997,12 +2119,14 @@ int32_t loom_chat_emoji_register_json(LoomSession *handle,
                                       const char *workspace,
                                       const char *chat_workspace_id,
                                       const char *kind,
+                                      const char *expected_entity_tag,
                                       char **out);
 
 int32_t loom_chat_emoji_unregister_json(LoomSession *handle,
                                         const char *workspace,
                                         const char *chat_workspace_id,
                                         const char *kind,
+                                        const char *expected_entity_tag,
                                         char **out);
 
 int32_t loom_chat_messages_json(LoomSession *handle,
@@ -2022,6 +2146,7 @@ int32_t loom_chat_update_cursor_json(LoomSession *handle,
                                      const char *chat_workspace_id,
                                      const char *channel_id,
                                      uint64_t next_sequence,
+                                     const char *expected_entity_tag,
                                      char **out);
 
 int32_t loom_chat_fetch_events_json(LoomSession *handle,
@@ -2029,7 +2154,7 @@ int32_t loom_chat_fetch_events_json(LoomSession *handle,
                                     const char *chat_workspace_id,
                                     const char *channel_id,
                                     uint64_t from_sequence,
-                                    uintptr_t max,
+                                    uint64_t max,
                                     char **out);
 
 /**
@@ -3115,6 +3240,536 @@ int32_t loom_fs_list_directory(LoomSession *handle,
                                uintptr_t *out_len);
 
 /**
+ * Define a standard lifecycle and return deterministic JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `out` writable.
+ */
+int32_t loom_lifecycle_define_standard_json(LoomSession *handle,
+                                            const char *workspace,
+                                            const char *kind,
+                                            const char *version,
+                                            const char *completion_predicate_digest,
+                                            char **out);
+
+/**
+ * Define a lifecycle from its canonical byte definition and return deterministic JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `workspace` must be a valid C string; `definition` must be
+ * null or readable for `definition_len` bytes; `out` writable.
+ */
+int32_t loom_lifecycle_define_json(LoomSession *handle,
+                                   const char *workspace,
+                                   const unsigned char *definition,
+                                   uintptr_t definition_len,
+                                   char **out);
+
+/**
+ * Instantiate a lifecycle and return deterministic JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings;
+ * `subject_refs_json` must be a JSON string array; `out` writable.
+ */
+int32_t loom_lifecycle_instantiate_json(LoomSession *handle,
+                                        const char *workspace,
+                                        const char *instance_id,
+                                        const char *definition_id,
+                                        const char *subject_refs_json,
+                                        char **out);
+
+/**
+ * Transition a lifecycle instance and return deterministic JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; optional strings may
+ * be null; `out` writable.
+ */
+int32_t loom_lifecycle_transition_json(LoomSession *handle,
+                                       const char *workspace,
+                                       const char *instance_id,
+                                       const char *transition_id,
+                                       const char *to_stage_id,
+                                       const char *actor_principal_id,
+                                       const char *gate_evaluations_json,
+                                       const char *snapshot_digest,
+                                       char **out);
+
+/**
+ * Reconcile references and return deterministic JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `workspace` must be a valid C string; `out` writable.
+ */
+int32_t loom_refs_reconcile_json(LoomSession *handle,
+                                 const char *workspace,
+                                 uint64_t max,
+                                 char **out);
+
+/**
+ * Apply an Exec request and return canonical `loom.exec.apply.result.v1` CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `request` must be null or readable for `request_len` bytes;
+ * `out_ptr` and `out_len` writable.
+ */
+int32_t loom_apply_cbor(LoomSession *handle,
+                        const unsigned char *request,
+                        uintptr_t request_len,
+                        unsigned char **out_ptr,
+                        uintptr_t *out_len);
+
+/**
+ * Import a normalized Meetings snapshot into an existing workspace and return the report JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `workspace` and `input_profile` must be valid C strings;
+ * `snapshot` must be null or readable for `snapshot_len` bytes; `out` writable.
+ */
+int32_t loom_meetings_import_snapshot(LoomSession *handle,
+                                      const char *workspace,
+                                      const char *input_profile,
+                                      const unsigned char *snapshot,
+                                      uintptr_t snapshot_len,
+                                      int32_t dry_run,
+                                      char **out);
+
+/**
+ * Execute SQL through the generated `Sql.sql_exec_result` owner and return canonical CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `out_ptr` and
+ * `out_len` writable.
+ */
+int32_t loom_sql_exec_result(LoomSession *handle,
+                             const char *workspace,
+                             const char *db,
+                             const char *sql,
+                             unsigned char **out_ptr,
+                             uintptr_t *out_len);
+
+/**
+ * Configure a served listener through the generated ServeConfig owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `request_json` must be a valid C string; `out` writable.
+ */
+int32_t loom_serve_listener_configure_json(LoomSession *handle,
+                                           const char *request_json,
+                                           char **out);
+
+/**
+ * List served listeners through the generated ServeConfig owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `out` writable.
+ */
+int32_t loom_serve_listener_list_json(LoomSession *handle, char **out);
+
+/**
+ * Enable or disable a served listener through the generated ServeConfig owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `listener_id` must be a valid C string; `out` writable.
+ */
+int32_t loom_serve_listener_set_enabled_json(LoomSession *handle,
+                                             const char *listener_id,
+                                             int32_t enabled,
+                                             char **out);
+
+/**
+ * Remove a served listener through the generated ServeConfig owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `listener_id` must be a valid C string; `out` writable.
+ */
+int32_t loom_serve_listener_remove_json(LoomSession *handle, const char *listener_id, char **out);
+
+/**
+ * List Web routes for a served listener through the generated ServeConfig owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `listener_id` must be a valid C string; `out` writable.
+ */
+int32_t loom_serve_web_route_list_json(LoomSession *handle, const char *listener_id, char **out);
+
+/**
+ * Set a Web route through the generated ServeConfig owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `request_json` must be a valid C string; `out` writable.
+ */
+int32_t loom_serve_web_route_set_json(LoomSession *handle, const char *request_json, char **out);
+
+/**
+ * Remove a Web route through the generated ServeConfig owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `out` writable.
+ */
+int32_t loom_serve_web_route_remove_json(LoomSession *handle,
+                                         const char *listener_id,
+                                         const char *route_id,
+                                         char **out);
+
+/**
+ * Import table CSV bytes and return the canonical import report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; optional strings
+ * may be null; `csv_payload` must be null or readable for `csv_payload_len` bytes; `out_ptr` and
+ * `out_len` writable.
+ */
+int32_t loom_import_table_csv(LoomSession *handle,
+                              const char *workspace,
+                              const char *source_scope,
+                              const unsigned char *csv_payload,
+                              uintptr_t csv_payload_len,
+                              const char *database,
+                              const char *table,
+                              const char *schema,
+                              const char *primary_key,
+                              const char *mode,
+                              int32_t commit,
+                              const char *author,
+                              const char *message,
+                              int32_t dry_run,
+                              unsigned char **out_ptr,
+                              uintptr_t *out_len);
+
+/**
+ * Import Redmine snapshot bytes and return the canonical import report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `snapshot_payload`
+ * must be null or readable for `snapshot_payload_len` bytes; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_import_redmine(LoomSession *handle,
+                            const char *workspace,
+                            const char *profile,
+                            const char *source_scope,
+                            const unsigned char *snapshot_payload,
+                            uintptr_t snapshot_payload_len,
+                            const char *field_policy,
+                            int32_t dry_run,
+                            unsigned char **out_ptr,
+                            uintptr_t *out_len);
+
+/**
+ * Import Asana snapshot bytes and return the canonical import report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `snapshot_payload`
+ * must be null or readable for `snapshot_payload_len` bytes; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_import_asana(LoomSession *handle,
+                          const char *workspace,
+                          const char *profile,
+                          const char *source_scope,
+                          const unsigned char *snapshot_payload,
+                          uintptr_t snapshot_payload_len,
+                          const char *field_policy,
+                          int32_t dry_run,
+                          unsigned char **out_ptr,
+                          uintptr_t *out_len);
+
+/**
+ * Import Jira snapshot bytes and return the canonical import report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `snapshot_payload`
+ * must be null or readable for `snapshot_payload_len` bytes; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_import_jira(LoomSession *handle,
+                         const char *workspace,
+                         const char *profile,
+                         const char *source_scope,
+                         const unsigned char *snapshot_payload,
+                         uintptr_t snapshot_payload_len,
+                         const char *field_policy,
+                         int32_t dry_run,
+                         unsigned char **out_ptr,
+                         uintptr_t *out_len);
+
+/**
+ * Import Confluence snapshot bytes and return the canonical import report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `snapshot_payload`
+ * must be null or readable for `snapshot_payload_len` bytes; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_import_confluence(LoomSession *handle,
+                               const char *workspace,
+                               const char *profile,
+                               const char *source_scope,
+                               const unsigned char *snapshot_payload,
+                               uintptr_t snapshot_payload_len,
+                               const char *default_space,
+                               int32_t dry_run,
+                               unsigned char **out_ptr,
+                               uintptr_t *out_len);
+
+/**
+ * Import Slack snapshot bytes and return the canonical import report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `snapshot_payload`
+ * must be null or readable for `snapshot_payload_len` bytes; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_import_slack(LoomSession *handle,
+                          const char *workspace,
+                          const char *profile,
+                          const char *source_scope,
+                          const unsigned char *snapshot_payload,
+                          uintptr_t snapshot_payload_len,
+                          int32_t dry_run,
+                          unsigned char **out_ptr,
+                          uintptr_t *out_len);
+
+/**
+ * Import Drive archive bytes and return the canonical import report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `archive_payload`
+ * must be null or readable for `archive_payload_len` bytes; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_import_drive(LoomSession *handle,
+                          const char *workspace,
+                          const char *profile,
+                          const char *source_scope,
+                          const unsigned char *archive_payload,
+                          uintptr_t archive_payload_len,
+                          int32_t dry_run,
+                          unsigned char **out_ptr,
+                          uintptr_t *out_len);
+
+/**
+ * Import Markdown archive bytes and return the canonical import report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `archive_payload`
+ * must be null or readable for `archive_payload_len` bytes; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_import_markdown(LoomSession *handle,
+                             const char *workspace,
+                             const char *profile,
+                             const char *source_scope,
+                             const unsigned char *archive_payload,
+                             uintptr_t archive_payload_len,
+                             const char *space,
+                             int32_t dry_run,
+                             unsigned char **out_ptr,
+                             uintptr_t *out_len);
+
+/**
+ * Import Notion snapshot bytes and return the canonical import report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `snapshot_payload`
+ * must be null or readable for `snapshot_payload_len` bytes; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_import_notion(LoomSession *handle,
+                           const char *workspace,
+                           const char *profile,
+                           const char *source_scope,
+                           const unsigned char *snapshot_payload,
+                           uintptr_t snapshot_payload_len,
+                           const char *default_space,
+                           int32_t dry_run,
+                           unsigned char **out_ptr,
+                           uintptr_t *out_len);
+
+/**
+ * Import Arrow IPC bytes through the generated Columnar owner and return the canonical report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `payload` must be
+ * null or readable for `payload_len` bytes; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_columnar_import_arrow(LoomSession *handle,
+                                   const char *workspace,
+                                   const char *name,
+                                   const unsigned char *payload,
+                                   uintptr_t payload_len,
+                                   uint64_t target_segment_rows,
+                                   int32_t replace,
+                                   int32_t dry_run,
+                                   unsigned char **out_ptr,
+                                   uintptr_t *out_len);
+
+/**
+ * Import Parquet bytes through the generated Columnar owner and return the canonical report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `payload` must be
+ * null or readable for `payload_len` bytes; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_columnar_import_parquet(LoomSession *handle,
+                                     const char *workspace,
+                                     const char *name,
+                                     const unsigned char *payload,
+                                     uintptr_t payload_len,
+                                     uint64_t target_segment_rows,
+                                     int32_t replace,
+                                     int32_t dry_run,
+                                     unsigned char **out_ptr,
+                                     uintptr_t *out_len);
+
+/**
+ * Upsert vector text through the generated Vector owner and return canonical report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `request` must be null or readable for `request_len` bytes;
+ * `out_ptr` and `out_len` writable.
+ */
+int32_t loom_vector_text_upsert(LoomSession *handle,
+                                const unsigned char *request,
+                                uintptr_t request_len,
+                                unsigned char **out_ptr,
+                                uintptr_t *out_len);
+
+/**
+ * Configure vector workspace binding through the generated Vector owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `out` writable.
+ */
+int32_t loom_vector_workspace_configure_json(LoomSession *handle,
+                                             const char *workspace,
+                                             const char *request_json,
+                                             char **out);
+
+/**
+ * Reindex Studio projections through the generated StudioMaintenance owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `out` writable.
+ */
+int32_t loom_studio_reindex_json(LoomSession *handle,
+                                 const char *workspace,
+                                 const char *profile,
+                                 char **out);
+
+/**
+ * Rebuild Studio revision indexes through the generated StudioMaintenance owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `out` writable.
+ */
+int32_t loom_studio_revisions_rebuild_json(LoomSession *handle,
+                                           const char *workspace,
+                                           const char *profile,
+                                           int32_t dry_run,
+                                           char **out);
+
+/**
+ * Import a store bundle through the generated StoreAdmin owner and return canonical report CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `bundle` must be null or readable for `bundle_len` bytes;
+ * `out_ptr` and `out_len` writable.
+ */
+int32_t loom_store_bundle_import(LoomSession *handle,
+                                 const unsigned char *bundle,
+                                 uintptr_t bundle_len,
+                                 int32_t dry_run,
+                                 unsigned char **out_ptr,
+                                 uintptr_t *out_len);
+
+/**
+ * Compact the audit retention log through the generated Audit owner and return canonical CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `out_ptr` and `out_len` writable.
+ */
+int32_t loom_audit_compact(LoomSession *handle,
+                           uint64_t through_seq,
+                           unsigned char **out_ptr,
+                           uintptr_t *out_len);
+
+/**
+ * Read store maintenance status through the generated StoreAdmin owner and return canonical CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `request` must be null or readable for `request_len` bytes;
+ * `out_ptr` and `out_len` writable.
+ */
+int32_t loom_store_maintenance_status(LoomSession *handle,
+                                      const unsigned char *request,
+                                      uintptr_t request_len,
+                                      unsigned char **out_ptr,
+                                      uintptr_t *out_len);
+
+/**
+ * Set store maintenance policy through the generated StoreAdmin owner and return canonical CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `update` must be null or readable for `update_len` bytes;
+ * `out_ptr` and `out_len` writable.
+ */
+int32_t loom_store_maintenance_policy_set(LoomSession *handle,
+                                          const unsigned char *update,
+                                          uintptr_t update_len,
+                                          unsigned char **out_ptr,
+                                          uintptr_t *out_len);
+
+/**
+ * Run bounded store maintenance through the generated StoreAdmin owner and return canonical CBOR.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; `request` must be null or readable for `request_len` bytes;
+ * `out_ptr` and `out_len` writable.
+ */
+int32_t loom_store_maintenance_run(LoomSession *handle,
+                                   const unsigned char *request,
+                                   uintptr_t request_len,
+                                   unsigned char **out_ptr,
+                                   uintptr_t *out_len);
+
+/**
+ * Create an inference instance through the generated InferenceInstance owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; optional strings
+ * may be null; `out` writable.
+ */
+int32_t loom_inference_instance_create_json(LoomSession *handle,
+                                            const char *workspace,
+                                            const char *name,
+                                            const char *model,
+                                            const char *kind,
+                                            const char *runtime,
+                                            const char *preset,
+                                            const char *settings_json,
+                                            char **out);
+
+/**
+ * Update an inference instance through the generated InferenceInstance owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; optional strings
+ * may be null; `out` writable.
+ */
+int32_t loom_inference_instance_update_json(LoomSession *handle,
+                                            const char *workspace,
+                                            const char *name,
+                                            const char *preset,
+                                            const char *settings_json,
+                                            char **out);
+
+/**
+ * Delete an inference instance through the generated InferenceInstance owner and return JSON.
+ *
+ * # Safety
+ * `handle` must be from [`loom_open`]; string arguments must be valid C strings; `out` writable.
+ */
+int32_t loom_inference_instance_delete_json(LoomSession *handle,
+                                            const char *workspace,
+                                            const char *name,
+                                            char **out);
+
+/**
  * Insert or replace node `id` (with `props` as a CBOR `text -> bytes` map, or empty for none) in graph
  * `name` of workspace `workspace` (UUID or name, created with the `graph` facet if absent). Returns `0`.
  *
@@ -3513,21 +4168,21 @@ int32_t loom_lanes_update_cbor(LoomSession *handle,
  * Add a ticket to the lane at the position selected by `placement` and return the updated lane as
  * canonical CBOR.
  *
- * `placement` is a public placement verb: null or empty => `append`; `first`; `before`/`after`
- * require a non-empty `anchor` ticket id. A null `anchor` is treated as absent. Ordering is never
- * caller-supplied; callers choose only where the ticket lands.
+ * `placement` is a `LoomLaneTicketPlacement` value. Passing `0` means `LAST`; `BEFORE` and `AFTER`
+ * require a non-empty `anchor` ticket id. `FIRST` and `LAST` reject an anchor. A null `anchor` is
+ * treated as absent. Ordering is never caller-supplied; callers choose only where the ticket lands.
  *
  * # Safety
  * `handle` must be from [`loom_open`]; `workspace`, `lane_id`, `ticket_id`, and `updated_by` must be
- * valid C strings; `placement` and `anchor` must be null or valid C strings; `out_ptr` and `out_len`
- * must be writable when non-null.
+ * valid C strings; `anchor` must be null or a valid C string; `out_ptr` and `out_len` must be
+ * writable when non-null.
  */
 int32_t loom_lanes_ticket_add_cbor(LoomSession *handle,
                                    const char *workspace,
                                    const char *lane_id,
                                    const char *ticket_id,
                                    const char *updated_by,
-                                   const char *placement,
+                                   LoomLaneTicketPlacement placement,
                                    const char *anchor,
                                    unsigned char **out_ptr,
                                    uintptr_t *out_len);
@@ -3865,21 +4520,6 @@ int32_t loom_mail_search(LoomSession *handle,
                          const char *text,
                          unsigned char **out_ptr,
                          uintptr_t *out_len);
-
-/**
- * Import a normalized Meetings snapshot into an existing workspace and return the import report as JSON.
- *
- * # Safety
- * `handle` must be from [`loom_open`]; `workspace` and `input_profile` valid C strings;
- * `snapshot` null or readable for `snapshot_len` bytes; `out` writable.
- */
-int32_t loom_meetings_import_snapshot(LoomSession *handle,
-                                      const char *workspace,
-                                      const char *input_profile,
-                                      const unsigned char *snapshot,
-                                      uintptr_t snapshot_len,
-                                      int32_t dry_run,
-                                      char **out);
 
 /**
  * Read a retained Meetings source payload from a workspace.
@@ -4883,6 +5523,68 @@ int32_t loom_search_query_cbor(LoomSession *handle,
                                unsigned char **out_ptr,
                                uintptr_t *out_len);
 
+int32_t loom_audit_config_show_json(LoomSession *handle, char **out);
+
+int32_t loom_audit_config_set_json(LoomSession *handle,
+                                   uint32_t retention_days,
+                                   int32_t has_retention_days,
+                                   int32_t legal_hold,
+                                   int32_t has_legal_hold,
+                                   char **out);
+
+int32_t loom_audit_list_json(LoomSession *handle, char **out);
+
+int32_t loom_audit_view_json(LoomSession *handle, const char *record, char **out);
+
+int32_t loom_certificate_list_json(LoomSession *handle, char **out);
+
+int32_t loom_certificate_import_json(LoomSession *handle,
+                                     const char *name,
+                                     const unsigned char *cert_chain_pem,
+                                     uintptr_t cert_chain_len,
+                                     const unsigned char *private_key_pem,
+                                     uintptr_t private_key_len,
+                                     const unsigned char *trust_bundle_pem,
+                                     uintptr_t trust_bundle_len,
+                                     int32_t force,
+                                     char **out);
+
+int32_t loom_certificate_export(LoomSession *handle,
+                                const char *name,
+                                int32_t include_cert_chain,
+                                int32_t include_private_key,
+                                int32_t include_trust_bundle,
+                                int32_t force,
+                                unsigned char **out_ptr,
+                                uintptr_t *out_len);
+
+int32_t loom_certificate_generate_self_signed_json(LoomSession *handle,
+                                                   const char *name,
+                                                   const char *dns_names_json,
+                                                   const char *ip_addresses_json,
+                                                   const char *cn,
+                                                   uint32_t days,
+                                                   const char *algorithm,
+                                                   int32_t force,
+                                                   char **out);
+
+int32_t loom_certificate_remove_json(LoomSession *handle, const char *name, char **out);
+
+int32_t loom_certificate_audit_json(LoomSession *handle, const char *name, char **out);
+
+int32_t loom_network_access_list_json(LoomSession *handle, char **out);
+
+int32_t loom_network_access_set_json(LoomSession *handle,
+                                     const char *name,
+                                     const char *description,
+                                     const char *default_action,
+                                     const char *rules_json,
+                                     char **out);
+
+int32_t loom_network_access_remove_json(LoomSession *handle, const char *name, char **out);
+
+int32_t loom_network_access_audit_json(LoomSession *handle, const char *name, char **out);
+
 /**
  * Create tag `tag_name` in workspace `ns_name` at the commit `rev` resolves to
  * (`HEAD`, a branch name, or a digest). A non-empty `message` makes an annotated tag (with `tagger`);
@@ -4965,6 +5667,7 @@ int32_t loom_tickets_project_settings_get_json(LoomSession *handle,
                                                const char *workspace,
                                                const char *ticket_workspace_id,
                                                const char *project_id,
+                                               bool include_contracts,
                                                char **out);
 
 int32_t loom_tickets_project_settings_set_json(LoomSession *handle,
@@ -4978,6 +5681,14 @@ int32_t loom_tickets_project_settings_set_json(LoomSession *handle,
                                                const char *project_owner_principal,
                                                bool clear_project_owner_principal,
                                                const char *acceptance_authorities_json,
+                                               bool acceptance_evidence_enforcement,
+                                               bool has_acceptance_evidence_enforcement,
+                                               const char *required_acceptance_evidence_keys_json,
+                                               const char *required_acceptance_reviews_json,
+                                               const char *owner_contract_summary,
+                                               const char *owner_contract_details,
+                                               const char *worker_contract_summary,
+                                               const char *worker_contract_details,
                                                const char *expected_root,
                                                char **out);
 

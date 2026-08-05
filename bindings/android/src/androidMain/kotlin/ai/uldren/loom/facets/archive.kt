@@ -4,6 +4,8 @@ actual fun Loom.fsImport(
     path: String,
     workspace: String,
     srcPath: String,
+    author: String?,
+    message: String?,
     commit: Boolean,
     dryRun: Boolean,
     passphrase: String?,
@@ -11,7 +13,7 @@ actual fun Loom.fsImport(
     authPrincipal: String?,
     authPassphrase: String?,
 ): ByteArray = LoomNative.nativeFsImport(
-    path, workspace, srcPath, commit, dryRun, passphrase?.encodeToByteArray(), kek,
+    path, workspace, srcPath, author, message, commit, dryRun, passphrase?.encodeToByteArray(), kek,
     authPrincipal, authPassphrase?.encodeToByteArray(),
 )
 
@@ -35,14 +37,18 @@ actual fun Loom.archiveImport(
     workspace: String,
     srcPath: String,
     kind: String,
+    gzipOutputPath: String?,
+    commit: Boolean,
+    author: String?,
+    message: String?,
     dryRun: Boolean,
     passphrase: String?,
     kek: ByteArray?,
     authPrincipal: String?,
     authPassphrase: String?,
 ): ByteArray = LoomNative.nativeArchiveImport(
-    path, workspace, srcPath, kind, dryRun, passphrase?.encodeToByteArray(), kek,
-    authPrincipal, authPassphrase?.encodeToByteArray(),
+    path, workspace, srcPath, kind, gzipOutputPath, commit, author, message, dryRun,
+    passphrase?.encodeToByteArray(), kek, authPrincipal, authPassphrase?.encodeToByteArray(),
 )
 
 actual fun Loom.archiveExport(

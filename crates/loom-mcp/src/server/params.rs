@@ -32,6 +32,73 @@ fn default_updated_by() -> String {
     "mcp".to_string()
 }
 
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+pub(crate) enum LaneTicketPlacementParam {
+    #[serde(rename = "FIRST")]
+    First,
+    #[serde(rename = "LAST")]
+    Last,
+    #[serde(rename = "BEFORE")]
+    Before,
+    #[serde(rename = "AFTER")]
+    After,
+}
+
+impl LaneTicketPlacementParam {
+    pub(crate) fn into_lane_placement<'a>(
+        self,
+        anchor: Option<&'a str>,
+    ) -> loom_core::Result<loom_lanes::LaneTicketPlacement<'a>> {
+        match self {
+            Self::Last => {
+                if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                    return Err(loom_core::LoomError::invalid(
+                        "placement 'LAST' rejects an anchor ticket id",
+                    ));
+                }
+                Ok(loom_lanes::LaneTicketPlacement::Last)
+            }
+            Self::First => {
+                if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                    return Err(loom_core::LoomError::invalid(
+                        "placement 'FIRST' rejects an anchor ticket id",
+                    ));
+                }
+                Ok(loom_lanes::LaneTicketPlacement::First)
+            }
+            Self::Before => anchor
+                .filter(|anchor| !anchor.is_empty())
+                .map(loom_lanes::LaneTicketPlacement::Before)
+                .ok_or_else(|| {
+                    loom_core::LoomError::invalid("placement 'BEFORE' requires an anchor ticket id")
+                }),
+            Self::After => anchor
+                .filter(|anchor| !anchor.is_empty())
+                .map(loom_lanes::LaneTicketPlacement::After)
+                .ok_or_else(|| {
+                    loom_core::LoomError::invalid("placement 'AFTER' requires an anchor ticket id")
+                }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+pub(crate) enum TicketReviewTypeParam {
+    #[serde(rename = "design_review")]
+    DesignReview,
+    #[serde(rename = "code_review")]
+    CodeReview,
+}
+
+impl From<TicketReviewTypeParam> for loom_tickets::TicketReviewType {
+    fn from(value: TicketReviewTypeParam) -> Self {
+        match value {
+            TicketReviewTypeParam::DesignReview => loom_tickets::TicketReviewType::DesignReview,
+            TicketReviewTypeParam::CodeReview => loom_tickets::TicketReviewType::CodeReview,
+        }
+    }
+}
+
 #[derive(Default, Deserialize, JsonSchema)]
 pub(crate) struct PResultPage {
     #[serde(default)]
@@ -43,6 +110,12 @@ pub(crate) struct PResultPage {
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct PData {
     pub(crate) data: Vec<u8>,
+}
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct PStoreBundleImport {
+    pub(crate) bundle: Vec<u8>,
+    #[serde(default)]
+    pub(crate) dry_run: bool,
 }
 #[derive(Default, Deserialize, JsonSchema)]
 pub(crate) struct PCapabilities {
@@ -487,6 +560,15 @@ pub(crate) struct PVectorSearchPolicy {
     pub(crate) pq_iters: u64,
 }
 #[derive(Deserialize, JsonSchema)]
+pub(crate) struct PVectorTextUpsert {
+    pub(crate) request: Vec<u8>,
+}
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct PVectorWorkspaceConfigure {
+    pub(crate) workspace: String,
+    pub(crate) request_json: String,
+}
+#[derive(Deserialize, JsonSchema)]
 pub(crate) struct PColumnarCreate {
     pub(crate) workspace: String,
     pub(crate) collection: String,
@@ -515,6 +597,17 @@ pub(crate) struct PColumnarAggregate {
     pub(crate) collection: String,
     pub(crate) aggregates: Vec<u8>,
     pub(crate) filter: Vec<u8>,
+}
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct PColumnarImport {
+    pub(crate) workspace: String,
+    pub(crate) collection: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) target_segment_rows: u64,
+    #[serde(default)]
+    pub(crate) replace: bool,
+    #[serde(default)]
+    pub(crate) dry_run: bool,
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct PDataframeCreate {
@@ -760,6 +853,8 @@ pub(crate) struct PTicketsProjectSettingsSet {
     pub(crate) acceptance_evidence_enforcement: Option<bool>,
     #[serde(default)]
     pub(crate) required_acceptance_evidence_keys: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) required_acceptance_reviews: Option<Vec<TicketReviewTypeParam>>,
     #[serde(default)]
     pub(crate) owner_contract_summary: Option<String>,
     #[serde(default)]
@@ -1222,10 +1317,10 @@ pub(crate) struct PLanesTicketAdd {
     pub(crate) workspace: String,
     pub(crate) lane_id: String,
     pub(crate) ticket_id: String,
-    /// Placement verb: "LAST" (default), "FIRST", "BEFORE", or "AFTER".
+    /// Placement enum value: FIRST, LAST, BEFORE, or AFTER.
     #[serde(default)]
-    pub(crate) placement: Option<String>,
-    /// Anchor ticket id required by the "BEFORE" and "AFTER" placements.
+    pub(crate) placement: Option<LaneTicketPlacementParam>,
+    /// Anchor ticket id required by the BEFORE and AFTER placements.
     #[serde(default)]
     pub(crate) anchor: Option<String>,
     #[serde(default)]
@@ -1429,11 +1524,27 @@ pub(crate) struct PChatPostMessage {
     pub(crate) body_text: String,
 }
 #[derive(Deserialize, JsonSchema)]
+pub(crate) struct PChatPostMessageBytes {
+    pub(crate) workspace: String,
+    pub(crate) channel_id: String,
+    pub(crate) message_id: String,
+    #[serde(default)]
+    pub(crate) thread_id: Option<String>,
+    pub(crate) body: Vec<u8>,
+}
+#[derive(Deserialize, JsonSchema)]
 pub(crate) struct PChatEditMessage {
     pub(crate) workspace: String,
     pub(crate) channel_id: String,
     pub(crate) message_id: String,
     pub(crate) body_text: String,
+}
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct PChatEditMessageBytes {
+    pub(crate) workspace: String,
+    pub(crate) channel_id: String,
+    pub(crate) message_id: String,
+    pub(crate) body: Vec<u8>,
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct PChatRedactMessage {
@@ -1486,6 +1597,16 @@ pub(crate) struct PChatInvokeAgent {
     #[serde(default)]
     pub(crate) source_message_ids: Vec<String>,
     pub(crate) prompt_text: String,
+}
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct PChatInvokeAgentBytes {
+    pub(crate) workspace: String,
+    pub(crate) channel_id: String,
+    pub(crate) invocation_id: String,
+    pub(crate) agent_principal: String,
+    #[serde(default)]
+    pub(crate) source_message_ids: Vec<String>,
+    pub(crate) prompt: Vec<u8>,
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct PChatAgentReply {

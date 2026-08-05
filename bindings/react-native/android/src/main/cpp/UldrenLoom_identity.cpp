@@ -427,6 +427,146 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeIdentityRevokePublicKey(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeIdentityForceDetachAuthorityJson(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring principal, jdouble generation,
+    jstring reason, jbyteArray passphrase, jbyteArray kek, jstring authPrincipal,
+    jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openStoreKeyed(env, p, passphrase, kek, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *principalChars = env->GetStringUTFChars(principal, nullptr);
+  const char *reasonChars = env->GetStringUTFChars(reason, nullptr);
+  char *out = nullptr;
+  st = authenticateStore(env, h, authPrincipal, authPassphrase);
+  if (st == 0) {
+    st = loom_identity_force_detach_authority_json(
+        h, principalChars, static_cast<uint64_t>(generation), reasonChars, &out);
+  }
+  env->ReleaseStringUTFChars(principal, principalChars);
+  env->ReleaseStringUTFChars(reason, reasonChars);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jstring result = env->NewStringUTF(out ? out : "");
+  if (out) {
+    loom_string_free(out);
+  }
+  return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeIdentityReplicateAuthorityJson(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring source, jboolean becomeAuthority,
+    jbyteArray passphrase, jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openStoreKeyed(env, p, passphrase, kek, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *sourceChars = env->GetStringUTFChars(source, nullptr);
+  char *out = nullptr;
+  st = authenticateStore(env, h, authPrincipal, authPassphrase);
+  if (st == 0) {
+    st = loom_identity_replicate_authority_json(h, sourceChars, becomeAuthority ? 1 : 0, &out);
+  }
+  env->ReleaseStringUTFChars(source, sourceChars);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jstring result = env->NewStringUTF(out ? out : "");
+  if (out) {
+    loom_string_free(out);
+  }
+  return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeIdentityConfigureAuthorityReplicationJson(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring id, jstring source, jboolean disabled,
+    jboolean pullOnStart, jdouble intervalMs, jboolean intervalMsPresent, jdouble jitterMs,
+    jdouble backoffMs, jboolean publishWitness, jbyteArray passphrase, jbyteArray kek,
+    jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openStoreKeyed(env, p, passphrase, kek, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *idChars = env->GetStringUTFChars(id, nullptr);
+  const char *sourceChars = env->GetStringUTFChars(source, nullptr);
+  char *out = nullptr;
+  st = authenticateStore(env, h, authPrincipal, authPassphrase);
+  if (st == 0) {
+    st = loom_identity_configure_authority_replication_json(
+        h, idChars, sourceChars, disabled ? 1 : 0, pullOnStart ? 1 : 0,
+        static_cast<uint64_t>(intervalMs), intervalMsPresent ? 1 : 0,
+        static_cast<uint64_t>(jitterMs), static_cast<uint64_t>(backoffMs),
+        publishWitness ? 1 : 0, &out);
+  }
+  env->ReleaseStringUTFChars(id, idChars);
+  env->ReleaseStringUTFChars(source, sourceChars);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jstring result = env->NewStringUTF(out ? out : "");
+  if (out) {
+    loom_string_free(out);
+  }
+  return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeIdentityRemoveAuthorityReplicationJson(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring id, jbyteArray passphrase, jbyteArray kek,
+    jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openStoreKeyed(env, p, passphrase, kek, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *idChars = env->GetStringUTFChars(id, nullptr);
+  char *out = nullptr;
+  st = authenticateStore(env, h, authPrincipal, authPassphrase);
+  if (st == 0) {
+    st = loom_identity_remove_authority_replication_json(h, idChars, &out);
+  }
+  env->ReleaseStringUTFChars(id, idChars);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jstring result = env->NewStringUTF(out ? out : "");
+  if (out) {
+    loom_string_free(out);
+  }
+  return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_rn_UldrenLoomNative_nativeAclListJson(
     JNIEnv *env, jobject thiz, jstring loomPath, jbyteArray passphrase, jbyteArray kek,
     jstring authPrincipal, jbyteArray authPassphrase) {

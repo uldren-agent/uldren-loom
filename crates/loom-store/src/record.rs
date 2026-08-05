@@ -36,6 +36,8 @@ pub(crate) struct RecordLoc {
 }
 
 impl RecordLoc {
+    pub(crate) const MAX_ENCODED_LEN: usize = 15;
+
     /// Build a locator from a global page index and intra-page slot.
     pub(crate) fn from_global(global_page: u64, slot: u32) -> Self {
         Self {
@@ -149,6 +151,17 @@ pub(crate) fn read_slab_slot(page: &[u8], slot: u32) -> Option<&[u8]> {
         return None;
     }
     Some(&page[off..end])
+}
+
+pub(crate) fn slab_slot_count(page: &[u8]) -> Option<u32> {
+    if page.len() < PAGE || page[0] != SLAB_MAGIC {
+        return None;
+    }
+    let stored = u32::from_le_bytes(page[PAGE - CRC..PAGE].try_into().ok()?);
+    if crc32c(&page[..PAGE - CRC]) != stored {
+        return None;
+    }
+    Some(u32::from(u16::from_le_bytes([page[1], page[2]])))
 }
 
 /// Pages a large-object run of `blob_len` framed bytes occupies.

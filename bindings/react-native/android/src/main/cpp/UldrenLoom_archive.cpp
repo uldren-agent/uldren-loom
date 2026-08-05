@@ -2,9 +2,9 @@
 
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_ai_uldren_loom_rn_UldrenLoomNative_nativeFsImport(
-    JNIEnv *env, jobject thiz, jstring loomPath, jstring ns, jstring srcPath, jboolean commit,
-    jboolean dryRun, jbyteArray passphrase, jbyteArray kek, jstring authPrincipal,
-    jbyteArray authPassphrase) {
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring ns, jstring srcPath, jstring author,
+    jstring message, jboolean commit, jboolean dryRun, jbyteArray passphrase, jbyteArray kek,
+    jstring authPrincipal, jbyteArray authPassphrase) {
   (void)thiz;
   const char *p = env->GetStringUTFChars(loomPath, nullptr);
   LoomSession *h = nullptr;
@@ -16,11 +16,21 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeFsImport(
   }
   const char *n = env->GetStringUTFChars(ns, nullptr);
   const char *src = env->GetStringUTFChars(srcPath, nullptr);
+  const char *a = author != nullptr ? env->GetStringUTFChars(author, nullptr) : nullptr;
+  const char *m = message != nullptr ? env->GetStringUTFChars(message, nullptr) : nullptr;
+  const char *authorArg = (a != nullptr && a[0] != '\0') ? a : nullptr;
+  const char *messageArg = (m != nullptr && m[0] != '\0') ? m : nullptr;
   unsigned char *ptr = nullptr;
   uintptr_t len = 0;
-  st = loom_fs_import(h, n, src, commit ? 1 : 0, dryRun ? 1 : 0, &ptr, &len);
+  st = loom_fs_import(h, n, src, authorArg, messageArg, commit ? 1 : 0, dryRun ? 1 : 0, &ptr, &len);
   env->ReleaseStringUTFChars(ns, n);
   env->ReleaseStringUTFChars(srcPath, src);
+  if (a != nullptr) {
+    env->ReleaseStringUTFChars(author, a);
+  }
+  if (m != nullptr) {
+    env->ReleaseStringUTFChars(message, m);
+  }
   loom_close(h);
   if (st != 0) {
     throwLoom(env);
@@ -66,8 +76,8 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeFsExport(
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_ai_uldren_loom_rn_UldrenLoomNative_nativeArchiveImport(
     JNIEnv *env, jobject thiz, jstring loomPath, jstring ns, jstring srcPath, jstring kind,
-    jboolean dryRun, jbyteArray passphrase, jbyteArray kek, jstring authPrincipal,
-    jbyteArray authPassphrase) {
+    jstring gzipOutputPath, jboolean commit, jstring author, jstring message, jboolean dryRun,
+    jbyteArray passphrase, jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
   (void)thiz;
   const char *p = env->GetStringUTFChars(loomPath, nullptr);
   LoomSession *h = nullptr;
@@ -80,12 +90,28 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeArchiveImport(
   const char *n = env->GetStringUTFChars(ns, nullptr);
   const char *src = env->GetStringUTFChars(srcPath, nullptr);
   const char *k = env->GetStringUTFChars(kind, nullptr);
+  const char *gzip = gzipOutputPath != nullptr ? env->GetStringUTFChars(gzipOutputPath, nullptr) : nullptr;
+  const char *a = author != nullptr ? env->GetStringUTFChars(author, nullptr) : nullptr;
+  const char *m = message != nullptr ? env->GetStringUTFChars(message, nullptr) : nullptr;
+  const char *gzipArg = (gzip != nullptr && gzip[0] != '\0') ? gzip : nullptr;
+  const char *authorArg = (a != nullptr && a[0] != '\0') ? a : nullptr;
+  const char *messageArg = (m != nullptr && m[0] != '\0') ? m : nullptr;
   unsigned char *ptr = nullptr;
   uintptr_t len = 0;
-  st = loom_archive_import(h, n, src, k, dryRun ? 1 : 0, &ptr, &len);
+  st = loom_archive_import(h, n, src, k, gzipArg, commit ? 1 : 0, authorArg, messageArg,
+                           dryRun ? 1 : 0, &ptr, &len);
   env->ReleaseStringUTFChars(ns, n);
   env->ReleaseStringUTFChars(srcPath, src);
   env->ReleaseStringUTFChars(kind, k);
+  if (gzip != nullptr) {
+    env->ReleaseStringUTFChars(gzipOutputPath, gzip);
+  }
+  if (a != nullptr) {
+    env->ReleaseStringUTFChars(author, a);
+  }
+  if (m != nullptr) {
+    env->ReleaseStringUTFChars(message, m);
+  }
   loom_close(h);
   if (st != 0) {
     throwLoom(env);

@@ -1,6 +1,6 @@
 use super::*;
 
-const STATE_SECTION_NAMES: [&str; 10] = [
+const STATE_SECTION_NAMES: [&str; 11] = [
     "00-registry",
     "01-content",
     "02-work",
@@ -11,11 +11,28 @@ const STATE_SECTION_NAMES: [&str; 10] = [
     "07-index",
     "08-open-files",
     "09-protected-refs",
+    "10-stream-low-water",
 ];
 
 const CONTENT_SECTION_NAME: &str = "01-content";
 const WORK_SECTION_NAME: &str = "02-work";
 const INDEX_SECTION_NAME: &str = "07-index";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineStateLoadStage {
+    Root,
+    Sections,
+    Content,
+    StagedMap,
+    Import,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineStateLoadProgress {
+    pub stage: EngineStateLoadStage,
+    pub completed: u64,
+    pub total: Option<u64>,
+}
 
 impl<S: ObjectStore> Loom<S> {
     pub(super) fn load_bounded_engine_base(
@@ -36,7 +53,11 @@ impl<S: ObjectStore> Loom<S> {
                 "bounded engine-state registry section is not a Blob",
             ));
         };
-        let registry = parse_registry_section(&registry_bytes)?.selected(scope.workspace)?;
+        let registry = match parse_registry_section(&registry_bytes)?.selected(scope.workspace) {
+            Ok(registry) => registry,
+            Err(error) if error.code == Code::NotFound => Registry::new(),
+            Err(error) => return Err(error),
+        };
 
         let Object::Tree(workspaces) = load_object_from(&self.store, sections[2].target)? else {
             return Err(LoomError::corrupt(
@@ -71,13 +92,30 @@ impl<S: ObjectStore> Loom<S> {
             }
         }
 
-        let wanted_content = work
+        let mut wanted_content = work
             .values()
             .filter_map(|entry| match entry {
                 StagedEntry::File(file) => Some(file.content_addr),
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
+        for staged in work.values() {
+            let StagedEntry::Table(root) = staged else {
+                continue;
+            };
+            let Object::Tree(entries) = load_object_from(&self.store, *root)? else {
+                return Err(LoomError::corrupt(
+                    "bounded engine-state table root is not a Tree",
+                ));
+            };
+            let schema = entries
+                .iter()
+                .find(|entry| entry.name == "schema" && entry.kind == EntryKind::Blob)
+                .ok_or_else(|| {
+                    LoomError::corrupt("bounded engine-state table has no schema entry")
+                })?;
+            wanted_content.insert(schema.target);
+        }
         let Object::Tree(content_entries) = load_object_from(&self.store, sections[1].target)?
         else {
             return Err(LoomError::corrupt(
@@ -140,14 +178,22 @@ impl<S: ObjectStore> Loom<S> {
         workspace: WorkspaceId,
         base_root: Digest,
     ) -> Result<SavedStateObjects> {
+        match self.prepare_current_facet_state_delta_reference(workspace, base_root) {
+            Ok((_, saved)) => Ok(saved),
+            Err(error) if error.code == Code::NotFound => self.save_state_objects(),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn prepare_current_facet_state_delta_reference(
+        &mut self,
+        workspace: WorkspaceId,
+        base_root: Digest,
+    ) -> Result<(EngineStateDelta, SavedStateObjects)> {
         self.ensure_full_state_loaded()?;
         let scope =
             EnginePlanningScope::new(workspace, [EnginePathSelector::Prefix(".loom".to_string())])?;
-        let base = match self.load_bounded_engine_base(base_root, &scope) {
-            Ok(base) => base,
-            Err(error) if error.code == Code::NotFound => return self.save_state_objects(),
-            Err(error) => return Err(error),
-        };
+        let base = self.load_bounded_engine_base(base_root, &scope)?;
         let current_work = self.work.get(&workspace).cloned().unwrap_or_default();
         let current_directories = self.dirs.get(&workspace).cloned().unwrap_or_default();
 
@@ -210,9 +256,10 @@ impl<S: ObjectStore> Loom<S> {
             .bounded_plans
             .fetch_add(1, Ordering::Relaxed);
         if delta.work.is_empty() && delta.directories.is_empty() && delta.content.is_empty() {
-            return Ok((base_root, Vec::new()));
+            return Ok((delta, (base_root, Vec::new())));
         }
-        self.prepare_engine_state_delta_reference(&delta, base_root, Vec::new())
+        let saved = self.prepare_engine_state_delta_reference(&delta, base_root, Vec::new())?;
+        Ok((delta, saved))
     }
 
     pub fn fork_state_into<T: ObjectStore>(&self, store: T) -> Result<Loom<T>> {
@@ -222,7 +269,18 @@ impl<S: ObjectStore> Loom<S> {
         fork.acl = self.acl.clone();
         fork.predicate_evaluator = self.predicate_evaluator.clone();
         fork.session = self.session.clone();
+        fork.mutable_overlay = self.mutable_overlay.clone();
         Ok(fork)
+    }
+
+    pub fn import_engine_state_from<T: ObjectStore>(&mut self, source: &Loom<T>) -> Result<()> {
+        self.import_state(&source.export_state())?;
+        self.mutable_overlay = source.mutable_overlay.clone();
+        Ok(())
+    }
+
+    pub fn import_engine_state_preserving_mutable_overlay(&mut self, bytes: &[u8]) -> Result<()> {
+        self.import_state(bytes)
     }
 
     /// Serialize the engine's **recoverable** state to canonical bytes: the workspace
@@ -386,15 +444,21 @@ impl<S: ObjectStore> Loom<S> {
             out.push(u8::from(policy.retention_lock));
             out.push(u8::from(policy.governance_lock));
         }
+        put_uvarint(&mut out, self.stream_low_water_marks.len() as u64);
+        for ((ns, stream), mark) in &self.stream_low_water_marks {
+            out.extend_from_slice(ns.as_bytes());
+            put_lp(&mut out, stream.as_bytes());
+            put_uvarint(&mut out, *mark);
+        }
         // KV map tier config lives in a committed reserved file, so it versions and syncs with the
         // workspace.
         out
     }
 
     /// Restore engine state from [`Loom::export_state`] bytes: replace the registry, content map, and
-    /// the **persisted working trees + directories** (the staging index). Unlike a checkout-on-load,
-    /// this preserves uncommitted staged changes. Objects the working trees reference must be present
-    /// (they are kept live by [`Loom::live_object_set`]).
+    /// the **persisted working trees + directories** (the staging index). Mutable-overlay state is
+    /// outside this encoding and remains attached to the live engine. Objects the working trees
+    /// reference must be present (they are kept live by [`Loom::live_object_set`]).
     pub fn import_state(&mut self, bytes: &[u8]) -> Result<()> {
         self.state_instrumentation
             .full_imports
@@ -626,6 +690,16 @@ impl<S: ObjectStore> Loom<S> {
                 );
             }
         }
+        let mut stream_low_water_marks: BTreeMap<(WorkspaceId, String), u64> = BTreeMap::new();
+        if c.pos < c.buf.len() {
+            let nmarks = c.uvarint()?;
+            for _ in 0..nmarks {
+                let ns = WorkspaceId::from_bytes(c.take16()?);
+                let stream = c.lp_str()?;
+                let mark = c.uvarint()?;
+                stream_low_water_marks.insert((ns, stream), mark);
+            }
+        }
         // KV map tier config lives in a committed reserved file. State blobs may carry a trailing
         // config section, which is ignored here.
         // Rebuild the linked-path -> inode reverse map from the inodes themselves.
@@ -641,7 +715,7 @@ impl<S: ObjectStore> Loom<S> {
         self.dirs = dirs;
         self.compression = compression;
         self.consumer_offsets = consumer_offsets;
-        self.stream_low_water_marks = BTreeMap::new();
+        self.stream_low_water_marks = stream_low_water_marks;
         self.merge_state = merge_state;
         self.index = if index_present {
             index
@@ -654,7 +728,6 @@ impl<S: ObjectStore> Loom<S> {
         self.next_inode = next_inode;
         self.next_handle = next_handle;
         self.protected_refs = protected_refs;
-        self.mutable_overlay = crate::MutableOverlay::new();
         self.lazy_state_sections = None;
         self.ephemeral_kv.clear();
         Ok(())
@@ -708,8 +781,28 @@ impl<S: ObjectStore> Loom<S> {
 
     /// Load engine state from a section Tree root.
     pub fn load_state(&mut self, root: Digest) -> Result<()> {
+        self.load_state_with_progress(root, |_| {})
+    }
+
+    pub fn load_state_with_progress(
+        &mut self,
+        root: Digest,
+        mut progress: impl FnMut(EngineStateLoadProgress),
+    ) -> Result<()> {
+        progress(EngineStateLoadProgress {
+            stage: EngineStateLoadStage::Root,
+            completed: 0,
+            total: Some(1),
+        });
         match self.get_object(&root)? {
-            Object::Tree(entries) => self.load_state_sections(entries),
+            Object::Tree(entries) => {
+                progress(EngineStateLoadProgress {
+                    stage: EngineStateLoadStage::Root,
+                    completed: 1,
+                    total: Some(1),
+                });
+                self.load_state_sections_with_progress(entries, &mut progress)
+            }
             other => Err(LoomError::corrupt(format!(
                 "engine-state root is not a section Tree: {:?}",
                 other.object_type()
@@ -762,11 +855,27 @@ impl<S: ObjectStore> Loom<S> {
     }
 
     fn load_state_sections(&mut self, entries: Vec<TreeEntry>) -> Result<()> {
+        self.load_state_sections_with_progress(entries, &mut |_| {})
+    }
+
+    fn load_state_sections_with_progress(
+        &mut self,
+        entries: Vec<TreeEntry>,
+        progress: &mut impl FnMut(EngineStateLoadProgress),
+    ) -> Result<()> {
         validate_state_section_entries(&entries)?;
+        let section_total = entries.len() as u64;
         let mut registry = None;
         let mut content = None;
         let mut tail = Vec::new();
-        for (entry, expected) in entries.into_iter().zip(STATE_SECTION_NAMES) {
+        for (section_index, (entry, expected)) in
+            entries.into_iter().zip(STATE_SECTION_NAMES).enumerate()
+        {
+            progress(EngineStateLoadProgress {
+                stage: EngineStateLoadStage::Sections,
+                completed: section_index as u64,
+                total: Some(section_total),
+            });
             if entry.name != expected {
                 return Err(LoomError::corrupt("engine-state section name"));
             }
@@ -777,7 +886,9 @@ impl<S: ObjectStore> Loom<S> {
                 Object::Tree(entries)
                     if entry.name == WORK_SECTION_NAME || entry.name == INDEX_SECTION_NAME =>
                 {
-                    tail.extend_from_slice(&self.staged_map_section_bytes(entries)?);
+                    tail.extend_from_slice(
+                        &self.staged_map_section_bytes_with_progress(entries, progress)?,
+                    );
                 }
                 Object::Blob(bytes)
                     if entry.name != CONTENT_SECTION_NAME
@@ -787,7 +898,7 @@ impl<S: ObjectStore> Loom<S> {
                     tail.extend_from_slice(&bytes);
                 }
                 Object::Tree(entries) if entry.name == CONTENT_SECTION_NAME => {
-                    content = Some(content_section_map(entries)?);
+                    content = Some(content_section_map_with_progress(entries, progress)?);
                 }
                 other => {
                     return Err(LoomError::corrupt(format!(
@@ -797,11 +908,28 @@ impl<S: ObjectStore> Loom<S> {
                 }
             }
         }
+        progress(EngineStateLoadProgress {
+            stage: EngineStateLoadStage::Sections,
+            completed: section_total,
+            total: Some(section_total),
+        });
         let registry =
             registry.ok_or_else(|| LoomError::corrupt("engine-state registry section missing"))?;
         let content =
             content.ok_or_else(|| LoomError::corrupt("engine-state content section missing"))?;
-        self.import_state_after_content(registry, content, StateCur { buf: &tail, pos: 0 })
+        progress(EngineStateLoadProgress {
+            stage: EngineStateLoadStage::Import,
+            completed: 0,
+            total: Some(tail.len() as u64),
+        });
+        let result =
+            self.import_state_after_content(registry, content, StateCur { buf: &tail, pos: 0 });
+        progress(EngineStateLoadProgress {
+            stage: EngineStateLoadStage::Import,
+            completed: tail.len() as u64,
+            total: Some(tail.len() as u64),
+        });
+        result
     }
 
     // ---- working tree ---------------------------------------------------------------------------
@@ -837,11 +965,21 @@ impl<S: ObjectStore> Loom<S> {
         Object::tree(workspace_entries)
     }
 
-    fn staged_map_section_bytes(&self, entries: Vec<TreeEntry>) -> Result<Vec<u8>> {
+    fn staged_map_section_bytes_with_progress(
+        &self,
+        entries: Vec<TreeEntry>,
+        progress: &mut impl FnMut(EngineStateLoadProgress),
+    ) -> Result<Vec<u8>> {
         let algo = self.store.digest_algo();
         let mut out = Vec::new();
+        let workspace_total = entries.len() as u64;
         put_uvarint(&mut out, entries.len() as u64);
-        for entry in entries {
+        for (workspace_index, entry) in entries.into_iter().enumerate() {
+            progress(EngineStateLoadProgress {
+                stage: EngineStateLoadStage::StagedMap,
+                completed: workspace_index as u64,
+                total: Some(workspace_total),
+            });
             if entry.kind != EntryKind::Tree {
                 return Err(LoomError::corrupt("staged map workspace entry kind"));
             }
@@ -858,6 +996,11 @@ impl<S: ObjectStore> Loom<S> {
                 put_slot(&mut out, &staged_slot_from_tree_entry(&path_entry, algo)?);
             }
         }
+        progress(EngineStateLoadProgress {
+            stage: EngineStateLoadStage::StagedMap,
+            completed: workspace_total,
+            total: Some(workspace_total),
+        });
         Ok(out)
     }
 }
@@ -1102,10 +1245,10 @@ fn tree_entry_from_staged_slot(staged: StagedEntry) -> TreeEntry {
 }
 
 fn validate_state_section_entries(entries: &[TreeEntry]) -> Result<()> {
-    if entries.len() != STATE_SECTION_NAMES.len() {
+    if entries.len() != 10 && entries.len() != STATE_SECTION_NAMES.len() {
         return Err(LoomError::corrupt("engine-state section count"));
     }
-    for (entry, expected) in entries.iter().zip(STATE_SECTION_NAMES) {
+    for (entry, expected) in entries.iter().zip(STATE_SECTION_NAMES.iter().copied()) {
         if entry.name != expected {
             return Err(LoomError::corrupt("engine-state section name"));
         }
@@ -1274,6 +1417,15 @@ fn split_state_sections(bytes: &[u8]) -> Result<Vec<(&'static str, Vec<u8>)>> {
     }
     sections.push((STATE_SECTION_NAMES[9], bytes[start..c.pos].to_vec()));
 
+    let start = c.pos;
+    let nmarks = c.uvarint()?;
+    for _ in 0..nmarks {
+        c.take16()?;
+        c.lp_str()?;
+        c.uvarint()?;
+    }
+    sections.push((STATE_SECTION_NAMES[10], bytes[start..c.pos].to_vec()));
+
     if c.pos != bytes.len() {
         return Err(LoomError::corrupt("engine-state trailing bytes"));
     }
@@ -1310,15 +1462,29 @@ fn parse_registry_section(bytes: &[u8]) -> Result<Registry> {
     Registry::decode(reg_bytes)
 }
 
-fn content_section_map(entries: Vec<TreeEntry>) -> Result<BTreeMap<Digest, Digest>> {
+fn content_section_map_with_progress(
+    entries: Vec<TreeEntry>,
+    progress: &mut impl FnMut(EngineStateLoadProgress),
+) -> Result<BTreeMap<Digest, Digest>> {
     let mut content = BTreeMap::new();
-    for entry in entries {
+    let total = entries.len() as u64;
+    for (index, entry) in entries.into_iter().enumerate() {
+        progress(EngineStateLoadProgress {
+            stage: EngineStateLoadStage::Content,
+            completed: index as u64,
+            total: Some(total),
+        });
         if entry.kind != EntryKind::Tree {
             return Err(LoomError::corrupt("content section entry kind"));
         }
         let content_addr = Digest::parse(&entry.name)?;
         content.insert(content_addr, entry.target);
     }
+    progress(EngineStateLoadProgress {
+        stage: EngineStateLoadStage::Content,
+        completed: total,
+        total: Some(total),
+    });
     Ok(content)
 }
 

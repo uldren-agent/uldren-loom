@@ -323,7 +323,11 @@ impl LoomStore {
             &entity_ref,
             expected_root.as_deref(),
         );
-        let out = to_json(loom_pages::update_structure_node(&mut self.loom, ns, request))?;
+        let out = to_json(loom_pages::update_structure_node(
+            &mut self.loom,
+            ns,
+            request,
+        ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
     }

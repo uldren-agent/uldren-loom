@@ -10,10 +10,20 @@
 //!
 //! Licensed under BUSL-1.1.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use loom_client::{
+    LocalLoomClient,
+    local::{
+        LaneUpdateInput, apply_lanes_update, apply_pages_publish, apply_pages_update_text,
+        publish_document_put_text,
+    },
+    types::LoomSession,
+};
 use loom_coordination::with_local_store_write_lock;
 use loom_core::error::{Code, LoomError, Result};
 use loom_core::keys::KeySpec;
@@ -33,6 +43,37 @@ const STORE_WRITE_BUSY_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_millis(80),
     Duration::from_millis(160),
 ];
+
+#[cfg(test)]
+type DocumentPublicationTestHook = Box<dyn FnOnce() -> Result<()> + Send>;
+
+#[cfg(test)]
+static DOCUMENT_PUBLICATION_TEST_HOOK: Mutex<Option<DocumentPublicationTestHook>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn install_document_publication_test_hook(hook: DocumentPublicationTestHook) {
+    *DOCUMENT_PUBLICATION_TEST_HOOK
+        .lock()
+        .expect("document publication hook lock") = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn document_publication_pre_commit_hook() -> Result<()> {
+    let hook = DOCUMENT_PUBLICATION_TEST_HOOK
+        .lock()
+        .expect("document publication hook lock")
+        .take();
+    if let Some(hook) = hook {
+        hook()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+pub(crate) fn document_publication_pre_commit_hook() -> Result<()> {
+    Ok(())
+}
 
 pub mod apps;
 mod chat;
@@ -222,7 +263,18 @@ pub struct RemoteVectorSearchPolicy<'a> {
     pub pq_iters: u64,
 }
 
+pub struct GeneratedMcpCall {
+    pub operation: loom_remote_protocol::generated::GeneratedOperationId,
+    pub args_without_handle: Vec<loom_codec::Value>,
+}
+
+pub type GeneratedMcpFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<loom_codec::Value>> + Send + 'a>>;
+
 pub trait RemoteMcpBackend: Send + Sync {
+    /// Execute one generated unary IDL operation through the backend's generated client boundary.
+    fn execute_generated_operation(&self, call: GeneratedMcpCall) -> GeneratedMcpFuture<'_>;
+
     /// Workspaces create (`Workspaces.create`); returns the workspace id string.
     fn workspace_create(&self, name: Option<&str>, facet: Option<FacetKind>) -> Result<String>;
 
@@ -338,6 +390,23 @@ pub trait RemoteMcpBackend: Send + Sync {
     /// Full-text status (`Search.status`) as canonical-CBOR status bytes.
     fn search_status(&self, workspace: &str, name: &str, engine_version: &str) -> Result<Vec<u8>>;
 
+    fn store_bundle_import(&self, bundle: &[u8], dry_run: bool) -> Result<Vec<u8>> {
+        let _ = (bundle, dry_run);
+        Err(remote_local_handle_unsupported())
+    }
+    fn store_maintenance_status(&self, request: &[u8]) -> Result<Vec<u8>> {
+        let _ = request;
+        Err(remote_local_handle_unsupported())
+    }
+    fn store_maintenance_policy_set(&self, update: &[u8]) -> Result<Vec<u8>> {
+        let _ = update;
+        Err(remote_local_handle_unsupported())
+    }
+    fn store_maintenance_run(&self, request: &[u8]) -> Result<Vec<u8>> {
+        let _ = request;
+        Err(remote_local_handle_unsupported())
+    }
+
     /// Columnar create (`Columnar.create`) from the canonical-CBOR `columns` schema.
     fn columnar_create(
         &self,
@@ -376,6 +445,44 @@ pub trait RemoteMcpBackend: Send + Sync {
         aggregates: &[u8],
         filter: &[u8],
     ) -> Result<Vec<u8>>;
+    fn columnar_import_arrow(
+        &self,
+        workspace: &str,
+        name: &str,
+        payload: &[u8],
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> Result<Vec<u8>> {
+        let _ = (
+            workspace,
+            name,
+            payload,
+            target_segment_rows,
+            replace,
+            dry_run,
+        );
+        Err(remote_local_handle_unsupported())
+    }
+    fn columnar_import_parquet(
+        &self,
+        workspace: &str,
+        name: &str,
+        payload: &[u8],
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> Result<Vec<u8>> {
+        let _ = (
+            workspace,
+            name,
+            payload,
+            target_segment_rows,
+            replace,
+            dry_run,
+        );
+        Err(remote_local_handle_unsupported())
+    }
 
     /// Calendar create-collection (`Calendar.create_collection`) with canonical-CBOR `meta`.
     fn calendar_create_collection(
@@ -704,6 +811,18 @@ pub trait RemoteMcpBackend: Send + Sync {
         name: &str,
         args: RemoteVectorSearchPolicy<'_>,
     ) -> Result<Vec<u8>>;
+    fn vector_text_upsert(&self, request: &[u8]) -> Result<Vec<u8>> {
+        let _ = request;
+        Err(remote_local_handle_unsupported())
+    }
+    fn vector_workspace_configure_json(
+        &self,
+        workspace: &str,
+        request_json: &str,
+    ) -> Result<String> {
+        let _ = (workspace, request_json);
+        Err(remote_local_handle_unsupported())
+    }
 
     fn metrics_put_descriptor(&self, workspace: &str, descriptor: &[u8]) -> Result<()>;
     fn metrics_get_descriptor(&self, workspace: &str, name: &str) -> Result<Option<Vec<u8>>>;
@@ -1010,6 +1129,10 @@ pub trait RemoteMcpBackend: Send + Sync {
     /// SQL list-databases (`Sql.sql_list_databases`): the SQL database (collection) names. The backend
     /// decodes the canonical-CBOR text array so the MCP host's `read_collections` gets a `Vec<String>`.
     fn sql_list_databases(&self, workspace: &str) -> Result<Vec<String>>;
+    fn sql_exec_result(&self, workspace: &str, db: &str, sql: &str) -> Result<Vec<u8>> {
+        let _ = (workspace, db, sql);
+        Err(remote_local_handle_unsupported())
+    }
     /// List the collection names for `facet` in `workspace`, decoding the canonical-CBOR text array to a
     /// `Vec<String>`. Kv/Document/TimeSeries/Ledger forward to their `<facet>.list_collections` IDL method;
     /// Queue forwards to `Queue.list_streams`. SQL uses [`RemoteMcpBackend::sql_list_databases`] instead.
@@ -1162,8 +1285,67 @@ pub trait RemoteMcpBackend: Send + Sync {
     /// read-only result method and a timestamp-carrying commit are pending contract decisions).
     fn sql_exec(&self, workspace: &str, db: &str, sql: &str) -> Result<Vec<u8>>;
 
-    fn lanes_create(&self, workspace: &str, lane: loom_lanes::Lane) -> Result<loom_lanes::Lane> {
-        let _ = (workspace, lane);
+    fn workspace_id(&self, workspace: &str) -> Result<String> {
+        let _ = workspace;
+        Err(remote_local_handle_unsupported())
+    }
+
+    fn tickets_create_json(
+        &self,
+        workspace: &str,
+        request: loom_tickets::TicketCreateRequest<'_>,
+    ) -> Result<String>;
+
+    fn tickets_update_json(
+        &self,
+        workspace: &str,
+        request: loom_tickets::TicketUpdateRequest<'_>,
+    ) -> Result<String>;
+
+    fn tickets_get_json(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        ticket_id: &str,
+        projection: Option<&str>,
+    ) -> Result<String>;
+
+    fn tickets_list_json(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        query: &loom_tickets::TicketListQuery,
+    ) -> Result<serde_json::Value> {
+        let _ = (workspace, workspace_id, query);
+        Err(remote_local_handle_unsupported())
+    }
+
+    fn tickets_history_json(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        ticket_id: Option<&str>,
+    ) -> Result<Vec<loom_tickets::TicketHistoryRecord>> {
+        let _ = (workspace, workspace_id, ticket_id);
+        Err(remote_local_handle_unsupported())
+    }
+
+    fn lanes_create(&self, workspace: &str, lane: loom_lanes::Lane) -> Result<loom_lanes::Lane>;
+
+    fn lanes_get_view(
+        &self,
+        workspace: &str,
+        ticket_workspace_id: &str,
+        lane_id: &str,
+        detailed: bool,
+    ) -> Result<Option<loom_lanes::LaneView>>;
+
+    fn lanes_list_views_json(
+        &self,
+        workspace: &str,
+        ticket_workspace_id: &str,
+    ) -> Result<Vec<loom_lanes::LaneView>> {
+        let _ = (workspace, ticket_workspace_id);
         Err(remote_local_handle_unsupported())
     }
 
@@ -1191,11 +1373,10 @@ pub trait RemoteMcpBackend: Send + Sync {
         workspace: &str,
         lane_id: &str,
         ticket_id: &str,
-        placement: Option<&str>,
-        anchor: Option<&str>,
+        placement: loom_lanes::LaneTicketPlacement<'_>,
         updated_by: &str,
     ) -> Result<loom_lanes::Lane> {
-        let _ = (workspace, lane_id, ticket_id, placement, anchor, updated_by);
+        let _ = (workspace, lane_id, ticket_id, placement, updated_by);
         Err(remote_local_handle_unsupported())
     }
 
@@ -1230,6 +1411,58 @@ pub trait RemoteMcpBackend: Send + Sync {
             ),
         ))
     }
+
+    fn spaces_create(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        space_id: &str,
+        title: &str,
+        expected_root: Option<&str>,
+    ) -> Result<loom_pages::SpaceSummary>;
+
+    fn spaces_get_json(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        space_id: &str,
+    ) -> Result<Option<loom_pages::SpaceSummary>> {
+        let _ = (workspace, workspace_id, space_id);
+        Err(remote_local_handle_unsupported())
+    }
+
+    fn pages_create(
+        &self,
+        workspace: &str,
+        request: loom_pages::PageCreateRequest<'_>,
+    ) -> Result<loom_pages::PageSummary>;
+
+    fn pages_update_text(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        page_id: &str,
+        body_text: &str,
+        expected_root: Option<&str>,
+    ) -> Result<loom_pages::PageUpdateSummary>;
+
+    fn pages_publish(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        page_id: &str,
+        expected_root: Option<&str>,
+    ) -> Result<loom_pages::PagePublishSummary> {
+        let _ = (workspace, workspace_id, page_id, expected_root);
+        Err(remote_local_handle_unsupported())
+    }
+
+    fn pages_get(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        page_id: &str,
+    ) -> Result<Option<loom_pages::PageSummary>>;
 }
 
 /// The error returned when an MCP operation that needs a local `Loom<FileStore>` handle is attempted
@@ -1369,6 +1602,188 @@ impl StoreAccess {
                 )))
             }
             StoreAccess::Persistent(_) | StoreAccess::Remote(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn with_local_generated_client<T>(
+        &self,
+        f: impl FnOnce(&LocalLoomClient, &LoomSession) -> Result<T>,
+    ) -> Result<T> {
+        match self {
+            StoreAccess::PerRequest {
+                path,
+                auth,
+                daemon_session,
+                read_cache,
+            } => {
+                if let Some(session) = daemon_session {
+                    session.ensure_live()?;
+                }
+                *read_cache.lock().map_err(|_| lock_poisoned())? = None;
+                with_local_store_write_lock(path, || {
+                    let client = LocalLoomClient::new(path);
+                    let session = client.open_with_local_auth(auth, daemon_session.is_some())?;
+                    let outcome = f(&client, &session);
+                    let closed = client.close(&session);
+                    match (outcome, closed) {
+                        (Ok(value), true) => Ok(value),
+                        (Ok(_), false) => Err(LoomError::new(
+                            Code::Internal,
+                            "generated local client session close failed",
+                        )),
+                        (Err(error), _) => Err(error),
+                    }
+                })
+            }
+            StoreAccess::Persistent(_) => Err(LoomError::new(
+                Code::Unsupported,
+                "path-bound LocalLoomClient execution is unavailable for persistent MCP stores",
+            )),
+            StoreAccess::Remote(_) => Err(remote_local_handle_unsupported()),
+        }
+    }
+
+    pub(crate) fn local_pages_update_text(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        page_id: &str,
+        body_text: &str,
+        expected_root: Option<&str>,
+    ) -> Result<loom_pages::PageUpdateSummary> {
+        match self {
+            StoreAccess::PerRequest { .. } => {
+                self.with_local_generated_client(|client, session| {
+                    client.pages_update_summary(
+                        session,
+                        workspace,
+                        workspace_id,
+                        page_id,
+                        body_text,
+                        expected_root,
+                    )
+                })
+            }
+            StoreAccess::Persistent(_) => self.write_without_persist(|loom| {
+                apply_pages_update_text(
+                    loom,
+                    workspace,
+                    workspace_id,
+                    page_id,
+                    body_text,
+                    expected_root,
+                )
+            }),
+            StoreAccess::Remote(_) => Err(remote_local_handle_unsupported()),
+        }
+    }
+
+    pub(crate) fn local_pages_publish(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        page_id: &str,
+        expected_root: Option<&str>,
+    ) -> Result<loom_pages::PagePublishSummary> {
+        match self {
+            StoreAccess::PerRequest { .. } => {
+                self.with_local_generated_client(|client, session| {
+                    client.pages_publish_summary(
+                        session,
+                        workspace,
+                        workspace_id,
+                        page_id,
+                        expected_root,
+                    )
+                })
+            }
+            StoreAccess::Persistent(_) => self.write_without_persist(|loom| {
+                apply_pages_publish(loom, workspace, workspace_id, page_id, expected_root)
+            }),
+            StoreAccess::Remote(_) => Err(remote_local_handle_unsupported()),
+        }
+    }
+
+    pub(crate) fn local_document_put_text(
+        &self,
+        workspace: &str,
+        collection: &str,
+        id: &str,
+        text: &str,
+        expected_entity_tag: Option<&str>,
+    ) -> Result<loom_core::document::DocumentPutResult> {
+        let bytes = match self {
+            StoreAccess::PerRequest { .. } => {
+                self.with_local_generated_client(|client, session| {
+                    client.document_put_text(
+                        session,
+                        workspace,
+                        collection,
+                        id,
+                        text,
+                        expected_entity_tag,
+                    )
+                })?
+            }
+            StoreAccess::Persistent(_) => self.write_without_persist(|loom| {
+                publish_document_put_text(
+                    loom,
+                    workspace,
+                    collection,
+                    id,
+                    text,
+                    expected_entity_tag,
+                    |_| crate::document_publication_pre_commit_hook(),
+                )
+            })?,
+            StoreAccess::Remote(_) => return Err(remote_local_handle_unsupported()),
+        };
+        let (digest, entity_tag) = loom_wire::document::put_result_from_cbor(&bytes)?;
+        Ok(loom_core::document::DocumentPutResult {
+            digest: Digest::parse(&digest)?,
+            entity_tag,
+        })
+    }
+
+    pub(crate) fn local_lanes_update(
+        &self,
+        workspace: &str,
+        request: RemoteLaneUpdate<'_>,
+    ) -> Result<loom_lanes::Lane> {
+        match self {
+            StoreAccess::PerRequest { .. } => {
+                self.with_local_generated_client(|client, session| {
+                    client.lanes_update(
+                        session,
+                        workspace,
+                        LaneUpdateInput {
+                            lane_id: request.lane_id,
+                            title: request.title,
+                            description: request.description,
+                            lane_status: request.lane_status,
+                            status_report: request.status_report,
+                            reviewer_feedback: request.reviewer_feedback,
+                            updated_by: request.updated_by,
+                        },
+                    )
+                })
+            }
+            StoreAccess::Persistent(_) => self.write_without_persist(|loom| {
+                apply_lanes_update(
+                    loom,
+                    workspace,
+                    LaneUpdateInput {
+                        lane_id: request.lane_id,
+                        title: request.title,
+                        description: request.description,
+                        lane_status: request.lane_status,
+                        status_report: request.status_report,
+                        reviewer_feedback: request.reviewer_feedback,
+                        updated_by: request.updated_by,
+                    },
+                )
+            }),
+            StoreAccess::Remote(_) => Err(remote_local_handle_unsupported()),
         }
     }
 
@@ -1595,6 +2010,13 @@ impl StoreAccess {
     /// mutates, saves, and closes; in server mode it locks the held handle and saves.
     pub fn write<T>(&self, f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>) -> Result<T> {
         self.write_internal(true, f)
+    }
+
+    pub(crate) fn write_without_persist<T>(
+        &self,
+        f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>,
+    ) -> Result<T> {
+        self.write_internal(false, f)
     }
 
     pub(crate) fn write_durable_transaction<T>(

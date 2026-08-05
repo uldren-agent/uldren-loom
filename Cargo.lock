@@ -8575,6 +8575,7 @@ name = "uldren-loom-chat"
 version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
+ "serde_json",
  "uldren-loom-core",
  "uldren-loom-reference",
  "uldren-loom-store",
@@ -8586,6 +8587,7 @@ dependencies = [
 name = "uldren-loom-cli"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "clap",
  "ctrlc",
@@ -8625,6 +8627,7 @@ dependencies = [
  "uldren-loom-reference",
  "uldren-loom-remote-client",
  "uldren-loom-remote-protocol",
+ "uldren-loom-result",
  "uldren-loom-sql",
  "uldren-loom-store",
  "uldren-loom-substrate",
@@ -8645,21 +8648,28 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "futures-core",
  "getrandom 0.4.3",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
+ "time",
  "uldren-loom-chat",
  "uldren-loom-codec",
  "uldren-loom-compute",
  "uldren-loom-core",
+ "uldren-loom-drive",
+ "uldren-loom-inference",
  "uldren-loom-interchange",
  "uldren-loom-interchange-io",
  "uldren-loom-lanes",
+ "uldren-loom-lifecycle",
  "uldren-loom-pages",
  "uldren-loom-reference",
  "uldren-loom-remote-protocol",
  "uldren-loom-result",
  "uldren-loom-sql",
  "uldren-loom-store",
+ "uldren-loom-substrate",
  "uldren-loom-tickets",
  "uldren-loom-types",
  "uldren-loom-wire",
@@ -8712,6 +8722,7 @@ dependencies = [
  "hex",
  "serde_json",
  "uldren-loom-chat",
+ "uldren-loom-client",
  "uldren-loom-codec",
  "uldren-loom-compute",
  "uldren-loom-core",
@@ -8813,12 +8824,17 @@ dependencies = [
 name = "uldren-loom-ffi"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "futures",
  "getrandom 0.4.3",
  "hex",
  "libloading 0.8.9",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
+ "time",
  "uldren-loom-chat",
+ "uldren-loom-client",
  "uldren-loom-codec",
  "uldren-loom-compute",
  "uldren-loom-core",
@@ -8835,6 +8851,7 @@ dependencies = [
  "uldren-loom-types",
  "uldren-loom-wire",
  "wat",
+ "zip",
 ]
 
 [[package]]
@@ -8886,6 +8903,7 @@ dependencies = [
  "tonic-prost",
  "tower",
  "uldren-loom-chat",
+ "uldren-loom-client",
  "uldren-loom-codec",
  "uldren-loom-compute",
  "uldren-loom-coordination",
@@ -8919,6 +8937,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "axum",
  "futures-util",
+ "getrandom 0.4.3",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -9073,6 +9092,7 @@ dependencies = [
  "uldren-loom-lifecycle",
  "uldren-loom-pages",
  "uldren-loom-reference",
+ "uldren-loom-remote-protocol",
  "uldren-loom-sql",
  "uldren-loom-store",
  "uldren-loom-substrate",
@@ -9143,14 +9163,29 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tower",
+ "uldren-loom-chat",
  "uldren-loom-client",
+ "uldren-loom-codec",
  "uldren-loom-core",
+ "uldren-loom-drive",
  "uldren-loom-hosted",
+ "uldren-loom-hosted-core",
+ "uldren-loom-inference",
+ "uldren-loom-interchange",
  "uldren-loom-lanes",
+ "uldren-loom-lifecycle",
+ "uldren-loom-locator",
  "uldren-loom-mcp",
+ "uldren-loom-pages",
+ "uldren-loom-reference",
+ "uldren-loom-remote-client",
+ "uldren-loom-remote-protocol",
  "uldren-loom-store",
  "uldren-loom-substrate",
+ "uldren-loom-tickets",
+ "uldren-loom-types",
  "uldren-loom-wire",
+ "zip",
 ]
 
 [[package]]
@@ -9186,9 +9221,11 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "uldren-loom-chat",
  "uldren-loom-client",
  "uldren-loom-codec",
  "uldren-loom-core",
+ "uldren-loom-drive",
  "uldren-loom-hosted-core",
  "uldren-loom-locator",
  "uldren-loom-remote-protocol",
@@ -9196,6 +9233,7 @@ dependencies = [
  "uldren-loom-store",
  "uldren-loom-tickets",
  "uldren-loom-types",
+ "uldren-loom-wire",
 ]
 
 [[package]]
@@ -9206,6 +9244,7 @@ version = "0.1.0-alpha.1"
 name = "uldren-loom-remote-protocol"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "blake3",
  "futures-core",
  "thiserror 2.0.18",
  "uldren-loom-codec",
@@ -9265,6 +9304,7 @@ name = "uldren-loom-substrate"
 version = "0.1.0-alpha.1"
 dependencies = [
  "chrono",
+ "serde",
  "serde_json",
  "uldren-loom-codec",
  "uldren-loom-core",

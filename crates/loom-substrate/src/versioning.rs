@@ -706,10 +706,14 @@ pub fn persist_current_revision_index_with_owner_state_and_writes<S: ObjectStore
             actor: loom.effective_principal()?.unwrap_or(workspace),
             expected_generation: Some(expected_generation),
             writes,
+            prepared_operations: Vec::new(),
+            revision_metadata: Vec::new(),
+            delivery_intents: Vec::new(),
             durability: OverlayDurabilityPolicy::Normal,
             boundary: AtomicityBoundary::Single,
             idempotency,
             owner_state,
+            post_commit_delta: None,
         })?;
     for outcome in receipt.writes {
         let current = loom
@@ -750,10 +754,14 @@ pub fn persist_revision_index_append_with_owner_state_and_writes<S: ObjectStore>
             actor: loom.effective_principal()?.unwrap_or(workspace),
             expected_generation: Some(expected_generation),
             writes,
+            prepared_operations: Vec::new(),
+            revision_metadata: Vec::new(),
+            delivery_intents: Vec::new(),
             durability: OverlayDurabilityPolicy::Normal,
             boundary: AtomicityBoundary::Single,
             idempotency,
             owner_state,
+            post_commit_delta: None,
         })?;
     for outcome in receipt.writes {
         let current = loom
@@ -1632,6 +1640,12 @@ mod tests {
                 generation,
                 root_after: Digest::blake3(&generation.as_u64().to_be_bytes()),
                 writes: outcomes,
+                operation_identities: Vec::new(),
+                revision_identities: Vec::new(),
+                audit_sequences: Vec::new(),
+                retained_sequences: Vec::new(),
+                delivery_receipts: Vec::new(),
+                post_commit_delta: None,
                 replayed: false,
             })
         }

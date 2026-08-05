@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use super::ObjectStore;
-use crate::digest::Digest;
+use crate::digest::{Algo, Digest};
 use crate::error::Result;
 
 /// A simple, deterministic in-memory [`ObjectStore`]. Interior mutability via a `Mutex`, so the store
@@ -30,6 +30,13 @@ impl MemoryStore {
     /// Create an empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn objects(&self) -> Vec<(Digest, Vec<u8>)> {
+        self.lock()
+            .iter()
+            .map(|(digest, bytes)| (Digest::of(Algo::Blake3, *digest), bytes.clone()))
+            .collect()
     }
 
     fn lock(

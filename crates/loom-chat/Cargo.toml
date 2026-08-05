@@ -14,6 +14,10 @@ name = "loom_chat"
 [lints]
 workspace = true
 
+[features]
+default = []
+test-clock = []
+
 [dependencies]
 loom-core.workspace = true
 loom-reference.workspace = true
@@ -21,3 +25,4 @@ loom-store.workspace = true
 loom-substrate = { workspace = true, features = ["studio-slackish"] }
 loom-tickets.workspace = true
 serde.workspace = true
+serde_json.workspace = true

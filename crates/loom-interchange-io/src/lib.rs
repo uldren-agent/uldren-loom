@@ -6,8 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use flate2::{Compression, GzBuilder};
 use loom_codec::Value as CborValue;
 use loom_core::{
-    AclRight, Bundle, ColumnType, FacetKind, FileKind, Loom, ObjectStore, Predicate, Schema, Table,
-    Value, bundle_export, bundle_import, get_table, put_table,
+    AclRight, Bundle, ColumnType, FacetKind, FacetWrite, FileKind, Loom, ObjectStore, Predicate,
+    Schema, Table, Value, WorkflowOwnerState, bundle_export, bundle_import, get_table, put_table,
 };
 use loom_interchange::{
     ArchiveEntry, ArchiveEntryKind, ArchiveKind, ArchiveManifest, ExportReport, FidelityIssue,
@@ -23,7 +23,8 @@ use loom_substrate::meetings::{
 };
 use loom_substrate::versioning::{
     BodyRef, ProfileRevisionUpdate, ProfileTransaction, ProfileTransactionState, RevisionIndex,
-    load_current_revision_index, persist_current_revision_index_with_owner_state,
+    current_revision_index_write, load_current_revision_index,
+    persist_current_revision_index_with_owner_state,
 };
 use loom_types::{Algo, Code, Digest, LoomError, Result, WorkspaceId};
 use zip::result::ZipError;
@@ -1029,6 +1030,18 @@ pub struct MeetingsImportResult {
     pub payload_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetingsImportPlan {
+    pub workspace_id: WorkspaceId,
+    pub report: ImportReport,
+    pub report_json: String,
+    pub changed: bool,
+    pub payload_bytes: u64,
+    pub engine_state: Vec<u8>,
+    pub writes: Vec<FacetWrite>,
+    pub owner_state: WorkflowOwnerState,
+}
+
 pub fn import_report_json(report: &ImportReport) -> Result<String> {
     let json = serde_json::json!({
         "profile": &report.profile,
@@ -1052,6 +1065,262 @@ pub fn import_report_json(report: &ImportReport) -> Result<String> {
         })).collect::<Vec<_>>()
     });
     serde_json::to_string(&json).map_err(|e| LoomError::invalid(e.to_string()))
+}
+
+pub fn import_report_from_json(json: &str) -> Result<ImportReport> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| LoomError::invalid(e.to_string()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| LoomError::invalid("import report must be a JSON object"))?;
+    let commit = match object.get("commit") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(serde_json::Value::String(value)) => Some(Digest::parse(value)?),
+        Some(_) => {
+            return Err(LoomError::invalid(
+                "import report commit must be null or string",
+            ));
+        }
+    };
+    let mut report = ImportReport::new(ImportReportInput {
+        profile: import_report_json_string_field(object, "profile")?,
+        source_scope: import_report_json_string_field(object, "source_scope")?,
+        commit,
+        objects_added: import_report_json_u64_field(object, "objects_added")?,
+        bytes_in: import_report_json_u64_field(object, "bytes_in")?,
+        bytes_stored: import_report_json_u64_field(object, "bytes_stored")?,
+        rows_imported: import_report_json_u64_field(object, "rows_imported")?,
+        skipped: import_report_json_u64_field(object, "skipped")?,
+        operations_planned: import_report_json_u64_field(object, "operations_planned")?,
+        operations_applied: import_report_json_u64_field(object, "operations_applied")?,
+        dry_run: import_report_json_bool_field(object, "dry_run")?,
+    })?;
+    report.warnings = import_report_json_string_array_field(object, "warnings")?;
+    report.fidelity_issues =
+        import_report_json_fidelity_issue_array_field(object, "fidelity_issues")?;
+    report.encode()?;
+    Ok(report)
+}
+
+fn import_report_json_string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| LoomError::invalid(format!("import report {field} must be a string")))
+}
+
+fn import_report_json_u64_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<u64> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| LoomError::invalid(format!("import report {field} must be a u64")))
+}
+
+fn import_report_json_bool_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<bool> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| LoomError::invalid(format!("import report {field} must be a bool")))
+}
+
+fn import_report_json_string_array_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Vec<String>> {
+    let array = object
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| LoomError::invalid(format!("import report {field} must be an array")))?;
+    array
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                LoomError::invalid(format!("import report {field} entries must be strings"))
+            })
+        })
+        .collect()
+}
+
+fn import_report_json_fidelity_issue_array_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Vec<FidelityIssue>> {
+    let array = object
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| LoomError::invalid(format!("import report {field} must be an array")))?;
+    array
+        .iter()
+        .map(|value| {
+            let issue = value.as_object().ok_or_else(|| {
+                LoomError::invalid(format!("import report {field} entries must be objects"))
+            })?;
+            let severity = match import_report_json_string_field(issue, "severity")? {
+                "Info" => FidelitySeverity::Info,
+                "Warning" => FidelitySeverity::Warning,
+                "Error" => FidelitySeverity::Error,
+                other => {
+                    return Err(LoomError::invalid(format!(
+                        "import report fidelity severity {other:?} is unsupported"
+                    )));
+                }
+            };
+            let mut out = FidelityIssue::new(
+                severity,
+                import_report_json_string_field(issue, "source_entity_id")?,
+                import_report_json_string_field(issue, "field")?,
+                import_report_json_string_field(issue, "reason")?,
+            )?;
+            out.source_digest = match issue.get("source_digest") {
+                Some(serde_json::Value::Null) | None => None,
+                Some(serde_json::Value::String(value)) => Some(Digest::parse(value)?),
+                Some(_) => {
+                    return Err(LoomError::invalid(
+                        "import report source_digest must be null or string",
+                    ));
+                }
+            };
+            Ok(out)
+        })
+        .collect()
+}
+
+pub fn plan_meetings_import<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace_id: WorkspaceId,
+    input_profile: InputProfile,
+    bytes: &[u8],
+    previous: Option<MeetingsProfileSnapshot>,
+    dry_run: bool,
+) -> Result<MeetingsImportPlan> {
+    let profile_id = workspace_id.to_string();
+    let imported = parse_meetings_import_snapshot(loom, &profile_id, input_profile, bytes)?;
+    let ParsedMeetingsImport {
+        snapshot: imported_snapshot,
+        checkpoint: mut imported_checkpoint,
+        payloads,
+        source_scope,
+        rows_imported,
+        operations_planned,
+    } = imported;
+    let key = meetings_profile_key(&profile_id)?;
+    let next = match previous {
+        Some(ref previous) => merge_meetings_snapshot(previous.clone(), imported_snapshot)?,
+        None => imported_snapshot,
+    };
+    let encoded = next.encode()?;
+    imported_checkpoint.profile_state_digest =
+        Some(Digest::hash(loom.store().digest_algo(), &encoded));
+    let checkpoint_encoded = imported_checkpoint.encode()?;
+    let changed = previous
+        .as_ref()
+        .map(MeetingsProfileSnapshot::encode)
+        .transpose()?
+        .as_deref()
+        != Some(encoded.as_slice());
+    let payload_bytes = if dry_run {
+        0
+    } else {
+        materialize_meetings_import_payloads(loom, workspace_id, &payloads)?
+    };
+    let mut writes = Vec::new();
+    let mut owner_state = WorkflowOwnerState::default();
+    if !dry_run && (changed || payload_bytes > 0) {
+        if changed {
+            let revision_index = next_meetings_revision_index(
+                loom,
+                workspace_id,
+                &profile_id,
+                previous.as_ref(),
+                &next,
+                &encoded,
+            )?;
+            let (write, mut revision_controls) = current_revision_index_write(
+                loom,
+                workspace_id,
+                &profile_id,
+                FacetKind::Document,
+                &revision_index,
+            )?;
+            writes.push(write);
+            owner_state.controls.append(&mut revision_controls);
+            owner_state.controls.extend([
+                loom_core::WorkflowControlWrite::Put {
+                    key,
+                    payload: encoded.clone(),
+                },
+                loom_core::WorkflowControlWrite::Put {
+                    key: meetings_import_checkpoint_key(
+                        &profile_id,
+                        &imported_checkpoint.checkpoint_id,
+                    ),
+                    payload: checkpoint_encoded,
+                },
+            ]);
+            owner_state.audits.extend([
+                loom_core::WorkflowAuditWrite {
+                    principal: Some(workspace_id),
+                    action: "meetings.import".to_string(),
+                    target: Some(profile_id.clone()),
+                },
+                loom_core::WorkflowAuditWrite {
+                    principal: Some(workspace_id),
+                    action: "meetings.import.checkpoint".to_string(),
+                    target: Some(imported_checkpoint.checkpoint_id.clone()),
+                },
+            ]);
+        }
+        let (reference_root, objects) = loom.save_state_objects()?;
+        owner_state.objects = objects;
+        owner_state.reference = loom_core::WorkflowReferenceUpdate::Set(Some(reference_root));
+    }
+    let mut report = ImportReport::new(ImportReportInput {
+        profile: "meetings",
+        source_scope: &source_scope,
+        commit: None,
+        objects_added: 0,
+        bytes_in: bytes.len() as u64,
+        bytes_stored: if dry_run {
+            0
+        } else {
+            encoded.len() as u64 + payload_bytes
+        },
+        rows_imported,
+        skipped: 0,
+        operations_planned,
+        operations_applied: if dry_run || !changed {
+            0
+        } else {
+            operations_planned
+        },
+        dry_run,
+    })?;
+    if !changed {
+        report
+            .warnings
+            .push("meetings snapshot already current".to_string());
+    }
+    let report_json = import_report_json(&report)?;
+    let engine_state = loom.export_state();
+    Ok(MeetingsImportPlan {
+        workspace_id,
+        report,
+        report_json,
+        changed,
+        payload_bytes,
+        engine_state,
+        writes,
+        owner_state,
+    })
 }
 
 struct ParsedMeetingsImport {
@@ -1199,8 +1468,8 @@ pub fn load_meetings_snapshot(
         .transpose()
 }
 
-fn parse_meetings_import_snapshot(
-    loom: &Loom<FileStore>,
+fn parse_meetings_import_snapshot<S: ObjectStore>(
+    loom: &Loom<S>,
     profile_id: &str,
     input_profile: InputProfile,
     bytes: &[u8],
@@ -1446,8 +1715,8 @@ fn parse_meetings_import_snapshot(
     })
 }
 
-fn materialize_meetings_import_payloads(
-    loom: &mut Loom<FileStore>,
+fn materialize_meetings_import_payloads<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace_id: WorkspaceId,
     payloads: &[MeetingsImportPayload],
 ) -> Result<u64> {
@@ -1502,8 +1771,8 @@ fn path_token(value: &str) -> String {
     out
 }
 
-struct ImportAnnotationContext<'a> {
-    loom: &'a Loom<FileStore>,
+struct ImportAnnotationContext<'a, S: ObjectStore> {
+    loom: &'a Loom<S>,
     item: &'a MeetingsImportItemJson,
     meeting_id: &'a str,
     source_id: &'a str,
@@ -1511,7 +1780,7 @@ struct ImportAnnotationContext<'a> {
 }
 
 fn append_import_annotations(
-    context: ImportAnnotationContext<'_>,
+    context: ImportAnnotationContext<'_, impl ObjectStore>,
     spans: &mut Vec<SpanRecord>,
     annotations: &mut Vec<AnnotationRecord>,
 ) -> Result<()> {
@@ -1615,7 +1884,7 @@ fn append_import_annotations(
 }
 
 fn append_import_structured_annotations(
-    context: &ImportAnnotationContext<'_>,
+    context: &ImportAnnotationContext<'_, impl ObjectStore>,
     spans: &mut Vec<SpanRecord>,
     annotations: &mut Vec<AnnotationRecord>,
     kind: &str,
@@ -1660,7 +1929,7 @@ fn append_import_structured_annotations(
 }
 
 fn source_span_ids_for_annotation(
-    context: &ImportAnnotationContext<'_>,
+    context: &ImportAnnotationContext<'_, impl ObjectStore>,
     field_name: &str,
     index: usize,
     explicit_ids: Option<&[String]>,
@@ -1757,8 +2026,8 @@ fn merge_meetings_snapshot(
     )
 }
 
-fn next_meetings_revision_index(
-    loom: &Loom<FileStore>,
+fn next_meetings_revision_index<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     profile_id: &str,
     previous: Option<&MeetingsProfileSnapshot>,
@@ -1955,6 +2224,38 @@ impl ArchiveImportOptions {
 pub struct ArchiveImportResult {
     pub manifest: ArchiveManifest,
     pub report: ImportReport,
+}
+
+impl ArchiveImportResult {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let manifest = loom_codec::Value::Array(vec![
+            loom_codec::Value::Text(self.manifest.archive_id.clone()),
+            loom_codec::Value::Text(archive_kind_name(self.manifest.kind).to_string()),
+            loom_codec::Value::Text(self.manifest.root_digest.to_string()),
+            loom_codec::Value::Array(
+                self.manifest
+                    .entries
+                    .iter()
+                    .map(ArchiveEntry::to_value)
+                    .collect(),
+            ),
+        ]);
+        loom_codec::encode(&loom_codec::Value::Array(vec![
+            manifest,
+            self.report.to_value(),
+        ]))
+        .map_err(|e| LoomError::invalid(e.to_string()))
+    }
+}
+
+fn archive_kind_name(kind: ArchiveKind) -> &'static str {
+    match kind {
+        ArchiveKind::Zip => "zip",
+        ArchiveKind::Tar => "tar",
+        ArchiveKind::Gzip => "gzip",
+        ArchiveKind::TarZstd => "tar-zstd",
+        ArchiveKind::TarGzip => "tar-gzip",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3954,7 +4255,9 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
-    use loom_core::{AclEffect, AclGrant, AclScope, AclSubject, IdentityStore, Loom, MemoryStore};
+    use loom_core::{
+        AclEffect, AclGrant, AclScope, AclSubject, IdentityStore, Loom, MemoryStore, Object,
+    };
     use std::fs::File;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
@@ -3977,6 +4280,45 @@ mod tests {
             .unwrap();
         loom.set_identity_store(identity);
         loom.set_session(session.id);
+    }
+
+    fn commit_object(loom: &Loom<MemoryStore>, digest: Digest) -> loom_core::Commit {
+        let bytes = loom.store().get(&digest).unwrap().unwrap();
+        match Object::decode(&bytes).unwrap() {
+            Object::Commit(commit) => commit,
+            other => panic!("expected commit, got {:?}", other.object_type()),
+        }
+    }
+
+    #[test]
+    fn import_report_json_round_trips_every_field() {
+        let commit = Digest::hash(Algo::Blake3, b"commit");
+        let source_digest = Digest::hash(Algo::Blake3, b"source");
+        let mut report = ImportReport::new(ImportReportInput {
+            profile: "meetings",
+            source_scope: "snapshot.json",
+            commit: Some(commit),
+            objects_added: 1,
+            bytes_in: 2,
+            bytes_stored: 3,
+            rows_imported: 4,
+            skipped: 5,
+            operations_planned: 6,
+            operations_applied: 7,
+            dry_run: true,
+        })
+        .unwrap();
+        report.warnings.push("warn".to_string());
+        let mut issue =
+            FidelityIssue::new(FidelitySeverity::Warning, "source-1", "field-1", "reason-1")
+                .unwrap();
+        issue.source_digest = Some(source_digest);
+        report.fidelity_issues.push(issue);
+
+        let json = import_report_json(&report).unwrap();
+        let decoded = import_report_from_json(&json).unwrap();
+
+        assert_eq!(decoded, report);
     }
 
     #[test]
@@ -5558,12 +5900,17 @@ mod tests {
         let ns = create_test_workspace(&mut loom, 1);
         let mut options = FsImportOptions::new("temp");
         options.commit = true;
+        options.author = "filesystem author".to_string();
+        options.message = "filesystem message".to_string();
         let report = import_fs(&mut loom, ns, &temp, &options).unwrap();
 
         assert_eq!(report.operations_planned, 4);
         assert_eq!(report.operations_applied, 4);
         assert!(report.objects_added > 0);
         assert!(report.commit.is_some());
+        let commit = commit_object(&loom, report.commit.unwrap());
+        assert_eq!(commit.author, "filesystem author");
+        assert_eq!(commit.message, "filesystem message");
         assert_eq!(loom.read_file(ns, "README.md").unwrap(), b"hello");
         assert_eq!(loom.read_file(ns, "docs/a.txt").unwrap(), b"a");
         assert!(loom.exists(ns, "docs/empty").unwrap());
@@ -6000,18 +6347,22 @@ mod tests {
 
         let mut loom = Loom::new(MemoryStore::new());
         let ns = create_test_workspace(&mut loom, 6);
-        let result = import_archive(
-            &mut loom,
-            ns,
-            &archive,
-            ArchiveKind::Gzip,
-            &ArchiveImportOptions::new("notes.txt.gz"),
-        )
-        .unwrap();
+        let mut options = ArchiveImportOptions::new("notes.txt.gz");
+        options.gzip_output_path = Some("custom/notes.txt".to_string());
+        options.commit = true;
+        options.author = "archive author".to_string();
+        options.message = "archive message".to_string();
+        let result = import_archive(&mut loom, ns, &archive, ArchiveKind::Gzip, &options).unwrap();
 
         assert_eq!(result.manifest.kind, ArchiveKind::Gzip);
-        assert_eq!(result.manifest.entries[0].path, "notes.txt");
-        assert_eq!(loom.read_file(ns, "notes.txt").unwrap(), b"compressed");
+        assert_eq!(result.manifest.entries[0].path, "custom/notes.txt");
+        assert_eq!(
+            loom.read_file(ns, "custom/notes.txt").unwrap(),
+            b"compressed"
+        );
+        let commit = commit_object(&loom, result.report.commit.unwrap());
+        assert_eq!(commit.author, "archive author");
+        assert_eq!(commit.message, "archive message");
 
         fs::remove_dir_all(temp).unwrap();
     }

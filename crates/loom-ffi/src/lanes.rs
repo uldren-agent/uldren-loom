@@ -3,6 +3,13 @@
 use super::*;
 use loom_lanes::{Lane, LaneStatus};
 
+pub type LoomLaneTicketPlacement = i32;
+
+pub const LOOM_LANE_TICKET_PLACEMENT_FIRST: LoomLaneTicketPlacement = 1;
+pub const LOOM_LANE_TICKET_PLACEMENT_LAST: LoomLaneTicketPlacement = 2;
+pub const LOOM_LANE_TICKET_PLACEMENT_BEFORE: LoomLaneTicketPlacement = 3;
+pub const LOOM_LANE_TICKET_PLACEMENT_AFTER: LoomLaneTicketPlacement = 4;
+
 fn ensure_lanes_ns(loom: &mut Loom<FileStore>, workspace: &str) -> LoomResult<WorkspaceId> {
     let selector = match WorkspaceId::parse(workspace) {
         Ok(id) => WsSelector::Id(id),
@@ -99,6 +106,39 @@ fn lanes_delete_ns(
     let lane = loom_lanes::delete_lane(&mut loom, ns, lane_id, now_ms(), updated_by)?;
     save_loom(&mut loom)?;
     lane.encode()
+}
+
+fn ffi_lane_ticket_placement<'a>(
+    placement: LoomLaneTicketPlacement,
+    anchor: Option<&'a str>,
+) -> LoomResult<loom_lanes::LaneTicketPlacement<'a>> {
+    match placement {
+        0 | LOOM_LANE_TICKET_PLACEMENT_LAST => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(LoomError::invalid(
+                    "placement 'LAST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::Last)
+        }
+        LOOM_LANE_TICKET_PLACEMENT_FIRST => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(LoomError::invalid(
+                    "placement 'FIRST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::First)
+        }
+        LOOM_LANE_TICKET_PLACEMENT_BEFORE => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::Before)
+            .ok_or_else(|| LoomError::invalid("placement 'BEFORE' requires an anchor ticket id")),
+        LOOM_LANE_TICKET_PLACEMENT_AFTER => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::After)
+            .ok_or_else(|| LoomError::invalid("placement 'AFTER' requires an anchor ticket id")),
+        _ => Err(LoomError::invalid("unknown lane ticket placement")),
+    }
 }
 
 fn update_lane_metadata(lane: &mut Lane, updated_by: &str) {
@@ -488,14 +528,14 @@ pub unsafe extern "C" fn loom_lanes_update_cbor(
 /// Add a ticket to the lane at the position selected by `placement` and return the updated lane as
 /// canonical CBOR.
 ///
-/// `placement` is a public placement verb: null or empty means `LAST`; `FIRST`; `BEFORE`/`AFTER`
-/// require a non-empty `anchor` ticket id. A null `anchor` is treated as absent. Ordering is never
-/// caller-supplied; callers choose only where the ticket lands.
+/// `placement` is a `LoomLaneTicketPlacement` value. Passing `0` means `LAST`; `BEFORE` and `AFTER`
+/// require a non-empty `anchor` ticket id. `FIRST` and `LAST` reject an anchor. A null `anchor` is
+/// treated as absent. Ordering is never caller-supplied; callers choose only where the ticket lands.
 ///
 /// # Safety
 /// `handle` must be from [`loom_open`]; `workspace`, `lane_id`, `ticket_id`, and `updated_by` must be
-/// valid C strings; `placement` and `anchor` must be null or valid C strings; `out_ptr` and `out_len`
-/// must be writable when non-null.
+/// valid C strings; `anchor` must be null or a valid C string; `out_ptr` and `out_len` must be
+/// writable when non-null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn loom_lanes_ticket_add_cbor(
     handle: *mut LoomSession,
@@ -503,7 +543,7 @@ pub unsafe extern "C" fn loom_lanes_ticket_add_cbor(
     lane_id: *const c_char,
     ticket_id: *const c_char,
     updated_by: *const c_char,
-    placement: *const c_char,
+    placement: LoomLaneTicketPlacement,
     anchor: *const c_char,
     out_ptr: *mut *mut c_uchar,
     out_len: *mut usize,
@@ -514,17 +554,12 @@ pub unsafe extern "C" fn loom_lanes_ticket_add_cbor(
     let lane_id = arg_str!(lane_id, "loom_lanes_ticket_add_cbor");
     let ticket_id = arg_str!(ticket_id, "loom_lanes_ticket_add_cbor");
     let updated_by = arg_str!(updated_by, "loom_lanes_ticket_add_cbor");
-    // A null placement pointer defaults to LAST.
-    let placement = match unsafe { lane_optional_field(placement, "loom_lanes_ticket_add_cbor") } {
-        Ok(value) => value.unwrap_or(""),
-        Err(e) => return fail(e),
-    };
     // A null anchor pointer is treated as absent (None).
     let anchor = match unsafe { lane_optional_field(anchor, "loom_lanes_ticket_add_cbor") } {
         Ok(value) => value,
         Err(e) => return fail(e),
     };
-    let placement = match loom_lanes::LaneTicketPlacement::parse(placement, anchor) {
+    let placement = match ffi_lane_ticket_placement(placement, anchor) {
         Ok(placement) => placement,
         Err(e) => return fail(e),
     };

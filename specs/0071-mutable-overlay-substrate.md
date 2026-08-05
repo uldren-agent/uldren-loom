@@ -334,6 +334,174 @@ traverse current entries without scanning every historical/control record. A sto
 current-state root may be handled only by a controlled migration path; normal open must not keep a
 permanent scan fallback.
 
+### 10.1 Canonical RegionTable and mutable root catalog
+
+The canonical mutable root layout is the single post-migration format for the 0071 mutable substrate.
+It replaces the mixed `overlay_root` authority with a direct current-state root and a typed catalog of
+family roots. The superblock and journal continue to point at one RegionTable page, so publication and
+recovery still swap one root-set pointer.
+
+The current source anchors for this replacement are: `crates/loom-store/src/page.rs:50` for the
+existing RegionTable fields, `crates/loom-store/src/page.rs:59` and `crates/loom-store/src/page.rs:85`
+for RegionTable encode/decode, `crates/loom-store/src/superblock.rs:14` and
+`crates/loom-store/src/journal.rs:30` for the committed root-set carriers, and
+`crates/loom-store/src/lib.rs:131` through `crates/loom-store/src/lib.rs:140` for the current mixed
+mutable overlay record-family address prefixes.
+
+All integers below are little-endian. Root slots use `present(1) + page_id(8)`. `present = 0` means
+absent and requires `page_id = 0`. `present = 1` means the page id is present. Other `present` values
+are corrupt. A present page id is validated against the committed page count by the decoder or caller
+that has the root set.
+
+The RegionTable is exactly one 4096-byte page:
+
+| Offset | Length | Field | Canonical value or rule |
+| ---: | ---: | --- | --- |
+| 0 | 4 | magic | ASCII `LRT5` |
+| 4 | 2 | layout_version | `5` |
+| 6 | 2 | layout_len | `4096` |
+| 8 | 8 | page_size_long | `4096` |
+| 16 | 9 | `index_root` | Object digest to `RecordLoc` index root. |
+| 25 | 9 | `freemap_root` | Persisted free-page map root. |
+| 34 | 9 | `maintenance_root` | Conservative maintenance metadata root. |
+| 43 | 9 | `current_record_root` | Direct current-state mutable record root. This is the only root normal cold open hydrates for current overlay records. |
+| 52 | 9 | `root_catalog_root` | Mutable root-catalog page root. Absent means all catalog families are absent. |
+| 61 | 8 | `open_segment` | Current open segment. |
+| 69 | 8 | `mutable_overlay_generation_floor` | Lowest canonical mutable generation accepted after activation. |
+| 77 | 8 | `metadata_bootstrap_capacity` | Source-defined hard capacity in pages. It must equal the current canonical capacity. |
+| 85 | 8 | `metadata_bootstrap_owning_generation` | Generation that owns the descriptor. |
+| 93 | 2 | `metadata_bootstrap_extent_count` | Number of sorted reserve extents, maximum `249`. |
+| 95 | 1 | reserved | Must be zero. |
+| 96 | `extent_count * 16` | metadata bootstrap extents | Each extent is `start_page(8) + page_count(8)`. Extents have nonzero length, are strictly ordered, coalesced, non-overlapping, and bounded by committed page count. Their total length cannot exceed capacity. |
+| `96 + extent_count * 16` | variable | reserved | Must be zero through offset `4092`. |
+| 4092 | 4 | crc32c | CRC-32C over bytes `[0, 4092)`. |
+
+The 4096-byte root catalog is stored at `root_catalog_root` when any catalog family is present.
+Catalog family absence has exactly one canonical representation: omit the family entry. An encoded
+catalog entry always carries a present nonzero root.
+
+| Offset | Length | Field | Canonical value or rule |
+| ---: | ---: | --- | --- |
+| 0 | 8 | magic | ASCII `LROOTC1\0` |
+| 8 | 2 | layout_version | `1` |
+| 10 | 2 | entry_size | `32` |
+| 12 | 2 | entry_count | Number of entries, maximum `126`. |
+| 14 | 2 | catalog_flags | `0` for this layout. |
+| 16 | 16 | reserved | Must be zero. |
+| 32 | `entry_count * 32` | entries | Fixed-size entries sorted by ascending `family_id`. |
+| `32 + entry_count * 32` | variable | reserved | Must be zero through offset `4092`. |
+| 4092 | 4 | crc32c | CRC-32C over bytes `[0, 4092)`. |
+
+Each catalog entry is exactly 32 bytes:
+
+| Entry offset | Length | Field | Canonical value or rule |
+| ---: | ---: | --- | --- |
+| 0 | 2 | `family_id` | Stable family id from the registry below. Entries are strictly sorted by this value. |
+| 2 | 2 | `family_flags` | `0x0001 = authoritative`, `0x0002 = advisory`. Exactly one of these bits must be set. Other bits are reserved and must be zero. |
+| 4 | 9 | `root` | Root slot for this family. It must have `present = 1` and a nonzero `page_id`. |
+| 13 | 19 | reserved | Must be zero. |
+
+Duplicate family ids are corrupt. Out-of-order entries are corrupt. A known family with flags that do
+not match the registry is corrupt. A known direct-region-table family encoded in the catalog is
+corrupt. An unknown authoritative entry is corrupt and fails closed because the store cannot know
+whether it participates in semantic liveness or recovery. An unknown advisory entry is physically
+marked as reachable and preserved by root rewrite, GC, and compaction, including every record page
+addressed by its root, but it is not used for semantic reads, GC liveness, retention decisions, or
+reclaim eligibility.
+
+The typed `RootFamily` descriptor registry is the only source of truth for routing, validation,
+attribution, and GC. It must expose at least:
+
+```text
+RootFamily {
+  family_id: u16,
+  name: &'static str,
+  location: direct-region-table | root-catalog,
+  flags: RootFamilyFlags,
+  role: current-state | retained-control | rebuildable-advisory,
+  open_hydration: direct-current | root-only | none,
+  absence: empty-family | optional-advisory,
+  gc_reachability: semantic-root | control-root | physical-safety-root | advisory-preserve-only,
+}
+```
+
+Initial registry:
+
+| Family id | Name | Location | Flags | Role | Open hydration | Absence | GC reachability | Source-backed owner |
+| ---: | --- | --- | --- | --- | --- | --- | --- | --- |
+| `0x0001` | `current_records` | direct-region-table | authoritative | current-state | direct-current | empty-family | semantic-root | Current mutable entries addressed by `mutable_overlay_entry_address`. This family is stored only in `current_record_root` and must not appear as a catalog entry. |
+| `0x0100` | `retained_history` | root-catalog | authoritative | retained-control | root-only | empty-family | semantic-root | Retained history heads and records. Current address helpers are `retained_history_head_address` and `retained_history_record_address`. |
+| `0x0110` | `owner_tokens` | root-catalog | authoritative | retained-control | root-only | empty-family | control-root | Durable owner-token and compare-token records. |
+| `0x0120` | `secondary_indexes` | root-catalog | authoritative | retained-control | root-only | empty-family | control-root | Transactional secondary-index records. |
+| `0x0130` | `mutable_idempotency` | root-catalog | authoritative | retained-control | root-only | empty-family | control-root | Mutable overlay idempotency receipts. |
+| `0x0131` | `workflow_idempotency` | root-catalog | authoritative | retained-control | root-only | empty-family | control-root | Workflow transaction idempotency receipts. |
+| `0x0140` | `audit_retention` | root-catalog | authoritative | retained-control | root-only | empty-family | semantic-root | Audit retention records and retained audit blockers. |
+| `0x0200` | `mvcc_generations` | root-catalog | authoritative | retained-control | root-only | empty-family | control-root | Generation to visible root-set metadata for snapshots and recovery proof. |
+| `0x0210` | `retention_index` | root-catalog | authoritative | retained-control | root-only | empty-family | semantic-root | Retention class and expiry metadata. Ordinary exact reads must not consult it. |
+| `0x0220` | `checkpoint_index` | root-catalog | authoritative | retained-control | root-only | empty-family | semantic-root | Checkpoint id to base root, generation, and retained-root metadata. |
+| `0x0230` | `reclaim_index` | root-catalog | authoritative | retained-control | root-only | empty-family | physical-safety-root | Obsolete page-run blocker metadata. It is not semantic liveness authority. |
+| `0x0300` | `delta_pack_candidates` | root-catalog | advisory | rebuildable-advisory | none | optional-advisory | advisory-preserve-only | Rebuildable delta-pack candidate and debt state. |
+
+For root-catalog families, `empty-family` and `optional-advisory` absence both mean the entry is
+omitted from the catalog. They do not mean an encoded entry with an absent root.
+
+There is no generic catch-all control family in this layout. Any new durable control family requires a
+new registry entry, a stable family id, validation rules, attribution behavior, and GC behavior before
+it may be written.
+
+Canonical positive vectors:
+
+- RegionTable v5 with page size `4096`, roots `index = 1`, `freemap = 2`, `maintenance = 3`,
+  `current_record = 4`, `root_catalog = 5`, `open_segment = 6`, mutable generation floor `9`,
+  bootstrap capacity `32`, owning generation `12`, and reserve extent `[7, 15)` has CRC
+  `0xb418c65e`. Bytes `[0, 112)` are
+  `4c5254350500001000100000000000000101000000000000000102000000000000000103000000000000000104000000000000000105000000000000000600000000000000090000000000000020000000000000000c0000000000000001000007000000000000000800000000000000`.
+  Bytes `[4088, 4096)` are `000000005ec618b4`.
+- Root catalog v1 with all initial root-catalog families present at page ids `100` through `110` in
+  registry order has CRC `0x4c92c1ba`. Bytes `[0, 64)` are this exact 128-digit hex string:
+  `4c524f4f54433100010020000b000000000000000000000000000000000000000001010001640000000000000000000000000000000000000000000000000000`.
+  Entry bytes, starting at offset `32`, are:
+
+```text
+0001010001640000000000000000000000000000000000000000000000000000
+1001010001650000000000000000000000000000000000000000000000000000
+2001010001660000000000000000000000000000000000000000000000000000
+3001010001670000000000000000000000000000000000000000000000000000
+3101010001680000000000000000000000000000000000000000000000000000
+4001010001690000000000000000000000000000000000000000000000000000
+00020100016a0000000000000000000000000000000000000000000000000000
+10020100016b0000000000000000000000000000000000000000000000000000
+20020100016c0000000000000000000000000000000000000000000000000000
+30020100016d0000000000000000000000000000000000000000000000000000
+00030200016e0000000000000000000000000000000000000000000000000000
+```
+
+  Bytes `[4088, 4096)` are `00000000bac1924c`.
+
+Canonical negative vectors:
+
+- RegionTable positive vector with byte `0` changed from `0x4c` to `0x00` is rejected for bad magic.
+- RegionTable positive vector with byte `69` changed from `0x00` to `0x01` and CRC recomputed is
+  rejected for nonzero reserved bytes.
+- RegionTable positive vector with byte `16` changed from `0x01` to `0x02` and CRC recomputed is
+  rejected for bad root-slot presence.
+- Root catalog positive vector with byte `12` changed from `0x0b` to `0x7f` and CRC recomputed is
+  rejected because `entry_count` exceeds the capacity implied by `entry_size = 32`.
+- Root catalog positive vector with byte `36` changed from `0x01` to `0x00` and CRC recomputed is
+  rejected because encoded catalog entries cannot carry an absent root.
+- Root catalog positive vector with bytes `[36, 45)` set to `010000000000000000` and CRC recomputed is
+  rejected because encoded catalog entries cannot carry a present zero page id.
+- Root catalog positive vector with bytes `[64, 66)` changed from `1001` to `0001` and CRC recomputed
+  is rejected for duplicate family id.
+- Root catalog positive vector with bytes `[96, 98)` changed from `2001` to `0801` and CRC recomputed
+  is rejected for out-of-order family id.
+- Root catalog positive vector with bytes `[384, 397)` set to `01400100016f00000000000000`,
+  byte `12` changed from `0x0b` to `0x0c`, and CRC recomputed is rejected as an unknown
+  authoritative family.
+- Root catalog positive vector with bytes `[384, 397)` set to `01400200016f00000000000000`,
+  byte `12` changed from `0x0b` to `0x0c`, and CRC recomputed is accepted as an unknown advisory
+  family for preservation only.
+
 Small records must not waste a full durable transaction per tiny payload. The implementation must
 support one or more of:
 
@@ -737,6 +905,138 @@ Until the full MVCC snapshot-handle API lands, implementation fixtures use the g
 contract above as the minimum source-backed snapshot model. Allocator reuse must not assume that a
 missing snapshot API means there are no pinned readers.
 
+### 14.2 Generation-stable concurrent reachability
+
+Automatic reachability maintenance uses snapshot-at-the-beginning marking. Foreground mutation does
+not invalidate an active mark merely because current reference, control, canonical, or derived roots
+advance. The epoch instead binds one immutable physical and logical snapshot and conservatively
+excludes later allocations from that epoch's reclamation decision.
+
+An epoch persists these values:
+
+| Field | Contract |
+| --- | --- |
+| `epoch_id` | Monotonic maintenance identity used by progress, completion, and reclaim evidence. |
+| `base_generation` | Committed store generation whose logical roots are captured. |
+| `page_high_water` | Exclusive upper page id of the committed store at `base_generation`. |
+| `captured_roots` | Reference, control, canonical root-catalog, derived-artifact, retained-history, audit, checkpoint, and other authoritative roots live at `base_generation`. |
+| `reclaim_fence` | Durable identity proving that pages below `page_high_water` were not reused while the epoch was active. |
+| `captured_free` | Canonical identity of the pages proven free at `base_generation`, plus durable consumption state that prevents reuse of one captured page more than once. |
+| `mark_state` | Bounded traversal queues, cursors, and marked object identities required to resume after interruption. |
+
+Beginning an epoch atomically publishes its descriptor before reclamation may rely on it. The
+descriptor captures the preceding committed generation and page high-water mark. Pages used to
+publish the descriptor itself are post-snapshot pages and are outside the epoch's reclaimable range.
+
+While an incomplete or completed-but-not-consumed epoch exists:
+
+1. Foreground transactions remain available and use ordinary copy-on-write publication.
+2. The allocator may reuse a page below `page_high_water` only when the epoch's immutable
+   `captured_free` identity proves that the page was already free at `base_generation`, the ordinary
+   recovery-generation and reader-lease rules permit reuse, and durable epoch consumption state proves
+   that the page has not already been consumed. A page not present in `captured_free` remains fenced.
+   A page created and freed inside the same uncommitted transaction remains reusable because no
+   committed snapshot could observe it.
+3. Every committed post-snapshot allocation has a page id at or above `page_high_water` and is
+   retained without requiring the marker to chase current-root mutations.
+4. Mark slices traverse only `captured_roots`. Advancing current roots does not return `CONFLICT`,
+   clear progress, or restart the epoch.
+5. Physical reclamation considers only records and pages strictly below `page_high_water`, marked
+   unreachable from `captured_roots`, outside the recovery window, and unblocked by external reader
+   leases or retained checkpoints.
+6. Reclaim evidence binds `epoch_id`, `base_generation`, `page_high_water`, a digest of
+   `captured_roots`, the `captured_free` identity and consumption state, the completed mark result,
+   and `reclaim_fence`. Evidence for one epoch cannot be applied to another generation or physical
+   page range.
+7. Metadata or evidence published into a captured-free page becomes protected current epoch state
+   before its containing transaction is visible. Traversal and reclamation cannot subsequently
+   classify that page as garbage or consume it again.
+
+This contract deliberately retains garbage created after `base_generation` until a later epoch. That
+is bounded reclamation lag, not semantic retention. It avoids an unbounded mutation-delta journal and
+keeps foreground transaction cost independent of mark-graph size. The next epoch captures the newer
+roots and can reclaim superseded post-snapshot objects.
+
+The reclaim fence is store-wide physical safety metadata, not a semantic root and not VCS history.
+The allocator checks it inside the serialized publication boundary. A process cannot opt out of the
+fence, and reopening a store resumes the same restriction before accepting writes. Clearing an epoch
+also clears its fence atomically only when no reclaim operation can still consume its evidence.
+
+Captured-free reuse is part of this same reclamation authority. It is not a second free-page queue or
+a compaction subsystem. Its canonical snapshot identity and monotonic consumption state resume after
+reopen. Recovery rejects contradictory identity, cursor regression, duplicate consumption, or an
+attempt to reuse a page that was not free in the captured snapshot. A malformed or legacy incomplete
+epoch is abandoned without reusing any uncertain page; a new epoch may then start from current state.
+
+Free-map publication uses one bounded metadata bootstrap reserve owned by `PageAllocator`. The
+reserve is an allocation class inside the existing transaction and reclamation authority, not a
+second allocator, free-page queue, or reclamation mechanism. Its durable descriptor is published
+beside the canonical physical roots and contains the reserved extents, capacity, and owning
+generation. Reserved pages are excluded from the canonical free map and from captured-free
+eligibility, so allocating the pages needed to encode the free map cannot change the set that the
+same free-map publication must describe.
+
+The reserve obeys these rules:
+
+1. Only free-map extent values and free-map B-tree nodes may consume bootstrap-reserve pages.
+2. The reserve has a source-defined hard capacity and refill target derived from the maximum bounded
+   free-map mutation accepted by one transaction. Exceeding that capacity fails before mutation with
+   `ResourceExhausted`; it does not loop, leak pages, or return `CorruptObject` for ordinary pressure.
+3. A transaction computes free-map demand before writing, consumes exactly that demand from the
+   current reserve, and carries every unused reserve page into the next descriptor.
+4. Replenishment removes pages from the ordinary canonical free map while the current reserve still
+   owns enough pages to publish that removal. Replenishment therefore cannot allocate its own
+   encoding from the pages being removed.
+5. The new free-map root and new reserve descriptor become authoritative through the same
+   `finish_txn` journal publication. Before commit, the prior root and prior reserve remain
+   authoritative; after commit, recovery selects the matching pair.
+6. Pages consumed from the prior reserve become live metadata pages. Superseded metadata pages enter
+   the existing generation-delayed reclamation path and never return directly to the reserve.
+7. Reserve exhaustion may extend the file only when no safe ordinary or captured-free refill source
+   exists. Such extension is bounded by the hard reserve capacity and is reported separately from
+   ordinary data allocation.
+
+Fresh stores initialize the reserve as part of creation. Existing development stores require one
+controlled offline migration that publishes the reserve descriptor and canonical free-map exclusion
+atomically. There is one current persisted shape after migration; no permanent legacy writer or
+compatibility branch remains.
+
+An interrupted epoch resumes from its persisted traversal state. A malformed descriptor, unreadable
+captured root, missing fence, or contradictory physical identity invalidates the epoch without
+reclaiming any candidate page. Recovery may discard that epoch and begin another, but must preserve
+all pages whose safety was not proven. Root advancement by itself is not corruption and is never an
+invalidation reason.
+
+Incomplete mark work is rescheduled as bounded background work rather than waiting the normal
+maintenance interval after every slice. Each slice obeys object and elapsed-time budgets, yields to
+foreground publication, records monotonic progress, and uses bounded retry backoff only when it makes
+no progress or encounters resource pressure. Continuous writes must not prevent eventual completion.
+
+Completion requires source-backed tests for:
+
+- continuous foreground writes while mark progress advances monotonically;
+- no reuse below `page_high_water` unless the page is eligible under the immutable captured-free
+  snapshot and its durable consumption state;
+- no double reuse, later garbage classification, or reclamation of a captured-free page used to
+  publish current epoch metadata or evidence;
+- conservative survival of every post-snapshot object through the current epoch;
+- reclamation of superseded post-snapshot objects by a subsequent epoch;
+- interruption and reopen at epoch creation, intermediate progress, completion, and reclaim;
+- rejection of mismatched epoch evidence without freeing pages;
+- external reader leases continuing to block unsafe reuse and tail truncation;
+- interruption and reopen immediately before and after captured-free allocation and evidence
+  publication, with monotonic consumption state and no widening of the captured-free set;
+- free-map publication from a fragmented free set where ordinary fixed-point planning oscillates,
+  proving bounded reserve consumption, atomic refill, exact reopen state, and no metadata-page leak;
+- interruption before and after reserve refill publication, proving recovery selects one matching
+  free-map root and reserve descriptor without double allocation;
+- bounded foreground latency, mark memory, progress-record size, and time to convergence.
+
+The implementation has snapshot identity, page-high-water fencing, resumable traversal, and validated
+reclaim evidence. It does not yet implement captured-free reuse. The conservative fence therefore
+prevents evidence publication from reusing pages that were already free at epoch start, causing
+physical growth proportional to maintenance evidence even when GC has identified reusable space.
+
 ## 15. Facet Scope
 
 The default rule is: hot mutable unless identity or retained history is the primary product semantic.
@@ -929,6 +1229,30 @@ batch measured 483,328 bytes of marginal growth for the second batch, down from 
 packing. Cross-transaction reuse of a partially occupied slab remains a separate page-format design
 problem because in-place append would violate crash atomicity and copy-on-write append would change
 every resident locator.
+
+Cross-transaction packing reuses the existing immutable record frame and one-page slab format. It
+does not introduce a second pack magic or multi-page pack directory. Authoritative family locator
+roots map each logical address to a `RecordLoc`. `RecordLocCodec` and `PackedRecordRefCodec` are
+distinct tree-layout discriminators over the same canonical locator bytes; neither stores a content
+digest in the tree value. The immutable record frame owns integrity and encryption metadata. The
+decoded family record must bind back to the requested logical address and owning family.
+
+Foreground commits write only fresh immutable slabs. Bounded maintenance consolidates live records
+from underfilled slabs into new slabs, applies sorted batched copy-on-write locator updates to each
+affected family root, and publishes the new roots through one RegionTable and journal commit.
+Candidate and debt metadata remains advisory and cannot affect exact reads or semantic liveness.
+Consolidation revalidates authoritative locators and generation before publication, and superseded
+slabs remain protected by the ordinary recovery window, snapshot pins, reachability, and validated
+GC evidence.
+
+The canonical RegionTable is the durable recovery-horizon authority. Its minimum recoverable
+generation advances atomically with each successful root-set publication and never exceeds that
+publication's generation. A page is physically reusable only when its freed generation is at or
+below this horizon, no reader lease pins the source, and no active mark epoch protects the page.
+Journal and superblock records select the RegionTable rather than duplicating the horizon in their
+fixed records. RegionTable pages written before this field decode with a zero horizon and advance to
+the canonical current value on the next successful publication. Logical mutable-overlay generation
+floors do not substitute for this physical recovery boundary.
 
 ### CLI and daemon latency attribution
 

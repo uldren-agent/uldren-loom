@@ -10,7 +10,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::api_types::{
-    Digest, LoomSession, LoomStream, ResultView, RowIter, SqlBatch, SqlSession, Task, Uuid,
+    Digest, LaneTicketPlacement, LoomSession, LoomStream, ResultView, RowIter, SqlBatch,
+    SqlSession, Task, Uuid,
 };
 use loom_types::LoomError;
 
@@ -126,6 +127,12 @@ pub trait Exec {
         handle: LoomSession,
         request: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `Exec.apply_cbor`.
+    fn apply_cbor(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
 }
 
 /// Generated trait for the IDL `Program` interface.
@@ -191,6 +198,16 @@ pub trait Identity {
         &self,
         handle: LoomSession,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `Identity.identity_authority_witness`.
+    fn identity_authority_witness(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `Identity.identity_list_authority_replication`.
+    fn identity_list_authority_replication(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<Vec<Vec<u8>>, LoomError>> + Send;
     /// Generated binding for `Identity.identity_add_principal`.
     fn identity_add_principal(
         &self,
@@ -274,6 +291,40 @@ pub trait Identity {
         handle: LoomSession,
         credential: Uuid,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `Identity.identity_force_detach_authority_json`.
+    fn identity_force_detach_authority_json(
+        &self,
+        handle: LoomSession,
+        principal: Uuid,
+        generation: u64,
+        reason: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Identity.identity_replicate_authority_json`.
+    fn identity_replicate_authority_json(
+        &self,
+        handle: LoomSession,
+        source: String,
+        become_authority: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Identity.identity_configure_authority_replication_json`.
+    fn identity_configure_authority_replication_json(
+        &self,
+        handle: LoomSession,
+        id: String,
+        source: String,
+        disabled: bool,
+        pull_on_start: bool,
+        interval_ms: Option<u64>,
+        jitter_ms: u64,
+        backoff_ms: u64,
+        publish_witness: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Identity.identity_remove_authority_replication_json`.
+    fn identity_remove_authority_replication_json(
+        &self,
+        handle: LoomSession,
+        id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
 }
 
 /// Generated trait for the IDL `Acl` interface.
@@ -348,6 +399,221 @@ pub trait ProtectedRefs {
     ) -> impl ::core::future::Future<Output = Result<bool, LoomError>> + Send;
 }
 
+/// Generated trait for the IDL `Lifecycle` interface.
+pub trait Lifecycle {
+    /// Generated binding for `Lifecycle.lifecycle_define_standard_json`.
+    fn lifecycle_define_standard_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        kind: String,
+        version: String,
+        completion_predicate_digest: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Lifecycle.lifecycle_define_json`.
+    fn lifecycle_define_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        definition: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Lifecycle.lifecycle_instantiate_json`.
+    fn lifecycle_instantiate_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        instance_id: String,
+        definition_id: String,
+        subject_refs: Vec<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Lifecycle.lifecycle_transition_json`.
+    fn lifecycle_transition_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        instance_id: String,
+        transition_id: String,
+        to_stage_id: String,
+        actor_principal_id: Option<String>,
+        gate_evaluations_json: String,
+        snapshot_digest: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+}
+
+/// Generated trait for the IDL `Refs` interface.
+pub trait Refs {
+    /// Generated binding for `Refs.refs_reconcile_json`.
+    fn refs_reconcile_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        max: u64,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+}
+
+/// Generated trait for the IDL `Audit` interface.
+pub trait Audit {
+    /// Generated binding for `Audit.audit_config_show_json`.
+    fn audit_config_show_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Audit.audit_config_set_json`.
+    fn audit_config_set_json(
+        &self,
+        handle: LoomSession,
+        retention_days: Option<u32>,
+        legal_hold: Option<bool>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Audit.audit_list_json`.
+    fn audit_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Audit.audit_view_json`.
+    fn audit_view_json(
+        &self,
+        handle: LoomSession,
+        record: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Audit.audit_compact`.
+    fn audit_compact(
+        &self,
+        handle: LoomSession,
+        through_seq: u64,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+}
+
+/// Generated trait for the IDL `Certificate` interface.
+pub trait Certificate {
+    /// Generated binding for `Certificate.certificate_list_json`.
+    fn certificate_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Certificate.certificate_import_json`.
+    fn certificate_import_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+        cert_chain_pem: Vec<u8>,
+        private_key_pem: Vec<u8>,
+        trust_bundle_pem: Option<Vec<u8>>,
+        force: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Certificate.certificate_export`.
+    fn certificate_export(
+        &self,
+        handle: LoomSession,
+        name: String,
+        include_cert_chain: bool,
+        include_private_key: bool,
+        include_trust_bundle: bool,
+        force: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `Certificate.certificate_generate_self_signed_json`.
+    fn certificate_generate_self_signed_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+        dns_names: Vec<String>,
+        ip_addresses: Vec<String>,
+        cn: Option<String>,
+        days: u32,
+        algorithm: String,
+        force: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Certificate.certificate_remove_json`.
+    fn certificate_remove_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Certificate.certificate_audit_json`.
+    fn certificate_audit_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+}
+
+/// Generated trait for the IDL `NetworkAccess` interface.
+pub trait NetworkAccess {
+    /// Generated binding for `NetworkAccess.network_access_list_json`.
+    fn network_access_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `NetworkAccess.network_access_set_json`.
+    fn network_access_set_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+        description: Option<String>,
+        default_action: String,
+        rules_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `NetworkAccess.network_access_remove_json`.
+    fn network_access_remove_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `NetworkAccess.network_access_audit_json`.
+    fn network_access_audit_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+}
+
+/// Generated trait for the IDL `ServeConfig` interface.
+pub trait ServeConfig {
+    /// Generated binding for `ServeConfig.serve_listener_configure_json`.
+    fn serve_listener_configure_json(
+        &self,
+        handle: LoomSession,
+        request_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `ServeConfig.serve_listener_list_json`.
+    fn serve_listener_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `ServeConfig.serve_listener_set_enabled_json`.
+    fn serve_listener_set_enabled_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+        enabled: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `ServeConfig.serve_listener_remove_json`.
+    fn serve_listener_remove_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `ServeConfig.serve_web_route_list_json`.
+    fn serve_web_route_list_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `ServeConfig.serve_web_route_set_json`.
+    fn serve_web_route_set_json(
+        &self,
+        handle: LoomSession,
+        request_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `ServeConfig.serve_web_route_remove_json`.
+    fn serve_web_route_remove_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+        route_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+}
+
 /// Generated trait for the IDL `Daemon` interface.
 pub trait Daemon {
     /// Generated binding for `Daemon.daemon_start`.
@@ -391,9 +657,8 @@ pub trait Locks {
     /// Generated binding for `Locks.lock_acquire`.
     fn lock_acquire(
         &self,
+        handle: LoomSession,
         key: String,
-        principal: String,
-        session: String,
         mode: Vec<u8>,
         permits: u32,
         capacity: u32,
@@ -403,27 +668,15 @@ pub trait Locks {
     /// Generated binding for `Locks.lock_refresh`.
     fn lock_refresh(
         &self,
-        key: String,
-        principal: String,
-        session: String,
-        mode: Vec<u8>,
-        permits: u32,
-        capacity: u32,
-        fence_low: u64,
-        fence_high: u64,
+        handle: LoomSession,
+        token: Vec<u8>,
         lease_ms: u64,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
     /// Generated binding for `Locks.lock_release`.
     fn lock_release(
         &self,
-        key: String,
-        principal: String,
-        session: String,
-        mode: Vec<u8>,
-        permits: u32,
-        capacity: u32,
-        fence_low: u64,
-        fence_high: u64,
+        handle: LoomSession,
+        token: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<(), LoomError>> + Send;
 }
 
@@ -805,6 +1058,8 @@ pub trait FileSystem {
         handle: LoomSession,
         workspace: String,
         src_path: String,
+        author: Option<String>,
+        message: Option<String>,
         commit: bool,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
@@ -823,6 +1078,8 @@ pub trait FileSystem {
         handle: LoomSession,
         workspace: String,
         src_path: String,
+        author: Option<String>,
+        message: Option<String>,
         commit: bool,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Task, LoomError>> + Send;
@@ -846,6 +1103,10 @@ pub trait Archive {
         workspace: String,
         src_path: String,
         kind: String,
+        gzip_output_path: Option<String>,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
     /// Generated binding for `Archive.archive_export`.
@@ -865,6 +1126,10 @@ pub trait Archive {
         workspace: String,
         src_path: String,
         kind: String,
+        gzip_output_path: Option<String>,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Task, LoomError>> + Send;
     /// Generated binding for `Archive.archive_export_async`.
@@ -877,6 +1142,113 @@ pub trait Archive {
         revision: Option<String>,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Task, LoomError>> + Send;
+}
+
+/// Generated trait for the IDL `InterchangeProfiles` interface.
+pub trait InterchangeProfiles {
+    /// Generated binding for `InterchangeProfiles.import_table_csv`.
+    fn import_table_csv(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        source_scope: String,
+        csv_payload: Vec<u8>,
+        database: String,
+        table: String,
+        schema: String,
+        primary_key: String,
+        mode: String,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `InterchangeProfiles.import_redmine`.
+    fn import_redmine(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        field_policy: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `InterchangeProfiles.import_asana`.
+    fn import_asana(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        field_policy: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `InterchangeProfiles.import_jira`.
+    fn import_jira(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        field_policy: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `InterchangeProfiles.import_confluence`.
+    fn import_confluence(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        default_space: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `InterchangeProfiles.import_slack`.
+    fn import_slack(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `InterchangeProfiles.import_drive`.
+    fn import_drive(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        archive_payload: Vec<u8>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `InterchangeProfiles.import_markdown`.
+    fn import_markdown(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        archive_payload: Vec<u8>,
+        space: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `InterchangeProfiles.import_notion`.
+    fn import_notion(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        default_space: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
 }
 
 /// Generated trait for the IDL `Car` interface.
@@ -1329,6 +1701,19 @@ pub trait Vector {
         pq_k: u64,
         pq_iters: u64,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `Vector.vector_text_upsert`.
+    fn vector_text_upsert(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `Vector.vector_workspace_configure_json`.
+    fn vector_workspace_configure_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        request_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
 }
 
 /// Generated trait for the IDL `Columnar` interface.
@@ -1409,6 +1794,28 @@ pub trait Columnar {
         name: String,
         aggregates: Vec<u8>,
         filter: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `Columnar.columnar_import_arrow`.
+    fn columnar_import_arrow(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        payload: Vec<u8>,
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `Columnar.columnar_import_parquet`.
+    fn columnar_import_parquet(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        payload: Vec<u8>,
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
 }
 
@@ -2076,7 +2483,7 @@ pub trait Lanes {
         workspace: String,
         lane_id: String,
         ticket_id: String,
-        placement: Option<String>,
+        placement: Option<LaneTicketPlacement>,
         anchor: Option<String>,
         updated_by: String,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
@@ -2666,6 +3073,14 @@ pub trait Sql {
         principal: Uuid,
         passphrase: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<(), LoomError>> + Send;
+    /// Generated binding for `Sql.sql_exec_result`.
+    fn sql_exec_result(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        db: String,
+        sql: String,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
     /// Generated binding for `Sql.sql_exec`.
     fn sql_exec(
         &self,
@@ -2881,6 +3296,71 @@ pub trait StudioSurfaces {
         &self,
         workspace: String,
         set: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+}
+
+/// Generated trait for the IDL `StudioMaintenance` interface.
+pub trait StudioMaintenance {
+    /// Generated binding for `StudioMaintenance.studio_reindex_json`.
+    fn studio_reindex_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `StudioMaintenance.studio_revisions_rebuild_json`.
+    fn studio_revisions_rebuild_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+}
+
+/// Generated trait for the IDL `InferenceInstance` interface.
+pub trait InferenceInstance {
+    /// Generated binding for `InferenceInstance.inference_instance_list_json`.
+    fn inference_instance_list_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        kind: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `InferenceInstance.inference_instance_get_json`.
+    fn inference_instance_get_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `InferenceInstance.inference_instance_create_json`.
+    fn inference_instance_create_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        model: String,
+        kind: String,
+        runtime: String,
+        preset: Option<String>,
+        settings_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `InferenceInstance.inference_instance_update_json`.
+    fn inference_instance_update_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        preset: Option<String>,
+        settings_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `InferenceInstance.inference_instance_delete_json`.
+    fn inference_instance_delete_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
 }
 
@@ -3414,6 +3894,7 @@ pub trait Chat {
         channel_id: String,
         channel_handle: String,
         name: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_rename_channel_json`.
     fn chat_rename_channel_json(
@@ -3423,6 +3904,7 @@ pub trait Chat {
         chat_workspace_id: String,
         selector: String,
         channel_handle: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_list_channels_json`.
     fn chat_list_channels_json(
@@ -3441,6 +3923,19 @@ pub trait Chat {
         message_id: String,
         thread_id: Option<String>,
         body_text: String,
+        expected_entity_tag: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Chat.chat_post_message_bytes_json`.
+    fn chat_post_message_bytes_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        message_id: String,
+        thread_id: Option<String>,
+        body: Vec<u8>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_edit_message_json`.
     fn chat_edit_message_json(
@@ -3451,6 +3946,18 @@ pub trait Chat {
         channel_id: String,
         message_id: String,
         body_text: String,
+        expected_entity_tag: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Chat.chat_edit_message_bytes_json`.
+    fn chat_edit_message_bytes_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        message_id: String,
+        body: Vec<u8>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_redact_message_json`.
     fn chat_redact_message_json(
@@ -3461,6 +3968,7 @@ pub trait Chat {
         channel_id: String,
         message_id: String,
         reason: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_create_thread_json`.
     fn chat_create_thread_json(
@@ -3471,6 +3979,7 @@ pub trait Chat {
         channel_id: String,
         thread_id: String,
         parent_message_id: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_create_task_json`.
     fn chat_create_task_json(
@@ -3482,6 +3991,7 @@ pub trait Chat {
         task_id: String,
         message_id: Option<String>,
         title: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_claim_task_json`.
     fn chat_claim_task_json(
@@ -3493,6 +4003,7 @@ pub trait Chat {
         task_id: String,
         claim_id: String,
         lease_token: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_complete_task_json`.
     fn chat_complete_task_json(
@@ -3504,6 +4015,7 @@ pub trait Chat {
         task_id: String,
         claim_id: String,
         result_message_id: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_invoke_agent_json`.
     fn chat_invoke_agent_json(
@@ -3516,6 +4028,20 @@ pub trait Chat {
         agent_principal: String,
         source_message_ids_json: String,
         prompt_text: String,
+        expected_entity_tag: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
+    /// Generated binding for `Chat.chat_invoke_agent_bytes_json`.
+    fn chat_invoke_agent_bytes_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        invocation_id: String,
+        agent_principal: String,
+        source_message_ids_json: String,
+        prompt: Vec<u8>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_agent_reply_json`.
     fn chat_agent_reply_json(
@@ -3526,6 +4052,7 @@ pub trait Chat {
         channel_id: String,
         invocation_id: String,
         message_id: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_request_handoff_json`.
     fn chat_request_handoff_json(
@@ -3538,6 +4065,7 @@ pub trait Chat {
         from_agent_principal: String,
         to_principal: Option<String>,
         reason: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_add_reaction_json`.
     fn chat_add_reaction_json(
@@ -3548,6 +4076,7 @@ pub trait Chat {
         channel_id: String,
         message_id: String,
         kind: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_remove_reaction_json`.
     fn chat_remove_reaction_json(
@@ -3558,6 +4087,7 @@ pub trait Chat {
         channel_id: String,
         message_id: String,
         kind: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_emoji_list_json`.
     fn chat_emoji_list_json(
@@ -3573,6 +4103,7 @@ pub trait Chat {
         workspace: String,
         chat_workspace_id: String,
         kind: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_emoji_unregister_json`.
     fn chat_emoji_unregister_json(
@@ -3581,6 +4112,7 @@ pub trait Chat {
         workspace: String,
         chat_workspace_id: String,
         kind: String,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_messages_json`.
     fn chat_messages_json(
@@ -3606,6 +4138,7 @@ pub trait Chat {
         chat_workspace_id: String,
         channel_id: String,
         next_sequence: u64,
+        expected_entity_tag: Option<String>,
     ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send;
     /// Generated binding for `Chat.chat_fetch_events_json`.
     fn chat_fetch_events_json(
@@ -3875,15 +4408,38 @@ pub trait StoreAdmin {
     fn store_policy_set(
         &self,
         handle: LoomSession,
-        fips_required: bool,
+        update: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
     /// Generated binding for `StoreAdmin.store_rekey`.
     fn store_rekey(
         &self,
         handle: LoomSession,
-        new_passphrase: Vec<u8>,
-        reseal: bool,
-        suite: Option<String>,
+        request: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `StoreAdmin.store_bundle_import`.
+    fn store_bundle_import(
+        &self,
+        handle: LoomSession,
+        bundle: Vec<u8>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `StoreAdmin.store_maintenance_status`.
+    fn store_maintenance_status(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `StoreAdmin.store_maintenance_policy_set`.
+    fn store_maintenance_policy_set(
+        &self,
+        handle: LoomSession,
+        update: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
+    /// Generated binding for `StoreAdmin.store_maintenance_run`.
+    fn store_maintenance_run(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send;
 }
 
@@ -3898,12 +4454,19 @@ pub trait LoomClient:
     + Identity
     + Acl
     + ProtectedRefs
+    + Lifecycle
+    + Refs
+    + Audit
+    + Certificate
+    + NetworkAccess
+    + ServeConfig
     + Daemon
     + Locks
     + VersionControl
     + Watch
     + FileSystem
     + Archive
+    + InterchangeProfiles
     + Car
     + FileHandle
     + Cas
@@ -3929,6 +4492,8 @@ pub trait LoomClient:
     + QueueConsumers
     + Sql
     + StudioSurfaces
+    + StudioMaintenance
+    + InferenceInstance
     + Meetings
     + Drive
     + Tickets

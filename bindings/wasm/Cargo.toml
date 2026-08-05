@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 loom-core = { package = "uldren-loom-core", path = "../../crates/loom-core" }
 loom-codec = { package = "uldren-loom-codec", path = "../../crates/loom-codec" }
+loom-client = { package = "uldren-loom-client", path = "../../crates/loom-client", default-features = false }
 loom-compute = { package = "uldren-loom-compute", path = "../../crates/loom-compute", features = ["guards", "sql-state-access"] }
 loom-chat = { package = "uldren-loom-chat", path = "../../crates/loom-chat" }
 loom-drive = { package = "uldren-loom-drive", path = "../../crates/loom-drive" }

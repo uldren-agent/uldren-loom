@@ -1357,6 +1357,9 @@ fn put_document_current_overlay_values<S: ObjectStore>(
             actor: loom.effective_principal()?.unwrap_or(workspace),
             expected_generation: Some(expected_generation),
             writes,
+            prepared_operations: Vec::new(),
+            revision_metadata: Vec::new(),
+            delivery_intents: Vec::new(),
             durability: OverlayDurabilityPolicy::Normal,
             boundary: AtomicityBoundary::Single,
             idempotency: None,
@@ -1366,6 +1369,7 @@ fn put_document_current_overlay_values<S: ObjectStore>(
                 controls: Vec::new(),
                 audits: Vec::new(),
             },
+            post_commit_delta: None,
         })?;
     for outcome in receipt.writes {
         let current = loom
@@ -1412,6 +1416,9 @@ fn put_document_current_overlay_tombstone<S: ObjectStore>(
                 }),
                 side_effects: FacetSideEffects::default(),
             }],
+            prepared_operations: Vec::new(),
+            revision_metadata: Vec::new(),
+            delivery_intents: Vec::new(),
             durability: OverlayDurabilityPolicy::Normal,
             boundary: AtomicityBoundary::Single,
             idempotency: None,
@@ -1421,6 +1428,7 @@ fn put_document_current_overlay_tombstone<S: ObjectStore>(
                 controls: Vec::new(),
                 audits: Vec::new(),
             },
+            post_commit_delta: None,
         })?;
     for outcome in receipt.writes {
         let current = loom
@@ -4332,6 +4340,12 @@ mod tests {
                 generation,
                 root_after: Digest::blake3(&generation.as_u64().to_be_bytes()),
                 writes: outcomes,
+                operation_identities: Vec::new(),
+                revision_identities: Vec::new(),
+                audit_sequences: Vec::new(),
+                retained_sequences: Vec::new(),
+                delivery_receipts: Vec::new(),
+                post_commit_delta: None,
                 replayed: false,
             })
         }

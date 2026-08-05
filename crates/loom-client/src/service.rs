@@ -6,27 +6,35 @@
 //!
 //! Licensed under BUSL-1.1.
 
-use crate::local::{DocumentReplaceTextArgs, LaneCloseoutInput, LaneUpdateInput, LocalLoomClient};
+use crate::local::{
+    DocumentReplaceTextArgs, LaneCloseoutInput, LaneUpdateInput, LocalLoomClient,
+    apply_pages_publish, apply_pages_update_text, save_generated_planning_candidate,
+    save_generated_planning_candidate_with_audits, vector_text_upsert_request_from_cbor,
+};
 use loom_codec::Value;
 use loom_core::digest::Digest as CoreDigest;
 use loom_core::identity::IdentityPublicKeySpec;
 use loom_core::keys::{KEY_LEN, KeySpec};
-use loom_core::{ProtectedRefPolicy, WorkspaceId, WsSelector, watch_batch_to_cbor};
+use loom_core::{
+    AclRight, FacetKind, Loom, PlanningObjectStore, ProtectedRefPolicy, WorkflowAuditWrite,
+    WorkspaceId, WsSelector, watch_batch_to_cbor,
+};
 use loom_remote_protocol::api_types::{
-    Digest, HandleId, LoomSession, LoomStream, ResultView, RowIter, SqlBatch, SqlSession, Task,
-    Uuid,
+    Digest, HandleId, LaneTicketPlacement, LoomSession, LoomStream, ResultView, RowIter, SqlBatch,
+    SqlSession, Task, Uuid,
 };
 use loom_remote_protocol::generated_api::{
-    Acl, Archive, Calendar, Car, Cas, Chat, Columnar, Contacts, Daemon, Dataframe, Diagnostics,
-    Document, Drive, Exec, FileHandle, FileSystem, Graph, Identity, KeySource, Kv, Lanes, Ledger,
-    Locks, Logs, LoomClient, Mail, ManagementKv, Meetings, Metrics, Pages, Program, ProtectedRefs,
-    Queue, QueueConsumers, ResultViews, Search, Sessions, Sql, Store, StoreAdmin, StudioSurfaces,
-    Tasks, Tickets, TimeSeries, Traces, Transfer, Triggers, Vector, VersionControl, Watch,
-    Workspaces,
+    Acl, Archive, Audit, Calendar, Car, Cas, Certificate, Chat, Columnar, Contacts, Daemon,
+    Dataframe, Diagnostics, Document, Drive, Exec, FileHandle, FileSystem, Graph, Identity,
+    InferenceInstance, InterchangeProfiles, KeySource, Kv, Lanes, Ledger, Lifecycle, Locks, Logs,
+    LoomClient, Mail, ManagementKv, Meetings, Metrics, NetworkAccess, Pages, Program,
+    ProtectedRefs, Queue, QueueConsumers, Refs, ResultViews, Search, ServeConfig, Sessions, Sql,
+    Store, StoreAdmin, StudioMaintenance, StudioSurfaces, Tasks, Tickets, TimeSeries, Traces,
+    Transfer, Triggers, Vector, VersionControl, Watch, Workspaces,
 };
 use loom_result::result_view::{Reader, ResultPayload};
 use loom_result::view;
-use loom_store::save_loom;
+use loom_store::{FileStore, save_loom};
 use loom_types::tabular::cell_from;
 use loom_types::{Code, LoomError, MutationChange, MutationEnvelope, MutationReceipt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -35,6 +43,25 @@ use serde_json::Value as JsonValue;
 fn json_string<T: Serialize>(value: &T) -> Result<String, LoomError> {
     serde_json::to_string(value)
         .map_err(|err| LoomError::new(Code::InvalidArgument, err.to_string()))
+}
+
+fn import_generated_chat_publication(
+    loom: &mut Loom<FileStore>,
+    published: &crate::local::GeneratedPlanningCandidatePublication,
+) -> Result<(), LoomError> {
+    for receipt in &published.workflow_receipts {
+        for outcome in &receipt.writes {
+            let current = loom
+                .store()
+                .mutable_overlay_current_entry(&outcome.target)?
+                .ok_or_else(|| {
+                    LoomError::corrupt("workflow transaction omitted committed current record")
+                })?;
+            loom.mutable_overlay_mut()
+                .synchronize_current_entry(current)?;
+        }
+    }
+    loom.import_engine_state_preserving_mutable_overlay(&published.engine_state)
 }
 
 fn parse_optional_json_list<T: DeserializeOwned>(
@@ -144,11 +171,36 @@ fn relation_mutation_json(
     json_string(&MutationEnvelope::new(relation, receipt))
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+fn lane_ticket_placement<'a>(
+    placement: LaneTicketPlacement,
+    anchor: Option<&'a str>,
+) -> Result<loom_lanes::LaneTicketPlacement<'a>, LoomError> {
+    match placement {
+        LaneTicketPlacement::First => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(LoomError::invalid(
+                    "placement 'FIRST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::First)
+        }
+        LaneTicketPlacement::Last => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(LoomError::invalid(
+                    "placement 'LAST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::Last)
+        }
+        LaneTicketPlacement::Before => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::Before)
+            .ok_or_else(|| LoomError::invalid("placement 'BEFORE' requires an anchor ticket id")),
+        LaneTicketPlacement::After => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::After)
+            .ok_or_else(|| LoomError::invalid("placement 'AFTER' requires an anchor ticket id")),
+    }
 }
 
 fn service_ns_selector(workspace: &str) -> WsSelector {
@@ -230,6 +282,7 @@ struct ServiceTicketProjectSettingsPatch {
     acceptance_authorities: Option<Vec<String>>,
     acceptance_evidence_enforcement: Option<bool>,
     required_acceptance_evidence_keys: Option<Vec<loom_tickets::TicketAcceptanceEvidenceKey>>,
+    required_acceptance_reviews: Option<Vec<loom_tickets::TicketReviewType>>,
     owner_contract_summary: Option<String>,
     owner_contract_details: Option<String>,
     worker_contract_summary: Option<String>,
@@ -339,6 +392,7 @@ fn parse_project_settings_patch(
         acceptance_authorities,
         acceptance_evidence_enforcement,
         required_acceptance_evidence_keys,
+        required_acceptance_reviews,
         owner_contract_summary,
         owner_contract_details,
         worker_contract_summary,
@@ -348,7 +402,7 @@ fn parse_project_settings_patch(
     else {
         return Err(LoomError::new(
             Code::InvalidArgument,
-            "project settings patch must have 14 fields",
+            "project settings patch must have 15 fields",
         ));
     };
     let default_projection = patch_optional_text(default_projection, "default_projection")?
@@ -378,6 +432,17 @@ fn parse_project_settings_patch(
         ),
         None => None,
     };
+    let required_acceptance_reviews =
+        match patch_optional_text_list(required_acceptance_reviews, "required_acceptance_reviews")?
+        {
+            Some(reviews) => Some(
+                reviews
+                    .iter()
+                    .map(|review| loom_tickets::TicketReviewType::parse(review))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
     Ok(ServiceTicketProjectSettingsPatch {
         default_projection,
         enable_projections,
@@ -400,6 +465,7 @@ fn parse_project_settings_patch(
             "acceptance_evidence_enforcement",
         )?,
         required_acceptance_evidence_keys,
+        required_acceptance_reviews,
         owner_contract_summary: patch_optional_text(
             owner_contract_summary,
             "owner_contract_summary",
@@ -418,11 +484,6 @@ fn parse_project_settings_patch(
         )?,
         expected_root: patch_optional_text(expected_root, "expected_root")?,
     })
-}
-
-fn parse_service_workspace_id(value: &str, field: &str) -> Result<WorkspaceId, LoomError> {
-    WorkspaceId::parse(value)
-        .map_err(|err| LoomError::new(Code::InvalidArgument, format!("{field}: {}", err.message)))
 }
 
 fn parse_string_list_json(value: &str, field: &str) -> Result<Vec<String>, LoomError> {
@@ -581,18 +642,6 @@ fn daemon_unavailable(op: &str) -> LoomError {
     )
 }
 
-// Compile-contract floor for IDL interfaces owned by a concurrent session (Meetings, StudioSurfaces):
-// they are present in `idl/loom.idl` and therefore in the generated `LoomClient` supertrait, so
-// `LocalLoomClient` must implement them to satisfy the generated contract. These are not real
-// implementations and make no claim about parity or spec status; they reject with a precise
-// Unsupported error until the owning session lands the real behavior.
-fn idl_contract_unimplemented(op: &str) -> LoomError {
-    LoomError::new(
-        Code::Unsupported,
-        format!("{op} is declared in idl/loom.idl but not implemented by LocalLoomClient yet"),
-    )
-}
-
 fn random_bytes(buf: &mut [u8]) -> Result<(), LoomError> {
     getrandom::fill(buf).map_err(|err| LoomError::new(Code::Internal, format!("rng: {err}")))
 }
@@ -662,6 +711,15 @@ impl Exec for LocalLoomClient {
         request: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
         let out = self.exec_cbor(&handle, &request);
+        async move { out }
+    }
+
+    fn apply_cbor(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.apply_cbor(&handle, &request);
         async move { out }
     }
 }
@@ -1807,10 +1865,20 @@ impl FileSystem for LocalLoomClient {
         handle: LoomSession,
         workspace: String,
         src_path: String,
+        author: Option<String>,
+        message: Option<String>,
         commit: bool,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
-        let out = self.import_fs(&handle, &workspace, &src_path, commit, dry_run);
+        let out = self.import_fs(
+            &handle,
+            &workspace,
+            &src_path,
+            author.as_deref(),
+            message.as_deref(),
+            commit,
+            dry_run,
+        );
         async move { out }
     }
 
@@ -1831,10 +1899,20 @@ impl FileSystem for LocalLoomClient {
         handle: LoomSession,
         workspace: String,
         src_path: String,
+        author: Option<String>,
+        message: Option<String>,
         commit: bool,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Task, LoomError>> + Send {
-        let task = self.import_fs_async(&handle, &workspace, &src_path, commit, dry_run);
+        let task = self.import_fs_async(
+            &handle,
+            &workspace,
+            &src_path,
+            author.as_deref(),
+            message.as_deref(),
+            commit,
+            dry_run,
+        );
         async move { Ok(task) }
     }
 
@@ -2226,6 +2304,50 @@ impl Columnar for LocalLoomClient {
         })();
         async move { out }
     }
+
+    fn columnar_import_arrow(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        payload: Vec<u8>,
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.columnar_import_arrow(
+            &handle,
+            &workspace,
+            &name,
+            &payload,
+            target_segment_rows,
+            replace,
+            dry_run,
+        );
+        async move { out }
+    }
+
+    fn columnar_import_parquet(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        payload: Vec<u8>,
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.columnar_import_parquet(
+            &handle,
+            &workspace,
+            &name,
+            &payload,
+            target_segment_rows,
+            replace,
+            dry_run,
+        );
+        async move { out }
+    }
 }
 
 impl Graph for LocalLoomClient {
@@ -2613,12 +2735,12 @@ impl Lanes for LocalLoomClient {
         workspace: String,
         lane_id: String,
         ticket_id: String,
-        placement: Option<String>,
+        placement: Option<LaneTicketPlacement>,
         anchor: Option<String>,
         updated_by: String,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
-        let placement = loom_lanes::LaneTicketPlacement::parse(
-            placement.as_deref().unwrap_or("LAST"),
+        let placement = lane_ticket_placement(
+            placement.unwrap_or(LaneTicketPlacement::Last),
             anchor.as_deref(),
         );
         let out = placement
@@ -2951,6 +3073,28 @@ impl Vector for LocalLoomClient {
         })();
         async move { out }
     }
+
+    fn vector_text_upsert(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = (|| {
+            let request = vector_text_upsert_request_from_cbor(&request)?;
+            self.vector_text_upsert_generated(&handle, request)
+        })();
+        async move { out }
+    }
+
+    fn vector_workspace_configure_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        request_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.vector_workspace_configure_json(&handle, &workspace, &request_json);
+        async move { out }
+    }
 }
 
 impl ManagementKv for LocalLoomClient {
@@ -3150,6 +3294,17 @@ impl Sql for LocalLoomClient {
     ) -> impl ::core::future::Future<Output = Result<(), LoomError>> + Send {
         let out =
             self.sql_authenticate_passphrase(&session, principal_from_uuid(principal), &passphrase);
+        async move { out }
+    }
+
+    fn sql_exec_result(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        db: String,
+        sql: String,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.sql_exec_result(&handle, &workspace, &db, &sql);
         async move { out }
     }
 
@@ -3985,6 +4140,42 @@ impl Metrics for LocalLoomClient {
     }
 }
 
+impl LocalLoomClient {
+    pub fn pages_update_summary(
+        &self,
+        handle: &LoomSession,
+        workspace: &str,
+        page_workspace_id: &str,
+        page_id: &str,
+        body_text: &str,
+        expected_root: Option<&str>,
+    ) -> Result<loom_pages::PageUpdateSummary, LoomError> {
+        self.with_session(handle, |loom| {
+            apply_pages_update_text(
+                loom,
+                workspace,
+                page_workspace_id,
+                page_id,
+                body_text,
+                expected_root,
+            )
+        })
+    }
+
+    pub fn pages_publish_summary(
+        &self,
+        handle: &LoomSession,
+        workspace: &str,
+        page_workspace_id: &str,
+        page_id: &str,
+        expected_root: Option<&str>,
+    ) -> Result<loom_pages::PagePublishSummary, LoomError> {
+        self.with_session(handle, |loom| {
+            apply_pages_publish(loom, workspace, page_workspace_id, page_id, expected_root)
+        })
+    }
+}
+
 impl Logs for LocalLoomClient {
     fn put_record(
         &self,
@@ -4090,9 +4281,23 @@ impl Archive for LocalLoomClient {
         workspace: String,
         src_path: String,
         kind: String,
+        gzip_output_path: Option<String>,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
-        let out = self.archive_import(&handle, &workspace, &src_path, &kind, dry_run);
+        let out = self.archive_import(
+            &handle,
+            &workspace,
+            &src_path,
+            &kind,
+            gzip_output_path.as_deref(),
+            commit,
+            author.as_deref(),
+            message.as_deref(),
+            dry_run,
+        );
         async move { out }
     }
 
@@ -4122,9 +4327,23 @@ impl Archive for LocalLoomClient {
         workspace: String,
         src_path: String,
         kind: String,
+        gzip_output_path: Option<String>,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
         dry_run: bool,
     ) -> impl ::core::future::Future<Output = Result<Task, LoomError>> + Send {
-        let task = self.archive_import_async(&handle, &workspace, &src_path, &kind, dry_run);
+        let task = self.archive_import_async(
+            &handle,
+            &workspace,
+            &src_path,
+            &kind,
+            gzip_output_path.as_deref(),
+            commit,
+            author.as_deref(),
+            message.as_deref(),
+            dry_run,
+        );
         async move { Ok(task) }
     }
 
@@ -4146,6 +4365,214 @@ impl Archive for LocalLoomClient {
             dry_run,
         );
         async move { Ok(task) }
+    }
+}
+
+impl InterchangeProfiles for LocalLoomClient {
+    fn import_table_csv(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        source_scope: String,
+        csv_payload: Vec<u8>,
+        database: String,
+        table: String,
+        schema: String,
+        primary_key: String,
+        mode: String,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.import_table_csv(
+            &handle,
+            &workspace,
+            &source_scope,
+            &csv_payload,
+            &database,
+            &table,
+            &schema,
+            &primary_key,
+            &mode,
+            commit,
+            author.as_deref(),
+            message.as_deref(),
+            dry_run,
+        );
+        async move { out }
+    }
+
+    fn import_redmine(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        field_policy: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.import_redmine(
+            &handle,
+            &workspace,
+            &profile,
+            &source_scope,
+            &snapshot_payload,
+            &field_policy,
+            dry_run,
+        );
+        async move { out }
+    }
+
+    fn import_asana(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        field_policy: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.import_asana(
+            &handle,
+            &workspace,
+            &profile,
+            &source_scope,
+            &snapshot_payload,
+            &field_policy,
+            dry_run,
+        );
+        async move { out }
+    }
+
+    fn import_jira(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        field_policy: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.import_jira(
+            &handle,
+            &workspace,
+            &profile,
+            &source_scope,
+            &snapshot_payload,
+            &field_policy,
+            dry_run,
+        );
+        async move { out }
+    }
+
+    fn import_confluence(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        default_space: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.import_confluence(
+            &handle,
+            &workspace,
+            &profile,
+            &source_scope,
+            &snapshot_payload,
+            &default_space,
+            dry_run,
+        );
+        async move { out }
+    }
+
+    fn import_slack(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.import_slack(
+            &handle,
+            &workspace,
+            &profile,
+            &source_scope,
+            &snapshot_payload,
+            dry_run,
+        );
+        async move { out }
+    }
+
+    fn import_drive(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        archive_payload: Vec<u8>,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.import_drive(
+            &handle,
+            &workspace,
+            &profile,
+            &source_scope,
+            &archive_payload,
+            dry_run,
+        );
+        async move { out }
+    }
+
+    fn import_markdown(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        archive_payload: Vec<u8>,
+        space: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.import_markdown(
+            &handle,
+            &workspace,
+            &profile,
+            &source_scope,
+            &archive_payload,
+            &space,
+            dry_run,
+        );
+        async move { out }
+    }
+
+    fn import_notion(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        source_scope: String,
+        snapshot_payload: Vec<u8>,
+        default_space: String,
+        dry_run: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.import_notion(
+            &handle,
+            &workspace,
+            &profile,
+            &source_scope,
+            &snapshot_payload,
+            &default_space,
+            dry_run,
+        );
+        async move { out }
     }
 }
 
@@ -4496,6 +4923,343 @@ impl ProtectedRefs for LocalLoomClient {
     }
 }
 
+impl Lifecycle for LocalLoomClient {
+    fn lifecycle_define_standard_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        kind: String,
+        version: String,
+        completion_predicate_digest: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.lifecycle_define_standard_json(
+            &handle,
+            &workspace,
+            &kind,
+            &version,
+            &completion_predicate_digest,
+        );
+        async move { out }
+    }
+
+    fn lifecycle_define_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        definition: Vec<u8>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.lifecycle_define_json(&handle, &workspace, &definition);
+        async move { out }
+    }
+
+    fn lifecycle_instantiate_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        instance_id: String,
+        definition_id: String,
+        subject_refs: Vec<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.lifecycle_instantiate_json(
+            &handle,
+            &workspace,
+            &instance_id,
+            &definition_id,
+            subject_refs,
+        );
+        async move { out }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lifecycle_transition_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        instance_id: String,
+        transition_id: String,
+        to_stage_id: String,
+        actor_principal_id: Option<String>,
+        gate_evaluations_json: String,
+        snapshot_digest: Option<String>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.lifecycle_transition_json(
+            &handle,
+            &workspace,
+            &instance_id,
+            &transition_id,
+            &to_stage_id,
+            actor_principal_id.as_deref(),
+            &gate_evaluations_json,
+            snapshot_digest.as_deref(),
+        );
+        async move { out }
+    }
+}
+
+impl Refs for LocalLoomClient {
+    fn refs_reconcile_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        max: u64,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = usize::try_from(max)
+            .map_err(|_| LoomError::new(Code::InvalidArgument, "refs reconcile max out of range"))
+            .and_then(|max| self.refs_reconcile_json(&handle, &workspace, max));
+        async move { out }
+    }
+}
+
+impl Audit for LocalLoomClient {
+    fn audit_config_show_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.audit_config_show_json(&handle);
+        async move { out }
+    }
+
+    fn audit_config_set_json(
+        &self,
+        handle: LoomSession,
+        retention_days: Option<u32>,
+        legal_hold: Option<bool>,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.audit_config_set_json(&handle, retention_days, legal_hold);
+        async move { out }
+    }
+
+    fn audit_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.audit_list_json(&handle);
+        async move { out }
+    }
+
+    fn audit_view_json(
+        &self,
+        handle: LoomSession,
+        record: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.audit_view_json(&handle, &record);
+        async move { out }
+    }
+
+    fn audit_compact(
+        &self,
+        handle: LoomSession,
+        through_seq: u64,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.audit_compact(&handle, through_seq);
+        async move { out }
+    }
+}
+
+impl Certificate for LocalLoomClient {
+    fn certificate_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.certificate_list_json(&handle);
+        async move { out }
+    }
+
+    fn certificate_import_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+        cert_chain_pem: Vec<u8>,
+        private_key_pem: Vec<u8>,
+        trust_bundle_pem: Option<Vec<u8>>,
+        force: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.certificate_import_json(
+            &handle,
+            &name,
+            cert_chain_pem,
+            private_key_pem,
+            trust_bundle_pem,
+            force,
+        );
+        async move { out }
+    }
+
+    fn certificate_export(
+        &self,
+        handle: LoomSession,
+        name: String,
+        include_cert_chain: bool,
+        include_private_key: bool,
+        include_trust_bundle: bool,
+        force: bool,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self.certificate_export(
+            &handle,
+            &name,
+            include_cert_chain,
+            include_private_key,
+            include_trust_bundle,
+            force,
+        );
+        async move { out }
+    }
+
+    fn certificate_generate_self_signed_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+        dns_names: Vec<String>,
+        ip_addresses: Vec<String>,
+        cn: Option<String>,
+        days: u32,
+        algorithm: String,
+        force: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.certificate_generate_self_signed_json(
+            &handle,
+            &name,
+            dns_names,
+            ip_addresses,
+            cn.as_deref(),
+            days,
+            &algorithm,
+            force,
+        );
+        async move { out }
+    }
+
+    fn certificate_remove_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.certificate_remove_json(&handle, &name);
+        async move { out }
+    }
+
+    fn certificate_audit_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.certificate_audit_json(&handle, &name);
+        async move { out }
+    }
+}
+
+impl NetworkAccess for LocalLoomClient {
+    fn network_access_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.network_access_list_json(&handle);
+        async move { out }
+    }
+
+    fn network_access_set_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+        description: Option<String>,
+        default_action: String,
+        rules_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.network_access_set_json(
+            &handle,
+            &name,
+            description.as_deref(),
+            &default_action,
+            &rules_json,
+        );
+        async move { out }
+    }
+
+    fn network_access_remove_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.network_access_remove_json(&handle, &name);
+        async move { out }
+    }
+
+    fn network_access_audit_json(
+        &self,
+        handle: LoomSession,
+        name: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.network_access_audit_json(&handle, &name);
+        async move { out }
+    }
+}
+
+impl ServeConfig for LocalLoomClient {
+    fn serve_listener_configure_json(
+        &self,
+        handle: LoomSession,
+        request_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.serve_listener_configure_json(&handle, &request_json);
+        async move { out }
+    }
+
+    fn serve_listener_list_json(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.serve_listener_list_json(&handle);
+        async move { out }
+    }
+
+    fn serve_listener_set_enabled_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+        enabled: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.serve_listener_set_enabled_json(&handle, &listener_id, enabled);
+        async move { out }
+    }
+
+    fn serve_listener_remove_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.serve_listener_remove_json(&handle, &listener_id);
+        async move { out }
+    }
+
+    fn serve_web_route_list_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.serve_web_route_list_json(&handle, &listener_id);
+        async move { out }
+    }
+
+    fn serve_web_route_set_json(
+        &self,
+        handle: LoomSession,
+        request_json: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.serve_web_route_set_json(&handle, &request_json);
+        async move { out }
+    }
+
+    fn serve_web_route_remove_json(
+        &self,
+        handle: LoomSession,
+        listener_id: String,
+        route_id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.serve_web_route_remove_json(&handle, &listener_id, &route_id);
+        async move { out }
+    }
+}
+
 impl Watch for LocalLoomClient {
     fn subscribe(
         &self,
@@ -4552,6 +5316,48 @@ impl Identity for LocalLoomClient {
         let out = self
             .identity_snapshot_store(&handle)
             .and_then(|store| loom_wire::identity::identity_snapshot_to_cbor(&store));
+        async move { out }
+    }
+
+    fn identity_authority_witness(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
+        let out = self
+            .identity_authority_witness(&handle)
+            .and_then(|witness| loom_wire::identity::identity_authority_witness_to_cbor(&witness));
+        async move { out }
+    }
+
+    fn identity_list_authority_replication(
+        &self,
+        handle: LoomSession,
+    ) -> impl ::core::future::Future<Output = Result<Vec<Vec<u8>>, LoomError>> + Send {
+        let out = self
+            .identity_list_authority_replication(&handle)
+            .and_then(|policies| {
+                policies
+                    .iter()
+                    .map(|policy| {
+                        let record = loom_wire::identity::AuthorityReplicationPolicyRecord {
+                            id: policy.id.clone(),
+                            schema_version: u32::from(policy.schema_version),
+                            source: policy.source.clone(),
+                            enabled: policy.enabled,
+                            pull_on_start: policy.pull_on_start,
+                            interval_ms: policy.interval_ms,
+                            jitter_ms: policy.jitter_ms,
+                            backoff_ms: policy.backoff_ms,
+                            publish_witness: policy.publish_witness,
+                            last_success_ms: policy.last_success_ms,
+                            last_failure_ms: policy.last_failure_ms,
+                            last_error: policy.last_error.clone(),
+                            last_modified_audit_seq: policy.last_modified_audit_seq,
+                        };
+                        loom_wire::identity::authority_replication_policy_record_to_cbor(&record)
+                    })
+                    .collect()
+            });
         async move { out }
     }
 
@@ -4728,6 +5534,67 @@ impl Identity for LocalLoomClient {
             let result = self.identity_revoke_app_credential(&handle, id_from_uuid(credential))?;
             loom_wire::identity::identity_audit_result_to_cbor(&result)
         })();
+        async move { out }
+    }
+
+    fn identity_force_detach_authority_json(
+        &self,
+        handle: LoomSession,
+        principal: Uuid,
+        generation: u64,
+        reason: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.identity_force_detach_authority_json(
+            &handle,
+            principal_from_uuid(principal),
+            generation,
+            &reason,
+        );
+        async move { out }
+    }
+
+    fn identity_replicate_authority_json(
+        &self,
+        handle: LoomSession,
+        source: String,
+        become_authority: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.identity_replicate_authority_json(&handle, &source, become_authority);
+        async move { out }
+    }
+
+    fn identity_configure_authority_replication_json(
+        &self,
+        handle: LoomSession,
+        id: String,
+        source: String,
+        disabled: bool,
+        pull_on_start: bool,
+        interval_ms: Option<u64>,
+        jitter_ms: u64,
+        backoff_ms: u64,
+        publish_witness: bool,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.identity_configure_authority_replication_json(
+            &handle,
+            &id,
+            &source,
+            disabled,
+            pull_on_start,
+            interval_ms,
+            jitter_ms,
+            backoff_ms,
+            publish_witness,
+        );
+        async move { out }
+    }
+
+    fn identity_remove_authority_replication_json(
+        &self,
+        handle: LoomSession,
+        id: String,
+    ) -> impl ::core::future::Future<Output = Result<String, LoomError>> + Send {
+        let out = self.identity_remove_authority_replication_json(&handle, &id);
         async move { out }
     }
 }
@@ -5129,68 +5996,46 @@ impl VersionControl for LocalLoomClient {
 }
 
 impl Locks for LocalLoomClient {
-    #[allow(clippy::too_many_arguments)]
     fn lock_acquire(
         &self,
+        handle: LoomSession,
         key: String,
-        principal: String,
-        session: String,
         mode: Vec<u8>,
         permits: u32,
         capacity: u32,
         lease_ms: u64,
-        // The in-process coordinator tries once and returns the contention error immediately; it never
-        // queues or sleeps, so `wait_ms` is unused.
-        _wait_ms: u64,
+        wait_ms: u64,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
         let out = (|| {
             let mode = loom_wire::lock::lock_mode_from_wire(&mode, permits, capacity)?;
-            let token = self.lock_acquire(key.as_bytes(), &principal, &session, mode, lease_ms)?;
+            let token = self.lock_acquire(&handle, key.as_bytes(), mode, lease_ms, wait_ms)?;
             loom_wire::lock::lock_token_to_cbor(&token)
         })();
         async move { out }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn lock_refresh(
         &self,
-        key: String,
-        principal: String,
-        session: String,
-        mode: Vec<u8>,
-        permits: u32,
-        capacity: u32,
-        fence_low: u64,
-        fence_high: u64,
+        handle: LoomSession,
+        token: Vec<u8>,
         lease_ms: u64,
     ) -> impl ::core::future::Future<Output = Result<Vec<u8>, LoomError>> + Send {
         let out = (|| {
-            let token = loom_wire::lock::lock_token_from_wire(
-                key, principal, session, &mode, permits, capacity, fence_low, fence_high,
-            )?;
-            let updated = self.lock_refresh(&token, lease_ms)?;
+            let token = loom_wire::lock::lock_token_from_cbor(&token)?;
+            let updated = self.lock_refresh(&handle, &token, lease_ms)?;
             loom_wire::lock::lock_token_to_cbor(&updated)
         })();
         async move { out }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn lock_release(
         &self,
-        key: String,
-        principal: String,
-        session: String,
-        mode: Vec<u8>,
-        permits: u32,
-        capacity: u32,
-        fence_low: u64,
-        fence_high: u64,
+        handle: LoomSession,
+        token: Vec<u8>,
     ) -> impl ::core::future::Future<Output = Result<(), LoomError>> + Send {
         let out = (|| {
-            let token = loom_wire::lock::lock_token_from_wire(
-                key, principal, session, &mode, permits, capacity, fence_low, fence_high,
-            )?;
-            self.lock_release(&token)
+            let token = loom_wire::lock::lock_token_from_cbor(&token)?;
+            self.lock_release(&handle, &token)
         })();
         async move { out }
     }
@@ -5310,252 +6155,358 @@ impl Transfer for LocalLoomClient {
 impl Drive for LocalLoomClient {
     async fn drive_list_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _folder_id: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        folder_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_list_json"))
+        self.with_session(&handle, |loom| {
+            let workspace = loom.registry().open(&service_ns_selector(&workspace))?;
+            json_string(&loom_drive::list_folder(
+                loom,
+                workspace,
+                &drive_workspace_id,
+                &folder_id,
+            )?)
+        })
     }
 
     async fn drive_stat_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _folder_id: String,
-        _name: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        folder_id: String,
+        name: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_stat_json"))
+        self.with_session(&handle, |loom| {
+            let workspace = loom.registry().open(&service_ns_selector(&workspace))?;
+            json_string(&loom_drive::stat_node(
+                loom,
+                workspace,
+                &drive_workspace_id,
+                &folder_id,
+                &name,
+            )?)
+        })
     }
 
     async fn drive_read_file(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _file_id: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        file_id: String,
     ) -> Result<Vec<u8>, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_read_file"))
+        self.with_session(&handle, |loom| {
+            let workspace = loom.registry().open(&service_ns_selector(&workspace))?;
+            loom_drive::read_file(loom, workspace, &drive_workspace_id, &file_id)
+        })
     }
 
     async fn drive_list_versions_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _file_id: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        file_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_list_versions_json"))
+        self.with_session(&handle, |loom| {
+            let workspace = loom.registry().open(&service_ns_selector(&workspace))?;
+            json_string(&loom_drive::list_versions(
+                loom,
+                workspace,
+                &drive_workspace_id,
+                &file_id,
+            )?)
+        })
     }
 
     async fn drive_list_conflicts_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Drive.drive_list_conflicts_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let workspace = loom.registry().open(&service_ns_selector(&workspace))?;
+            json_string(&loom_drive::list_conflicts(
+                loom,
+                workspace,
+                &drive_workspace_id,
+            )?)
+        })
     }
 
     async fn drive_list_shares_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_list_shares_json"))
+        self.with_session(&handle, |loom| {
+            let workspace = loom.registry().open(&service_ns_selector(&workspace))?;
+            json_string(&loom_drive::list_shares(
+                loom,
+                workspace,
+                &drive_workspace_id,
+            )?)
+        })
     }
 
     async fn drive_list_retention_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Drive.drive_list_retention_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let workspace = loom.registry().open(&service_ns_selector(&workspace))?;
+            json_string(&loom_drive::list_retention(
+                loom,
+                workspace,
+                &drive_workspace_id,
+            )?)
+        })
     }
 
     async fn drive_create_folder_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _parent_folder_id: String,
-        _folder_id: String,
-        _name: String,
-        _expected_root: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        parent_folder_id: String,
+        folder_id: String,
+        name: String,
+        expected_root: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_create_folder_json"))
+        self.drive_create_folder_json(
+            &handle,
+            &workspace,
+            &drive_workspace_id,
+            &parent_folder_id,
+            &folder_id,
+            &name,
+            &expected_root,
+        )
     }
 
     async fn drive_create_upload_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _upload_id: String,
-        _parent_folder_id: String,
-        _name: String,
-        _file_id: String,
-        _expected_root: String,
-        _created_at_ms: u64,
-        _replace_file: bool,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        upload_id: String,
+        parent_folder_id: String,
+        name: String,
+        file_id: String,
+        expected_root: String,
+        created_at_ms: u64,
+        replace_file: bool,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_create_upload_json"))
+        self.drive_create_upload_json(
+            &handle,
+            &workspace,
+            &drive_workspace_id,
+            &upload_id,
+            &parent_folder_id,
+            &name,
+            &file_id,
+            &expected_root,
+            created_at_ms,
+            replace_file,
+        )
     }
 
     async fn drive_upload_chunk_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _upload_id: String,
-        _chunk: Vec<u8>,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        upload_id: String,
+        chunk: Vec<u8>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_upload_chunk_json"))
+        self.drive_upload_chunk_json(&handle, &workspace, &drive_workspace_id, &upload_id, &chunk)
     }
 
     async fn drive_commit_upload_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _upload_id: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        upload_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_commit_upload_json"))
+        self.drive_commit_upload_json(&handle, &workspace, &drive_workspace_id, &upload_id)
     }
 
     async fn drive_rename_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _folder_id: String,
-        _node_id: String,
-        _new_name: String,
-        _expected_root: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        folder_id: String,
+        node_id: String,
+        new_name: String,
+        expected_root: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_rename_json"))
+        self.drive_rename_json(
+            &handle,
+            &workspace,
+            &drive_workspace_id,
+            &folder_id,
+            &node_id,
+            &new_name,
+            &expected_root,
+        )
     }
 
     async fn drive_move_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _source_folder_id: String,
-        _target_folder_id: String,
-        _node_id: String,
-        _expected_root: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        source_folder_id: String,
+        target_folder_id: String,
+        node_id: String,
+        expected_root: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_move_json"))
+        self.drive_move_json(
+            &handle,
+            &workspace,
+            &drive_workspace_id,
+            &source_folder_id,
+            &target_folder_id,
+            &node_id,
+            &expected_root,
+        )
     }
 
     async fn drive_delete_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _folder_id: String,
-        _node_id: String,
-        _expected_root: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        folder_id: String,
+        node_id: String,
+        expected_root: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_delete_json"))
+        self.drive_delete_json(
+            &handle,
+            &workspace,
+            &drive_workspace_id,
+            &folder_id,
+            &node_id,
+            &expected_root,
+        )
     }
 
     async fn drive_resolve_conflict_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _conflict_id: String,
-        _resolution: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        conflict_id: String,
+        resolution: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Drive.drive_resolve_conflict_json",
-        ))
+        self.drive_resolve_conflict_json(
+            &handle,
+            &workspace,
+            &drive_workspace_id,
+            &conflict_id,
+            &resolution,
+        )
     }
 
     async fn drive_grant_share_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _grant_id: String,
-        _target_kind: String,
-        _target_id: String,
-        _principal: String,
-        _role: String,
-        _granted_at_ms: u64,
-        _expires_at_ms: Option<u64>,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        grant_id: String,
+        target_kind: String,
+        target_id: String,
+        principal: String,
+        role: String,
+        granted_at_ms: u64,
+        expires_at_ms: Option<u64>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_grant_share_json"))
+        self.drive_grant_share_json(
+            &handle,
+            &workspace,
+            &drive_workspace_id,
+            &grant_id,
+            &target_kind,
+            &target_id,
+            &principal,
+            &role,
+            granted_at_ms,
+            expires_at_ms,
+        )
     }
 
     async fn drive_revoke_share_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _grant_id: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        grant_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_revoke_share_json"))
+        self.drive_revoke_share_json(&handle, &workspace, &drive_workspace_id, &grant_id)
     }
 
     async fn drive_apply_share_expiry_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _now_ms: u64,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        now_ms: u64,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Drive.drive_apply_share_expiry_json",
-        ))
+        self.drive_apply_share_expiry_json(&handle, &workspace, &drive_workspace_id, now_ms)
     }
 
     async fn drive_pin_retention_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _pin_id: String,
-        _kind: String,
-        _root: String,
-        _target_entity_id: Option<String>,
-        _added_at_ms: u64,
-        _expires_at_ms: Option<u64>,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        pin_id: String,
+        kind: String,
+        root: String,
+        target_entity_id: Option<String>,
+        added_at_ms: u64,
+        expires_at_ms: Option<u64>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Drive.drive_pin_retention_json"))
+        self.drive_pin_retention_json(
+            &handle,
+            &workspace,
+            &drive_workspace_id,
+            &pin_id,
+            &kind,
+            &root,
+            target_entity_id.as_deref(),
+            added_at_ms,
+            expires_at_ms,
+        )
     }
 
     async fn drive_unpin_retention_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _pin_id: String,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        pin_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Drive.drive_unpin_retention_json",
-        ))
+        self.drive_unpin_retention_json(&handle, &workspace, &drive_workspace_id, &pin_id)
     }
 
     async fn drive_apply_retention_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _drive_workspace_id: String,
-        _now_ms: u64,
+        handle: LoomSession,
+        workspace: String,
+        drive_workspace_id: String,
+        now_ms: u64,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Drive.drive_apply_retention_json",
-        ))
+        self.drive_apply_retention_json(&handle, &workspace, &drive_workspace_id, now_ms)
     }
 }
 
@@ -5722,7 +6673,6 @@ impl Tickets for LocalLoomClient {
             )?;
             let result =
                 ticket_mutation_json(ticket, "ticket.created", expected_root.as_deref(), changes)?;
-            save_loom(loom)?;
             Ok(result)
         })
     }
@@ -5885,7 +6835,6 @@ impl Tickets for LocalLoomClient {
             )?;
             let result =
                 ticket_mutation_json(ticket, "ticket.updated", expected_root.as_deref(), changes)?;
-            save_loom(loom)?;
             Ok(result)
         })
     }
@@ -5915,7 +6864,6 @@ impl Tickets for LocalLoomClient {
                 expected_root.as_deref(),
                 vec![MutationChange::ResourceDeleted],
             )?;
-            save_loom(loom)?;
             Ok(result)
         })
     }
@@ -5981,7 +6929,6 @@ impl Tickets for LocalLoomClient {
                 expected_root.as_deref(),
                 changes,
             )?;
-            save_loom(loom)?;
             Ok(result)
         })
     }
@@ -6030,7 +6977,6 @@ impl Tickets for LocalLoomClient {
                 expected_root.as_deref(),
                 changes,
             )?;
-            save_loom(loom)?;
             Ok(result)
         })
     }
@@ -6065,7 +7011,6 @@ impl Tickets for LocalLoomClient {
                     Some(comment_id.to_string()),
                 )],
             )?;
-            save_loom(loom)?;
             Ok(result)
         })
     }
@@ -6106,7 +7051,6 @@ impl Tickets for LocalLoomClient {
                     relation.target_id,
                 )],
             )?;
-            save_loom(loom)?;
             Ok(result)
         })
     }
@@ -6142,7 +7086,6 @@ impl Tickets for LocalLoomClient {
                     relation.target_id,
                 )],
             )?;
-            save_loom(loom)?;
             Ok(result)
         })
     }
@@ -6219,6 +7162,7 @@ impl Tickets for LocalLoomClient {
                 policy_labels: request.policy_labels,
                 ready_only: request.ready,
                 include_completed: request.include_completed,
+                lane_id: request.lane,
                 lane_member_ids,
                 board_id: request.board,
                 cursor: request.cursor,
@@ -6507,6 +7451,7 @@ impl Tickets for LocalLoomClient {
                     required_acceptance_evidence_keys: patch
                         .required_acceptance_evidence_keys
                         .as_deref(),
+                    required_acceptance_reviews: patch.required_acceptance_reviews.as_deref(),
                     owner_contract_summary: patch.owner_contract_summary.as_deref(),
                     owner_contract_details: patch.owner_contract_details.as_deref(),
                     worker_contract_summary: patch.worker_contract_summary.as_deref(),
@@ -6694,21 +7639,15 @@ impl Pages for LocalLoomClient {
         body_text: String,
         expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        self.with_session(&handle, |loom| {
-            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
-            let summary = loom_pages::update_page_text(
-                loom,
-                ns,
-                &page_workspace_id,
-                &page_id,
-                &body_text,
-                now_ms(),
-                expected_root.as_deref(),
-            )?;
-            let result = json_string(&summary)?;
-            save_loom(loom)?;
-            Ok(result)
-        })
+        let summary = self.pages_update_summary(
+            &handle,
+            &workspace,
+            &page_workspace_id,
+            &page_id,
+            &body_text,
+            expected_root.as_deref(),
+        )?;
+        json_string(&summary)
     }
 
     async fn pages_publish_json(
@@ -6719,20 +7658,14 @@ impl Pages for LocalLoomClient {
         page_id: String,
         expected_root: Option<String>,
     ) -> Result<String, LoomError> {
-        self.with_session(&handle, |loom| {
-            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
-            let publish = loom_pages::publish_page(
-                loom,
-                ns,
-                &page_workspace_id,
-                &page_id,
-                now_ms(),
-                expected_root.as_deref(),
-            )?;
-            let result = json_string(&publish)?;
-            save_loom(loom)?;
-            Ok(result)
-        })
+        let publish = self.pages_publish_summary(
+            &handle,
+            &workspace,
+            &page_workspace_id,
+            &page_id,
+            expected_root.as_deref(),
+        )?;
+        json_string(&publish)
     }
 
     async fn pages_get_json(
@@ -7046,37 +7979,127 @@ impl Pages for LocalLoomClient {
 impl Meetings for LocalLoomClient {
     async fn meetings_import_snapshot(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _input_profile: String,
-        _snapshot: Vec<u8>,
-        _dry_run: bool,
+        handle: LoomSession,
+        workspace: String,
+        input_profile: String,
+        snapshot: Vec<u8>,
+        dry_run: bool,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Meetings.meetings_import_snapshot",
-        ))
+        self.meetings_import_snapshot(&handle, &workspace, &input_profile, &snapshot, dry_run)
     }
 
     async fn meetings_source_read(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _source_id: String,
-        _leaf: String,
+        handle: LoomSession,
+        workspace: String,
+        source_id: String,
+        leaf: String,
     ) -> Result<Vec<u8>, LoomError> {
-        Err(idl_contract_unimplemented("Meetings.meetings_source_read"))
+        self.with_session(&handle, |loom| {
+            let workspace_id = loom.registry().open(&service_ns_selector(&workspace))?;
+            loom.authorize(workspace_id, FacetKind::Vcs, AclRight::Read)?;
+            loom_interchange_io::validate_meetings_source_payload_leaf(&leaf)?;
+            let path = loom_interchange_io::meetings_source_payload_path(
+                &workspace_id.to_string(),
+                &source_id,
+                &leaf,
+            );
+            loom.read_file_reserved(workspace_id, &path)
+        })
     }
 }
 
 impl StudioSurfaces for LocalLoomClient {
     async fn studio_surface_catalog_json(
         &self,
-        _workspace: String,
-        _set: String,
+        workspace: String,
+        set: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "StudioSurfaces.studio_surface_catalog_json",
-        ))
+        loom_substrate::surfaces::surface_catalog_json(&workspace, &set)
+    }
+}
+
+impl StudioMaintenance for LocalLoomClient {
+    async fn studio_reindex_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+    ) -> Result<String, LoomError> {
+        self.studio_reindex_json(&handle, &workspace, &profile)
+    }
+
+    async fn studio_revisions_rebuild_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        profile: String,
+        dry_run: bool,
+    ) -> Result<String, LoomError> {
+        self.studio_revisions_rebuild_json(&handle, &workspace, &profile, dry_run)
+    }
+}
+
+impl InferenceInstance for LocalLoomClient {
+    async fn inference_instance_list_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        kind: Option<String>,
+    ) -> Result<String, LoomError> {
+        self.inference_instance_list_json(&handle, &workspace, kind)
+    }
+
+    async fn inference_instance_get_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+    ) -> Result<String, LoomError> {
+        self.inference_instance_get_json(&handle, &workspace, &name)
+    }
+
+    async fn inference_instance_create_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        model: String,
+        kind: String,
+        runtime: String,
+        preset: Option<String>,
+        settings_json: String,
+    ) -> Result<String, LoomError> {
+        self.inference_instance_create_json(
+            &handle,
+            &workspace,
+            name,
+            model,
+            kind,
+            runtime,
+            preset,
+            &settings_json,
+        )
+    }
+
+    async fn inference_instance_update_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+        preset: Option<String>,
+        settings_json: String,
+    ) -> Result<String, LoomError> {
+        self.inference_instance_update_json(&handle, &workspace, name, preset, &settings_json)
+    }
+
+    async fn inference_instance_delete_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        name: String,
+    ) -> Result<String, LoomError> {
+        self.inference_instance_delete_json(&handle, &workspace, name)
     }
 }
 
@@ -7092,24 +8115,23 @@ impl StoreAdmin for LocalLoomClient {
     async fn store_policy_set(
         &self,
         handle: LoomSession,
-        fips_required: bool,
+        update: Vec<u8>,
     ) -> Result<Vec<u8>, LoomError> {
-        self.store_policy_set(&handle, fips_required)
+        self.store_policy_set(&handle, &update)
     }
 
     async fn store_rekey(
         &self,
         handle: LoomSession,
-        new_passphrase: Vec<u8>,
-        reseal: bool,
-        suite: Option<String>,
+        request: Vec<u8>,
     ) -> Result<Vec<u8>, LoomError> {
         // All key material is generated server-side: the client never handles the DEK, salt, or nonce.
         let mut salt = [0u8; 16];
         let mut wrap_nonce = [0u8; 24];
         random_bytes(&mut salt)?;
         random_bytes(&mut wrap_nonce)?;
-        let new_dek = if reseal {
+        let decoded = loom_wire::store_admin::store_rekey_request_from_cbor(&request)?;
+        let new_dek = if decoded.reseal {
             let mut dek = [0u8; KEY_LEN];
             random_bytes(&mut dek)?;
             Some(dek)
@@ -7118,47 +8140,141 @@ impl StoreAdmin for LocalLoomClient {
         };
         self.store_rekey(
             &handle,
-            &new_passphrase,
-            reseal,
-            suite.as_deref(),
+            &request,
             salt.to_vec(),
             wrap_nonce.to_vec(),
             new_dek,
         )
+    }
+
+    async fn store_bundle_import(
+        &self,
+        handle: LoomSession,
+        bundle: Vec<u8>,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.store_bundle_import(&handle, &bundle, dry_run)
+    }
+
+    async fn store_maintenance_status(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.store_maintenance_status(&handle, &request)
+    }
+
+    async fn store_maintenance_policy_set(
+        &self,
+        handle: LoomSession,
+        update: Vec<u8>,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.store_maintenance_policy_set(&handle, &update)
+    }
+
+    async fn store_maintenance_run(
+        &self,
+        handle: LoomSession,
+        request: Vec<u8>,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.store_maintenance_run(&handle, &request)
     }
 }
 
 impl Chat for LocalLoomClient {
     async fn chat_create_channel_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _channel_handle: String,
-        _name: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        channel_handle: String,
+        name: String,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_create_channel_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::ensure_channel_from_request(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                &channel_handle,
+                &name,
+                expected_entity_tag.as_deref(),
+            )?;
+            let actor = candidate.effective_principal()?.unwrap_or(ns);
+            let target = format!("chat:{chat_workspace_id}:channel:{}", summary.channel_id);
+            let published = save_generated_planning_candidate_with_audits(
+                self.store_path(),
+                loom.store(),
+                &mut candidate,
+                vec![WorkflowAuditWrite {
+                    principal: Some(actor),
+                    action: "chat.channel.create".to_string(),
+                    target: Some(target),
+                }],
+            )?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_rename_channel_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _selector: String,
-        _channel_handle: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        selector: String,
+        channel_handle: String,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_rename_channel_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::rename_channel(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &selector,
+                &channel_handle,
+                expected_entity_tag.as_deref(),
+            )?;
+            let actor = candidate.effective_principal()?.unwrap_or(ns);
+            let target = format!("chat:{chat_workspace_id}:channel:{}", summary.channel_id);
+            let published = save_generated_planning_candidate_with_audits(
+                self.store_path(),
+                loom.store(),
+                &mut candidate,
+                vec![WorkflowAuditWrite {
+                    principal: Some(actor),
+                    action: "chat.channel.rename".to_string(),
+                    target: Some(target),
+                }],
+            )?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_list_channels_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_list_channels_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let channels = loom_chat::list_channels(loom, ns, &chat_workspace_id)?;
+            json_string(&channels)
+        })
     }
 
     async fn chat_post_message_json(
@@ -7170,19 +8286,52 @@ impl Chat for LocalLoomClient {
         message_id: String,
         thread_id: Option<String>,
         body_text: String,
+        expected_entity_tag: Option<String>,
+    ) -> Result<String, LoomError> {
+        <LocalLoomClient as Chat>::chat_post_message_bytes_json(
+            self,
+            handle,
+            workspace,
+            chat_workspace_id,
+            channel_id,
+            message_id,
+            thread_id,
+            body_text.into_bytes(),
+            expected_entity_tag,
+        )
+        .await
+    }
+
+    async fn chat_post_message_bytes_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        message_id: String,
+        thread_id: Option<String>,
+        body: Vec<u8>,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
         self.with_session(&handle, |loom| {
-            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
             let summary = loom_chat::post_message(
-                loom,
+                &mut candidate,
                 ns,
                 &chat_workspace_id,
                 &channel_id,
                 &message_id,
                 thread_id.as_deref(),
-                body_text.into_bytes(),
+                body,
+                expected_entity_tag.as_deref(),
             )?;
-            save_loom(loom)?;
+            let published =
+                save_generated_planning_candidate(self.store_path(), loom.store(), &mut candidate)?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
             json_string(&summary)
         })
     }
@@ -7195,83 +8344,217 @@ impl Chat for LocalLoomClient {
         channel_id: String,
         message_id: String,
         body_text: String,
+        expected_entity_tag: Option<String>,
+    ) -> Result<String, LoomError> {
+        <LocalLoomClient as Chat>::chat_edit_message_bytes_json(
+            self,
+            handle,
+            workspace,
+            chat_workspace_id,
+            channel_id,
+            message_id,
+            body_text.into_bytes(),
+            expected_entity_tag,
+        )
+        .await
+    }
+
+    async fn chat_edit_message_bytes_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        message_id: String,
+        body: Vec<u8>,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
         self.with_session(&handle, |loom| {
-            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
             let summary = loom_chat::edit_message(
-                loom,
+                &mut candidate,
                 ns,
                 &chat_workspace_id,
                 &channel_id,
                 &message_id,
-                body_text.into_bytes(),
+                body,
+                expected_entity_tag.as_deref(),
             )?;
-            save_loom(loom)?;
+            let published =
+                save_generated_planning_candidate(self.store_path(), loom.store(), &mut candidate)?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
             json_string(&summary)
         })
     }
 
     async fn chat_redact_message_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _message_id: String,
-        _reason: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        message_id: String,
+        reason: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_redact_message_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::redact_message(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                &message_id,
+                reason.as_deref(),
+                expected_entity_tag.as_deref(),
+            )?;
+            let published =
+                save_generated_planning_candidate(self.store_path(), loom.store(), &mut candidate)?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_create_thread_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _thread_id: String,
-        _parent_message_id: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        thread_id: String,
+        parent_message_id: String,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_create_thread_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::create_thread(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                &thread_id,
+                &parent_message_id,
+                expected_entity_tag.as_deref(),
+            )?;
+            let published =
+                save_generated_planning_candidate(self.store_path(), loom.store(), &mut candidate)?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_create_task_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _task_id: String,
-        _message_id: Option<String>,
-        _title: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        task_id: String,
+        message_id: Option<String>,
+        title: String,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_create_task_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::create_task(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                &task_id,
+                message_id.as_deref(),
+                &title,
+                expected_entity_tag.as_deref(),
+            )?;
+            let published =
+                save_generated_planning_candidate(self.store_path(), loom.store(), &mut candidate)?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_claim_task_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _task_id: String,
-        _claim_id: String,
-        _lease_token: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        task_id: String,
+        claim_id: String,
+        lease_token: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_claim_task_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::claim_task(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                &task_id,
+                &claim_id,
+                lease_token.as_deref(),
+                expected_entity_tag.as_deref(),
+            )?;
+            let published =
+                save_generated_planning_candidate(self.store_path(), loom.store(), &mut candidate)?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_complete_task_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _task_id: String,
-        _claim_id: String,
-        _result_message_id: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        task_id: String,
+        claim_id: String,
+        result_message_id: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_complete_task_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::complete_task(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                &task_id,
+                &claim_id,
+                result_message_id.as_deref(),
+                expected_entity_tag.as_deref(),
+            )?;
+            let published =
+                save_generated_planning_candidate(self.store_path(), loom.store(), &mut candidate)?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_invoke_agent_json(
@@ -7284,149 +8567,403 @@ impl Chat for LocalLoomClient {
         agent_principal: String,
         source_message_ids_json: String,
         prompt_text: String,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        let agent_principal = parse_service_workspace_id(&agent_principal, "agent_principal")?;
-        let source_message_ids =
-            parse_string_list_json(&source_message_ids_json, "source_message_ids_json")?;
+        <LocalLoomClient as Chat>::chat_invoke_agent_bytes_json(
+            self,
+            handle,
+            workspace,
+            chat_workspace_id,
+            channel_id,
+            invocation_id,
+            agent_principal,
+            source_message_ids_json,
+            prompt_text.into_bytes(),
+            expected_entity_tag,
+        )
+        .await
+    }
+
+    async fn chat_invoke_agent_bytes_json(
+        &self,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        invocation_id: String,
+        agent_principal: String,
+        source_message_ids_json: String,
+        prompt: Vec<u8>,
+        expected_entity_tag: Option<String>,
+    ) -> Result<String, LoomError> {
         self.with_session(&handle, |loom| {
-            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
-            let summary = loom_chat::invoke_agent(
-                loom,
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::invoke_agent_from_request(
+                &mut candidate,
                 ns,
                 &chat_workspace_id,
                 &channel_id,
                 &invocation_id,
-                agent_principal,
-                source_message_ids,
-                prompt_text.into_bytes(),
+                &agent_principal,
+                &source_message_ids_json,
+                prompt,
+                expected_entity_tag.as_deref(),
             )?;
-            save_loom(loom)?;
+            let actor = candidate.effective_principal()?.unwrap_or(ns);
+            let target = format!(
+                "chat:{chat_workspace_id}:channel:{}:invocation:{invocation_id}",
+                summary.channel_id
+            );
+            let published = save_generated_planning_candidate_with_audits(
+                self.store_path(),
+                loom.store(),
+                &mut candidate,
+                vec![WorkflowAuditWrite {
+                    principal: Some(actor),
+                    action: "chat.agent.invoke".to_string(),
+                    target: Some(target),
+                }],
+            )?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
             json_string(&summary)
         })
     }
 
     async fn chat_agent_reply_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _invocation_id: String,
-        _message_id: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        invocation_id: String,
+        message_id: String,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_agent_reply_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::agent_reply(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                &invocation_id,
+                &message_id,
+                expected_entity_tag.as_deref(),
+            )?;
+            let published =
+                save_generated_planning_candidate(self.store_path(), loom.store(), &mut candidate)?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_request_handoff_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _handoff_id: String,
-        _from_agent_principal: String,
-        _to_principal: Option<String>,
-        _reason: Option<String>,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        handoff_id: String,
+        from_agent_principal: String,
+        to_principal: Option<String>,
+        reason: Option<String>,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_request_handoff_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::request_handoff_from_request(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                &handoff_id,
+                &from_agent_principal,
+                to_principal.as_deref(),
+                reason.as_deref(),
+                expected_entity_tag.as_deref(),
+            )?;
+            let actor = candidate.effective_principal()?.unwrap_or(ns);
+            let target = format!(
+                "chat:{chat_workspace_id}:channel:{}:handoff:{handoff_id}",
+                summary.channel_id
+            );
+            let published = save_generated_planning_candidate_with_audits(
+                self.store_path(),
+                loom.store(),
+                &mut candidate,
+                vec![WorkflowAuditWrite {
+                    principal: Some(actor),
+                    action: "chat.handoff.request".to_string(),
+                    target: Some(target),
+                }],
+            )?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_add_reaction_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _message_id: String,
-        _kind: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        message_id: String,
+        kind: String,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_add_reaction_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::add_reaction(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                &message_id,
+                &kind,
+                expected_entity_tag.as_deref(),
+            )?;
+            let published =
+                save_generated_planning_candidate(self.store_path(), loom.store(), &mut candidate)?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_remove_reaction_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _message_id: String,
-        _kind: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        message_id: String,
+        kind: String,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_remove_reaction_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let summary = loom_chat::remove_reaction(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                &message_id,
+                &kind,
+                expected_entity_tag.as_deref(),
+            )?;
+            let published =
+                save_generated_planning_candidate(self.store_path(), loom.store(), &mut candidate)?;
+            drop(candidate);
+            import_generated_chat_publication(loom, &published)?;
+            json_string(&summary)
+        })
     }
 
     async fn chat_emoji_list_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_emoji_list_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let registry = loom_chat::emoji_registry(loom, ns, &chat_workspace_id)?;
+            json_string(&registry)
+        })
     }
 
     async fn chat_emoji_register_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _kind: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        kind: String,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_emoji_register_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let (summary, changed) = loom_chat::register_emoji_with_change(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &kind,
+                expected_entity_tag.as_deref(),
+            )?;
+            if changed {
+                let target = format!("chat:{chat_workspace_id}:emoji-registry");
+                let actor = candidate.effective_principal()?.unwrap_or(ns);
+                let published = save_generated_planning_candidate_with_audits(
+                    self.store_path(),
+                    loom.store(),
+                    &mut candidate,
+                    vec![WorkflowAuditWrite {
+                        principal: Some(actor),
+                        action: "chat.emoji.register".to_string(),
+                        target: Some(target),
+                    }],
+                )?;
+                drop(candidate);
+                import_generated_chat_publication(loom, &published)?;
+            }
+            json_string(&summary)
+        })
     }
 
     async fn chat_emoji_unregister_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _kind: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        kind: String,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented(
-            "Chat.chat_emoji_unregister_json",
-        ))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let (summary, changed) = loom_chat::unregister_emoji_with_change(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &kind,
+                expected_entity_tag.as_deref(),
+            )?;
+            if changed {
+                let target = format!("chat:{chat_workspace_id}:emoji-registry");
+                let actor = candidate.effective_principal()?.unwrap_or(ns);
+                let published = save_generated_planning_candidate_with_audits(
+                    self.store_path(),
+                    loom.store(),
+                    &mut candidate,
+                    vec![WorkflowAuditWrite {
+                        principal: Some(actor),
+                        action: "chat.emoji.unregister".to_string(),
+                        target: Some(target),
+                    }],
+                )?;
+                drop(candidate);
+                import_generated_chat_publication(loom, &published)?;
+            }
+            json_string(&summary)
+        })
     }
 
     async fn chat_messages_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_messages_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let channel = loom_chat::channel_projection(loom, ns, &chat_workspace_id, &channel_id)?;
+            json_string(&channel)
+        })
     }
 
     async fn chat_cursor_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_cursor_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            let cursor = loom_chat::read_cursor(loom, ns, &chat_workspace_id, &channel_id)?;
+            json_string(&cursor)
+        })
     }
 
     async fn chat_update_cursor_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _next_sequence: u64,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        next_sequence: u64,
+        expected_entity_tag: Option<String>,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_update_cursor_json"))
+        self.with_session(&handle, |loom| {
+            let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&service_ns_selector(&workspace))?;
+            let (summary, changed) = loom_chat::update_cursor_with_change(
+                &mut candidate,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                next_sequence,
+                expected_entity_tag.as_deref(),
+            )?;
+            if changed {
+                let published = save_generated_planning_candidate(
+                    self.store_path(),
+                    loom.store(),
+                    &mut candidate,
+                )?;
+                drop(candidate);
+                import_generated_chat_publication(loom, &published)?;
+            }
+            json_string(&summary)
+        })
     }
 
     async fn chat_fetch_events_json(
         &self,
-        _handle: LoomSession,
-        _workspace: String,
-        _chat_workspace_id: String,
-        _channel_id: String,
-        _from_sequence: u64,
-        _max: u64,
+        handle: LoomSession,
+        workspace: String,
+        chat_workspace_id: String,
+        channel_id: String,
+        from_sequence: u64,
+        max: u64,
     ) -> Result<String, LoomError> {
-        Err(idl_contract_unimplemented("Chat.chat_fetch_events_json"))
+        self.with_session(&handle, |loom| {
+            let ns = loom.registry().open(&service_ns_selector(&workspace))?;
+            loom.authorize_domain(
+                ns,
+                loom_core::workspace::AclDomain::Chat,
+                loom_core::AclRight::Read,
+            )?;
+            let max = usize::try_from(max)
+                .map_err(|_| LoomError::invalid("chat event max exceeds platform limit"))?;
+            let batch = loom_chat::operation_changes(
+                loom,
+                ns,
+                &chat_workspace_id,
+                &channel_id,
+                from_sequence,
+                max,
+            )?;
+            json_string(&loom_substrate::changes::hosted_operation_changes_batch(
+                batch,
+            ))
+        })
     }
 }
 
@@ -7452,12 +8989,174 @@ mod tests {
         }
     }
 
+    #[test]
+    fn studio_surface_generated_owner_preserves_catalog_sets_and_errors() {
+        let client = LocalLoomClient::new("unused-studio-surface-owner.loom");
+        for set in ["core", "all", "meeting-memory"] {
+            let generated = block(StudioSurfaces::studio_surface_catalog_json(
+                &client,
+                "workspace-a".to_string(),
+                set.to_string(),
+            ))
+            .expect("generated catalog");
+            let authoritative = loom_substrate::surfaces::surface_catalog_json("workspace-a", set)
+                .expect("authoritative catalog");
+            assert_eq!(generated, authoritative);
+        }
+
+        let error = block(StudioSurfaces::studio_surface_catalog_json(
+            &client,
+            "workspace-a".to_string(),
+            "invalid".to_string(),
+        ))
+        .expect_err("invalid set");
+        assert_eq!(error.code, Code::InvalidArgument);
+    }
+
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("loom-client-service-{}-{tag}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn canonical_locks_generated_contract_uses_authenticated_handle() {
+        let dir = temp_dir("canonical-locks");
+        let client = LocalLoomClient::new(dir.join("store.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open session");
+        let token = block(Locks::lock_acquire(
+            &client,
+            session.clone(),
+            "generated-key".to_string(),
+            vec![0],
+            1,
+            1,
+            5_000,
+            0,
+        ))
+        .expect("generated acquire");
+        let decoded = loom_wire::lock::lock_token_from_cbor(&token).expect("decode token");
+        assert_eq!(decoded.owner.principal, "unauthenticated-root");
+        assert!(!decoded.owner.session.is_empty());
+        let refreshed = block(Locks::lock_refresh(&client, session.clone(), token, 5_000))
+            .expect("generated refresh");
+        block(Locks::lock_release(&client, session.clone(), refreshed)).expect("generated release");
+        client.close(&session);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct SharedMem(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl loom_store::BackingIo for SharedMem {
+        fn pread(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            let bytes = self.0.lock().unwrap();
+            let off = off as usize;
+            let end = off + buf.len();
+            if end > bytes.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "eof",
+                ));
+            }
+            buf.copy_from_slice(&bytes[off..end]);
+            Ok(())
+        }
+
+        fn pwrite(&mut self, off: u64, buf: &[u8]) -> std::io::Result<()> {
+            let mut bytes = self.0.lock().unwrap();
+            let off = off as usize;
+            let end = off + buf.len();
+            if end > bytes.len() {
+                bytes.resize(end, 0);
+            }
+            bytes[off..end].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn size(&self) -> std::io::Result<u64> {
+            Ok(self.0.lock().unwrap().len() as u64)
+        }
+
+        fn grow(&mut self, len: u64) -> std::io::Result<()> {
+            self.0.lock().unwrap().resize(len as usize, 0);
+            Ok(())
+        }
+
+        fn fsync(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailNthFsyncMem {
+        shared: SharedMem,
+        pending: Vec<u8>,
+        fsyncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        fail_on: u64,
+    }
+
+    impl FailNthFsyncMem {
+        fn new(shared: SharedMem, fail_on: u64) -> Self {
+            let pending = shared.0.lock().unwrap().clone();
+            Self {
+                shared,
+                pending,
+                fsyncs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                fail_on,
+            }
+        }
+    }
+
+    impl loom_store::BackingIo for FailNthFsyncMem {
+        fn pread(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            let off = off as usize;
+            let end = off + buf.len();
+            if end > self.pending.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "eof",
+                ));
+            }
+            buf.copy_from_slice(&self.pending[off..end]);
+            Ok(())
+        }
+
+        fn pwrite(&mut self, off: u64, buf: &[u8]) -> std::io::Result<()> {
+            let off = off as usize;
+            let end = off + buf.len();
+            if end > self.pending.len() {
+                self.pending.resize(end, 0);
+            }
+            self.pending[off..end].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn size(&self) -> std::io::Result<u64> {
+            Ok(self.pending.len() as u64)
+        }
+
+        fn grow(&mut self, len: u64) -> std::io::Result<()> {
+            self.pending.resize(len as usize, 0);
+            Ok(())
+        }
+
+        fn fsync(&mut self) -> std::io::Result<()> {
+            let next = self
+                .fsyncs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if next == self.fail_on {
+                self.pending = self.shared.0.lock().unwrap().clone();
+                Err(std::io::Error::other("injected fsync failure"))
+            } else {
+                *self.shared.0.lock().unwrap() = self.pending.clone();
+                Ok(())
+            }
+        }
     }
 
     fn seed_client(
@@ -7478,18 +9177,702 @@ mod tests {
         (client, session, workspace, dir)
     }
 
-    fn settings_patch_cbor(
-        default_projection: Option<&str>,
-        actor_enforcement: Option<&str>,
-        acceptance_authorities: Option<Vec<&str>>,
+    #[test]
+    fn meetings_generated_source_read_authorizes_before_leaf_validation() {
+        let (client, session, workspace, dir) = seed_client("meetings-source-read-auth");
+        let user = WorkspaceId::from_bytes([109; 16]);
+        client
+            .with_session(&session, |loom| {
+                let mut identity = loom_core::IdentityStore::new(workspace);
+                identity.add_principal(user, "reader", loom_core::PrincipalKind::User)?;
+                identity.set_passphrase(user, "reader-pass", b"meetings-read")?;
+                loom.store().save_identity_store(&identity)?;
+                loom.set_identity_store(identity);
+                save_loom(loom)
+            })
+            .expect("seed restricted principal");
+        client
+            .authenticate_passphrase(&session, user, b"reader-pass")
+            .expect("authenticate restricted principal");
+
+        let error = block(<LocalLoomClient as Meetings>::meetings_source_read(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "missing".to_string(),
+            "bad/name".to_string(),
+        ))
+        .expect_err("authorization precedes caller-controlled leaf validation");
+        assert_eq!(error.code, Code::PermissionDenied);
+
+        client.close(&session);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn token_hex(token: Option<loom_core::OverlayOwnerToken>) -> String {
+        match token {
+            Some(token) => bytes_hex(token.as_bytes()),
+            None => "none".to_string(),
+        }
+    }
+
+    fn bytes_hex(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            write!(&mut out, "{byte:02x}").expect("write hex");
+        }
+        out
+    }
+
+    #[test]
+    fn tickets_field_retire_uses_refreshed_same_session_project_owner_token() {
+        let (client, session, workspace, dir) = seed_client("tickets-field-retire-same-session");
+        let workspace_id = workspace.to_string();
+        block(<LocalLoomClient as Tickets>::tickets_project_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "MX".to_string(),
+            "Matrix".to_string(),
+            None,
+        ))
+        .expect("create project");
+        #[cfg(feature = "test-hooks")]
+        loom_store::reset_mutable_overlay_current_entries_enumerations();
+        block(<LocalLoomClient as Tickets>::tickets_field_put_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "risk".to_string(),
+            "risk".to_string(),
+            "Risk".to_string(),
+            None,
+            "string".to_string(),
+            None,
+            64,
+            true,
+            false,
+            true,
+            false,
+            "optional".to_string(),
+            serde_json::json!(["task"]).to_string(),
+            None,
+        ))
+        .expect("put field");
+        let (overlay_key, expected_token, persisted_token) = client
+            .with_session(&session, |loom| {
+                let key = loom_tickets::workflow_current_key(
+                    &workspace_id,
+                    "matrix",
+                    loom_tickets::WorkflowCurrentRecordKind::Project,
+                    "matrix",
+                )?;
+                let expected = loom.mutable_overlay_snapshot().owner_token(&key)?;
+                let persisted = loom
+                    .store()
+                    .mutable_overlay_current_entry(&key)?
+                    .map(|entry| entry.owner_token);
+                Ok((bytes_hex(key.as_bytes()), expected, persisted))
+            })
+            .expect("project token state");
+        assert_eq!(
+            expected_token,
+            persisted_token,
+            "project current owner token was stale before field retire: key={overlay_key} expected={} persisted={}",
+            token_hex(expected_token.clone()),
+            token_hex(persisted_token.clone())
+        );
+        block(<LocalLoomClient as Tickets>::tickets_field_retire_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id,
+            "matrix".to_string(),
+            "risk".to_string(),
+            None,
+        ))
+        .unwrap_or_else(|error| {
+            panic!(
+                "retire field failed for project current key {overlay_key}; expected owner token {}; persisted owner token {}: {error}",
+                token_hex(expected_token),
+                token_hex(persisted_token)
+            )
+        });
+        #[cfg(feature = "test-hooks")]
+        assert_eq!(
+            loom_store::mutable_overlay_current_entries_enumerations(),
+            0,
+            "same-session field put then retire performed complete current-entry enumeration"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tickets_field_retire_uses_refreshed_shared_daemon_session_project_owner_token() {
+        let dir = temp_dir("tickets-field-retire-shared-daemon-session");
+        let path = dir.join("t.loom");
+        let bootstrap = LocalLoomClient::new(&path);
+        bootstrap.create().expect("create store");
+        let bootstrap_session = bootstrap.open().expect("open bootstrap");
+        let workspace = bootstrap
+            .workspace_create(&bootstrap_session, Some("repo"), Some(FacetKind::Vcs))
+            .expect("workspace");
+        bootstrap.close(&bootstrap_session);
+
+        let loom = loom_store::open_loom(&path).expect("open shared loom");
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(loom));
+        let client = LocalLoomClient::new(&path);
+        let workspace_id = workspace.to_string();
+
+        let run = |operation: &dyn Fn(LoomSession) -> Result<(), LoomError>| {
+            let session = client
+                .register_daemon_shared_loom(shared.clone(), None)
+                .expect("register shared session");
+            let result = operation(session.clone());
+            client.close(&session);
+            result
+        };
+
+        run(&|session| {
+            block(<LocalLoomClient as Tickets>::tickets_project_create_json(
+                &client,
+                session,
+                "repo".to_string(),
+                workspace_id.clone(),
+                "matrix".to_string(),
+                "MX".to_string(),
+                "Matrix".to_string(),
+                None,
+            ))
+            .map(|_| ())
+        })
+        .expect("create project");
+        run(&|session| {
+            block(<LocalLoomClient as Tickets>::tickets_field_put_json(
+                &client,
+                session,
+                "repo".to_string(),
+                workspace_id.clone(),
+                "matrix".to_string(),
+                "risk".to_string(),
+                "risk".to_string(),
+                "Risk".to_string(),
+                None,
+                "string".to_string(),
+                None,
+                64,
+                true,
+                false,
+                true,
+                false,
+                "optional".to_string(),
+                serde_json::json!(["task"]).to_string(),
+                None,
+            ))
+            .map(|_| ())
+        })
+        .expect("put field");
+        let created = {
+            let session = client
+                .register_daemon_shared_loom(shared.clone(), None)
+                .expect("register shared session");
+            let result = block(<LocalLoomClient as Tickets>::tickets_create_json(
+                &client,
+                session.clone(),
+                "repo".to_string(),
+                workspace_id.clone(),
+                "matrix".to_string(),
+                "task".to_string(),
+                None,
+                None,
+                serde_json::json!({"risk":"low","title":"Refresh project current"}).to_string(),
+                "[]".to_string(),
+                None,
+            ));
+            client.close(&session);
+            result.expect("create ticket")
+        };
+        let created: serde_json::Value = serde_json::from_str(&created).expect("create json");
+        let created_root = created["resource"]["profile_root"]
+            .as_str()
+            .expect("created root")
+            .to_string();
+        run(&|session| {
+            block(<LocalLoomClient as Tickets>::tickets_update_json(
+                &client,
+                session,
+                "repo".to_string(),
+                workspace_id.clone(),
+                "MX-1".to_string(),
+                Some(serde_json::json!({"status":"in_progress","risk":"medium"}).to_string()),
+                "[]".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(created_root.clone()),
+                None,
+                None,
+                None,
+            ))
+            .map(|_| ())
+        })
+        .expect("update ticket");
+
+        let (overlay_key, expected_token, persisted_token) = {
+            let loom = shared.lock().expect("shared loom lock");
+            let key = loom_tickets::workflow_current_key(
+                &workspace_id,
+                "matrix",
+                loom_tickets::WorkflowCurrentRecordKind::Project,
+                "matrix",
+            )
+            .expect("project current key");
+            let expected = loom
+                .mutable_overlay_snapshot()
+                .owner_token(&key)
+                .expect("live project token");
+            let persisted = loom
+                .store()
+                .mutable_overlay_current_entry(&key)
+                .expect("persisted project current")
+                .map(|entry| entry.owner_token);
+            (bytes_hex(key.as_bytes()), expected, persisted)
+        };
+        assert_eq!(
+            expected_token,
+            persisted_token,
+            "project current owner token was stale before shared-session field retire: key={overlay_key} expected={} persisted={}",
+            token_hex(expected_token.clone()),
+            token_hex(persisted_token.clone())
+        );
+
+        run(&|session| {
+            block(<LocalLoomClient as Tickets>::tickets_field_retire_json(
+                &client,
+                session,
+                "repo".to_string(),
+                workspace_id.clone(),
+                "matrix".to_string(),
+                "risk".to_string(),
+                None,
+            ))
+            .map(|_| ())
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "retire field failed for shared-session project current key {overlay_key}; expected owner token {}; persisted owner token {}: {error}",
+                token_hex(expected_token),
+                token_hex(persisted_token)
+            )
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ChatStateSnapshot {
+        reference_root: Option<String>,
+        channels: Vec<(String, String, String)>,
+        projection: Option<ChatProjectionSnapshot>,
+        emoji_custom: Vec<String>,
+        cursor: Option<(u64, u64, String)>,
+        audit_actions: Vec<String>,
+        audit_events: Vec<(String, Option<String>)>,
+        revision_history: Vec<(u64, String, String, u64, String, u64)>,
+    }
+
+    type ChatMessageSnapshot = (String, Vec<u8>, bool, Vec<(String, String)>);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ChatProjectionSnapshot {
+        messages: Vec<ChatMessageSnapshot>,
+        threads: Vec<(String, String)>,
+        tasks: Vec<(String, Option<String>, String)>,
+        agent_invocations: Vec<(String, String, Vec<String>, Vec<String>)>,
+        handoffs: Vec<(String, String, Option<String>)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ChatGeneratedReadInvariantSnapshot {
+        file_len: u64,
+        file_bytes: Vec<u8>,
+        mutable_generation: u64,
+        audit_count: usize,
+        consumer_position: u64,
+    }
+
+    fn chat_json_entity_tag(json: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(json).expect("chat json");
+        value["entity_tag"]
+            .as_str()
+            .expect("entity tag")
+            .to_string()
+    }
+
+    fn generated_chat_read_invariant_snapshot(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: WorkspaceId,
+        chat_workspace_id: &str,
+        channel_id: &str,
+    ) -> ChatGeneratedReadInvariantSnapshot {
+        let path = client.store_path();
+        let file_bytes = std::fs::read(path).expect("store bytes");
+        let file_len = std::fs::metadata(path).expect("store metadata").len();
+        client
+            .with_session(session, |loom| {
+                let stream = loom_chat::chat_queue_stream_name(chat_workspace_id, channel_id)?;
+                let principal = loom.effective_principal()?.unwrap_or(workspace).to_string();
+                Ok(ChatGeneratedReadInvariantSnapshot {
+                    file_len,
+                    file_bytes,
+                    mutable_generation: loom.store().mutable_overlay_generation()?.as_u64(),
+                    audit_count: loom.store().audit_records()?.len(),
+                    consumer_position: loom
+                        .consumer_position_internal(workspace, &stream, &principal)?,
+                })
+            })
+            .expect("generated read invariant snapshot")
+    }
+
+    fn assert_generated_chat_read_preserves_store(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: WorkspaceId,
+        chat_workspace_id: &str,
+        channel_id: &str,
+        read: impl FnOnce() -> Result<String, LoomError>,
+    ) -> String {
+        let before = generated_chat_read_invariant_snapshot(
+            client,
+            session,
+            workspace,
+            chat_workspace_id,
+            channel_id,
+        );
+        let result = read().expect("generated chat read");
+        let after = generated_chat_read_invariant_snapshot(
+            client,
+            session,
+            workspace,
+            chat_workspace_id,
+            channel_id,
+        );
+        assert_eq!(after, before);
+        result
+    }
+
+    fn chat_state_snapshot(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: WorkspaceId,
+        chat_workspace_id: &str,
+        selector: &str,
+        revision_entity: Option<&str>,
+    ) -> ChatStateSnapshot {
+        client
+            .with_session(session, |loom| {
+                chat_state_snapshot_from_loom(
+                    loom,
+                    workspace,
+                    chat_workspace_id,
+                    selector,
+                    revision_entity,
+                )
+            })
+            .expect("chat state snapshot")
+    }
+
+    fn chat_state_snapshot_from_loom(
+        loom: &mut Loom<FileStore>,
+        workspace: WorkspaceId,
+        chat_workspace_id: &str,
+        selector: &str,
+        revision_entity: Option<&str>,
+    ) -> Result<ChatStateSnapshot, LoomError> {
+        loom.ensure_full_state_loaded()?;
+        let mut channels = loom_chat::list_channels(loom, workspace, chat_workspace_id)?
+            .into_iter()
+            .map(|channel| (channel.channel_id, channel.handle, channel.entity_tag))
+            .collect::<Vec<_>>();
+        channels.sort();
+        let projection =
+            match loom_chat::channel_projection(loom, workspace, chat_workspace_id, selector) {
+                Ok(channel) => Some(ChatProjectionSnapshot {
+                    messages: channel
+                        .messages
+                        .into_iter()
+                        .map(|message| {
+                            let reactions = message
+                                .reactions
+                                .into_iter()
+                                .map(|reaction| (reaction.kind, reaction.principal))
+                                .collect();
+                            (
+                                message.message_id,
+                                message.body,
+                                message.redacted,
+                                reactions,
+                            )
+                        })
+                        .collect(),
+                    threads: channel
+                        .threads
+                        .into_iter()
+                        .map(|thread| (thread.thread_id, thread.parent_message_id))
+                        .collect(),
+                    tasks: channel
+                        .tasks
+                        .into_iter()
+                        .map(|task| {
+                            let state = match task.state {
+                                loom_chat::HostedChatTaskState::Open => "open".to_string(),
+                                loom_chat::HostedChatTaskState::Claimed { claim_id, .. } => {
+                                    format!("claimed:{claim_id}")
+                                }
+                                loom_chat::HostedChatTaskState::Completed { claim_id, .. } => {
+                                    format!("completed:{claim_id}")
+                                }
+                            };
+                            (task.task_id, task.message_id, state)
+                        })
+                        .collect(),
+                    agent_invocations: channel
+                        .agent_invocations
+                        .into_iter()
+                        .map(|invocation| {
+                            (
+                                invocation.invocation_id,
+                                invocation.agent_principal,
+                                invocation.source_message_ids,
+                                invocation.reply_message_ids,
+                            )
+                        })
+                        .collect(),
+                    handoffs: channel
+                        .handoffs
+                        .into_iter()
+                        .map(|handoff| {
+                            (
+                                handoff.handoff_id,
+                                handoff.from_agent_principal,
+                                handoff.to_principal,
+                            )
+                        })
+                        .collect(),
+                }),
+                Err(error) if error.code == Code::NotFound => None,
+                Err(error) => return Err(error),
+            };
+        let emoji_custom = loom_chat::emoji_registry(loom, workspace, chat_workspace_id)?
+            .custom
+            .into_iter()
+            .collect::<Vec<_>>();
+        let cursor = match loom_chat::read_cursor(loom, workspace, chat_workspace_id, selector) {
+            Ok(cursor) => Some((
+                cursor.next_sequence,
+                cursor.head_sequence,
+                cursor.entity_tag,
+            )),
+            Err(error) if error.code == Code::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let audit_events = loom
+            .store()
+            .audit_records()?
+            .into_iter()
+            .filter(|record| record.action.starts_with("chat."))
+            .map(|record| (record.action, record.target))
+            .collect::<Vec<_>>();
+        let audit_actions = audit_events
+            .iter()
+            .map(|(action, _)| action.clone())
+            .collect::<Vec<_>>();
+        let revision_history = if let Some(entity) = revision_entity {
+            loom_substrate::versioning::load_current_revision_index(
+                loom,
+                workspace,
+                chat_workspace_id,
+            )?
+            .history(entity)
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.revision,
+                    entry.operation_id.clone(),
+                    entry.body.digest.to_string(),
+                    entry.body.len,
+                    entry.root.to_string(),
+                    entry.timestamp_ms,
+                )
+            })
+            .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(ChatStateSnapshot {
+            reference_root: loom.store().reference_root().map(|root| root.to_string()),
+            channels,
+            projection,
+            emoji_custom,
+            cursor,
+            audit_actions,
+            audit_events,
+            revision_history,
+        })
+    }
+
+    fn reopened_chat_state_snapshot(
+        path: &std::path::Path,
+        workspace: WorkspaceId,
+        chat_workspace_id: &str,
+        selector: &str,
+        revision_entity: Option<&str>,
+    ) -> ChatStateSnapshot {
+        let client = LocalLoomClient::new(path);
+        let session = client.open().expect("open snapshot store");
+        let snapshot = chat_state_snapshot(
+            &client,
+            &session,
+            workspace,
+            chat_workspace_id,
+            selector,
+            revision_entity,
+        );
+        client.close(&session);
+        snapshot
+    }
+
+    fn backing_chat_state_snapshot(
+        shared: SharedMem,
+        workspace: WorkspaceId,
+        chat_workspace_id: &str,
+        selector: &str,
+        revision_entity: Option<&str>,
+    ) -> ChatStateSnapshot {
+        let store = FileStore::with_backing(Box::new(shared), true).expect("open backing snapshot");
+        let root = store.reference_root();
+        let mut loom = Loom::new(store);
+        if let Some(root) = root {
+            loom.load_state(root).expect("load backing snapshot state");
+        }
+        chat_state_snapshot_from_loom(
+            &mut loom,
+            workspace,
+            chat_workspace_id,
+            selector,
+            revision_entity,
+        )
+        .expect("backing chat snapshot")
+    }
+
+    fn seed_backing_chat_store(
+        shared: SharedMem,
+        tag_byte: u8,
+    ) -> (WorkspaceId, WorkspaceId, WorkspaceId) {
+        let store =
+            FileStore::with_backing(Box::new(shared), true).expect("create backing chat store");
+        let mut loom = Loom::new(store);
+        loom.ensure_full_state_loaded()
+            .expect("initialize backing chat store state");
+        let workspace = loom
+            .registry_mut()
+            .create(
+                FacetKind::Document,
+                Some("repo"),
+                WorkspaceId::from_bytes([tag_byte; 16]),
+            )
+            .expect("create backing workspace");
+        let allowed_channel = WorkspaceId::from_bytes([tag_byte.wrapping_add(1); 16]);
+        let denied_channel = WorkspaceId::from_bytes([tag_byte.wrapping_add(2); 16]);
+        let mut directory =
+            loom_substrate::chat::ChatChannelDirectory::new("studio").expect("chat directory");
+        directory
+            .create_channel(allowed_channel, "general", "General")
+            .expect("create allowed channel");
+        directory
+            .create_channel(denied_channel, "private", "Private")
+            .expect("create denied channel");
+        let path = String::from_utf8(
+            loom_substrate::chat::chat_channel_directory_key("studio").expect("chat directory key"),
+        )
+        .expect("chat directory key utf8");
+        loom.create_directory_reserved(workspace, "profile/chat/v1/studio/channels", true)
+            .expect("create chat directory path");
+        loom.write_file_reserved(
+            workspace,
+            &path,
+            &directory.encode().expect("encode chat directory"),
+            0o100644,
+        )
+        .expect("write chat directory");
+        loom_chat::post_message(
+            &mut loom,
+            workspace,
+            "studio",
+            "general",
+            "m1",
+            None,
+            b"before".to_vec(),
+            None,
+        )
+        .expect("seed message");
+        loom.write_file_reserved(
+            workspace,
+            &path,
+            &directory.encode().expect("encode chat directory"),
+            0o100644,
+        )
+        .expect("restore chat directory after stream seed");
+        save_loom(&mut loom).expect("save backing chat store");
+        (workspace, allowed_channel, denied_channel)
+    }
+
+    fn failing_backing_client_session(
+        shared: SharedMem,
+        fail_on: u64,
+        tag: &str,
+    ) -> (LocalLoomClient, LoomSession, std::path::PathBuf) {
+        let dir = temp_dir(tag);
+        let store = FileStore::with_backing(Box::new(FailNthFsyncMem::new(shared, fail_on)), true)
+            .expect("open failing backing");
+        let root = store.reference_root();
+        let mut loom = Loom::new(store);
+        if let Some(root) = root {
+            loom.load_state(root).expect("load failing backing state");
+        }
+        let client = LocalLoomClient::new(dir.join("failing.loom"));
+        let session = client
+            .register_daemon_shared_loom(std::sync::Arc::new(std::sync::Mutex::new(loom)), None)
+            .expect("register failing backing session");
+        (client, session, dir)
+    }
+
+    struct SettingsPatchCbor<'a> {
+        default_projection: Option<&'a str>,
+        actor_enforcement: Option<&'a str>,
+        acceptance_authorities: Option<Vec<&'a str>>,
         acceptance_evidence_enforcement: Option<bool>,
-        required_acceptance_evidence_keys: Option<Vec<&str>>,
-        owner_contract_summary: Option<&str>,
-        owner_contract_details: Option<&str>,
-        worker_contract_summary: Option<&str>,
-        worker_contract_details: Option<&str>,
-        expected_root: Option<&str>,
-    ) -> Vec<u8> {
+        required_acceptance_evidence_keys: Option<Vec<&'a str>>,
+        required_acceptance_reviews: Option<Vec<&'a str>>,
+        owner_contract_summary: Option<&'a str>,
+        owner_contract_details: Option<&'a str>,
+        worker_contract_summary: Option<&'a str>,
+        worker_contract_details: Option<&'a str>,
+        expected_root: Option<&'a str>,
+    }
+
+    fn settings_patch_cbor(patch: SettingsPatchCbor<'_>) -> Vec<u8> {
         let opt_text = |value: Option<&str>| {
             value
                 .map(|value| Value::Text(value.to_string()))
@@ -7508,22 +9891,24 @@ mod tests {
                 .unwrap_or(Value::Null)
         };
         loom_codec::encode(&Value::Array(vec![
-            opt_text(default_projection),
+            opt_text(patch.default_projection),
             Value::Array(Vec::new()),
             Value::Array(Vec::new()),
-            opt_text(actor_enforcement),
+            opt_text(patch.actor_enforcement),
             Value::Null,
             Value::Bool(false),
-            opt_text_list(acceptance_authorities),
-            acceptance_evidence_enforcement
+            opt_text_list(patch.acceptance_authorities),
+            patch
+                .acceptance_evidence_enforcement
                 .map(Value::Bool)
                 .unwrap_or(Value::Null),
-            opt_text_list(required_acceptance_evidence_keys),
-            opt_text(owner_contract_summary),
-            opt_text(owner_contract_details),
-            opt_text(worker_contract_summary),
-            opt_text(worker_contract_details),
-            opt_text(expected_root),
+            opt_text_list(patch.required_acceptance_evidence_keys),
+            opt_text_list(patch.required_acceptance_reviews),
+            opt_text(patch.owner_contract_summary),
+            opt_text(patch.owner_contract_details),
+            opt_text(patch.worker_contract_summary),
+            opt_text(patch.worker_contract_details),
+            opt_text(patch.expected_root),
         ]))
         .expect("settings patch cbor")
     }
@@ -7862,24 +10247,29 @@ mod tests {
                 "repo".to_string(),
                 workspace_id.clone(),
                 "matrix".to_string(),
-                settings_patch_cbor(
-                    Some("jira"),
-                    Some("write_access"),
-                    Some(Vec::new()),
-                    Some(true),
-                    Some(vec!["checks_run", "source_anchors"]),
-                    Some("Owner accepts completed work."),
-                    Some("Owner details."),
-                    Some("Worker delivers evidence."),
-                    Some("Worker details."),
-                    project["profile_root"].as_str(),
-                ),
+                settings_patch_cbor(SettingsPatchCbor {
+                    default_projection: Some("jira"),
+                    actor_enforcement: Some("write_access"),
+                    acceptance_authorities: Some(Vec::new()),
+                    acceptance_evidence_enforcement: Some(true),
+                    required_acceptance_evidence_keys: Some(vec!["checks_run", "source_anchors"]),
+                    required_acceptance_reviews: Some(vec!["design_review"]),
+                    owner_contract_summary: Some("Owner accepts completed work."),
+                    owner_contract_details: Some("Owner details."),
+                    worker_contract_summary: Some("Worker delivers evidence."),
+                    worker_contract_details: Some("Worker details."),
+                    expected_root: project["profile_root"].as_str(),
+                }),
             ),
         )
         .expect("set project settings");
         let settings: serde_json::Value = serde_json::from_str(&settings).expect("settings json");
         assert_eq!(settings["default_projection"], "jira");
         assert_eq!(settings["acceptance_evidence_enforcement"], true);
+        assert_eq!(
+            settings["required_acceptance_reviews"],
+            serde_json::json!(["design_review"])
+        );
         assert_eq!(
             settings["required_acceptance_evidence_keys"],
             serde_json::json!(["source_anchors", "checks_run"])
@@ -8578,6 +10968,191 @@ mod tests {
     }
 
     #[test]
+    fn ticket_create_defaults_status_ready_and_preserves_explicit_status() {
+        let (client, session, workspace, dir) = seed_client("tickets-status-default");
+        let workspace_id = workspace.to_string();
+        block(<LocalLoomClient as Tickets>::tickets_project_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "MX".to_string(),
+            "Matrix".to_string(),
+            None,
+        ))
+        .expect("create project");
+
+        let defaulted = block(<LocalLoomClient as Tickets>::tickets_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "task".to_string(),
+            None,
+            None,
+            serde_json::json!({"title": "Defaults status"}).to_string(),
+            "[]".to_string(),
+            None,
+        ))
+        .expect("create defaulted ticket");
+        let defaulted: serde_json::Value =
+            serde_json::from_str(&defaulted).expect("defaulted ticket json");
+        assert_eq!(defaulted["resource"]["primary_key"], "MX-1");
+        assert_eq!(defaulted["resource"]["fields"]["status"], "ready");
+        let defaulted_root = defaulted["resource"]["profile_root"]
+            .as_str()
+            .expect("defaulted root")
+            .to_string();
+
+        let defaulted_get = block(<LocalLoomClient as Tickets>::tickets_get_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "MX-1".to_string(),
+            None,
+        ))
+        .expect("get defaulted ticket");
+        let defaulted_get: serde_json::Value =
+            serde_json::from_str(&defaulted_get).expect("defaulted get json");
+        assert_eq!(defaulted_get["fields"]["status"], "ready");
+
+        let explicit = block(<LocalLoomClient as Tickets>::tickets_create_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "matrix".to_string(),
+            "task".to_string(),
+            None,
+            None,
+            serde_json::json!({"title": "Keeps status", "status": "blocked"}).to_string(),
+            "[]".to_string(),
+            Some(defaulted_root),
+        ))
+        .expect("create explicit ticket");
+        let explicit: serde_json::Value =
+            serde_json::from_str(&explicit).expect("explicit ticket json");
+        assert_eq!(explicit["resource"]["primary_key"], "MX-2");
+        assert_eq!(explicit["resource"]["fields"]["status"], "blocked");
+
+        let explicit_get = block(<LocalLoomClient as Tickets>::tickets_get_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            workspace_id,
+            "MX-2".to_string(),
+            None,
+        ))
+        .expect("get explicit ticket");
+        let explicit_get: serde_json::Value =
+            serde_json::from_str(&explicit_get).expect("explicit get json");
+        assert_eq!(explicit_get["fields"]["status"], "blocked");
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lane_view_reopens_public_ticket_key_members_without_explicit_status() {
+        let (client, session, workspace, dir) = seed_client("lanes-public-key-reopen");
+        let workspace_id = workspace.to_string();
+        let ticket = client
+            .with_session(&session, |loom| {
+                loom_tickets::create_project(
+                    loom,
+                    workspace,
+                    &workspace_id,
+                    "matrix",
+                    "MX",
+                    "Matrix",
+                    None,
+                )?;
+                let ticket = loom_tickets::create_ticket(
+                    loom,
+                    workspace,
+                    loom_tickets::TicketCreateRequest {
+                        workspace_id: &workspace_id,
+                        project_id: "matrix",
+                        ticket_type: "task",
+                        external_source: None,
+                        external_id: None,
+                        fields: &serde_json::json!({
+                            "title": "Public-key lane member"
+                        }),
+                        policy_labels: &[],
+                        expected_root: None,
+                    },
+                )?;
+                save_loom(loom)?;
+                Ok(ticket)
+            })
+            .expect("seed ticket");
+        assert_eq!(ticket.primary_key, "MX-1");
+        assert_eq!(ticket.fields["status"], "ready");
+
+        client
+            .lanes_create(
+                &session,
+                "repo",
+                loom_lanes::Lane {
+                    lane_id: "public-key-lane".to_string(),
+                    lane_key: "public-key-lane".to_string(),
+                    title: "Public-key lane".to_string(),
+                    description: "Lane view public-key ticket resolution regression.".to_string(),
+                    lane_kind: loom_lanes::LaneKind::Assignment.as_str().to_string(),
+                    owner_principal: None,
+                    lane_status: "ready".to_string(),
+                    lane_tickets: vec![loom_lanes::LaneTicket {
+                        ticket_id: ticket.primary_key.clone(),
+                        order_key: "F".to_string(),
+                    }],
+                    active_ticket_id: None,
+                    status_report: String::new(),
+                    reviewer_feedback: String::new(),
+                    updated_at: 1,
+                    updated_by: "agent-2".to_string(),
+                },
+            )
+            .expect("seed lane");
+        client.close(&session);
+
+        let reopened = LocalLoomClient::open(&client).expect("reopen");
+        let ticket_read = block(<LocalLoomClient as Tickets>::tickets_get_json(
+            &client,
+            reopened.clone(),
+            "repo".to_string(),
+            workspace_id.clone(),
+            "MX-1".to_string(),
+            None,
+        ))
+        .expect("reopened ticket read");
+        let ticket_read: serde_json::Value =
+            serde_json::from_str(&ticket_read).expect("reopened ticket json");
+        assert_eq!(ticket_read["fields"]["status"], "ready");
+
+        let view = client
+            .lanes_get_view(&reopened, "repo", &workspace_id, "public-key-lane")
+            .expect("reopened lane view")
+            .expect("lane exists");
+        assert_eq!(view.lane_tickets.len(), 1);
+        assert_eq!(view.lane_tickets[0].ticket_id, "MX-1");
+        assert_eq!(
+            view.lane_tickets[0].title.as_deref(),
+            Some("Public-key lane member")
+        );
+        assert_eq!(view.lane_tickets[0].status.as_deref(), Some("ready"));
+        assert_eq!(view.status_counts.ready, 1);
+        assert_eq!(view.status_counts.missing, 0);
+        assert_eq!(view.status_counts.next_ticket_id.as_deref(), Some("MX-1"));
+
+        client.close(&reopened);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn tickets_update_json_composes_fields_status_comments_and_relations_locally() {
         let (client, session, workspace, dir) = seed_client("tickets-update-json");
         let workspace_id = workspace.to_string();
@@ -9044,7 +11619,7 @@ mod tests {
         client
             .with_session(&session, |loom| {
                 loom_chat::ensure_channel(
-                    loom, workspace, "studio", channel_id, "general", "General",
+                    loom, workspace, "studio", channel_id, "general", "General", None,
                 )?;
                 save_loom(loom)
             })
@@ -9053,12 +11628,13 @@ mod tests {
         block(<LocalLoomClient as Chat>::chat_post_message_json(
             &client,
             session.clone(),
-            "repo".to_string(),
+            workspace.to_string(),
             "studio".to_string(),
             "general".to_string(),
             "m1".to_string(),
             None,
             "hello".to_string(),
+            None,
         ))
         .expect("post message");
         block(<LocalLoomClient as Chat>::chat_edit_message_json(
@@ -9069,6 +11645,7 @@ mod tests {
             "general".to_string(),
             "m1".to_string(),
             "edited".to_string(),
+            None,
         ))
         .expect("edit message");
         block(<LocalLoomClient as Chat>::chat_invoke_agent_json(
@@ -9081,6 +11658,7 @@ mod tests {
             WorkspaceId::from_bytes([7; 16]).to_string(),
             "[\"m1\"]".to_string(),
             "summarize".to_string(),
+            None,
         ))
         .expect("invoke agent");
 
@@ -9096,6 +11674,3073 @@ mod tests {
             })
             .expect("read channel");
         client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_b_chat_generated_mutations_return_tags_audit_and_reopen() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-b");
+        let channel_id = WorkspaceId::from_bytes([10; 16]);
+        let channel_id_text = channel_id.to_string();
+
+        let created = block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "general".to_string(),
+            "General".to_string(),
+            None,
+        ))
+        .expect("create channel");
+        let created: serde_json::Value = serde_json::from_str(&created).expect("create json");
+        assert_eq!(created["channel_id"], channel_id_text);
+        let create_tag = created["entity_tag"].as_str().expect("create tag");
+
+        let renamed = block(<LocalLoomClient as Chat>::chat_rename_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "team".to_string(),
+            Some(create_tag.to_string()),
+        ))
+        .expect("rename channel");
+        let renamed: serde_json::Value = serde_json::from_str(&renamed).expect("rename json");
+        assert_eq!(renamed["handle"], "team");
+        let rename_tag = renamed["entity_tag"].as_str().expect("rename tag");
+        assert_ne!(rename_tag, create_tag);
+
+        let post = block(<LocalLoomClient as Chat>::chat_post_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "m1".to_string(),
+            None,
+            "hello".to_string(),
+            None,
+        ))
+        .expect("post message");
+        let post: serde_json::Value = serde_json::from_str(&post).expect("post json");
+        assert_eq!(post["operation_kind"], "message.created");
+        let post_tag = post["entity_tag"].as_str().expect("post tag");
+
+        let stale_edit = block(<LocalLoomClient as Chat>::chat_edit_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "m1".to_string(),
+            "stale".to_string(),
+            Some(create_tag.to_string()),
+        ))
+        .expect_err("stale edit");
+        assert_eq!(stale_edit.code, Code::Conflict);
+
+        let edited = block(<LocalLoomClient as Chat>::chat_edit_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "m1".to_string(),
+            "edited".to_string(),
+            Some(post_tag.to_string()),
+        ))
+        .expect("edit message");
+        let edited: serde_json::Value = serde_json::from_str(&edited).expect("edit json");
+        assert_eq!(edited["operation_kind"], "message.edited");
+        let edit_tag = edited["entity_tag"].as_str().expect("edit tag");
+        assert_ne!(edit_tag, post_tag);
+
+        let thread = block(<LocalLoomClient as Chat>::chat_create_thread_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "t1".to_string(),
+            "m1".to_string(),
+            Some(edit_tag.to_string()),
+        ))
+        .expect("create thread");
+        let thread: serde_json::Value = serde_json::from_str(&thread).expect("thread json");
+        assert_eq!(thread["operation_kind"], "thread.created");
+        let thread_tag = thread["entity_tag"].as_str().expect("thread tag");
+
+        let redacted = block(<LocalLoomClient as Chat>::chat_redact_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "m1".to_string(),
+            Some("cleanup".to_string()),
+            Some(thread_tag.to_string()),
+        ))
+        .expect("redact message");
+        let redacted: serde_json::Value = serde_json::from_str(&redacted).expect("redact json");
+        assert_eq!(redacted["operation_kind"], "message.redacted");
+        assert!(redacted["entity_tag"].as_str().is_some());
+
+        client
+            .with_session(&session, |loom| {
+                let audit_actions = loom
+                    .store()
+                    .audit_records()?
+                    .into_iter()
+                    .map(|record| record.action)
+                    .filter(|action| action.starts_with("chat."))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    audit_actions,
+                    ["chat.channel.create", "chat.channel.rename"]
+                );
+                let channel = loom_chat::channel_projection(loom, workspace, "studio", "team")?;
+                assert_eq!(channel.messages.len(), 1);
+                assert!(channel.messages[0].redacted);
+                assert_eq!(channel.threads.len(), 1);
+                Ok(())
+            })
+            .expect("inspect live chat");
+
+        client.close(&session);
+        let reopened_client = LocalLoomClient::new(dir.join("t.loom"));
+        let reopened_session = reopened_client.open().expect("reopen");
+        reopened_client
+            .with_session(&reopened_session, |loom| {
+                let channel = loom_chat::channel_projection(loom, workspace, "studio", "team")?;
+                assert_eq!(channel.messages.len(), 1);
+                assert!(channel.messages[0].redacted);
+                assert_eq!(channel.threads[0].thread_id, "t1");
+                Ok(())
+            })
+            .expect("inspect reopened chat");
+        reopened_client.close(&reopened_session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_b_chat_create_parses_channel_id_after_session_auth() {
+        let (client, session, _workspace, dir) = seed_client("chat-generated-k-b-auth-order");
+        let closed_session = session.clone();
+        client.close(&session);
+
+        let error = block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            closed_session,
+            "repo".to_string(),
+            "studio".to_string(),
+            "not-a-workspace-id".to_string(),
+            "general".to_string(),
+            "General".to_string(),
+            None,
+        ))
+        .expect_err("closed session rejects before channel id parse");
+        assert_ne!(error.code, Code::InvalidArgument);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_b_chat_alias_and_uuid_route_to_canonical_channel() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-b-alias");
+        let channel_id = WorkspaceId::from_bytes([11; 16]);
+        let channel_id_text = channel_id.to_string();
+        block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "general".to_string(),
+            "General".to_string(),
+            None,
+        ))
+        .expect("create channel");
+
+        let by_alias = block(<LocalLoomClient as Chat>::chat_post_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            None,
+            "hello".to_string(),
+            None,
+        ))
+        .expect("post by alias");
+        let by_alias: serde_json::Value = serde_json::from_str(&by_alias).expect("alias json");
+        assert_eq!(by_alias["channel_id"], channel_id_text);
+        let alias_tag = by_alias["entity_tag"].as_str().expect("alias tag");
+
+        let by_uuid = block(<LocalLoomClient as Chat>::chat_edit_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "m1".to_string(),
+            "edited".to_string(),
+            Some(alias_tag.to_string()),
+        ))
+        .expect("edit by uuid");
+        let by_uuid: serde_json::Value = serde_json::from_str(&by_uuid).expect("uuid json");
+        assert_eq!(by_uuid["channel_id"], channel_id_text);
+        assert_ne!(by_uuid["entity_tag"].as_str().expect("uuid tag"), alias_tag);
+
+        client
+            .with_session(&session, |loom| {
+                let alias_projection =
+                    loom_chat::channel_projection(loom, workspace, "studio", "general")?;
+                let uuid_projection =
+                    loom_chat::channel_projection(loom, workspace, "studio", &channel_id_text)?;
+                assert_eq!(alias_projection.channel_id, uuid_projection.channel_id);
+                assert_eq!(uuid_projection.messages[0].body, b"edited");
+                Ok(())
+            })
+            .expect("inspect canonical projection");
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_b_chat_restricted_principal_uses_canonical_channel_acl() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-b-restricted-acl");
+        let root = WorkspaceId::from_bytes([41; 16]);
+        let user = WorkspaceId::from_bytes([42; 16]);
+        let allowed_channel = WorkspaceId::from_bytes([43; 16]);
+        let allowed_channel_text = allowed_channel.to_string();
+        let denied_channel = WorkspaceId::from_bytes([44; 16]);
+        client
+            .with_session(&session, |loom| {
+                loom_chat::ensure_channel(
+                    loom,
+                    workspace,
+                    "studio",
+                    allowed_channel,
+                    "general",
+                    "General",
+                    None,
+                )?;
+                loom_chat::ensure_channel(
+                    loom,
+                    workspace,
+                    "studio",
+                    denied_channel,
+                    "private",
+                    "Private",
+                    None,
+                )?;
+                let mut identity = loom_core::IdentityStore::new(root);
+                identity.set_passphrase(root, "root-pass", b"chat-root")?;
+                identity.add_principal(user, "user", loom_core::PrincipalKind::User)?;
+                identity.set_passphrase(user, "user-pass", b"chat-acl")?;
+                let mut acl = loom_core::acl::AclStore::new();
+                acl.allow(
+                    loom_core::acl::AclSubject::Principal(root),
+                    Some(workspace),
+                    None,
+                    [loom_core::AclRight::Admin],
+                )?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::All],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Read]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: b"chat/studio/channels/".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Read]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: format!("chat/studio/channels/{allowed_channel_text}").into_bytes(),
+                    }],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Write]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Files.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Path,
+                        prefix: b"profile/chat/v1/studio/channels/index.lch".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Files.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Path,
+                        prefix: b".loom/substrate/refs".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Vcs.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Table,
+                        prefix: b".loom/substrate/refs/reconciliation".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.allow(
+                    loom_core::acl::AclSubject::Principal(user),
+                    Some(workspace),
+                    Some(loom_core::FacetKind::Vcs),
+                    [loom_core::AclRight::Read, loom_core::AclRight::Write],
+                )?;
+                loom.store().save_identity_store(&identity)?;
+                loom.store().save_acl_store(&acl)?;
+                loom.set_identity_store(identity);
+                loom.set_acl_store(acl);
+                save_loom(loom)
+            })
+            .expect("seed restricted chat acl");
+        client
+            .authenticate_passphrase(&session, user, b"user-pass")
+            .expect("authenticate restricted user");
+        client
+            .with_session(&session, |loom| {
+                let collection = b"chat/studio/channels/";
+                loom.authorize_resource(
+                    loom_core::AclResource::scoped(
+                        workspace,
+                        loom_core::AclDomain::Chat,
+                        None,
+                        loom_core::AclResourceScope::Prefix {
+                            kind: loom_core::AclScopeKind::Collection,
+                            value: collection,
+                        },
+                    ),
+                    loom_core::AclRight::Read,
+                )?;
+                let allowed = format!("chat/studio/channels/{allowed_channel_text}");
+                loom.authorize_resource(
+                    loom_core::AclResource::scoped(
+                        workspace,
+                        loom_core::AclDomain::Chat,
+                        None,
+                        loom_core::AclResourceScope::Prefix {
+                            kind: loom_core::AclScopeKind::Collection,
+                            value: allowed.as_bytes(),
+                        },
+                    ),
+                    loom_core::AclRight::Write,
+                )?;
+                Ok(())
+            })
+            .expect("restricted grants authorize collection discovery and canonical channel");
+
+        let create_denied = block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            WorkspaceId::from_bytes([45; 16]).to_string(),
+            "new".to_string(),
+            "New".to_string(),
+            None,
+        ))
+        .expect_err("collection read alone cannot create a channel");
+        assert_eq!(create_denied.code, Code::PermissionDenied);
+
+        let by_alias = block(<LocalLoomClient as Chat>::chat_rename_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "team".to_string(),
+            None,
+        ))
+        .expect("alias mutation authorized by canonical grant");
+        let by_alias: serde_json::Value = serde_json::from_str(&by_alias).expect("alias json");
+        assert_eq!(by_alias["channel_id"], allowed_channel_text);
+        assert_eq!(by_alias["handle"], "team");
+
+        let by_uuid = block(<LocalLoomClient as Chat>::chat_rename_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            allowed_channel_text.clone(),
+            "general".to_string(),
+            None,
+        ))
+        .expect("uuid mutation authorized by canonical grant");
+        let by_uuid: serde_json::Value = serde_json::from_str(&by_uuid).expect("uuid json");
+        assert_eq!(by_uuid["channel_id"], allowed_channel_text);
+        assert_eq!(by_uuid["handle"], "general");
+
+        let denied = block(<LocalLoomClient as Chat>::chat_rename_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "private".to_string(),
+            "hidden".to_string(),
+            None,
+        ))
+        .expect_err("unrelated channel grant denied");
+        assert_eq!(denied.code, Code::PermissionDenied);
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_b_chat_stream_save_failure_rolls_back_live_and_reopen_state() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-b-stream-rollback");
+        let path = dir.join("t.loom");
+        let channel_id = WorkspaceId::from_bytes([12; 16]);
+        let channel_id_text = channel_id.to_string();
+        block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "general".to_string(),
+            "General".to_string(),
+            None,
+        ))
+        .expect("create channel");
+        let post = block(<LocalLoomClient as Chat>::chat_post_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            None,
+            "before".to_string(),
+            None,
+        ))
+        .expect("post baseline");
+        let post: serde_json::Value = serde_json::from_str(&post).expect("post json");
+        let post_tag = post["entity_tag"].as_str().expect("post tag").to_string();
+        let entity_id = format!("chat:{channel_id_text}:message:m1");
+        let before = chat_state_snapshot(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+
+        crate::local::install_exec_apply_candidate_save_hook(
+            client.store_path().to_path_buf(),
+            Box::new(|| {
+                Err(LoomError::new(
+                    Code::Io,
+                    "injected chat stream save failure",
+                ))
+            }),
+        );
+        let error = block(<LocalLoomClient as Chat>::chat_edit_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            "after".to_string(),
+            Some(post_tag),
+        ))
+        .expect_err("injected stream save failure");
+        assert_eq!(error.code, Code::Io, "{error:?}");
+
+        let after = chat_state_snapshot(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        assert_eq!(after, before);
+        client.close(&session);
+        let reopened =
+            reopened_chat_state_snapshot(&path, workspace, "studio", "general", Some(&entity_id));
+        assert_eq!(reopened, before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_b_chat_audit_publication_failure_rolls_back_directory_and_audit() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-b-audit-rollback");
+        let path = dir.join("t.loom");
+        let channel_id = WorkspaceId::from_bytes([13; 16]);
+        let channel_id_text = channel_id.to_string();
+        let before = chat_state_snapshot(&client, &session, workspace, "studio", "general", None);
+
+        crate::local::install_exec_apply_candidate_save_hook(
+            client.store_path().to_path_buf(),
+            Box::new(|| Err(LoomError::new(Code::Io, "injected chat audit save failure"))),
+        );
+        let error = block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text,
+            "general".to_string(),
+            "General".to_string(),
+            None,
+        ))
+        .expect_err("injected audited create failure");
+        assert_eq!(error.code, Code::Io, "{error:?}");
+
+        let after = chat_state_snapshot(&client, &session, workspace, "studio", "general", None);
+        assert_eq!(after, before);
+        client.close(&session);
+        let reopened = reopened_chat_state_snapshot(&path, workspace, "studio", "general", None);
+        assert_eq!(reopened, before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_b_chat_real_stream_publication_failure_preserves_live_and_reopen_state() {
+        let shared = SharedMem::default();
+        let (workspace, channel_id, _) = seed_backing_chat_store(shared.clone(), 61);
+        let channel_id_text = channel_id.to_string();
+        let entity_id = format!("chat:{channel_id_text}:message:m1");
+        let before = backing_chat_state_snapshot(
+            shared.clone(),
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        assert!(!before.revision_history.is_empty(), "{before:?}");
+        let (client, session, dir) = failing_backing_client_session(
+            shared.clone(),
+            2,
+            "chat-generated-k-b-real-stream-fail",
+        );
+
+        let error = client
+            .with_session(&session, |loom| {
+                let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+                let mut directory = loom_substrate::chat::ChatChannelDirectory::new("studio")?;
+                directory.create_channel(channel_id, "general", "General")?;
+                let path =
+                    String::from_utf8(loom_substrate::chat::chat_channel_directory_key("studio")?)
+                        .map_err(|_| LoomError::corrupt("chat directory key is not utf8"))?;
+                candidate.create_directory_reserved(
+                    workspace,
+                    "profile/chat/v1/studio/channels",
+                    true,
+                )?;
+                candidate.write_file_reserved(workspace, &path, &directory.encode()?, 0o100644)?;
+                loom_chat::post_message(
+                    &mut candidate,
+                    workspace,
+                    "studio",
+                    "general",
+                    "m2",
+                    None,
+                    b"after".to_vec(),
+                    None,
+                )?;
+                let published = save_generated_planning_candidate(
+                    client.store_path(),
+                    loom.store(),
+                    &mut candidate,
+                )?;
+                drop(candidate);
+                import_generated_chat_publication(loom, &published)?;
+                Ok(())
+            })
+            .expect_err("real stream publication failure");
+        assert_eq!(error.code, Code::Io, "{error:?}");
+
+        let live = chat_state_snapshot(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        assert_eq!(live, before);
+        client.close(&session);
+        let reopened =
+            backing_chat_state_snapshot(shared, workspace, "studio", "general", Some(&entity_id));
+        assert_eq!(reopened, before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_b_chat_real_audit_publication_failure_preserves_live_and_reopen_state() {
+        let shared = SharedMem::default();
+        let (workspace, _, _) = seed_backing_chat_store(shared.clone(), 71);
+        let before =
+            backing_chat_state_snapshot(shared.clone(), workspace, "studio", "general", None);
+        let (client, session, dir) =
+            failing_backing_client_session(shared.clone(), 1, "chat-generated-k-b-real-audit-fail");
+        let new_channel = WorkspaceId::from_bytes([74; 16]).to_string();
+
+        let error = client
+            .with_session(&session, |loom| {
+                let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+                let summary = loom_chat::ensure_channel(
+                    &mut candidate,
+                    workspace,
+                    "studio",
+                    WorkspaceId::parse(&new_channel)?,
+                    "alerts",
+                    "Alerts",
+                    None,
+                )?;
+                let published = save_generated_planning_candidate_with_audits(
+                    client.store_path(),
+                    loom.store(),
+                    &mut candidate,
+                    vec![WorkflowAuditWrite {
+                        principal: Some(workspace),
+                        action: "chat.channel.create".to_string(),
+                        target: Some(format!("chat:studio:channel:{}", summary.channel_id)),
+                    }],
+                )?;
+                drop(candidate);
+                import_generated_chat_publication(loom, &published)?;
+                Ok(())
+            })
+            .expect_err("real audited publication failure");
+        assert_eq!(error.code, Code::Io, "{error:?}");
+
+        let live = chat_state_snapshot(&client, &session, workspace, "studio", "general", None);
+        assert_eq!(live, before);
+        client.close(&session);
+        let reopened = backing_chat_state_snapshot(shared, workspace, "studio", "general", None);
+        assert_eq!(reopened, before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_c_chat_task_agent_handoff_generated_sequence_audit_and_reopen() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-c-sequence");
+        let path = dir.join("t.loom");
+        let channel_id = WorkspaceId::from_bytes([81; 16]);
+        let channel_id_text = channel_id.to_string();
+        let agent = WorkspaceId::from_bytes([82; 16]).to_string();
+        let recipient = WorkspaceId::from_bytes([83; 16]).to_string();
+
+        block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "general".to_string(),
+            "General".to_string(),
+            None,
+        ))
+        .expect("create channel");
+        let baseline_audits =
+            chat_state_snapshot(&client, &session, workspace, "studio", "general", None)
+                .audit_actions;
+        assert_eq!(baseline_audits, ["chat.channel.create"]);
+
+        let post = block(<LocalLoomClient as Chat>::chat_post_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            None,
+            "hello".to_string(),
+            None,
+        ))
+        .expect("post message");
+        let post_tag = chat_json_entity_tag(&post);
+
+        let created = block(<LocalLoomClient as Chat>::chat_create_task_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "task-1".to_string(),
+            Some("m1".to_string()),
+            "Investigate".to_string(),
+            Some(post_tag.clone()),
+        ))
+        .expect("create task");
+        let create_tag = chat_json_entity_tag(&created);
+        assert_ne!(create_tag, post_tag);
+
+        let claimed = block(<LocalLoomClient as Chat>::chat_claim_task_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "task-1".to_string(),
+            "claim-1".to_string(),
+            Some("lease-1".to_string()),
+            Some(create_tag.clone()),
+        ))
+        .expect("claim task");
+        let claim_tag = chat_json_entity_tag(&claimed);
+        assert_ne!(claim_tag, create_tag);
+
+        let stale = block(<LocalLoomClient as Chat>::chat_complete_task_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "task-1".to_string(),
+            "claim-1".to_string(),
+            Some("m1".to_string()),
+            Some(create_tag),
+        ))
+        .expect_err("stale tag rejected");
+        assert_eq!(stale.code, Code::Conflict);
+
+        let result = block(<LocalLoomClient as Chat>::chat_post_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m2".to_string(),
+            None,
+            "done".to_string(),
+            Some(claim_tag.clone()),
+        ))
+        .expect("post result");
+        let result_tag = chat_json_entity_tag(&result);
+        assert_ne!(result_tag, claim_tag);
+
+        let completed = block(<LocalLoomClient as Chat>::chat_complete_task_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "task-1".to_string(),
+            "claim-1".to_string(),
+            Some("m2".to_string()),
+            Some(result_tag.clone()),
+        ))
+        .expect("complete task");
+        let complete_tag = chat_json_entity_tag(&completed);
+        assert_ne!(complete_tag, result_tag);
+
+        let invoked = block(<LocalLoomClient as Chat>::chat_invoke_agent_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "inv-1".to_string(),
+            agent.clone(),
+            "[\"m1\"]".to_string(),
+            "summarize".to_string(),
+            Some(complete_tag.clone()),
+        ))
+        .expect("invoke agent");
+        let invoke_tag = chat_json_entity_tag(&invoked);
+        assert_ne!(invoke_tag, complete_tag);
+
+        let replied = block(<LocalLoomClient as Chat>::chat_agent_reply_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "inv-1".to_string(),
+            "m2".to_string(),
+            Some(invoke_tag.clone()),
+        ))
+        .expect("agent reply");
+        let reply_tag = chat_json_entity_tag(&replied);
+        assert_ne!(reply_tag, invoke_tag);
+
+        let handoff = block(<LocalLoomClient as Chat>::chat_request_handoff_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "handoff-1".to_string(),
+            agent.clone(),
+            Some(recipient.clone()),
+            Some("needs owner".to_string()),
+            Some(reply_tag.clone()),
+        ))
+        .expect("request handoff");
+        let handoff_tag = chat_json_entity_tag(&handoff);
+        assert_ne!(handoff_tag, reply_tag);
+
+        let audits = chat_state_snapshot(&client, &session, workspace, "studio", "general", None)
+            .audit_actions;
+        assert_eq!(
+            audits,
+            [
+                "chat.channel.create",
+                "chat.agent.invoke",
+                "chat.handoff.request"
+            ]
+        );
+        let audit_events =
+            chat_state_snapshot(&client, &session, workspace, "studio", "general", None)
+                .audit_events;
+        assert_eq!(
+            audit_events,
+            [
+                (
+                    "chat.channel.create".to_string(),
+                    Some(format!("chat:studio:channel:{channel_id_text}"))
+                ),
+                (
+                    "chat.agent.invoke".to_string(),
+                    Some(format!(
+                        "chat:studio:channel:{channel_id_text}:invocation:inv-1"
+                    ))
+                ),
+                (
+                    "chat.handoff.request".to_string(),
+                    Some(format!(
+                        "chat:studio:channel:{channel_id_text}:handoff:handoff-1"
+                    ))
+                )
+            ]
+        );
+
+        client.close(&session);
+        let reopened_client = LocalLoomClient::new(path);
+        let reopened_session = reopened_client.open().expect("reopen");
+        reopened_client
+            .with_session(&reopened_session, |loom| {
+                let channel = loom_chat::channel_projection(loom, workspace, "studio", "general")?;
+                assert_eq!(channel.tasks.len(), 1);
+                assert_eq!(channel.tasks[0].task_id, "task-1");
+                assert_eq!(channel.tasks[0].message_id.as_deref(), Some("m1"));
+                match &channel.tasks[0].state {
+                    loom_chat::HostedChatTaskState::Completed {
+                        claim_id,
+                        result_message_id,
+                        ..
+                    } => {
+                        assert_eq!(claim_id, "claim-1");
+                        assert_eq!(result_message_id.as_deref(), Some("m2"));
+                    }
+                    state => panic!("unexpected task state: {state:?}"),
+                }
+                assert_eq!(channel.agent_invocations.len(), 1);
+                assert_eq!(channel.agent_invocations[0].invocation_id, "inv-1");
+                assert_eq!(channel.agent_invocations[0].agent_principal, agent);
+                assert_eq!(channel.agent_invocations[0].source_message_ids, ["m1"]);
+                assert_eq!(channel.agent_invocations[0].prompt, b"summarize");
+                assert_eq!(channel.agent_invocations[0].reply_message_ids, ["m2"]);
+                assert_eq!(channel.handoffs.len(), 1);
+                assert_eq!(channel.handoffs[0].handoff_id, "handoff-1");
+                assert_eq!(channel.handoffs[0].from_agent_principal, agent);
+                assert_eq!(
+                    channel.handoffs[0].to_principal.as_deref(),
+                    Some(recipient.as_str())
+                );
+                Ok(())
+            })
+            .expect("inspect reopened task agent handoff projection");
+        reopened_client.close(&reopened_session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_c_chat_restricted_principal_task_alias_uuid_and_denied_channel() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-c-restricted-acl");
+        let root = WorkspaceId::from_bytes([84; 16]);
+        let user = WorkspaceId::from_bytes([85; 16]);
+        let allowed_channel = WorkspaceId::from_bytes([86; 16]);
+        let allowed_channel_text = allowed_channel.to_string();
+        let denied_channel = WorkspaceId::from_bytes([87; 16]);
+        client
+            .with_session(&session, |loom| {
+                loom_chat::ensure_channel(
+                    loom,
+                    workspace,
+                    "studio",
+                    allowed_channel,
+                    "general",
+                    "General",
+                    None,
+                )?;
+                loom_chat::ensure_channel(
+                    loom,
+                    workspace,
+                    "studio",
+                    denied_channel,
+                    "private",
+                    "Private",
+                    None,
+                )?;
+                let mut identity = loom_core::IdentityStore::new(root);
+                identity.set_passphrase(root, "root-pass", b"chat-root")?;
+                identity.add_principal(user, "user", loom_core::PrincipalKind::User)?;
+                identity.set_passphrase(user, "user-pass", b"chat-acl")?;
+                let mut acl = loom_core::acl::AclStore::new();
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: b"chat/studio/channels/".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Read]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: format!("chat/studio/channels/{allowed_channel_text}").into_bytes(),
+                    }],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Write]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                let allowed_stream =
+                    loom_chat::chat_queue_stream_name("studio", &allowed_channel_text)?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Queue.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: allowed_stream.into_bytes(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Files.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Path,
+                        prefix: b"profile/chat/v1/studio/channels/index.lch".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Files.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Path,
+                        prefix: b".loom/substrate/refs".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Vcs.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Table,
+                        prefix: b".loom/substrate/refs/reconciliation".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.allow(
+                    loom_core::acl::AclSubject::Principal(user),
+                    Some(workspace),
+                    Some(loom_core::FacetKind::Vcs),
+                    [loom_core::AclRight::Read, loom_core::AclRight::Write],
+                )?;
+                loom.store().save_identity_store(&identity)?;
+                loom.store().save_acl_store(&acl)?;
+                loom.set_identity_store(identity);
+                loom.set_acl_store(acl);
+                save_loom(loom)
+            })
+            .expect("seed restricted chat acl");
+        client
+            .authenticate_passphrase(&session, user, b"user-pass")
+            .expect("authenticate restricted user");
+
+        let created = block(<LocalLoomClient as Chat>::chat_create_task_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "task-1".to_string(),
+            None,
+            "Investigate".to_string(),
+            None,
+        ))
+        .expect("create task by alias");
+        let create_tag = chat_json_entity_tag(&created);
+
+        let claimed = block(<LocalLoomClient as Chat>::chat_claim_task_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            allowed_channel_text.clone(),
+            "task-1".to_string(),
+            "claim-1".to_string(),
+            Some("lease-1".to_string()),
+            Some(create_tag),
+        ))
+        .expect("claim task by uuid");
+        let claimed: serde_json::Value = serde_json::from_str(&claimed).expect("claim json");
+        assert_eq!(claimed["channel_id"], allowed_channel_text);
+
+        let denied = block(<LocalLoomClient as Chat>::chat_claim_task_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "private".to_string(),
+            "task-1".to_string(),
+            "claim-2".to_string(),
+            None,
+            None,
+        ))
+        .expect_err("unrelated channel denied");
+        assert_eq!(denied.code, Code::PermissionDenied);
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_c_chat_agent_and_handoff_request_parsing_after_authorization() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-c-auth-order");
+        let root = WorkspaceId::from_bytes([88; 16]);
+        let user = WorkspaceId::from_bytes([89; 16]);
+        let channel_id = WorkspaceId::from_bytes([90; 16]);
+        client
+            .with_session(&session, |loom| {
+                loom_chat::ensure_channel(
+                    loom, workspace, "studio", channel_id, "general", "General", None,
+                )?;
+                let mut identity = loom_core::IdentityStore::new(root);
+                identity.set_passphrase(root, "root-pass", b"chat-root")?;
+                identity.add_principal(user, "user", loom_core::PrincipalKind::User)?;
+                identity.set_passphrase(user, "user-pass", b"chat-acl")?;
+                let mut acl = loom_core::acl::AclStore::new();
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: b"chat/studio/channels/".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Read]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Files.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Path,
+                        prefix: b"profile/chat/v1/studio/channels/index.lch".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                loom.store().save_identity_store(&identity)?;
+                loom.store().save_acl_store(&acl)?;
+                loom.set_identity_store(identity);
+                loom.set_acl_store(acl);
+                save_loom(loom)
+            })
+            .expect("seed restricted chat acl");
+        client
+            .authenticate_passphrase(&session, user, b"user-pass")
+            .expect("authenticate restricted user");
+
+        let invoke = block(<LocalLoomClient as Chat>::chat_invoke_agent_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "inv-1".to_string(),
+            "not-a-principal".to_string(),
+            "not-json".to_string(),
+            "prompt".to_string(),
+            None,
+        ))
+        .expect_err("invoke authorization precedes parsing");
+        assert_eq!(invoke.code, Code::PermissionDenied);
+
+        let handoff = block(<LocalLoomClient as Chat>::chat_request_handoff_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "handoff-1".to_string(),
+            "not-a-principal".to_string(),
+            Some("also-not-a-principal".to_string()),
+            Some("reason".to_string()),
+            None,
+        ))
+        .expect_err("handoff authorization precedes parsing");
+        assert_eq!(handoff.code, Code::PermissionDenied);
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_c_chat_closed_session_rejects_before_agent_and_handoff_parsing() {
+        let (client, session, _workspace, dir) = seed_client("chat-generated-k-c-closed-session");
+        let closed_session = session.clone();
+        client.close(&session);
+
+        let invoke = block(<LocalLoomClient as Chat>::chat_invoke_agent_json(
+            &client,
+            closed_session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "inv-closed".to_string(),
+            "not-a-principal".to_string(),
+            "not-json".to_string(),
+            "prompt".to_string(),
+            None,
+        ))
+        .expect_err("closed session rejects invoke before parsing");
+        assert_eq!(invoke.code, Code::NotFound);
+        assert_ne!(invoke.code, Code::InvalidArgument);
+
+        let handoff = block(<LocalLoomClient as Chat>::chat_request_handoff_json(
+            &client,
+            closed_session,
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "handoff-closed".to_string(),
+            "not-a-principal".to_string(),
+            Some("also-not-a-principal".to_string()),
+            Some("reason".to_string()),
+            None,
+        ))
+        .expect_err("closed session rejects handoff before parsing");
+        assert_eq!(handoff.code, Code::NotFound);
+        assert_ne!(handoff.code, Code::InvalidArgument);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_c_chat_real_task_publication_failure_preserves_live_and_reopen_state() {
+        let shared = SharedMem::default();
+        let (workspace, channel_id, _) = seed_backing_chat_store(shared.clone(), 91);
+        let channel_id_text = channel_id.to_string();
+        let entity_id = format!("chat:{channel_id_text}:message:m1");
+        let before = backing_chat_state_snapshot(
+            shared.clone(),
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        assert!(!before.revision_history.is_empty(), "{before:?}");
+        let (client, session, dir) =
+            failing_backing_client_session(shared.clone(), 1, "chat-generated-k-c-task-fail");
+
+        let error = block(<LocalLoomClient as Chat>::chat_create_task_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "task-fail".to_string(),
+            None,
+            "Fail".to_string(),
+            None,
+        ))
+        .expect_err("real task publication failure");
+        assert_eq!(error.code, Code::Io, "{error:?}");
+
+        let live = chat_state_snapshot(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        assert_eq!(live, before);
+        client.close(&session);
+        let reopened =
+            backing_chat_state_snapshot(shared, workspace, "studio", "general", Some(&entity_id));
+        assert_eq!(reopened, before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_c_chat_real_handoff_publication_failure_preserves_live_and_reopen_state() {
+        let shared = SharedMem::default();
+        let (workspace, channel_id, _) = seed_backing_chat_store(shared.clone(), 95);
+        let channel_id_text = channel_id.to_string();
+        let entity_id = format!("chat:{channel_id_text}:message:m1");
+        let before = backing_chat_state_snapshot(
+            shared.clone(),
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        assert!(!before.revision_history.is_empty(), "{before:?}");
+        let (client, session, dir) =
+            failing_backing_client_session(shared.clone(), 1, "chat-generated-k-c-handoff-fail");
+        let agent = WorkspaceId::from_bytes([96; 16]).to_string();
+
+        let error = block(<LocalLoomClient as Chat>::chat_request_handoff_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "handoff-fail".to_string(),
+            agent,
+            None,
+            Some("handoff".to_string()),
+            None,
+        ))
+        .expect_err("real handoff publication failure");
+        assert_eq!(error.code, Code::Io, "{error:?}");
+
+        let live = chat_state_snapshot(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        assert_eq!(live, before);
+        client.close(&session);
+        let reopened =
+            backing_chat_state_snapshot(shared, workspace, "studio", "general", Some(&entity_id));
+        assert_eq!(reopened, before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_d_b_chat_generated_reads_project_existing_state_without_mutation() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-d-b-reads");
+        let channel_id = WorkspaceId::from_bytes([101; 16]);
+        let channel_id_text = channel_id.to_string();
+        let agent = WorkspaceId::from_bytes([102; 16]).to_string();
+        let recipient = WorkspaceId::from_bytes([103; 16]).to_string();
+
+        let empty_channels = assert_generated_chat_read_preserves_store(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            &channel_id_text,
+            || {
+                block(<LocalLoomClient as Chat>::chat_list_channels_json(
+                    &client,
+                    session.clone(),
+                    "repo".to_string(),
+                    "studio".to_string(),
+                ))
+            },
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&empty_channels).expect("empty channels"),
+            serde_json::json!([])
+        );
+        let default_emoji = assert_generated_chat_read_preserves_store(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            &channel_id_text,
+            || {
+                block(<LocalLoomClient as Chat>::chat_emoji_list_json(
+                    &client,
+                    session.clone(),
+                    "repo".to_string(),
+                    "studio".to_string(),
+                ))
+            },
+        );
+        let default_emoji: serde_json::Value =
+            serde_json::from_str(&default_emoji).expect("default emoji json");
+        assert_eq!(default_emoji["custom"], serde_json::json!([]));
+
+        block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "general".to_string(),
+            "General".to_string(),
+            None,
+        ))
+        .expect("create channel");
+        let first_post = block(<LocalLoomClient as Chat>::chat_post_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            None,
+            "hello".to_string(),
+            None,
+        ))
+        .expect("post message");
+        let first_tag = chat_json_entity_tag(&first_post);
+        let thread = block(<LocalLoomClient as Chat>::chat_create_thread_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "t1".to_string(),
+            "m1".to_string(),
+            Some(first_tag),
+        ))
+        .expect("create thread");
+        let thread_tag = chat_json_entity_tag(&thread);
+        let task = block(<LocalLoomClient as Chat>::chat_create_task_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "task-1".to_string(),
+            Some("m1".to_string()),
+            "Investigate".to_string(),
+            Some(thread_tag),
+        ))
+        .expect("create task");
+        let task_tag = chat_json_entity_tag(&task);
+        let second_post = block(<LocalLoomClient as Chat>::chat_post_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m2".to_string(),
+            Some("t1".to_string()),
+            "reply".to_string(),
+            Some(task_tag),
+        ))
+        .expect("post reply");
+        let second_tag = chat_json_entity_tag(&second_post);
+        let invoked = block(<LocalLoomClient as Chat>::chat_invoke_agent_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "inv-1".to_string(),
+            agent.clone(),
+            "[\"m1\"]".to_string(),
+            "summarize".to_string(),
+            Some(second_tag),
+        ))
+        .expect("invoke agent");
+        let invoke_tag = chat_json_entity_tag(&invoked);
+        let replied = block(<LocalLoomClient as Chat>::chat_agent_reply_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "inv-1".to_string(),
+            "m2".to_string(),
+            Some(invoke_tag),
+        ))
+        .expect("agent reply");
+        let reply_tag = chat_json_entity_tag(&replied);
+        block(<LocalLoomClient as Chat>::chat_request_handoff_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "handoff-1".to_string(),
+            agent.clone(),
+            Some(recipient.clone()),
+            Some("needs owner".to_string()),
+            Some(reply_tag),
+        ))
+        .expect("handoff");
+        client
+            .with_session(&session, |loom| {
+                loom_chat::register_emoji(loom, workspace, "studio", "shipit", None)?;
+                loom_chat::update_cursor(loom, workspace, "studio", "general", 2, None)?;
+                save_loom(loom)
+            })
+            .expect("seed emoji and cursor");
+
+        let populated_channels = assert_generated_chat_read_preserves_store(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            &channel_id_text,
+            || {
+                block(<LocalLoomClient as Chat>::chat_list_channels_json(
+                    &client,
+                    session.clone(),
+                    "repo".to_string(),
+                    "studio".to_string(),
+                ))
+            },
+        );
+        let populated_channels: serde_json::Value =
+            serde_json::from_str(&populated_channels).expect("channels json");
+        assert_eq!(populated_channels.as_array().expect("channels").len(), 1);
+        assert_eq!(populated_channels[0]["channel_id"], channel_id_text);
+        assert_eq!(populated_channels[0]["handle"], "general");
+
+        let populated_emoji = assert_generated_chat_read_preserves_store(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            &channel_id_text,
+            || {
+                block(<LocalLoomClient as Chat>::chat_emoji_list_json(
+                    &client,
+                    session.clone(),
+                    "repo".to_string(),
+                    "studio".to_string(),
+                ))
+            },
+        );
+        let populated_emoji: serde_json::Value =
+            serde_json::from_str(&populated_emoji).expect("emoji json");
+        assert_eq!(populated_emoji["custom"], serde_json::json!(["shipit"]));
+
+        let messages = assert_generated_chat_read_preserves_store(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            &channel_id_text,
+            || {
+                block(<LocalLoomClient as Chat>::chat_messages_json(
+                    &client,
+                    session.clone(),
+                    "repo".to_string(),
+                    "studio".to_string(),
+                    "general".to_string(),
+                ))
+            },
+        );
+        let messages: serde_json::Value = serde_json::from_str(&messages).expect("messages json");
+        assert_eq!(messages["messages"].as_array().expect("messages").len(), 2);
+        assert_eq!(messages["messages"][0]["body"], serde_json::json!(b"hello"));
+        assert_eq!(messages["messages"][1]["thread_id"], "t1");
+        assert_eq!(messages["threads"][0]["thread_id"], "t1");
+        assert_eq!(messages["tasks"][0]["task_id"], "task-1");
+        assert_eq!(
+            messages["agent_invocations"][0]["source_message_ids"],
+            serde_json::json!(["m1"])
+        );
+        assert_eq!(
+            messages["agent_invocations"][0]["prompt"],
+            serde_json::json!(b"summarize")
+        );
+        assert_eq!(
+            messages["agent_invocations"][0]["reply_message_ids"],
+            serde_json::json!(["m2"])
+        );
+        assert_eq!(messages["handoffs"][0]["to_principal"], recipient);
+
+        let cursor = assert_generated_chat_read_preserves_store(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            &channel_id_text,
+            || {
+                block(<LocalLoomClient as Chat>::chat_cursor_json(
+                    &client,
+                    session.clone(),
+                    "repo".to_string(),
+                    "studio".to_string(),
+                    "general".to_string(),
+                ))
+            },
+        );
+        let cursor: serde_json::Value = serde_json::from_str(&cursor).expect("cursor json");
+        assert_eq!(cursor["principal"], workspace.to_string());
+        assert_eq!(cursor["next_sequence"], 2);
+        assert_eq!(cursor["head_sequence"], 7);
+        assert_eq!(cursor["unread_count"], 5);
+
+        let first_events = assert_generated_chat_read_preserves_store(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            &channel_id_text,
+            || {
+                block(<LocalLoomClient as Chat>::chat_fetch_events_json(
+                    &client,
+                    session.clone(),
+                    "repo".to_string(),
+                    "studio".to_string(),
+                    "general".to_string(),
+                    1,
+                    2,
+                ))
+            },
+        );
+        let first_events: serde_json::Value =
+            serde_json::from_str(&first_events).expect("events json");
+        assert_eq!(first_events["events"].as_array().expect("events").len(), 2);
+        assert_eq!(first_events["events"][0]["sequence"], 1);
+        assert_eq!(first_events["events"][1]["sequence"], 2);
+        assert_eq!(
+            first_events["next"],
+            format!("oplog:3:chat:studio:{channel_id_text}")
+        );
+
+        let later_events = assert_generated_chat_read_preserves_store(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            &channel_id_text,
+            || {
+                block(<LocalLoomClient as Chat>::chat_fetch_events_json(
+                    &client,
+                    session.clone(),
+                    "repo".to_string(),
+                    "studio".to_string(),
+                    "general".to_string(),
+                    3,
+                    10,
+                ))
+            },
+        );
+        let later_events: serde_json::Value =
+            serde_json::from_str(&later_events).expect("later events json");
+        assert_eq!(later_events["events"].as_array().expect("events").len(), 5);
+        assert_eq!(
+            later_events["next"],
+            format!("oplog:8:chat:studio:{channel_id_text}")
+        );
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_d_b_chat_generated_reads_authorize_before_resource_or_cursor_validation() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-d-b-read-auth");
+        let user = WorkspaceId::from_bytes([104; 16]);
+        client
+            .with_session(&session, |loom| {
+                let mut identity = loom_core::IdentityStore::new(workspace);
+                identity.add_principal(user, "reader", loom_core::PrincipalKind::User)?;
+                identity.set_passphrase(user, "reader-pass", b"chat-read")?;
+                loom.store().save_identity_store(&identity)?;
+                loom.set_identity_store(identity);
+                save_loom(loom)
+            })
+            .expect("seed restricted principal");
+        client
+            .authenticate_passphrase(&session, user, b"reader-pass")
+            .expect("authenticate restricted principal");
+
+        let missing_channel = block(<LocalLoomClient as Chat>::chat_messages_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "missing".to_string(),
+        ))
+        .expect_err("chat read auth precedes missing channel lookup");
+        assert_eq!(missing_channel.code, Code::PermissionDenied);
+
+        let missing_registry = block(<LocalLoomClient as Chat>::chat_emoji_list_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "bad/scope".to_string(),
+        ))
+        .expect_err("chat read auth precedes registry path validation");
+        assert_eq!(missing_registry.code, Code::PermissionDenied);
+
+        let invalid_cursor = block(<LocalLoomClient as Chat>::chat_fetch_events_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "missing".to_string(),
+            0,
+            u64::MAX,
+        ))
+        .expect_err("chat read auth precedes event cursor validation");
+        assert_eq!(invalid_cursor.code, Code::PermissionDenied);
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_d_a_chat_reaction_emoji_cursor_generated_sequence_audit_and_tags() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-d-a-sequence");
+        let channel_id = WorkspaceId::from_bytes([121; 16]);
+        let channel_id_text = channel_id.to_string();
+        let empty_channel_id = WorkspaceId::from_bytes([122; 16]).to_string();
+
+        block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "general".to_string(),
+            "General".to_string(),
+            None,
+        ))
+        .expect("create channel");
+        block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            empty_channel_id,
+            "empty".to_string(),
+            "Empty".to_string(),
+            None,
+        ))
+        .expect("create empty channel");
+
+        let registered = block(<LocalLoomClient as Chat>::chat_emoji_register_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "ship".to_string(),
+            None,
+        ))
+        .expect("register emoji");
+        let register_tag = chat_json_entity_tag(&registered);
+
+        let duplicate = block(<LocalLoomClient as Chat>::chat_emoji_register_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "ship".to_string(),
+            Some(register_tag.clone()),
+        ))
+        .expect("duplicate emoji no-op");
+        assert_eq!(chat_json_entity_tag(&duplicate), register_tag);
+
+        let post = block(<LocalLoomClient as Chat>::chat_post_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            None,
+            "hello".to_string(),
+            None,
+        ))
+        .expect("post message");
+        let post_tag = chat_json_entity_tag(&post);
+
+        let added = block(<LocalLoomClient as Chat>::chat_add_reaction_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            "ship".to_string(),
+            Some(post_tag.clone()),
+        ))
+        .expect("add reaction");
+        let add_tag = chat_json_entity_tag(&added);
+        assert_ne!(add_tag, post_tag);
+
+        let removed = block(<LocalLoomClient as Chat>::chat_remove_reaction_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "m1".to_string(),
+            "ship".to_string(),
+            Some(add_tag.clone()),
+        ))
+        .expect("remove reaction");
+        let remove_tag = chat_json_entity_tag(&removed);
+        assert_ne!(remove_tag, add_tag);
+
+        let stale = block(<LocalLoomClient as Chat>::chat_add_reaction_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            "ship".to_string(),
+            Some(add_tag),
+        ))
+        .expect_err("stale reaction tag rejected");
+        assert_eq!(stale.code, Code::Conflict);
+
+        let unregistered = block(<LocalLoomClient as Chat>::chat_add_reaction_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            "missing".to_string(),
+            Some(remove_tag),
+        ))
+        .expect_err("unregistered reaction kind rejected");
+        assert_eq!(unregistered.code, Code::InvalidArgument);
+
+        let cursor = block(<LocalLoomClient as Chat>::chat_cursor_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+        ))
+        .expect("read cursor");
+        let cursor_tag = chat_json_entity_tag(&cursor);
+        let cursor: serde_json::Value = serde_json::from_str(&cursor).expect("cursor json");
+        assert_eq!(cursor["next_sequence"], 0);
+        let head = cursor["head_sequence"].as_u64().expect("head");
+
+        let advanced = block(<LocalLoomClient as Chat>::chat_update_cursor_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            1,
+            Some(cursor_tag),
+        ))
+        .expect("advance cursor");
+        let advanced: serde_json::Value = serde_json::from_str(&advanced).expect("advanced cursor");
+        assert_eq!(advanced["next_sequence"], 1);
+        assert_ne!(advanced["entity_tag"], cursor["entity_tag"]);
+
+        let past_head = block(<LocalLoomClient as Chat>::chat_update_cursor_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            head.saturating_add(1),
+            advanced["entity_tag"].as_str().map(str::to_string),
+        ))
+        .expect_err("past-head cursor rejected");
+        assert_eq!(past_head.code, Code::InvalidArgument);
+
+        let empty_cursor = block(<LocalLoomClient as Chat>::chat_cursor_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "empty".to_string(),
+        ))
+        .expect("read empty cursor");
+        let empty_tag = chat_json_entity_tag(&empty_cursor);
+        let empty_updated = block(<LocalLoomClient as Chat>::chat_update_cursor_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "empty".to_string(),
+            0,
+            Some(empty_tag.clone()),
+        ))
+        .expect("zero cursor no-op");
+        assert_eq!(chat_json_entity_tag(&empty_updated), empty_tag);
+
+        let unregistered = block(<LocalLoomClient as Chat>::chat_emoji_unregister_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "ship".to_string(),
+            Some(register_tag),
+        ))
+        .expect("unregister emoji");
+        let unregister_tag = chat_json_entity_tag(&unregistered);
+        block(<LocalLoomClient as Chat>::chat_emoji_unregister_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "ship".to_string(),
+            Some(unregister_tag),
+        ))
+        .expect("missing emoji no-op");
+
+        let audit_events =
+            chat_state_snapshot(&client, &session, workspace, "studio", "general", None)
+                .audit_events
+                .into_iter()
+                .filter(|(action, _)| action.starts_with("chat.emoji."))
+                .collect::<Vec<_>>();
+        assert_eq!(
+            audit_events,
+            [
+                (
+                    "chat.emoji.register".to_string(),
+                    Some("chat:studio:emoji-registry".to_string())
+                ),
+                (
+                    "chat.emoji.unregister".to_string(),
+                    Some("chat:studio:emoji-registry".to_string())
+                )
+            ]
+        );
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_d_a_chat_reaction_emoji_cursor_restricted_principal_authority() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-d-a-restricted-acl");
+        let root = WorkspaceId::from_bytes([123; 16]);
+        let user = WorkspaceId::from_bytes([124; 16]);
+        let allowed_channel = WorkspaceId::from_bytes([125; 16]);
+        let allowed_channel_text = allowed_channel.to_string();
+        let denied_channel = WorkspaceId::from_bytes([126; 16]);
+        let principal = user.to_string();
+        client
+            .with_session(&session, |loom| {
+                loom_chat::ensure_channel(
+                    loom,
+                    workspace,
+                    "studio",
+                    allowed_channel,
+                    "general",
+                    "General",
+                    None,
+                )?;
+                loom_chat::ensure_channel(
+                    loom,
+                    workspace,
+                    "studio",
+                    denied_channel,
+                    "private",
+                    "Private",
+                    None,
+                )?;
+                loom_chat::post_message(
+                    loom,
+                    workspace,
+                    "studio",
+                    "general",
+                    "m1",
+                    None,
+                    b"hello".to_vec(),
+                    None,
+                )?;
+                let mut identity = loom_core::IdentityStore::new(root);
+                identity.set_passphrase(root, "root-pass", b"chat-root")?;
+                identity.add_principal(user, "user", loom_core::PrincipalKind::User)?;
+                identity.set_passphrase(user, "user-pass", b"chat-acl")?;
+                let mut acl = loom_core::acl::AclStore::new();
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::All],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Read]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: b"chat/studio/channels/".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Read]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: format!("chat/studio/channels/{allowed_channel_text}").into_bytes(),
+                    }],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Write]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                let allowed_stream =
+                    loom_chat::chat_queue_stream_name("studio", &allowed_channel_text)?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Queue.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: allowed_stream.into_bytes(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Advance,
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Files.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Path,
+                        prefix: b"profile/chat/v1/studio/channels/index.lch".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                let emoji_path = loom_substrate::annotation::emoji_registry_path("studio")?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Files.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Path,
+                        prefix: emoji_path.into_bytes(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                loom.store().save_identity_store(&identity)?;
+                loom.store().save_acl_store(&acl)?;
+                loom.set_identity_store(identity);
+                loom.set_acl_store(acl);
+                save_loom(loom)
+            })
+            .expect("seed restricted reaction acl");
+        client
+            .authenticate_passphrase(&session, user, b"user-pass")
+            .expect("authenticate restricted user");
+
+        let denied_admin = block(<LocalLoomClient as Chat>::chat_emoji_register_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "bad/kind".to_string(),
+            None,
+        ))
+        .expect_err("emoji admin authorization precedes kind validation");
+        assert_eq!(denied_admin.code, Code::PermissionDenied);
+
+        client
+            .with_session(&session, |loom| {
+                let acl = {
+                    let acl = loom.acl_store_mut();
+                    acl.grant(loom_core::acl::AclGrant {
+                        subject: loom_core::acl::AclSubject::Principal(user),
+                        workspace: Some(workspace),
+                        domain: Some(loom_core::AclDomain::Chat),
+                        ref_glob: None,
+                        scopes: vec![loom_core::acl::AclScope::Prefix {
+                            kind: loom_core::AclScopeKind::Collection,
+                            prefix: b"chat/studio/emoji-registry".to_vec(),
+                        }],
+                        rights: std::collections::BTreeSet::from([loom_core::AclRight::Admin]),
+                        effect: loom_core::acl::AclEffect::Allow,
+                        predicate: None,
+                    })?;
+                    acl.clone()
+                };
+                loom.store().save_acl_store(&acl)?;
+                save_loom(loom)
+            })
+            .expect("grant emoji admin");
+        let registered = block(<LocalLoomClient as Chat>::chat_emoji_register_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "ship".to_string(),
+            None,
+        ))
+        .expect("restricted principal registers emoji after admin grant");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&registered).expect("registry json")["custom"],
+            serde_json::json!(["ship"])
+        );
+
+        let by_alias = block(<LocalLoomClient as Chat>::chat_add_reaction_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            "ship".to_string(),
+            None,
+        ))
+        .expect("add reaction by alias");
+        let alias_value: serde_json::Value =
+            serde_json::from_str(&by_alias).expect("reaction alias json");
+        assert_eq!(alias_value["channel_id"], allowed_channel_text);
+        assert_eq!(alias_value["operation_kind"], "reaction.added");
+        let alias_snapshot = block(<LocalLoomClient as Chat>::chat_messages_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+        ))
+        .expect("read alias reaction projection");
+        let alias_snapshot: serde_json::Value =
+            serde_json::from_str(&alias_snapshot).expect("alias projection json");
+        assert_eq!(
+            alias_snapshot["messages"][0]["reactions"][0],
+            serde_json::json!({ "kind": "ship", "principal": principal.clone() })
+        );
+
+        let by_uuid = block(<LocalLoomClient as Chat>::chat_remove_reaction_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            allowed_channel_text.clone(),
+            "m1".to_string(),
+            "ship".to_string(),
+            None,
+        ))
+        .expect("remove reaction by uuid");
+        let uuid_value: serde_json::Value = serde_json::from_str(&by_uuid).expect("reaction json");
+        assert_eq!(uuid_value["channel_id"], allowed_channel_text);
+        assert_eq!(uuid_value["operation_kind"], "reaction.removed");
+        let uuid_snapshot = block(<LocalLoomClient as Chat>::chat_messages_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+        ))
+        .expect("read uuid reaction projection");
+        let uuid_snapshot: serde_json::Value =
+            serde_json::from_str(&uuid_snapshot).expect("uuid projection json");
+        assert_eq!(
+            uuid_snapshot["messages"][0]["reactions"]
+                .as_array()
+                .expect("uuid reactions")
+                .len(),
+            0
+        );
+
+        let denied_channel = block(<LocalLoomClient as Chat>::chat_add_reaction_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "private".to_string(),
+            "m1".to_string(),
+            "ship".to_string(),
+            None,
+        ))
+        .expect_err("unrelated channel denied");
+        assert_eq!(denied_channel.code, Code::PermissionDenied);
+
+        let denied_cursor = block(<LocalLoomClient as Chat>::chat_update_cursor_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            u64::MAX,
+            None,
+        ))
+        .expect_err("cursor advance authorization precedes sequence validation");
+        assert_eq!(denied_cursor.code, Code::PermissionDenied);
+
+        client
+            .with_session(&session, |loom| {
+                let acl = {
+                    let acl = loom.acl_store_mut();
+                    acl.grant(loom_core::acl::AclGrant {
+                        subject: loom_core::acl::AclSubject::Principal(user),
+                        workspace: Some(workspace),
+                        domain: Some(loom_core::AclDomain::Chat),
+                        ref_glob: None,
+                        scopes: vec![loom_core::acl::AclScope::Prefix {
+                            kind: loom_core::AclScopeKind::Collection,
+                            prefix: format!(
+                                "chat/studio/channels/{allowed_channel_text}/cursor/{principal}"
+                            )
+                            .into_bytes(),
+                        }],
+                        rights: std::collections::BTreeSet::from([loom_core::AclRight::Advance]),
+                        effect: loom_core::acl::AclEffect::Allow,
+                        predicate: None,
+                    })?;
+                    acl.clone()
+                };
+                loom.store().save_acl_store(&acl)?;
+                save_loom(loom)
+            })
+            .expect("grant cursor advance");
+        block(<LocalLoomClient as Chat>::chat_update_cursor_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            1,
+            None,
+        ))
+        .expect("cursor advances after cursor grant");
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_d_a_chat_closed_session_rejects_before_reaction_and_cursor_validation() {
+        let (client, session, _workspace, dir) = seed_client("chat-generated-k-d-a-closed-session");
+        let closed_session = session.clone();
+        client.close(&session);
+
+        let reaction = block(<LocalLoomClient as Chat>::chat_add_reaction_json(
+            &client,
+            closed_session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            "bad/kind".to_string(),
+            None,
+        ))
+        .expect_err("closed session rejects reaction before kind validation");
+        assert_eq!(reaction.code, Code::NotFound);
+        assert_ne!(reaction.code, Code::InvalidArgument);
+
+        let cursor = block(<LocalLoomClient as Chat>::chat_update_cursor_json(
+            &client,
+            closed_session,
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            u64::MAX,
+            None,
+        ))
+        .expect_err("closed session rejects cursor before sequence validation");
+        assert_eq!(cursor.code, Code::NotFound);
+        assert_ne!(cursor.code, Code::InvalidArgument);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_d_a_chat_real_publication_failures_preserve_live_and_reopened_state() {
+        let shared = SharedMem::default();
+        let (workspace, channel_id, _) = seed_backing_chat_store(shared.clone(), 127);
+        let channel_id_text = channel_id.to_string();
+        let entity_id = format!("chat:{channel_id_text}:message:m1");
+        let before = backing_chat_state_snapshot(
+            shared.clone(),
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+
+        let (client, session, dir) =
+            failing_backing_client_session(shared.clone(), 1, "chat-generated-k-d-a-reaction-fail");
+        let reaction_error = block(<LocalLoomClient as Chat>::chat_add_reaction_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            "👍".to_string(),
+            None,
+        ))
+        .expect_err("real reaction publication failure");
+        assert_eq!(reaction_error.code, Code::Io, "{reaction_error:?}");
+        assert_eq!(
+            chat_state_snapshot(
+                &client,
+                &session,
+                workspace,
+                "studio",
+                "general",
+                Some(&entity_id)
+            ),
+            before
+        );
+        client.close(&session);
+        assert_eq!(
+            backing_chat_state_snapshot(
+                shared.clone(),
+                workspace,
+                "studio",
+                "general",
+                Some(&entity_id)
+            ),
+            before
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (client, session, dir) =
+            failing_backing_client_session(shared.clone(), 1, "chat-generated-k-d-a-emoji-fail");
+        let emoji_error = block(<LocalLoomClient as Chat>::chat_emoji_register_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "ship".to_string(),
+            None,
+        ))
+        .expect_err("real emoji publication failure");
+        assert_eq!(emoji_error.code, Code::Io, "{emoji_error:?}");
+        assert_eq!(
+            chat_state_snapshot(
+                &client,
+                &session,
+                workspace,
+                "studio",
+                "general",
+                Some(&entity_id)
+            ),
+            before
+        );
+        client.close(&session);
+        assert_eq!(
+            backing_chat_state_snapshot(
+                shared.clone(),
+                workspace,
+                "studio",
+                "general",
+                Some(&entity_id)
+            ),
+            before
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (client, session, dir) =
+            failing_backing_client_session(shared.clone(), 1, "chat-generated-k-d-a-cursor-fail");
+        let cursor_error = block(<LocalLoomClient as Chat>::chat_update_cursor_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            1,
+            None,
+        ))
+        .expect_err("real cursor publication failure");
+        assert_eq!(cursor_error.code, Code::Io, "{cursor_error:?}");
+        assert_eq!(
+            chat_state_snapshot(
+                &client,
+                &session,
+                workspace,
+                "studio",
+                "general",
+                Some(&entity_id)
+            ),
+            before
+        );
+        client.close(&session);
+        assert_eq!(
+            backing_chat_state_snapshot(shared, workspace, "studio", "general", Some(&entity_id)),
+            before
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_e_chat_byte_body_methods_preserve_bytes_and_string_adapter_state() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-e-bytes");
+        let path = client.store_path().to_path_buf();
+        let channel_id = WorkspaceId::from_bytes([131; 16]);
+        let channel_id_text = channel_id.to_string();
+        let agent = WorkspaceId::from_bytes([132; 16]).to_string();
+        let body = vec![0, 0xff, b'h', 0xfe, b'i'];
+        let edited = vec![0xf0, 0x28, 0x8c, 0x28, b'!'];
+        let prompt = vec![b'a', 0xff, b'g', 0x80];
+
+        block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text.clone(),
+            "general".to_string(),
+            "General".to_string(),
+            None,
+        ))
+        .expect("create channel");
+        let posted = block(<LocalLoomClient as Chat>::chat_post_message_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            None,
+            body.clone(),
+            None,
+        ))
+        .expect("post bytes");
+        let post_tag = chat_json_entity_tag(&posted);
+        block(<LocalLoomClient as Chat>::chat_edit_message_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            edited.clone(),
+            Some(post_tag.clone()),
+        ))
+        .expect("edit bytes");
+        let stale = block(<LocalLoomClient as Chat>::chat_edit_message_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            b"stale".to_vec(),
+            Some(post_tag),
+        ))
+        .expect_err("stale byte edit tag rejected");
+        assert_eq!(stale.code, Code::Conflict);
+        block(<LocalLoomClient as Chat>::chat_invoke_agent_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "inv-1".to_string(),
+            agent.clone(),
+            "[\"m1\"]".to_string(),
+            prompt.clone(),
+            None,
+        ))
+        .expect("invoke bytes");
+        block(<LocalLoomClient as Chat>::chat_post_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m2".to_string(),
+            None,
+            "hello".to_string(),
+            None,
+        ))
+        .expect("post string adapter");
+        block(<LocalLoomClient as Chat>::chat_edit_message_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m2".to_string(),
+            "world".to_string(),
+            None,
+        ))
+        .expect("edit string adapter");
+        block(<LocalLoomClient as Chat>::chat_invoke_agent_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "inv-2".to_string(),
+            agent.clone(),
+            "[\"m2\"]".to_string(),
+            "prompt".to_string(),
+            None,
+        ))
+        .expect("invoke string adapter");
+
+        let messages = block(<LocalLoomClient as Chat>::chat_messages_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+        ))
+        .expect("read messages");
+        let messages: serde_json::Value = serde_json::from_str(&messages).expect("messages json");
+        assert_eq!(messages["messages"][0]["body"], serde_json::json!(edited));
+        assert_eq!(messages["messages"][1]["body"], serde_json::json!(b"world"));
+        assert_eq!(
+            messages["agent_invocations"][0]["prompt"],
+            serde_json::json!(prompt)
+        );
+        assert_eq!(
+            messages["agent_invocations"][1]["prompt"],
+            serde_json::json!(b"prompt")
+        );
+        let audit_events =
+            chat_state_snapshot(&client, &session, workspace, "studio", "general", None)
+                .audit_events
+                .into_iter()
+                .filter(|(action, _)| action == "chat.agent.invoke")
+                .collect::<Vec<_>>();
+        assert_eq!(
+            audit_events,
+            [
+                (
+                    "chat.agent.invoke".to_string(),
+                    Some(format!(
+                        "chat:studio:channel:{channel_id_text}:invocation:inv-1"
+                    ))
+                ),
+                (
+                    "chat.agent.invoke".to_string(),
+                    Some(format!(
+                        "chat:studio:channel:{channel_id_text}:invocation:inv-2"
+                    ))
+                )
+            ]
+        );
+
+        client.close(&session);
+        let reopened = LocalLoomClient::new(&path);
+        let reopened_session = reopened.open().expect("reopen");
+        let reopened_messages = block(<LocalLoomClient as Chat>::chat_messages_json(
+            &reopened,
+            reopened_session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+        ))
+        .expect("read reopened messages");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reopened_messages)
+                .expect("reopened messages json"),
+            messages
+        );
+        reopened.close(&reopened_session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_e_chat_byte_body_publication_failures_preserve_state() {
+        let shared = SharedMem::default();
+        let (workspace, channel_id, _) = seed_backing_chat_store(shared.clone(), 133);
+        let channel_id_text = channel_id.to_string();
+        let entity_id = format!("chat:{channel_id_text}:message:m1");
+        let before = backing_chat_state_snapshot(
+            shared.clone(),
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+
+        let (client, session, dir) =
+            failing_backing_client_session(shared.clone(), 1, "chat-generated-k-e-post-fail");
+        let post_error = block(<LocalLoomClient as Chat>::chat_post_message_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m2".to_string(),
+            None,
+            vec![0xff, b'p'],
+            None,
+        ))
+        .expect_err("post bytes publication failure");
+        assert_eq!(post_error.code, Code::Io, "{post_error:?}");
+        assert_eq!(
+            chat_state_snapshot(
+                &client,
+                &session,
+                workspace,
+                "studio",
+                "general",
+                Some(&entity_id)
+            ),
+            before
+        );
+        client.close(&session);
+        assert_eq!(
+            backing_chat_state_snapshot(
+                shared.clone(),
+                workspace,
+                "studio",
+                "general",
+                Some(&entity_id)
+            ),
+            before
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (client, session, dir) =
+            failing_backing_client_session(shared.clone(), 1, "chat-generated-k-e-edit-fail");
+        let edit_error = block(<LocalLoomClient as Chat>::chat_edit_message_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            vec![0xfe, b'e'],
+            None,
+        ))
+        .expect_err("edit bytes publication failure");
+        assert_eq!(edit_error.code, Code::Io, "{edit_error:?}");
+        assert_eq!(
+            chat_state_snapshot(
+                &client,
+                &session,
+                workspace,
+                "studio",
+                "general",
+                Some(&entity_id)
+            ),
+            before
+        );
+        client.close(&session);
+        assert_eq!(
+            backing_chat_state_snapshot(
+                shared.clone(),
+                workspace,
+                "studio",
+                "general",
+                Some(&entity_id)
+            ),
+            before
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let (client, session, dir) =
+            failing_backing_client_session(shared.clone(), 1, "chat-generated-k-e-invoke-fail");
+        let invoke_error = block(<LocalLoomClient as Chat>::chat_invoke_agent_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "inv-fail".to_string(),
+            WorkspaceId::from_bytes([134; 16]).to_string(),
+            "[\"m1\"]".to_string(),
+            vec![0xfd, b'i'],
+            None,
+        ))
+        .expect_err("invoke bytes publication failure");
+        assert_eq!(invoke_error.code, Code::Io, "{invoke_error:?}");
+        assert_eq!(
+            chat_state_snapshot(
+                &client,
+                &session,
+                workspace,
+                "studio",
+                "general",
+                Some(&entity_id)
+            ),
+            before
+        );
+        client.close(&session);
+        assert_eq!(
+            backing_chat_state_snapshot(shared, workspace, "studio", "general", Some(&entity_id)),
+            before
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_e_chat_byte_body_restricted_principal_authorization_order() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-e-restricted-acl");
+        let path = client.store_path().to_path_buf();
+        let root = WorkspaceId::from_bytes([137; 16]);
+        let user = WorkspaceId::from_bytes([138; 16]);
+        let allowed_channel = WorkspaceId::from_bytes([139; 16]);
+        let allowed_channel_text = allowed_channel.to_string();
+        let denied_channel = WorkspaceId::from_bytes([140; 16]);
+        let agent = WorkspaceId::from_bytes([141; 16]).to_string();
+        let entity_id = format!("chat:{allowed_channel_text}:message:m1");
+        client
+            .with_session(&session, |loom| {
+                loom_chat::ensure_channel(
+                    loom,
+                    workspace,
+                    "studio",
+                    allowed_channel,
+                    "general",
+                    "General",
+                    None,
+                )?;
+                loom_chat::ensure_channel(
+                    loom,
+                    workspace,
+                    "studio",
+                    denied_channel,
+                    "private",
+                    "Private",
+                    None,
+                )?;
+                loom_chat::post_message(
+                    loom,
+                    workspace,
+                    "studio",
+                    "general",
+                    "m1",
+                    None,
+                    b"seed".to_vec(),
+                    None,
+                )?;
+                let mut identity = loom_core::IdentityStore::new(root);
+                identity.set_passphrase(root, "root-pass", b"chat-root")?;
+                identity.add_principal(user, "user", loom_core::PrincipalKind::User)?;
+                identity.set_passphrase(user, "user-pass", b"chat-acl")?;
+                let mut acl = loom_core::acl::AclStore::new();
+                acl.allow(
+                    loom_core::acl::AclSubject::Principal(root),
+                    Some(workspace),
+                    None,
+                    [loom_core::AclRight::Admin],
+                )?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: b"chat/studio/channels/".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Read]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::AclDomain::Chat),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: format!("chat/studio/channels/{allowed_channel_text}").into_bytes(),
+                    }],
+                    rights: std::collections::BTreeSet::from([loom_core::AclRight::Write]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                let allowed_stream =
+                    loom_chat::chat_queue_stream_name("studio", &allowed_channel_text)?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Queue.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Collection,
+                        prefix: allowed_stream.into_bytes(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Files.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Path,
+                        prefix: b"profile/chat/v1/studio/channels/index.lch".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Files.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Path,
+                        prefix: b".loom/substrate/refs".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.grant(loom_core::acl::AclGrant {
+                    subject: loom_core::acl::AclSubject::Principal(user),
+                    workspace: Some(workspace),
+                    domain: Some(loom_core::FacetKind::Vcs.into()),
+                    ref_glob: None,
+                    scopes: vec![loom_core::acl::AclScope::Prefix {
+                        kind: loom_core::AclScopeKind::Table,
+                        prefix: b".loom/substrate/refs/reconciliation".to_vec(),
+                    }],
+                    rights: std::collections::BTreeSet::from([
+                        loom_core::AclRight::Read,
+                        loom_core::AclRight::Write,
+                    ]),
+                    effect: loom_core::acl::AclEffect::Allow,
+                    predicate: None,
+                })?;
+                acl.allow(
+                    loom_core::acl::AclSubject::Principal(user),
+                    Some(workspace),
+                    Some(loom_core::FacetKind::Vcs),
+                    [loom_core::AclRight::Read, loom_core::AclRight::Write],
+                )?;
+                loom.store().save_identity_store(&identity)?;
+                loom.store().save_acl_store(&acl)?;
+                loom.set_identity_store(identity);
+                loom.set_acl_store(acl);
+                save_loom(loom)
+            })
+            .expect("seed restricted byte ACL");
+        client
+            .authenticate_passphrase(&session, user, b"user-pass")
+            .expect("authenticate restricted user");
+        block(<LocalLoomClient as Chat>::chat_post_message_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m2".to_string(),
+            None,
+            vec![0xff, b'p'],
+            None,
+        ))
+        .expect("restricted post by handle");
+        block(<LocalLoomClient as Chat>::chat_edit_message_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            allowed_channel_text.clone(),
+            "m2".to_string(),
+            vec![0xfe, b'e'],
+            None,
+        ))
+        .expect("restricted edit by uuid");
+        block(<LocalLoomClient as Chat>::chat_invoke_agent_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "inv-1".to_string(),
+            agent,
+            "[\"m2\"]".to_string(),
+            vec![0xfd, b'i'],
+            None,
+        ))
+        .expect("restricted invoke by handle");
+
+        client
+            .authenticate_passphrase(&session, root, b"root-pass")
+            .expect("authenticate root for snapshot");
+        let before_denied = chat_state_snapshot(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        client
+            .authenticate_passphrase(&session, user, b"user-pass")
+            .expect("reauthenticate restricted user");
+
+        let denied_post = block(<LocalLoomClient as Chat>::chat_post_message_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "private".to_string(),
+            "bad/message".to_string(),
+            None,
+            vec![0xff],
+            None,
+        ))
+        .expect_err("denied post precedes message validation");
+        assert_eq!(denied_post.code, Code::PermissionDenied);
+        let denied_edit = block(<LocalLoomClient as Chat>::chat_edit_message_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "private".to_string(),
+            "bad/message".to_string(),
+            vec![0xfe],
+            None,
+        ))
+        .expect_err("denied edit precedes message validation");
+        assert_eq!(denied_edit.code, Code::PermissionDenied);
+        let denied_invoke = block(<LocalLoomClient as Chat>::chat_invoke_agent_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "private".to_string(),
+            "inv/invalid".to_string(),
+            "not-a-principal".to_string(),
+            "not json".to_string(),
+            vec![0xfc],
+            None,
+        ))
+        .expect_err("denied invoke precedes principal and source parsing");
+        assert_eq!(denied_invoke.code, Code::PermissionDenied);
+
+        client
+            .authenticate_passphrase(&session, root, b"root-pass")
+            .expect("authenticate root for denied snapshot");
+        let after_denied = chat_state_snapshot(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        assert_eq!(after_denied, before_denied);
+        client.close(&session);
+        let reopened = LocalLoomClient::new(&path);
+        let reopened_session = reopened.open().expect("reopen restricted store");
+        reopened
+            .authenticate_passphrase(&reopened_session, root, b"root-pass")
+            .expect("authenticate reopened root");
+        let reopened_snapshot = chat_state_snapshot(
+            &reopened,
+            &reopened_session,
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        assert_eq!(reopened_snapshot, before_denied);
+        reopened.close(&reopened_session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_k_e_chat_byte_body_closed_session_precedes_domain_validation() {
+        let (client, session, workspace, dir) = seed_client("chat-generated-k-e-closed-session");
+        let path = client.store_path().to_path_buf();
+        let channel_id = WorkspaceId::from_bytes([142; 16]);
+        let channel_id_text = channel_id.to_string();
+        let entity_id = format!("chat:{channel_id_text}:message:m1");
+        block(<LocalLoomClient as Chat>::chat_create_channel_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            channel_id_text,
+            "general".to_string(),
+            "General".to_string(),
+            None,
+        ))
+        .expect("create channel");
+        block(<LocalLoomClient as Chat>::chat_post_message_bytes_json(
+            &client,
+            session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            "m1".to_string(),
+            None,
+            b"seed".to_vec(),
+            None,
+        ))
+        .expect("seed message");
+        let before = chat_state_snapshot(
+            &client,
+            &session,
+            workspace,
+            "studio",
+            "general",
+            Some(&entity_id),
+        );
+        let closed_session = session.clone();
+        client.close(&session);
+
+        let post = block(<LocalLoomClient as Chat>::chat_post_message_bytes_json(
+            &client,
+            closed_session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "bad/channel".to_string(),
+            "bad/message".to_string(),
+            Some("bad/thread".to_string()),
+            vec![0xff],
+            None,
+        ))
+        .expect_err("closed session rejects post bytes before parsing");
+        assert_eq!(post.code, Code::NotFound);
+        let edit = block(<LocalLoomClient as Chat>::chat_edit_message_bytes_json(
+            &client,
+            closed_session.clone(),
+            "repo".to_string(),
+            "studio".to_string(),
+            "bad/channel".to_string(),
+            "bad/message".to_string(),
+            vec![0xfe],
+            None,
+        ))
+        .expect_err("closed session rejects edit bytes before parsing");
+        assert_eq!(edit.code, Code::NotFound);
+        let invoke = block(<LocalLoomClient as Chat>::chat_invoke_agent_bytes_json(
+            &client,
+            closed_session,
+            "repo".to_string(),
+            "studio".to_string(),
+            "bad/channel".to_string(),
+            "bad/invocation".to_string(),
+            "not-a-principal".to_string(),
+            "not json".to_string(),
+            vec![0xfd],
+            None,
+        ))
+        .expect_err("closed session rejects invoke bytes before parsing");
+        assert_eq!(invoke.code, Code::NotFound);
+
+        assert_eq!(
+            reopened_chat_state_snapshot(&path, workspace, "studio", "general", Some(&entity_id)),
+            before
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

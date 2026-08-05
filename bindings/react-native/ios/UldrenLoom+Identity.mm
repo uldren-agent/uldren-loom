@@ -475,6 +475,157 @@ static BOOL loomAclScopeArrays(NSArray *scopes,
   });
 }
 
+- (void)identityForceDetachAuthorityJson:(NSString *)loomPath
+                               principal:(NSString *)principal
+                              generation:(double)generation
+                                  reason:(NSString *)reason
+                              passphrase:(NSString *)passphrase
+                                     kek:(NSArray *)kek
+                           authPrincipal:(NSString *)authPrincipal
+                          authPassphrase:(NSString *)authPassphrase
+                                 resolve:(RCTPromiseResolveBlock)resolve
+                                  reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    char *out = NULL;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_identity_force_detach_authority_json(
+          h, principal.UTF8String, (uint64_t)generation, reason.UTF8String, &out);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSString *result = out ? [NSString stringWithUTF8String:out] : @"";
+    if (out) {
+      loom_string_free(out);
+    }
+    resolve(result);
+  });
+}
+
+- (void)identityReplicateAuthorityJson:(NSString *)loomPath
+                                source:(NSString *)source
+                       becomeAuthority:(BOOL)becomeAuthority
+                            passphrase:(NSString *)passphrase
+                                   kek:(NSArray *)kek
+                         authPrincipal:(NSString *)authPrincipal
+                        authPassphrase:(NSString *)authPassphrase
+                               resolve:(RCTPromiseResolveBlock)resolve
+                                reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    char *out = NULL;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_identity_replicate_authority_json(h, source.UTF8String, becomeAuthority ? 1 : 0, &out);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSString *result = out ? [NSString stringWithUTF8String:out] : @"";
+    if (out) {
+      loom_string_free(out);
+    }
+    resolve(result);
+  });
+}
+
+- (void)identityConfigureAuthorityReplicationJson:(NSString *)loomPath
+                                               id:(NSString *)id
+                                           source:(NSString *)source
+                                         disabled:(BOOL)disabled
+                                      pullOnStart:(BOOL)pullOnStart
+                                       intervalMs:(double)intervalMs
+                                intervalMsPresent:(BOOL)intervalMsPresent
+                                         jitterMs:(double)jitterMs
+                                        backoffMs:(double)backoffMs
+                                   publishWitness:(BOOL)publishWitness
+                                       passphrase:(NSString *)passphrase
+                                              kek:(NSArray *)kek
+                                    authPrincipal:(NSString *)authPrincipal
+                                   authPassphrase:(NSString *)authPassphrase
+                                          resolve:(RCTPromiseResolveBlock)resolve
+                                           reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    char *out = NULL;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_identity_configure_authority_replication_json(
+          h, id.UTF8String, source.UTF8String, disabled ? 1 : 0, pullOnStart ? 1 : 0,
+          (uint64_t)intervalMs, intervalMsPresent ? 1 : 0, (uint64_t)jitterMs,
+          (uint64_t)backoffMs, publishWitness ? 1 : 0, &out);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSString *result = out ? [NSString stringWithUTF8String:out] : @"";
+    if (out) {
+      loom_string_free(out);
+    }
+    resolve(result);
+  });
+}
+
+- (void)identityRemoveAuthorityReplicationJson:(NSString *)loomPath
+                                            id:(NSString *)id
+                                    passphrase:(NSString *)passphrase
+                                           kek:(NSArray *)kek
+                                 authPrincipal:(NSString *)authPrincipal
+                                authPassphrase:(NSString *)authPassphrase
+                                       resolve:(RCTPromiseResolveBlock)resolve
+                                        reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async([self workQueue], ^{
+    LoomSession *h = [self openStore:loomPath passphrase:passphrase kek:kek];
+    if (h == NULL) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    char *out = NULL;
+    int32_t st = [self authenticateStore:h principal:authPrincipal passphrase:authPassphrase];
+    if (st == 0) {
+      st = loom_identity_remove_authority_replication_json(h, id.UTF8String, &out);
+    }
+    loom_close(h);
+    if (st != 0) {
+      NSError *err = [self loomError];
+      reject([@(err.code) stringValue], err.localizedDescription, err);
+      return;
+    }
+    NSString *result = out ? [NSString stringWithUTF8String:out] : @"";
+    if (out) {
+      loom_string_free(out);
+    }
+    resolve(result);
+  });
+}
+
 - (void)aclListJson:(NSString *)loomPath
          passphrase:(NSString *)passphrase
                 kek:(NSArray *)kek

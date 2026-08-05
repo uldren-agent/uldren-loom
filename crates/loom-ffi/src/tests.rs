@@ -3,8 +3,9 @@ use super::*;
 // exercise the whole surface, can call them unqualified as before.
 use crate::{
     archive::*, calendar::*, cas::*, columnar::*, contacts::*, dataframe::*, document::*, drive::*,
-    files::*, graph::*, kv::*, lanes::*, ledger::*, mail::*, meetings::*, metrics::*, queue::*,
-    replay::*, restore::*, search::*, tags::*, tickets::*, timeseries::*, vector::*,
+    files::*, generated_local::*, graph::*, kv::*, lanes::*, ledger::*, mail::*, meetings::*,
+    metrics::*, queue::*, replay::*, restore::*, search::*, tags::*, tickets::*, timeseries::*,
+    vector::*,
 };
 use std::io::{Read, Write};
 
@@ -156,6 +157,184 @@ fn studio_surface_catalog_json_over_the_c_abi() {
             .1
             .contains("unsupported Studio surface catalog set"),
     );
+}
+
+#[test]
+fn tickets_project_settings_round_trip_over_the_c_abi() {
+    let dir = temp_loom();
+    let path = cs(dir.to_str().unwrap());
+    let default_workspace = cs("default");
+    assert_eq!(
+        unsafe {
+            loom_create(
+                path.as_ptr(),
+                default_workspace.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                0,
+            )
+        },
+        0,
+        "create failed: {:?}",
+        last_err()
+    );
+
+    let mut handle: *mut LoomSession = core::ptr::null_mut();
+    assert_eq!(unsafe { loom_open(path.as_ptr(), &mut handle) }, 0);
+
+    let workspace_name = cs("tickets");
+    let mut workspace_out = core::ptr::null_mut();
+    let workspace_id = unsafe {
+        ok_out(
+            loom_workspace_create(
+                handle,
+                workspace_name.as_ptr(),
+                core::ptr::null(),
+                &mut workspace_out,
+            ),
+            workspace_out,
+        )
+    };
+    let workspace = cs(&workspace_id);
+    let ticket_workspace_id = cs("tickets");
+    let project_id = cs("matrix");
+    let key_prefix = cs("MX");
+    let name = cs("Matrix");
+    let mut create_out = core::ptr::null_mut();
+    let _created = unsafe {
+        ok_out(
+            loom_tickets_project_create_json(
+                handle,
+                workspace.as_ptr(),
+                ticket_workspace_id.as_ptr(),
+                project_id.as_ptr(),
+                key_prefix.as_ptr(),
+                name.as_ptr(),
+                core::ptr::null(),
+                &mut create_out,
+            ),
+            create_out,
+        )
+    };
+
+    let enable = cs(r#"["native","jira"]"#);
+    let disable = cs("[]");
+    let required_keys = cs(r#"["source_anchors","checks_run"]"#);
+    let required_reviews = cs(r#"["design_review","code_review"]"#);
+    let owner_summary = cs("Owner summary from ABI");
+    let owner_details = cs("Owner details from ABI");
+    let worker_summary = cs("Worker summary from ABI");
+    let worker_details = cs("Worker details from ABI");
+    let mut set_out = core::ptr::null_mut();
+    let set_json = unsafe {
+        ok_out(
+            loom_tickets_project_settings_set_json(
+                handle,
+                workspace.as_ptr(),
+                ticket_workspace_id.as_ptr(),
+                project_id.as_ptr(),
+                core::ptr::null(),
+                enable.as_ptr(),
+                disable.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                false,
+                core::ptr::null(),
+                true,
+                true,
+                required_keys.as_ptr(),
+                required_reviews.as_ptr(),
+                owner_summary.as_ptr(),
+                owner_details.as_ptr(),
+                worker_summary.as_ptr(),
+                worker_details.as_ptr(),
+                core::ptr::null(),
+                &mut set_out,
+            ),
+            set_out,
+        )
+    };
+    let set_value: serde_json::Value = serde_json::from_str(&set_json).unwrap();
+    assert_eq!(set_value["acceptance_evidence_enforcement"], true);
+    assert_eq!(
+        set_value["required_acceptance_evidence_keys"],
+        serde_json::json!(["source_anchors", "checks_run"])
+    );
+    assert_eq!(
+        set_value["required_acceptance_reviews"],
+        serde_json::json!(["design_review", "code_review"])
+    );
+    assert_eq!(
+        set_value["contracts"]["owner"]["summary"],
+        "Owner summary from ABI"
+    );
+    assert_eq!(
+        set_value["contracts"]["owner"]["details"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        set_value["contracts"]["worker"]["summary"],
+        "Worker summary from ABI"
+    );
+    assert_eq!(
+        set_value["contracts"]["worker"]["details"],
+        serde_json::Value::Null
+    );
+
+    let mut public_out = core::ptr::null_mut();
+    let public_json = unsafe {
+        ok_out(
+            loom_tickets_project_settings_get_json(
+                handle,
+                workspace.as_ptr(),
+                ticket_workspace_id.as_ptr(),
+                project_id.as_ptr(),
+                false,
+                &mut public_out,
+            ),
+            public_out,
+        )
+    };
+    let public_value: serde_json::Value = serde_json::from_str(&public_json).unwrap();
+    assert_eq!(
+        public_value["contracts"]["owner"]["details"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        public_value["contracts"]["worker"]["details"],
+        serde_json::Value::Null
+    );
+
+    let mut private_out = core::ptr::null_mut();
+    let private_json = unsafe {
+        ok_out(
+            loom_tickets_project_settings_get_json(
+                handle,
+                workspace.as_ptr(),
+                ticket_workspace_id.as_ptr(),
+                project_id.as_ptr(),
+                true,
+                &mut private_out,
+            ),
+            private_out,
+        )
+    };
+    let private_value: serde_json::Value = serde_json::from_str(&private_json).unwrap();
+    assert_eq!(private_value["acceptance_evidence_enforcement"], true);
+    assert_eq!(
+        private_value["required_acceptance_evidence_keys"],
+        serde_json::json!(["source_anchors", "checks_run"])
+    );
+    assert_eq!(
+        private_value["contracts"]["owner"]["details"],
+        "Owner details from ABI"
+    );
+    assert_eq!(
+        private_value["contracts"]["worker"]["details"],
+        "Worker details from ABI"
+    );
+
+    unsafe { loom_close(handle) };
 }
 
 #[test]
@@ -2601,6 +2780,7 @@ fn document_timeseries_ledger_round_trip_over_the_c_abi() {
             last_err()
         );
     }
+
     let (mut tp, mut tn, mut tfound, mut ts_out) = (core::ptr::null_mut(), 0usize, -1i32, 0i64);
     assert_eq!(
         unsafe {
@@ -2938,7 +3118,7 @@ fn lanes_contract_over_the_c_abi() {
                 lane_id.as_ptr(),
                 ticket_id.as_ptr(),
                 updated_by.as_ptr(),
-                core::ptr::null(),
+                0,
                 core::ptr::null(),
                 &mut p,
                 &mut n,
@@ -2976,7 +3156,6 @@ fn lanes_contract_over_the_c_abi() {
     assert_eq!(updated.reviewer_feedback, "review available");
 
     let ticket_two = cs("MX-111");
-    let first = cs("first");
     let added_first = unsafe {
         ok_raw(
             loom_lanes_ticket_add_cbor(
@@ -2985,7 +3164,7 @@ fn lanes_contract_over_the_c_abi() {
                 lane_id.as_ptr(),
                 ticket_two.as_ptr(),
                 updated_by.as_ptr(),
-                first.as_ptr(),
+                LOOM_LANE_TICKET_PLACEMENT_FIRST,
                 core::ptr::null(),
                 &mut p,
                 &mut n,
@@ -3122,7 +3301,7 @@ fn lane_view_json_over_the_c_abi_is_compact_by_default_and_detailed_on_flag() {
                 lane_id.as_ptr(),
                 ticket_id.as_ptr(),
                 updated_by.as_ptr(),
-                core::ptr::null(),
+                0,
                 core::ptr::null(),
                 &mut p,
                 &mut n,
@@ -5241,6 +5420,8 @@ fn filesystem_import_export_over_the_c_abi() {
                 handle,
                 workspace.as_ptr(),
                 import_path.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
                 0,
                 0,
                 &mut p,
@@ -5354,6 +5535,10 @@ fn archive_round_trip_over_the_c_abi() {
                 workspace.as_ptr(),
                 archive.as_ptr(),
                 kind.as_ptr(),
+                core::ptr::null(),
+                1,
+                core::ptr::null(),
+                core::ptr::null(),
                 0,
                 &mut task,
             )

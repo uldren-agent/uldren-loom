@@ -17,7 +17,23 @@ actual object Loom {
 
     actual external fun studioSurfaceCatalogJson(workspace: String, set: String): String
 
+    actual fun create(
+        path: String,
+        profile: String,
+        suite: String?,
+        passphrase: String?,
+    ) = LoomNative.nativeCreate(path, profile, suite, passphrase?.encodeToByteArray())
+
     actual fun execCbor(
+        path: String,
+        request: ByteArray,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): ByteArray = applyCbor(path, request, passphrase, kek, authPrincipal, authPassphrase)
+
+    actual fun applyCbor(
         path: String,
         request: ByteArray,
         passphrase: ByteArray?,
@@ -32,6 +48,201 @@ actual object Loom {
         authPrincipal,
         authPassphrase,
     )
+
+    actual fun auditConfigShowJson(
+        path: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeAuditConfigShowJson(path, passphrase, kek, authPrincipal, authPassphrase)
+
+    actual fun auditConfigSetJson(
+        path: String,
+        retentionDays: Int?,
+        legalHold: Boolean?,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeAuditConfigSetJson(
+        path,
+        retentionDays ?: 0,
+        retentionDays != null,
+        legalHold ?: false,
+        legalHold != null,
+        passphrase,
+        kek,
+        authPrincipal,
+        authPassphrase,
+    )
+
+    actual fun auditListJson(
+        path: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeAuditListJson(path, passphrase, kek, authPrincipal, authPassphrase)
+
+    actual fun auditViewJson(
+        path: String,
+        record: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeAuditViewJson(path, record, passphrase, kek, authPrincipal, authPassphrase)
+
+    actual fun certificateListJson(
+        path: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeCertificateListJson(path, passphrase, kek, authPrincipal, authPassphrase)
+
+    actual fun certificateImportJson(
+        path: String,
+        name: String,
+        certChainPem: ByteArray,
+        privateKeyPem: ByteArray,
+        trustBundlePem: ByteArray?,
+        force: Boolean,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeCertificateImportJson(
+        path,
+        name,
+        certChainPem,
+        privateKeyPem,
+        trustBundlePem,
+        force,
+        passphrase,
+        kek,
+        authPrincipal,
+        authPassphrase,
+    )
+
+    actual fun certificateExport(
+        path: String,
+        name: String,
+        includeCertChain: Boolean,
+        includePrivateKey: Boolean,
+        includeTrustBundle: Boolean,
+        force: Boolean,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): ByteArray = LoomNative.nativeCertificateExport(
+        path,
+        name,
+        includeCertChain,
+        includePrivateKey,
+        includeTrustBundle,
+        force,
+        passphrase,
+        kek,
+        authPrincipal,
+        authPassphrase,
+    )
+
+    actual fun certificateGenerateSelfSignedJson(
+        path: String,
+        name: String,
+        dnsNamesJson: String,
+        ipAddressesJson: String,
+        cn: String?,
+        days: Int,
+        algorithm: String,
+        force: Boolean,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeCertificateGenerateSelfSignedJson(
+        path,
+        name,
+        dnsNamesJson,
+        ipAddressesJson,
+        cn,
+        days,
+        algorithm,
+        force,
+        passphrase,
+        kek,
+        authPrincipal,
+        authPassphrase,
+    )
+
+    actual fun certificateRemoveJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeCertificateRemoveJson(path, name, passphrase, kek, authPrincipal, authPassphrase)
+
+    actual fun certificateAuditJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeCertificateAuditJson(path, name, passphrase, kek, authPrincipal, authPassphrase)
+
+    actual fun networkAccessListJson(
+        path: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeNetworkAccessListJson(path, passphrase, kek, authPrincipal, authPassphrase)
+
+    actual fun networkAccessSetJson(
+        path: String,
+        name: String,
+        description: String?,
+        defaultAction: String,
+        rulesJson: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeNetworkAccessSetJson(
+        path,
+        name,
+        description,
+        defaultAction,
+        rulesJson,
+        passphrase,
+        kek,
+        authPrincipal,
+        authPassphrase,
+    )
+
+    actual fun networkAccessRemoveJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeNetworkAccessRemoveJson(path, name, passphrase, kek, authPrincipal, authPassphrase)
+
+    actual fun networkAccessAuditJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String = LoomNative.nativeNetworkAccessAuditJson(path, name, passphrase, kek, authPrincipal, authPassphrase)
 
 }
 
@@ -215,6 +426,234 @@ internal object LoomNative {
         authPassphrase: ByteArray?,
     ): ByteArray
 
+    external fun nativeLifecycleDefineStandardJson(
+        path: String,
+        workspace: String,
+        kind: String,
+        version: String,
+        completionPredicateDigest: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeLifecycleDefineJson(
+        path: String,
+        workspace: String,
+        definition: ByteArray,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeLifecycleInstantiateJson(
+        path: String,
+        workspace: String,
+        instanceId: String,
+        definitionId: String,
+        subjectRefsJson: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeLifecycleTransitionJson(
+        path: String,
+        workspace: String,
+        instanceId: String,
+        transitionId: String,
+        toStageId: String,
+        actorPrincipalId: String?,
+        gateEvaluationsJson: String,
+        snapshotDigest: String?,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeRefsReconcileJson(
+        path: String,
+        workspace: String,
+        max: Long,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeStudioReindexJson(path: String, workspace: String, profile: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeStudioRevisionsRebuildJson(path: String, workspace: String, profile: String, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeStoreBundleImport(path: String, bundle: ByteArray, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeAuditCompact(path: String, throughSeq: Long, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeStoreMaintenanceStatus(path: String, request: ByteArray, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeStoreMaintenancePolicySet(path: String, update: ByteArray, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeStoreMaintenanceRun(path: String, request: ByteArray, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeImportTableCsv(path: String, workspace: String, sourceScope: String, csvPayload: ByteArray, database: String, table: String, schema: String, primaryKey: String, mode: String, commit: Boolean, author: String?, message: String?, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeImportRedmine(path: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ByteArray, fieldPolicy: String, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeImportAsana(path: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ByteArray, fieldPolicy: String, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeImportJira(path: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ByteArray, fieldPolicy: String, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeImportConfluence(path: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ByteArray, defaultSpace: String, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeImportSlack(path: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ByteArray, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeImportDrive(path: String, workspace: String, profile: String, sourceScope: String, archivePayload: ByteArray, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeImportMarkdown(path: String, workspace: String, profile: String, sourceScope: String, archivePayload: ByteArray, space: String, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeImportNotion(path: String, workspace: String, profile: String, sourceScope: String, snapshotPayload: ByteArray, defaultSpace: String, dryRun: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeInferenceInstanceCreateJson(path: String, workspace: String, name: String, model: String, kind: String, runtime: String, preset: String?, settingsJson: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeInferenceInstanceUpdateJson(path: String, workspace: String, name: String, preset: String?, settingsJson: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeInferenceInstanceDeleteJson(path: String, workspace: String, name: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeServeListenerConfigureJson(path: String, requestJson: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeServeListenerListJson(path: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeServeListenerSetEnabledJson(path: String, listenerId: String, enabled: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeServeListenerRemoveJson(path: String, listenerId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeServeWebRouteListJson(path: String, listenerId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeServeWebRouteSetJson(path: String, requestJson: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeServeWebRouteRemoveJson(path: String, listenerId: String, routeId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+
+    external fun nativeAuditConfigShowJson(
+        path: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeAuditConfigSetJson(
+        path: String,
+        retentionDays: Int,
+        hasRetentionDays: Boolean,
+        legalHold: Boolean,
+        hasLegalHold: Boolean,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeAuditListJson(
+        path: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeAuditViewJson(
+        path: String,
+        record: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeCertificateListJson(
+        path: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeCertificateImportJson(
+        path: String,
+        name: String,
+        certChainPem: ByteArray,
+        privateKeyPem: ByteArray,
+        trustBundlePem: ByteArray?,
+        force: Boolean,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeCertificateExport(
+        path: String,
+        name: String,
+        includeCertChain: Boolean,
+        includePrivateKey: Boolean,
+        includeTrustBundle: Boolean,
+        force: Boolean,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): ByteArray
+
+    external fun nativeCertificateGenerateSelfSignedJson(
+        path: String,
+        name: String,
+        dnsNamesJson: String,
+        ipAddressesJson: String,
+        cn: String?,
+        days: Int,
+        algorithm: String,
+        force: Boolean,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeCertificateRemoveJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeCertificateAuditJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeNetworkAccessListJson(
+        path: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeNetworkAccessSetJson(
+        path: String,
+        name: String,
+        description: String?,
+        defaultAction: String,
+        rulesJson: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeNetworkAccessRemoveJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeNetworkAccessAuditJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
     external fun nativeIdentityListJson(
         path: String,
         passphrase: ByteArray?,
@@ -326,6 +765,52 @@ internal object LoomNative {
         authPrincipal: String?,
         authPassphrase: ByteArray?,
     )
+
+    external fun nativeIdentityForceDetachAuthorityJson(
+        path: String,
+        principal: String,
+        generation: Long,
+        reason: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeIdentityReplicateAuthorityJson(
+        path: String,
+        source: String,
+        becomeAuthority: Boolean,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeIdentityConfigureAuthorityReplicationJson(
+        path: String,
+        id: String,
+        source: String,
+        disabled: Boolean,
+        pullOnStart: Boolean,
+        intervalMs: Long?,
+        jitterMs: Long,
+        backoffMs: Long,
+        publishWitness: Boolean,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
+    external fun nativeIdentityRemoveAuthorityReplicationJson(
+        path: String,
+        id: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
 
     external fun nativeAclListJson(
         path: String,
@@ -550,6 +1035,17 @@ internal object LoomNative {
         table: String,
         fromCommit: String,
         toCommit: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): ByteArray
+
+    external fun nativeSqlExecResult(
+        path: String,
+        workspace: String,
+        db: String,
+        sql: String,
         passphrase: ByteArray?,
         kek: ByteArray?,
         authPrincipal: String?,
@@ -1171,8 +1667,8 @@ internal object LoomNative {
     external fun nativeDriveApplyRetentionJson(path: String, workspace: String, driveWorkspaceId: String, nowMs: Long, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
     external fun nativeTicketsProjectCreateJson(path: String, workspace: String, ticketWorkspaceId: String, projectId: String, keyPrefix: String, name: String, expectedRoot: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
     external fun nativeTicketsProjectRekeyJson(path: String, workspace: String, ticketWorkspaceId: String, projectId: String, keyPrefix: String, expectedRoot: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeTicketsProjectSettingsGetJson(path: String, workspace: String, ticketWorkspaceId: String, projectId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeTicketsProjectSettingsSetJson(path: String, workspace: String, ticketWorkspaceId: String, projectId: String, defaultProjection: String?, enableProjectionsJson: String, disableProjectionsJson: String, actorEnforcement: String?, projectOwnerPrincipal: String?, clearProjectOwnerPrincipal: Boolean, acceptanceAuthoritiesJson: String?, expectedRoot: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeTicketsProjectSettingsGetJson(path: String, workspace: String, ticketWorkspaceId: String, projectId: String, includeContracts: Boolean, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeTicketsProjectSettingsSetJson(path: String, workspace: String, ticketWorkspaceId: String, projectId: String, defaultProjection: String?, enableProjectionsJson: String, disableProjectionsJson: String, actorEnforcement: String?, projectOwnerPrincipal: String?, clearProjectOwnerPrincipal: Boolean, acceptanceAuthoritiesJson: String?, acceptanceEvidenceEnforcement: Boolean, hasAcceptanceEvidenceEnforcement: Boolean, requiredAcceptanceEvidenceKeysJson: String?, requiredAcceptanceReviewsJson: String?, ownerContractSummary: String?, ownerContractDetails: String?, workerContractSummary: String?, workerContractDetails: String?, expectedRoot: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
     external fun nativeTicketsFieldsJson(path: String, workspace: String, ticketWorkspaceId: String, projectId: String, projection: String, operation: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
     external fun nativeTicketsFieldPutJson(path: String, workspace: String, ticketWorkspaceId: String, projectId: String, fieldId: String, key: String, name: String, description: String?, fieldType: String, optionSet: String?, maxLength: Int, hasMaxLength: Boolean, required: Boolean, searchable: Boolean, orderable: Boolean, cardinality: String, applicableTypeIdsJson: String, expectedRoot: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
     external fun nativeTicketsFieldRetireJson(path: String, workspace: String, ticketWorkspaceId: String, projectId: String, fieldId: String, expectedRoot: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
@@ -1206,35 +1702,40 @@ internal object LoomNative {
     external fun nativeLanesGet(path: String, workspace: String, laneId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray?
     external fun nativeLanesList(path: String, workspace: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
     external fun nativeLanesUpdate(path: String, workspace: String, laneId: String, title: String?, description: String?, laneStatus: String?, statusReport: String?, reviewerFeedback: String?, updatedBy: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
-    external fun nativeLanesTicketAdd(path: String, workspace: String, laneId: String, ticketId: String, updatedBy: String, placement: String, anchor: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
+    external fun nativeLanesTicketAdd(path: String, workspace: String, laneId: String, ticketId: String, updatedBy: String, placement: Int, anchor: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
     external fun nativeLanesTicketRemove(path: String, workspace: String, laneId: String, ticketId: String, updatedBy: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): ByteArray
-    external fun nativeChatCreateChannelJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, channelHandle: String, name: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatRenameChannelJson(path: String, workspace: String, chatWorkspaceId: String, selector: String, channelHandle: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatCreateChannelJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, channelHandle: String, name: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatRenameChannelJson(path: String, workspace: String, chatWorkspaceId: String, selector: String, channelHandle: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
     external fun nativeChatListChannelsJson(path: String, workspace: String, chatWorkspaceId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatPostMessageJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, threadId: String?, bodyText: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatEditMessageJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, bodyText: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatRedactMessageJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, reason: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatCreateThreadJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, threadId: String, parentMessageId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatCreateTaskJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, messageId: String, title: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatClaimTaskJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, claimId: String, leaseToken: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatCompleteTaskJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, claimId: String, resultMessageId: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatInvokeAgentJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, invocationId: String, agentPrincipal: String, sourceMessageIdsJson: String, promptText: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatAgentReplyJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, invocationId: String, messageId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatRequestHandoffJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, handoffId: String, fromAgentPrincipal: String, toPrincipal: String?, reason: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatAddReactionJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, kind: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatRemoveReactionJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, kind: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatPostMessageJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, threadId: String?, bodyText: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatPostMessageBytesJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, threadId: String?, body: ByteArray, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatEditMessageJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, bodyText: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatEditMessageBytesJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, body: ByteArray, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatRedactMessageJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, reason: String?, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatCreateThreadJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, threadId: String, parentMessageId: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatCreateTaskJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, messageId: String, title: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatClaimTaskJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, claimId: String, leaseToken: String?, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatCompleteTaskJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, taskId: String, claimId: String, resultMessageId: String?, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatInvokeAgentJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, invocationId: String, agentPrincipal: String, sourceMessageIdsJson: String, promptText: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatInvokeAgentBytesJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, invocationId: String, agentPrincipal: String, sourceMessageIdsJson: String, prompt: ByteArray, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatAgentReplyJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, invocationId: String, messageId: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatRequestHandoffJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, handoffId: String, fromAgentPrincipal: String, toPrincipal: String?, reason: String?, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatAddReactionJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, kind: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatRemoveReactionJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, messageId: String, kind: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
     external fun nativeChatEmojiListJson(path: String, workspace: String, chatWorkspaceId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatEmojiRegisterJson(path: String, workspace: String, chatWorkspaceId: String, kind: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatEmojiUnregisterJson(path: String, workspace: String, chatWorkspaceId: String, kind: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatEmojiRegisterJson(path: String, workspace: String, chatWorkspaceId: String, kind: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatEmojiUnregisterJson(path: String, workspace: String, chatWorkspaceId: String, kind: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
     external fun nativeChatMessagesJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
     external fun nativeChatCursorJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
-    external fun nativeChatUpdateCursorJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, nextSequence: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
+    external fun nativeChatUpdateCursorJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, nextSequence: String, expectedEntityTag: String?, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
     external fun nativeChatFetchEventsJson(path: String, workspace: String, chatWorkspaceId: String, channelId: String, fromSequence: String, max: String, passphrase: ByteArray?, kek: ByteArray?, authPrincipal: String?, authPassphrase: ByteArray?): String
 
     external fun nativeFsImport(
         path: String,
         workspace: String,
         srcPath: String,
+        author: String?,
+        message: String?,
         commit: Boolean,
         dryRun: Boolean,
         passphrase: ByteArray?,
@@ -1260,6 +1761,10 @@ internal object LoomNative {
         workspace: String,
         srcPath: String,
         kind: String,
+        gzipOutputPath: String?,
+        commit: Boolean,
+        author: String?,
+        message: String?,
         dryRun: Boolean,
         passphrase: ByteArray?,
         kek: ByteArray?,
@@ -2024,6 +2529,25 @@ internal object LoomNative {
         authPassphrase: ByteArray?,
     ): ByteArray
 
+    external fun nativeVectorTextUpsert(
+        path: String,
+        request: ByteArray,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): ByteArray
+
+    external fun nativeVectorWorkspaceConfigureJson(
+        path: String,
+        workspace: String,
+        requestJson: String,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): String
+
 
     external fun nativeColumnarCreate(
         path: String,
@@ -2131,6 +2655,34 @@ internal object LoomNative {
         name: String,
         aggregates: ByteArray,
         filter: ByteArray,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): ByteArray
+
+    external fun nativeColumnarImportArrow(
+        path: String,
+        workspace: String,
+        name: String,
+        payload: ByteArray,
+        targetSegmentRows: String,
+        replace: Boolean,
+        dryRun: Boolean,
+        passphrase: ByteArray?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: ByteArray?,
+    ): ByteArray
+
+    external fun nativeColumnarImportParquet(
+        path: String,
+        workspace: String,
+        name: String,
+        payload: ByteArray,
+        targetSegmentRows: String,
+        replace: Boolean,
+        dryRun: Boolean,
         passphrase: ByteArray?,
         kek: ByteArray?,
         authPrincipal: String?,

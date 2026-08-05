@@ -35,6 +35,58 @@ fn update_metadata(lane: &mut Lane, updated_by: &str) {
 }
 
 #[napi]
+pub const LANE_TICKET_PLACEMENT_FIRST: i32 = 1;
+#[napi]
+pub const LANE_TICKET_PLACEMENT_LAST: i32 = 2;
+#[napi]
+pub const LANE_TICKET_PLACEMENT_BEFORE: i32 = 3;
+#[napi]
+pub const LANE_TICKET_PLACEMENT_AFTER: i32 = 4;
+
+fn lane_ticket_placement<'a>(
+    placement: i32,
+    anchor: Option<&'a str>,
+) -> loom_core::error::Result<loom_lanes::LaneTicketPlacement<'a>> {
+    match placement {
+        0 | LANE_TICKET_PLACEMENT_LAST => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(loom_core::error::LoomError::invalid(
+                    "placement 'LAST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::Last)
+        }
+        LANE_TICKET_PLACEMENT_FIRST => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(loom_core::error::LoomError::invalid(
+                    "placement 'FIRST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::First)
+        }
+        LANE_TICKET_PLACEMENT_BEFORE => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::Before)
+            .ok_or_else(|| {
+                loom_core::error::LoomError::invalid(
+                    "placement 'BEFORE' requires an anchor ticket id",
+                )
+            }),
+        LANE_TICKET_PLACEMENT_AFTER => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::After)
+            .ok_or_else(|| {
+                loom_core::error::LoomError::invalid(
+                    "placement 'AFTER' requires an anchor ticket id",
+                )
+            }),
+        _ => Err(loom_core::error::LoomError::invalid(
+            "unknown lane ticket placement",
+        )),
+    }
+}
+
+#[napi]
 pub fn lanes_create(
     loom_path: String,
     workspace: String,
@@ -121,7 +173,10 @@ pub fn lanes_update(
                 lane.description = description;
             }
             if let Some(lane_status) = lane_status {
-                lane.lane_status = LaneStatus::parse(&lane_status).map_err(reason)?.as_str().to_string();
+                lane.lane_status = LaneStatus::parse(&lane_status)
+                    .map_err(reason)?
+                    .as_str()
+                    .to_string();
             }
             if let Some(status_report) = status_report {
                 lane.status_report = status_report;
@@ -142,7 +197,7 @@ pub fn lanes_ticket_add(
     lane_id: String,
     ticket_id: String,
     updated_by: String,
-    placement: String,
+    placement: i32,
     anchor: Option<String>,
     passphrase: Option<String>,
 ) -> napi::Result<Uint8Array> {
@@ -152,8 +207,7 @@ pub fn lanes_ticket_add(
         &lane_id,
         passphrase.as_deref(),
         |lane| {
-            let placement = loom_lanes::LaneTicketPlacement::parse(&placement, anchor.as_deref())
-                .map_err(reason)?;
+            let placement = lane_ticket_placement(placement, anchor.as_deref()).map_err(reason)?;
             loom_lanes::place_lane_ticket(lane, &ticket_id, placement).map_err(reason)?;
             update_metadata(lane, &updated_by);
             Ok(())
@@ -225,8 +279,8 @@ pub fn lanes_delete(
     let mut loom =
         open_loom_unlocked(&loom_path, key_spec(passphrase.as_deref()).as_ref()).map_err(reason)?;
     let ns = ensure_lanes_ns(&mut loom, &workspace)?;
-    let lane = loom_lanes::delete_lane(&mut loom, ns, &lane_id, now_ms(), &updated_by)
-        .map_err(reason)?;
+    let lane =
+        loom_lanes::delete_lane(&mut loom, ns, &lane_id, now_ms(), &updated_by).map_err(reason)?;
     save_loom(&mut loom).map_err(reason)?;
     Ok(Uint8Array::from(lane.encode().map_err(reason)?))
 }

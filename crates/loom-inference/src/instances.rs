@@ -13,7 +13,6 @@ pub const INSTANCE_STORE_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct VectorWorkspaceBinding {
-    pub store: String,
     pub workspace: String,
     pub embedding_instance: String,
 }
@@ -70,16 +69,17 @@ impl InferenceInstanceState {
     }
 
     pub fn upsert_vector_binding(&mut self, binding: VectorWorkspaceBinding) {
-        if let Some(existing) = self.vector_bindings.iter_mut().find(|existing| {
-            existing.store == binding.store && existing.workspace == binding.workspace
-        }) {
+        if let Some(existing) = self
+            .vector_bindings
+            .iter_mut()
+            .find(|existing| existing.workspace == binding.workspace)
+        {
             *existing = binding;
         } else {
             self.vector_bindings.push(binding);
         }
-        self.vector_bindings.sort_by(|left, right| {
-            (&left.store, &left.workspace).cmp(&(&right.store, &right.workspace))
-        });
+        self.vector_bindings
+            .sort_by(|left, right| left.workspace.cmp(&right.workspace));
     }
 
     pub fn instance_ref_count(&self, name: &str) -> usize {
@@ -326,7 +326,6 @@ mod tests {
     fn delete_ref_count_tracks_vector_bindings() {
         let mut state = InferenceInstanceState::default();
         state.vector_bindings.push(VectorWorkspaceBinding {
-            store: "store.loom".to_string(),
             workspace: "main".to_string(),
             embedding_instance: "fast-embed".to_string(),
         });

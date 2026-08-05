@@ -257,4 +257,31 @@ public final class VectorOps {
                             outLen.get(ValueLayout.JAVA_LONG, 0));
                 });
     }
+
+    public byte[] textUpsert(byte[] request) {
+        return session.onHandle("loom_vector_text_upsert", (arena, handle) -> {
+            MemorySegment outPtr = arena.allocate(ValueLayout.ADDRESS);
+            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+            int status = (int) Loom.LOOM_VECTOR_TEXT_UPSERT.invokeExact(
+                    handle, Loom.bytesOrNull(arena, request), (long) (request != null ? request.length : 0),
+                    outPtr, outLen);
+            if (status != 0) {
+                throw Loom.lastError("loom_vector_text_upsert");
+            }
+            return Loom.takeOwnedBytes(outPtr.get(ValueLayout.ADDRESS, 0),
+                    outLen.get(ValueLayout.JAVA_LONG, 0));
+        });
+    }
+
+    public String workspaceConfigureJson(String workspace, String requestJson) {
+        return session.onHandle("loom_vector_workspace_configure_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) Loom.LOOM_VECTOR_WORKSPACE_CONFIGURE_JSON.invokeExact(
+                    handle, arena.allocateFrom(workspace), arena.allocateFrom(requestJson), out);
+            if (status != 0) {
+                throw Loom.lastError("loom_vector_workspace_configure_json");
+            }
+            return Loom.takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+        });
+    }
 }

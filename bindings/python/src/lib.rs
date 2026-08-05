@@ -54,17 +54,27 @@ mod daemon_fns;
 mod dataframe;
 mod document;
 mod drive;
+mod exec_generated;
 mod files;
+mod generated_session;
 mod graph;
+mod inference_instance;
+mod interchange_profiles;
 mod kv;
 mod lanes;
 mod ledger;
+mod lifecycle_refs;
 mod mail_fns;
 mod meetings;
 mod pages;
 mod queue;
 mod search;
+mod security_admin;
+mod serve_config;
 mod sql;
+mod sql_generated;
+mod store_admin;
+mod studio_maintenance;
 mod telemetry;
 mod tickets;
 mod timeseries;
@@ -1519,6 +1529,77 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(admin::blob_digest, m)?)?;
     m.add_function(wrap_pyfunction!(admin::create_loom, m)?)?;
     m.add_function(wrap_pyfunction!(exec_cbor, m)?)?;
+    m.add_function(wrap_pyfunction!(exec_generated::apply_cbor, m)?)?;
+    m.add_function(wrap_pyfunction!(sql_generated::sql_exec_result, m)?)?;
+    m.add_function(wrap_pyfunction!(columnar::columnar_import_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(columnar::columnar_import_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(vector::vector_text_upsert, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        vector::vector_workspace_configure_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        studio_maintenance::studio_reindex_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        studio_maintenance::studio_revisions_rebuild_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(store_admin::audit_compact, m)?)?;
+    m.add_function(wrap_pyfunction!(store_admin::store_bundle_import, m)?)?;
+    m.add_function(wrap_pyfunction!(store_admin::store_maintenance_status, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        store_admin::store_maintenance_policy_set,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(store_admin::store_maintenance_run, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        inference_instance::inference_instance_create_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        inference_instance::inference_instance_update_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        inference_instance::inference_instance_delete_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        serve_config::serve_listener_configure_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(serve_config::serve_listener_list_json, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        serve_config::serve_listener_set_enabled_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        serve_config::serve_listener_remove_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        serve_config::serve_web_route_list_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(serve_config::serve_web_route_set_json, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        serve_config::serve_web_route_remove_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(interchange_profiles::import_table_csv, m)?)?;
+    m.add_function(wrap_pyfunction!(interchange_profiles::import_redmine, m)?)?;
+    m.add_function(wrap_pyfunction!(interchange_profiles::import_asana, m)?)?;
+    m.add_function(wrap_pyfunction!(interchange_profiles::import_jira, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        interchange_profiles::import_confluence,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(interchange_profiles::import_slack, m)?)?;
+    m.add_function(wrap_pyfunction!(interchange_profiles::import_drive, m)?)?;
+    m.add_function(wrap_pyfunction!(interchange_profiles::import_markdown, m)?)?;
+    m.add_function(wrap_pyfunction!(interchange_profiles::import_notion, m)?)?;
     m.add_function(wrap_pyfunction!(admin::authenticate_passphrase, m)?)?;
     m.add_function(wrap_pyfunction!(admin::identity_list_json, m)?)?;
     m.add_function(wrap_pyfunction!(admin::identity_add_principal, m)?)?;
@@ -1540,6 +1621,22 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(admin::identity_add_public_key, m)?)?;
     m.add_function(wrap_pyfunction!(admin::identity_revoke_public_key, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::identity_force_detach_authority_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::identity_replicate_authority_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::identity_configure_authority_replication_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::identity_remove_authority_replication_json,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(admin::acl_list_json, m)?)?;
     m.add_function(wrap_pyfunction!(admin::acl_grant, m)?)?;
     m.add_function(wrap_pyfunction!(admin::acl_grant_scoped, m)?)?;
@@ -1562,11 +1659,60 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(archive::archive_export, m)?)?;
     m.add_function(wrap_pyfunction!(archive::car_import, m)?)?;
     m.add_function(wrap_pyfunction!(archive::car_export, m)?)?;
+    m.add_function(wrap_pyfunction!(security_admin::audit_config_show_json, m)?)?;
+    m.add_function(wrap_pyfunction!(security_admin::audit_config_set_json, m)?)?;
+    m.add_function(wrap_pyfunction!(security_admin::audit_list_json, m)?)?;
+    m.add_function(wrap_pyfunction!(security_admin::audit_view_json, m)?)?;
+    m.add_function(wrap_pyfunction!(security_admin::certificate_list_json, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::certificate_import_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(security_admin::certificate_export, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::certificate_generate_self_signed_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::certificate_remove_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(security_admin::certificate_audit_json, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::network_access_list_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::network_access_set_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::network_access_remove_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        security_admin::network_access_audit_json,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(cas::cas_put, m)?)?;
     m.add_function(wrap_pyfunction!(cas::cas_get, m)?)?;
     m.add_function(wrap_pyfunction!(cas::cas_has, m)?)?;
     m.add_function(wrap_pyfunction!(cas::cas_delete, m)?)?;
     m.add_function(wrap_pyfunction!(cas::cas_list_json, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        lifecycle_refs::lifecycle_define_standard_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(lifecycle_refs::lifecycle_define_json, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        lifecycle_refs::lifecycle_instantiate_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        lifecycle_refs::lifecycle_transition_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(lifecycle_refs::refs_reconcile_json, m)?)?;
     m.add_function(wrap_pyfunction!(meetings::meetings_import_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(meetings::meetings_source_read, m)?)?;
     m.add_function(wrap_pyfunction!(drive::drive_list_json, m)?)?;
@@ -1651,13 +1797,16 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(chat::chat_rename_channel_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_list_channels_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_post_message_json, m)?)?;
+    m.add_function(wrap_pyfunction!(chat::chat_post_message_bytes_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_edit_message_json, m)?)?;
+    m.add_function(wrap_pyfunction!(chat::chat_edit_message_bytes_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_redact_message_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_create_thread_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_create_task_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_claim_task_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_complete_task_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_invoke_agent_json, m)?)?;
+    m.add_function(wrap_pyfunction!(chat::chat_invoke_agent_bytes_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_agent_reply_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_request_handoff_json, m)?)?;
     m.add_function(wrap_pyfunction!(chat::chat_add_reaction_json, m)?)?;
@@ -1682,6 +1831,22 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lanes::lanes_ticket_remove, m)?)?;
     m.add_function(wrap_pyfunction!(lanes::lanes_ticket_transfer, m)?)?;
     m.add_function(wrap_pyfunction!(lanes::lanes_delete, m)?)?;
+    m.add(
+        "LANE_TICKET_PLACEMENT_FIRST",
+        lanes::LANE_TICKET_PLACEMENT_FIRST,
+    )?;
+    m.add(
+        "LANE_TICKET_PLACEMENT_LAST",
+        lanes::LANE_TICKET_PLACEMENT_LAST,
+    )?;
+    m.add(
+        "LANE_TICKET_PLACEMENT_BEFORE",
+        lanes::LANE_TICKET_PLACEMENT_BEFORE,
+    )?;
+    m.add(
+        "LANE_TICKET_PLACEMENT_AFTER",
+        lanes::LANE_TICKET_PLACEMENT_AFTER,
+    )?;
     m.add_function(wrap_pyfunction!(graph::graph_upsert_node, m)?)?;
     m.add_function(wrap_pyfunction!(graph::graph_get_node, m)?)?;
     m.add_function(wrap_pyfunction!(graph::graph_remove_node, m)?)?;

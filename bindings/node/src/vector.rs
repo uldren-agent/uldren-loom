@@ -1,6 +1,8 @@
 //! Licensed under BUSL-1.1 (see the workspace `LICENSE`). (c) Uldren Technologies LLC.
 
 use super::*;
+use futures::executor::block_on;
+use loom_client::generated_api::Vector as GeneratedVector;
 
 use loom_core::EmbeddingModel;
 use loom_core::tabular::{cell_from, cell_value};
@@ -455,4 +457,55 @@ pub fn vector_search_policy(
         )
         .map_err(reason)?,
     )))
+}
+
+#[napi]
+pub fn vector_text_upsert(
+    loom_path: String,
+    request: Uint8Array,
+    store_passphrase: Option<String>,
+    auth_principal: Option<String>,
+    auth_passphrase: Option<String>,
+) -> napi::Result<Uint8Array> {
+    let generated = generated_session::open_generated_session(
+        &loom_path,
+        store_passphrase.as_deref(),
+        auth_principal.as_deref(),
+        auth_passphrase.as_deref(),
+    )?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedVector>::vector_text_upsert(
+            &generated.client,
+            generated.session.clone(),
+            request.to_vec(),
+        ),
+    )
+    .map(Uint8Array::from)
+    .map_err(reason)
+}
+
+#[napi]
+pub fn vector_workspace_configure_json(
+    loom_path: String,
+    workspace: String,
+    request_json: String,
+    store_passphrase: Option<String>,
+    auth_principal: Option<String>,
+    auth_passphrase: Option<String>,
+) -> napi::Result<String> {
+    let generated = generated_session::open_generated_session(
+        &loom_path,
+        store_passphrase.as_deref(),
+        auth_principal.as_deref(),
+        auth_passphrase.as_deref(),
+    )?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedVector>::vector_workspace_configure_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace,
+            request_json,
+        ),
+    )
+    .map_err(reason)
 }

@@ -27,6 +27,10 @@ fmt:
 fmt-fix:
     cargo fmt --all
 
+# Build the full CLI with usable debug information and bounded macOS unwind metadata.
+debug-cli:
+    cargo build --profile dev-cli -p uldren-loom-cli
+
 # Lint library and binary targets with warnings denied. Builds FUSE on Linux/BSD (and macOS with
 # macFUSE); where FUSE can't build it skips that crate and lints the NFS-only CLI instead.
 lint:
@@ -91,6 +95,21 @@ test-ffi-integration:
 test-cli-integration:
     cargo test -p uldren-loom-cli --bin loom --no-default-features --features nfs,integration-tests
 
+test-cli-offline-reads:
+    cargo test -p uldren-loom-cli --features integration-tests --test offline_cli_reads
+
+# Run focused daemon-active CLI generated-client routing tests. This is not a substitute for `just ci`.
+test-cli-daemon-active:
+    cargo test -p uldren-loom-cli --test daemon_cli_authority --no-default-features --features nfs,serve,remote-client,mcp,daemon-cli-tests
+
+# Run idle and physical-growth diagnostic acceptance harness. This is not a substitute for `just ci`.
+diagnostic-mu10b:
+    cargo test -p uldren-loom-cli diagnostic_mu10b_idle_physical_growth_acceptance --no-default-features --features serve -- --ignored --nocapture
+
+# Run sustained mutable-growth diagnostic acceptance harness. This is not a substitute for `just ci`.
+diagnostic-mu17j-e:
+    cargo test -p uldren-loom-store diagnostic_mu17j_e --lib --no-default-features -- --ignored --nocapture
+
 # Run daemon socket integration tests. This is not a substitute for `just ci`.
 test-store-daemon-integration:
     cargo test -p uldren-loom-store --test daemon_integration
@@ -103,6 +122,7 @@ test-vfs-integration:
 # Run MCP attached-daemon integration tests. This is not a substitute for `just ci`.
 test-mcp-integration:
     cargo test -p uldren-loom-mcp --test attached_daemon
+    cargo test -p uldren-loom-cli --test daemon_mcp_authority --no-default-features --features nfs,serve,remote-client,mcp,mcp-daemon-cli-tests
 
 # Run host-toolchain dynamic-library integration tests. This is not a substitute for `just ci`.
 test-native-integration:
@@ -145,6 +165,10 @@ test-integration:
 # Run bounded manual storage-growth, timing, latency, concurrency, durability, and VCS-promotion probes.
 test-performance:
     cargo run -p uldren-loom-store --example performance_harness --offline
+
+# Run the cross-facet physical-growth acceptance gate outside the default unit-test path.
+test-storage-amplification:
+    cargo test -p uldren-loom-mcp --features test-hooks --test storage_amplification -- --ignored --nocapture
 
 # Fast type-check (no codegen). FUSE backend skipped where it can't build (a Mac without macFUSE).
 check:

@@ -8,8 +8,8 @@ use loom_core::keys::KeySpec;
 use loom_core::{Algo, Loom, RuntimeProfile, WorkspaceId};
 use loom_store::{
     FileStore, LocalOpenAuth, VerifiedExternalCredential, attach_local_auth,
-    local_auth_requires_write, open_loom_daemon_authorized_unlocked, open_loom_read_unlocked,
-    open_loom_unlocked, save_loom,
+    attach_local_auth_in_place, local_auth_requires_write, open_loom_daemon_authorized_unlocked,
+    open_loom_read_unlocked, open_loom_unlocked, save_loom,
 };
 
 pub mod generated_dispatch;
@@ -460,6 +460,7 @@ pub struct HostedKernel {
     unlock_key: Option<KeySpec>,
     write_guard: HostedWriteGuard,
     write_lock: Arc<Mutex<()>>,
+    shared_engine: Option<Arc<Mutex<Loom<FileStore>>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -477,6 +478,7 @@ impl HostedKernel {
             unlock_key: None,
             write_guard: HostedWriteGuard::DirectFileLock,
             write_lock,
+            shared_engine: None,
         }
     }
 
@@ -487,6 +489,12 @@ impl HostedKernel {
 
     pub fn with_write_guard(mut self, write_guard: HostedWriteGuard) -> Self {
         self.write_guard = write_guard;
+        self
+    }
+
+    pub fn with_shared_engine(mut self, engine: Arc<Mutex<Loom<FileStore>>>) -> Self {
+        self.shared_engine = Some(engine);
+        self.write_guard = HostedWriteGuard::DaemonAuthorized;
         self
     }
 
@@ -535,6 +543,13 @@ impl HostedKernel {
         auth: &HostedAuth,
         f: impl FnOnce(&Loom<FileStore>) -> Result<T>,
     ) -> Result<T> {
+        if self.shared_engine.is_some() {
+            let out = self.with_shared_engine_auth(auth, |loom| f(loom));
+            if let Err(err) = &out {
+                self.audit_security_failure(auth, err);
+            }
+            return out;
+        }
         self.with_read_loom(auth, |loom| f(&loom))
     }
 
@@ -543,6 +558,13 @@ impl HostedKernel {
         auth: &HostedAuth,
         f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>,
     ) -> Result<T> {
+        if self.shared_engine.is_some() {
+            let out = self.with_shared_engine_auth(auth, f);
+            if let Err(err) = &out {
+                self.audit_security_failure(auth, err);
+            }
+            return out;
+        }
         self.with_read_loom(auth, |mut loom| f(&mut loom))
     }
 
@@ -551,7 +573,28 @@ impl HostedKernel {
         auth: &HostedAuth,
         f: impl FnOnce(Loom<FileStore>) -> Result<T>,
     ) -> Result<T> {
-        let local_auth = auth.local_open_auth(self.unlock_key.clone());
+        let mut local_auth = auth.local_open_auth(self.unlock_key.clone());
+        if self.shared_engine.is_some() && local_auth_requires_write(&local_auth) {
+            let principal = match self.with_shared_engine_auth(auth, |loom| {
+                loom.effective_principal()?.ok_or_else(|| {
+                    LoomError::new(
+                        Code::AuthenticationFailed,
+                        "hosted credential did not resolve a principal",
+                    )
+                })
+            }) {
+                Ok(principal) => principal,
+                Err(error) => {
+                    self.audit_security_failure(auth, &error);
+                    return Err(error);
+                }
+            };
+            local_auth.principal = None;
+            local_auth.passphrase = None;
+            local_auth.app_credential = None;
+            local_auth.verified_external = None;
+            local_auth.preauthenticated_principal = Some(principal);
+        }
         let out = if local_auth_requires_write(&local_auth) {
             let _guard = self
                 .write_lock
@@ -572,6 +615,17 @@ impl HostedKernel {
         auth: &HostedAuth,
         f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>,
     ) -> Result<T> {
+        if self.shared_engine.is_some() {
+            let out = self.with_shared_engine_auth(auth, |loom| {
+                let out = f(loom)?;
+                save_loom(loom)?;
+                Ok(out)
+            });
+            if let Err(err) = &out {
+                self.audit_security_failure(auth, err);
+            }
+            return out;
+        }
         let out = {
             let _guard = self
                 .write_lock
@@ -595,6 +649,13 @@ impl HostedKernel {
         auth: &HostedAuth,
         f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>,
     ) -> Result<T> {
+        if self.shared_engine.is_some() {
+            let out = self.with_shared_engine_auth(auth, f);
+            if let Err(err) = &out {
+                self.audit_security_failure(auth, err);
+            }
+            return out;
+        }
         let out = {
             let _guard = self
                 .write_lock
@@ -618,6 +679,12 @@ impl HostedKernel {
         action: &str,
         target: Option<&str>,
     ) -> Result<u64> {
+        if let Some(engine) = &self.shared_engine {
+            let loom = engine.lock().map_err(|_| {
+                LoomError::new(Code::Internal, "hosted shared engine lock poisoned")
+            })?;
+            return loom.store().audit_append(principal, action, target);
+        }
         let _guard = self
             .write_lock
             .lock()
@@ -638,6 +705,29 @@ impl HostedKernel {
         };
         let target = format!("session={};code={}", auth.session_id, err.code.as_str());
         let _ = self.audit_append(auth.principal, action, Some(&target));
+    }
+
+    fn with_shared_engine_auth<T>(
+        &self,
+        auth: &HostedAuth,
+        f: impl FnOnce(&mut Loom<FileStore>) -> Result<T>,
+    ) -> Result<T> {
+        let engine = self
+            .shared_engine
+            .as_ref()
+            .ok_or_else(|| LoomError::new(Code::Internal, "hosted shared engine is unavailable"))?;
+        let mut loom = engine
+            .lock()
+            .map_err(|_| LoomError::new(Code::Internal, "hosted shared engine lock poisoned"))?;
+        let local_auth = auth.local_open_auth(self.unlock_key.clone());
+        loom.set_acl_predicate_evaluator(Arc::new(loom_compute::CelAclPredicateEvaluator));
+        if let Err(error) = attach_local_auth_in_place(&mut loom, &local_auth) {
+            loom.clear_session();
+            return Err(error);
+        }
+        let out = f(&mut loom);
+        loom.clear_session();
+        out
     }
 }
 
@@ -671,6 +761,61 @@ pub fn hosted_outcome<T>(result: Result<T>) -> HostedOutcome<T> {
 #[cfg(test)]
 mod hosted_kernel_tests {
     use super::*;
+
+    #[test]
+    fn shared_daemon_engine_serves_reads_writes_and_audits_without_reopening() {
+        let path = std::env::temp_dir().join(format!(
+            "loom-hosted-core-shared-engine-{}.loom",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = FileStore::create_with_profile(&path, Algo::Blake3).unwrap();
+        let mut loom = Loom::new(store);
+        let workspace = WorkspaceId::v4_from_bytes([41; 16]);
+        loom.registry_mut()
+            .create(loom_core::FacetKind::Cas, Some("main"), workspace)
+            .unwrap();
+        save_loom(&mut loom).unwrap();
+        let engine = Arc::new(Mutex::new(loom));
+        let kernel = HostedKernel::new(&path).with_shared_engine(engine.clone());
+
+        assert!(FileStore::open(&path).is_err());
+        let digest = kernel
+            .write(&HostedAuth::unauthenticated(), |loom| {
+                loom_core::cas_put(loom, workspace, b"shared")
+            })
+            .unwrap();
+        assert_eq!(
+            kernel
+                .read(&HostedAuth::unauthenticated(), |loom| {
+                    loom_core::cas_get(loom, workspace, &digest)
+                })
+                .unwrap(),
+            Some(b"shared".to_vec())
+        );
+        assert_eq!(
+            kernel
+                .with_read_loom(&HostedAuth::unauthenticated(), |loom| {
+                    loom.registry()
+                        .open(&loom_core::WsSelector::Name("main".to_string()))
+                })
+                .unwrap(),
+            workspace
+        );
+        assert_eq!(kernel.audit_append(None, "hosted.test", None).unwrap(), 0);
+
+        drop(kernel);
+        drop(engine);
+        assert_eq!(
+            open_loom_unlocked(&path, None)
+                .unwrap()
+                .registry()
+                .open(&loom_core::WsSelector::Name("main".to_string()))
+                .unwrap(),
+            workspace
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn hosted_kernels_for_same_store_share_write_lock() {

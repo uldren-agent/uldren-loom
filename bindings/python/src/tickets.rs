@@ -170,6 +170,26 @@ fn parse_projection_list(
         .collect()
 }
 
+fn parse_acceptance_evidence_key_list(
+    value: &str,
+    what: &str,
+) -> PyResult<Vec<loom_tickets::TicketAcceptanceEvidenceKey>> {
+    parse_string_list(value, what)?
+        .into_iter()
+        .map(|key| loom_tickets::TicketAcceptanceEvidenceKey::parse(&key).map_err(py_err))
+        .collect()
+}
+
+fn parse_review_type_list(
+    value: &str,
+    what: &str,
+) -> PyResult<Vec<loom_tickets::TicketReviewType>> {
+    parse_string_list(value, what)?
+        .into_iter()
+        .map(|review| loom_tickets::TicketReviewType::parse(&review).map_err(py_err))
+        .collect()
+}
+
 fn parse_cardinality(value: &str) -> PyResult<loom_tickets::TicketFieldCardinality> {
     match value {
         "single" => Ok(loom_tickets::TicketFieldCardinality::Single),
@@ -446,26 +466,28 @@ pub(crate) fn tickets_project_rekey_json(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, ticket_workspace_id, project_id, passphrase=None))]
+#[pyo3(signature = (path, workspace, ticket_workspace_id, project_id, include_contracts=false, passphrase=None))]
 pub(crate) fn tickets_project_settings_get_json(
     path: &str,
     workspace: &str,
     ticket_workspace_id: &str,
     project_id: &str,
+    include_contracts: bool,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
     tickets_read(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_tickets::get_project(
+        to_json(loom_tickets::get_project_with_contract_details(
             loom,
             ns,
             ticket_workspace_id,
             project_id,
+            include_contracts,
         ))
     })
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, ticket_workspace_id, project_id, default_projection=None, enable_projections_json="[]", disable_projections_json="[]", actor_enforcement=None, project_owner_principal=None, clear_project_owner_principal=false, acceptance_authorities_json=None, expected_root=None, passphrase=None))]
+#[pyo3(signature = (path, workspace, ticket_workspace_id, project_id, default_projection=None, enable_projections_json="[]", disable_projections_json="[]", actor_enforcement=None, project_owner_principal=None, clear_project_owner_principal=false, acceptance_authorities_json=None, acceptance_evidence_enforcement=None, required_acceptance_evidence_keys_json=None, required_acceptance_reviews_json=None, owner_contract_summary=None, owner_contract_details=None, worker_contract_summary=None, worker_contract_details=None, expected_root=None, passphrase=None))]
 pub(crate) fn tickets_project_settings_set_json(
     path: &str,
     workspace: &str,
@@ -478,6 +500,13 @@ pub(crate) fn tickets_project_settings_set_json(
     project_owner_principal: Option<&str>,
     clear_project_owner_principal: bool,
     acceptance_authorities_json: Option<&str>,
+    acceptance_evidence_enforcement: Option<bool>,
+    required_acceptance_evidence_keys_json: Option<&str>,
+    required_acceptance_reviews_json: Option<&str>,
+    owner_contract_summary: Option<&str>,
+    owner_contract_details: Option<&str>,
+    worker_contract_summary: Option<&str>,
+    worker_contract_details: Option<&str>,
     expected_root: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
@@ -496,6 +525,17 @@ pub(crate) fn tickets_project_settings_set_json(
     let acceptance_authorities = acceptance_authorities_json
         .map(|value| parse_string_list(value, "ticket acceptance authorities json"))
         .transpose()?;
+    let required_acceptance_evidence_keys = required_acceptance_evidence_keys_json
+        .map(|value| {
+            parse_acceptance_evidence_key_list(
+                value,
+                "ticket required acceptance evidence keys json",
+            )
+        })
+        .transpose()?;
+    let required_acceptance_reviews = required_acceptance_reviews_json
+        .map(|value| parse_review_type_list(value, "ticket required acceptance reviews json"))
+        .transpose()?;
     tickets_write(path, workspace, passphrase, |loom, ns| {
         to_json(loom_tickets::set_project_settings(
             loom,
@@ -510,6 +550,13 @@ pub(crate) fn tickets_project_settings_set_json(
                 project_owner_principal,
                 clear_project_owner_principal,
                 acceptance_authorities: acceptance_authorities.as_deref(),
+                acceptance_evidence_enforcement,
+                required_acceptance_evidence_keys: required_acceptance_evidence_keys.as_deref(),
+                required_acceptance_reviews: required_acceptance_reviews.as_deref(),
+                owner_contract_summary,
+                owner_contract_details,
+                worker_contract_summary,
+                worker_contract_details,
                 expected_root,
             },
         ))
@@ -651,7 +698,6 @@ pub(crate) fn tickets_create_json(
             },
         )
         .map_err(py_err)?;
-        sync_ticket_references(loom, ns, &ticket)?;
         ticket_mutation_json(
             ticket,
             "ticket.created",
@@ -744,6 +790,7 @@ pub(crate) fn tickets_update_json(
         comment_id,
         comment_type,
         body,
+        evidence: None,
     });
     let comments = comments_input
         .iter()
@@ -751,6 +798,7 @@ pub(crate) fn tickets_update_json(
             comment_id: comment.comment_id.as_deref(),
             comment_type: comment.comment_type.as_deref(),
             body: &comment.body,
+            evidence: None,
         })
         .collect::<Vec<_>>();
     let relation_sets = relation_sets_input
@@ -875,6 +923,7 @@ pub(crate) fn tickets_comment_add_json(
                 comment_id,
                 comment_type,
                 body,
+                evidence: None,
                 expected_root,
             },
         )
@@ -914,6 +963,7 @@ pub(crate) fn tickets_comment_update_json(
                 comment_id,
                 comment_type,
                 body,
+                evidence: None,
                 expected_root,
             },
         )

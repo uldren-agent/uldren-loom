@@ -84,12 +84,24 @@ use crate::substrate_revisions::REVISION_INDEX_DIR;
 use crate::substrate_views::{VIEW_DIR, ViewDefinitionSummary, view_path};
 use crate::{LoomMcp, authorize_workgraph_task, now_ms, reject_stateless_ephemeral_kv};
 use loom_client::local::build_lane_view;
-use loom_lanes::{Lane, LaneDecodeDiagnostic, LaneView};
+use loom_lanes::{Lane, LaneDiagnostic, LaneView};
 use loom_lifecycle::{
     LifecycleDefinitionSummary, LifecycleInstanceSummary, LifecycleOperationLogSummary,
     LifecycleSnapshotPlanSummary, LifecycleSnapshotRecordSummary, LifecycleStageSurfaceSummary,
 };
 use loom_tickets::{BoardSummary, TicketHistoryRecord, TicketProjectSummary, TicketSummary};
+
+fn lane_diagnostics_from_views(views: &[LaneView]) -> Vec<LaneDiagnostic> {
+    views
+        .iter()
+        .flat_map(|view| {
+            view.status_warnings.iter().map(|warning| LaneDiagnostic {
+                lane_id: view.lane_id.clone(),
+                error: warning.message.clone(),
+            })
+        })
+        .collect()
+}
 
 pub struct VectorSearchPolicyRead<'a> {
     pub workspace: &'a str,
@@ -3746,6 +3758,19 @@ impl LoomMcp {
         })
     }
 
+    pub fn read_tickets_page_value(
+        &self,
+        workspace: &str,
+        workspace_id: &str,
+        query: loom_tickets::TicketListQuery,
+    ) -> Result<serde_json::Value> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.tickets_list_json(workspace, workspace_id, &query);
+        }
+        serde_json::to_value(self.read_tickets_page(workspace, workspace_id, query)?)
+            .map_err(|e| LoomError::corrupt(format!("ticket list page json: {e}")))
+    }
+
     pub fn read_tickets_boards_get(
         &self,
         workspace: &str,
@@ -3776,6 +3801,9 @@ impl LoomMcp {
         workspace_id: &str,
         ticket_id: Option<&str>,
     ) -> Result<Vec<TicketHistoryRecord>> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.tickets_history_json(workspace, workspace_id, ticket_id);
+        }
         self.store.read(|loom| {
             let ns = resolve_ns(loom, workspace)?;
             loom_tickets::history(loom, ns, workspace_id, ticket_id)
@@ -3817,22 +3845,11 @@ impl LoomMcp {
         })
     }
 
-    /// Fail-soft lane listing: the lanes that decode plus one diagnostic per record that does not.
-    /// The remote backend path has no diagnostic channel, so it reports an empty diagnostic list.
-    pub fn read_lanes_list_with_diagnostics(
-        &self,
-        workspace: &str,
-    ) -> Result<(Vec<Lane>, Vec<LaneDecodeDiagnostic>)> {
-        if let Some(backend) = self.store.remote_backend() {
-            return Ok((backend.lanes_list(workspace)?, Vec::new()));
-        }
-        self.store.read(|loom| {
-            let ns = resolve_ns(loom, workspace)?;
-            loom_lanes::list_lanes_with_diagnostics(loom, ns)
-        })
-    }
-
     pub fn read_lanes_get_view(&self, workspace: &str, lane_id: &str) -> Result<Option<LaneView>> {
+        if let Some(backend) = self.store.remote_backend() {
+            let workspace_id = backend.workspace_id(workspace)?;
+            return backend.lanes_get_view(workspace, &workspace_id, lane_id, true);
+        }
         self.store.read(|loom| {
             let ns = resolve_ns(loom, workspace)?;
             let Some(lane) = loom_lanes::get_lane(loom, ns, lane_id)? else {
@@ -3842,28 +3859,26 @@ impl LoomMcp {
         })
     }
 
-    /// Fail-soft lane view listing for the MCP reader: the healthy lane views plus a diagnostic per
-    /// record that failed to decode, so malformed coordination records surface instead of vanishing.
+    /// Lane views plus consistency warnings derived from their ticket status.
     pub fn read_lanes_list_views_with_diagnostics(
         &self,
         workspace: &str,
-    ) -> Result<(Vec<LaneView>, Vec<LaneDecodeDiagnostic>)> {
+    ) -> Result<(Vec<LaneView>, Vec<LaneDiagnostic>)> {
+        if let Some(backend) = self.store.remote_backend() {
+            let ticket_workspace_id = backend.workspace_id(workspace)?;
+            let views = backend.lanes_list_views_json(workspace, &ticket_workspace_id)?;
+            let diagnostics = lane_diagnostics_from_views(&views);
+            return Ok((views, diagnostics));
+        }
         self.store.read(|loom| {
             let ns = resolve_ns(loom, workspace)?;
-            let (lanes, mut diagnostics) = loom_lanes::list_lanes_with_diagnostics(loom, ns)?;
+            let lanes = loom_lanes::list_lanes(loom, ns)?;
             let ticket_workspace_id = ns.to_string();
             let views = lanes
                 .iter()
                 .map(|lane| build_lane_view(loom, ns, &ticket_workspace_id, lane))
                 .collect::<Vec<_>>();
-            diagnostics.extend(views.iter().flat_map(|view| {
-                view.status_warnings
-                    .iter()
-                    .map(|warning| LaneDecodeDiagnostic {
-                        lane_id: view.lane_id.clone(),
-                        error: warning.message.clone(),
-                    })
-            }));
+            let diagnostics = lane_diagnostics_from_views(&views);
             Ok((views, diagnostics))
         })
     }
@@ -3892,7 +3907,8 @@ impl LoomMcp {
         let status_filter = statuses.iter().cloned().collect::<BTreeSet<_>>();
         let lane_filter = lanes.iter().cloned().collect::<BTreeSet<_>>();
         let tickets = self.read_tickets_list(workspace, &workspace_id, None)?;
-        let (lanes, lane_diagnostics) = self.read_lanes_list_with_diagnostics(workspace)?;
+        let lanes = self.read_lanes_list(workspace)?;
+        let lane_diagnostics: Vec<LaneDiagnostic> = Vec::new();
         let mut status_counts = BTreeMap::<String, usize>::new();
         let mut ticket_lane_index = BTreeMap::<String, Vec<&Lane>>::new();
         for lane in &lanes {
@@ -4006,6 +4022,9 @@ impl LoomMcp {
         workspace_id: &str,
         space_id: &str,
     ) -> Result<Option<SpaceSummary>> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.spaces_get_json(workspace, workspace_id, space_id);
+        }
         self.store.read(|loom| {
             let ns = resolve_ns(loom, workspace)?;
             crate::pages::get_space(loom, ns, workspace_id, space_id)
@@ -4018,6 +4037,9 @@ impl LoomMcp {
         workspace_id: &str,
         page_id: &str,
     ) -> Result<Option<PageSummary>> {
+        if let Some(backend) = self.store.remote_backend() {
+            return backend.pages_get(workspace, workspace_id, page_id);
+        }
         self.store.read(|loom| {
             let ns = resolve_ns(loom, workspace)?;
             crate::pages::get_page(loom, ns, workspace_id, page_id)

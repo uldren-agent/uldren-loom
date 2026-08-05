@@ -16,6 +16,7 @@ loom-compute = { package = "uldren-loom-compute", path = "../../crates/loom-comp
 loom-chat = { package = "uldren-loom-chat", path = "../../crates/loom-chat" }
 loom-codec = { package = "uldren-loom-codec", path = "../../crates/loom-codec" }
 loom-drive = { package = "uldren-loom-drive", path = "../../crates/loom-drive" }
+loom-client = { package = "uldren-loom-client", path = "../../crates/loom-client" }
 loom-interchange = { package = "uldren-loom-interchange", path = "../../crates/loom-interchange" }
 loom-interchange-io = { package = "uldren-loom-interchange-io", path = "../../crates/loom-interchange-io" }
 loom-lanes = { package = "uldren-loom-lanes", path = "../../crates/loom-lanes" }
@@ -27,6 +28,7 @@ loom-store = { package = "uldren-loom-store", path = "../../crates/loom-store" }
 loom-tickets = { package = "uldren-loom-tickets", path = "../../crates/loom-tickets" }
 loom-types = { package = "uldren-loom-types", path = "../../crates/loom-types" }
 loom-wire = { package = "uldren-loom-wire", path = "../../crates/loom-wire" }
+futures = "0.3"
 getrandom = "0.2"
 napi = { version = "3", default-features = false, features = ["napi8"] }
 napi-derive = "3"

@@ -1,6 +1,8 @@
 //! Licensed under BUSL-1.1 (see the workspace `LICENSE`). (c) Uldren Technologies LLC.
 
 use super::*;
+use futures::executor::block_on;
+use loom_client::generated_api::Vector as GeneratedVector;
 
 use loom_core::EmbeddingModel;
 use loom_core::tabular::{cell_from, cell_value};
@@ -453,4 +455,60 @@ pub(crate) fn vector_search_policy<'py>(
         .map_err(py_err)?,
     );
     Ok(PyBytes::new(py, &bytes))
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, request, store_passphrase=None, auth_principal=None, auth_passphrase=None))]
+pub(crate) fn vector_text_upsert<'py>(
+    py: Python<'py>,
+    path: &str,
+    request: &[u8],
+    store_passphrase: Option<&str>,
+    auth_principal: Option<&str>,
+    auth_passphrase: Option<&str>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
+        let generated = generated_session::open_generated_session(
+            path,
+            store_passphrase,
+            auth_principal,
+            auth_passphrase,
+        )?;
+        block_on(
+            <loom_client::LocalLoomClient as GeneratedVector>::vector_text_upsert(
+                &generated.client,
+                generated.session.clone(),
+                request.to_vec(),
+            ),
+        )
+        .map_err(py_err)
+    })?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, workspace, request_json, store_passphrase=None, auth_principal=None, auth_passphrase=None))]
+pub(crate) fn vector_workspace_configure_json(
+    path: &str,
+    workspace: &str,
+    request_json: &str,
+    store_passphrase: Option<&str>,
+    auth_principal: Option<&str>,
+    auth_passphrase: Option<&str>,
+) -> PyResult<String> {
+    let generated = generated_session::open_generated_session(
+        path,
+        store_passphrase,
+        auth_principal,
+        auth_passphrase,
+    )?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedVector>::vector_workspace_configure_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            request_json.to_string(),
+        ),
+    )
+    .map_err(py_err)
 }

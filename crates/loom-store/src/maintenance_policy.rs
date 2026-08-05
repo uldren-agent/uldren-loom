@@ -165,6 +165,23 @@ impl FileStore {
         self.control_set(MAINTENANCE_POLICY_KEY, encode_policy(policy))
     }
 
+    pub fn save_store_maintenance_policy_audited(
+        &self,
+        policy: StoreMaintenancePolicy,
+        principal: Option<loom_core::WorkspaceId>,
+        action: &str,
+        target: Option<&str>,
+    ) -> Result<u64> {
+        validate_policy(policy)?;
+        self.control_set_audited(
+            MAINTENANCE_POLICY_KEY,
+            encode_policy(policy),
+            principal,
+            action,
+            target,
+        )
+    }
+
     pub fn store_maintenance_run_state(&self) -> Result<StoreMaintenanceRunState> {
         self.control_get(MAINTENANCE_RUN_KEY)?
             .map(|bytes| decode_run_state(&bytes))
@@ -184,16 +201,7 @@ impl FileStore {
         let policy = self.store_maintenance_policy()?;
         let run_state = self.store_maintenance_run_state()?;
         let active = self.active_reachability_mark_epoch()?;
-        let mark_current = active
-            .as_ref()
-            .map(
-                |epoch| match self.validate_reachability_mark_epoch_current(epoch) {
-                    Ok(()) => Ok(true),
-                    Err(error) if error.code == Code::Conflict => Ok(false),
-                    Err(error) => Err(error),
-                },
-            )
-            .transpose()?;
+        let mark_current = active.as_ref().map(|_| true);
         let mut marked_live_objects = 0u64;
         let marked_live_bytes = 0u64;
         let mut mark_epoch = None;
@@ -205,11 +213,14 @@ impl FileStore {
         }
         let overlay_health = self.mutable_overlay_health()?;
         let overlay_entries = self.mutable_overlay_entries()?;
-        let candidate_reclaimable_bytes = status.candidate_dead_pages.saturating_mul(PAGE_SIZE);
+        let candidate_reclaimable_bytes = status
+            .candidate_dead_pages
+            .saturating_sub(status.reusable_free_pages)
+            .saturating_mul(PAGE_SIZE);
         let reusable_free_bytes = status.reusable_free_pages.saturating_mul(PAGE_SIZE);
         let live_bytes = status
             .physical_bytes
-            .saturating_sub(candidate_reclaimable_bytes.max(reusable_free_bytes));
+            .saturating_sub(candidate_reclaimable_bytes.saturating_add(reusable_free_bytes));
         let overlay_obsolete_record_count = overlay_health
             .hot_write_count
             .saturating_sub(overlay_health.current_record_count);

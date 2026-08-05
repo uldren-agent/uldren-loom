@@ -39,30 +39,50 @@ fn archive_import_ns(
     workspace: &str,
     src_path: &str,
     kind: &str,
+    gzip_output_path: Option<String>,
+    commit: bool,
+    author: Option<String>,
+    message: Option<String>,
     dry_run: bool,
 ) -> LoomResult<Vec<u8>> {
     let mut loom = open_h_write(h)?;
     let ns = resolve_workspace_arg(&loom, workspace)?;
     let archive_kind = parse_archive_kind(kind)?;
     let mut options = ArchiveImportOptions::new(src_path);
+    options.gzip_output_path = gzip_output_path;
+    options.commit = commit;
+    if let Some(author) = author {
+        options.author = author;
+    }
+    if let Some(message) = message {
+        options.message = message;
+    }
     options.dry_run = dry_run;
     let result = import_archive(&mut loom, ns, Path::new(src_path), archive_kind, &options)?;
     if !dry_run {
         save_loom(&mut loom)?;
     }
-    result.report.encode()
+    result.encode()
 }
 
 fn fs_import_ns(
     h: &LoomSession,
     workspace: &str,
     src_path: &str,
+    author: Option<String>,
+    message: Option<String>,
     commit: bool,
     dry_run: bool,
 ) -> LoomResult<Vec<u8>> {
     let mut loom = open_h_write(h)?;
     let ns = resolve_workspace_arg(&loom, workspace)?;
     let mut options = FsImportOptions::new(src_path);
+    if let Some(author) = author {
+        options.author = author;
+    }
+    if let Some(message) = message {
+        options.message = message;
+    }
     options.commit = commit;
     options.dry_run = dry_run;
     let report = import_fs(&mut loom, ns, Path::new(src_path), &options)?;
@@ -141,6 +161,8 @@ pub unsafe extern "C" fn loom_fs_import(
     handle: *mut LoomSession,
     workspace: *const c_char,
     src_path: *const c_char,
+    author: *const c_char,
+    message: *const c_char,
     commit: i32,
     dry_run: i32,
     out_ptr: *mut *mut c_uchar,
@@ -150,7 +172,23 @@ pub unsafe extern "C" fn loom_fs_import(
     let h = handle_ref!(handle, "loom_fs_import");
     let workspace = arg_str!(workspace, "loom_fs_import");
     let src_path = arg_str!(src_path, "loom_fs_import");
-    match fs_import_ns(h, workspace, src_path, commit != 0, dry_run != 0) {
+    let author = match optional_revision(author, "loom_fs_import") {
+        Ok(author) => author,
+        Err(e) => return fail(e),
+    };
+    let message = match optional_revision(message, "loom_fs_import") {
+        Ok(message) => message,
+        Err(e) => return fail(e),
+    };
+    match fs_import_ns(
+        h,
+        workspace,
+        src_path,
+        author,
+        message,
+        commit != 0,
+        dry_run != 0,
+    ) {
         Ok(bytes) => unsafe { ok_bytes(out_ptr, out_len, bytes) },
         Err(e) => fail(e),
     }
@@ -197,6 +235,10 @@ pub unsafe extern "C" fn loom_archive_import(
     workspace: *const c_char,
     src_path: *const c_char,
     kind: *const c_char,
+    gzip_output_path: *const c_char,
+    commit: i32,
+    author: *const c_char,
+    message: *const c_char,
     dry_run: i32,
     out_ptr: *mut *mut c_uchar,
     out_len: *mut usize,
@@ -206,7 +248,29 @@ pub unsafe extern "C" fn loom_archive_import(
     let workspace = arg_str!(workspace, "loom_archive_import");
     let src_path = arg_str!(src_path, "loom_archive_import");
     let kind = arg_str!(kind, "loom_archive_import");
-    match archive_import_ns(h, workspace, src_path, kind, dry_run != 0) {
+    let gzip_output_path = match optional_revision(gzip_output_path, "loom_archive_import") {
+        Ok(gzip_output_path) => gzip_output_path,
+        Err(e) => return fail(e),
+    };
+    let author = match optional_revision(author, "loom_archive_import") {
+        Ok(author) => author,
+        Err(e) => return fail(e),
+    };
+    let message = match optional_revision(message, "loom_archive_import") {
+        Ok(message) => message,
+        Err(e) => return fail(e),
+    };
+    match archive_import_ns(
+        h,
+        workspace,
+        src_path,
+        kind,
+        gzip_output_path,
+        commit != 0,
+        author,
+        message,
+        dry_run != 0,
+    ) {
         Ok(bytes) => unsafe { ok_bytes(out_ptr, out_len, bytes) },
         Err(e) => fail(e),
     }
@@ -300,6 +364,8 @@ pub unsafe extern "C" fn loom_fs_import_async(
     handle: *mut LoomSession,
     workspace: *const c_char,
     src_path: *const c_char,
+    author: *const c_char,
+    message: *const c_char,
     commit: i32,
     dry_run: i32,
     out_task: *mut *mut LoomTask,
@@ -308,13 +374,25 @@ pub unsafe extern "C" fn loom_fs_import_async(
     let h = handle_ref!(handle, "loom_fs_import_async");
     let workspace = arg_str!(workspace, "loom_fs_import_async").to_string();
     let src_path = arg_str!(src_path, "loom_fs_import_async").to_string();
+    let author = match optional_revision(author, "loom_fs_import_async") {
+        Ok(author) => author,
+        Err(e) => return fail(e),
+    };
+    let message = match optional_revision(message, "loom_fs_import_async") {
+        Ok(message) => message,
+        Err(e) => return fail(e),
+    };
     let owned = task_handle(h);
     let commit = commit != 0;
     let dry_run = dry_run != 0;
     unsafe {
         spawn_task(
             out_task,
-            Box::new(move || fs_import_ns(&owned, &workspace, &src_path, commit, dry_run)),
+            Box::new(move || {
+                fs_import_ns(
+                    &owned, &workspace, &src_path, author, message, commit, dry_run,
+                )
+            }),
         )
     }
 }
@@ -362,6 +440,10 @@ pub unsafe extern "C" fn loom_archive_import_async(
     workspace: *const c_char,
     src_path: *const c_char,
     kind: *const c_char,
+    gzip_output_path: *const c_char,
+    commit: i32,
+    author: *const c_char,
+    message: *const c_char,
     dry_run: i32,
     out_task: *mut *mut LoomTask,
 ) -> i32 {
@@ -370,12 +452,37 @@ pub unsafe extern "C" fn loom_archive_import_async(
     let workspace = arg_str!(workspace, "loom_archive_import_async").to_string();
     let src_path = arg_str!(src_path, "loom_archive_import_async").to_string();
     let kind = arg_str!(kind, "loom_archive_import_async").to_string();
+    let gzip_output_path = match optional_revision(gzip_output_path, "loom_archive_import_async") {
+        Ok(gzip_output_path) => gzip_output_path,
+        Err(e) => return fail(e),
+    };
+    let author = match optional_revision(author, "loom_archive_import_async") {
+        Ok(author) => author,
+        Err(e) => return fail(e),
+    };
+    let message = match optional_revision(message, "loom_archive_import_async") {
+        Ok(message) => message,
+        Err(e) => return fail(e),
+    };
     let owned = task_handle(h);
+    let commit = commit != 0;
     let dry_run = dry_run != 0;
     unsafe {
         spawn_task(
             out_task,
-            Box::new(move || archive_import_ns(&owned, &workspace, &src_path, &kind, dry_run)),
+            Box::new(move || {
+                archive_import_ns(
+                    &owned,
+                    &workspace,
+                    &src_path,
+                    &kind,
+                    gzip_output_path,
+                    commit,
+                    author,
+                    message,
+                    dry_run,
+                )
+            }),
         )
     }
 }

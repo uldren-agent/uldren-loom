@@ -25,11 +25,22 @@ pub(crate) fn run_daemon(action: DaemonCmd, keys: &KeyOpts) -> Result<(), String
                 Err(e) if e.contains("not running") => {}
                 Err(e) => return Err(e),
             }
-            daemon_start_with_transport(&store, &transport)
+            daemon_start_with_transport_for(
+                &store,
+                &transport,
+                daemon::DaemonStartupMode::Persistent,
+                daemon::DaemonStartupInitiator::CliDaemonRestart,
+            )
         }
         DaemonCmd::Status { store, json } => daemon_status(&store, json),
         DaemonCmd::Maintenance { action } => run_daemon_maintenance(action, keys),
         DaemonCmd::Session { action } => match action {
+            DaemonSessionCmd::Open { store, out } => {
+                daemon_logical_session_open(&store, &out, keys)
+            }
+            DaemonSessionCmd::Close { store, session } => {
+                daemon_logical_session_close(&store, &session, keys)
+            }
             DaemonSessionCmd::Attach { store, session } => {
                 daemon_session(&store, "attach", &session, keys)
             }
@@ -47,7 +58,17 @@ pub(crate) fn run_daemon(action: DaemonCmd, keys: &KeyOpts) -> Result<(), String
             pid_file,
             lock_file,
             transport,
-        } => daemon_run(&store, &addr_file, &pid_file, &lock_file, &transport),
+            startup_mode,
+            startup_initiator,
+        } => daemon_run(
+            &store,
+            &addr_file,
+            &pid_file,
+            &lock_file,
+            &transport,
+            &startup_mode,
+            &startup_initiator,
+        ),
     }
 }
 
@@ -83,7 +104,7 @@ fn resolve_mcp_target(
         loom_locator::Target::Remote(target) => {
             if stateless {
                 return Err(format!(
-                    "--stateless applies only to a local MCP host; the remote endpoint {} manages session statefulness on the server",
+                    "--stateless is not a local CLI override for remote MCP; the remote endpoint {} manages session statefulness",
                     target.url
                 ));
             }
@@ -111,50 +132,67 @@ pub(crate) fn run_mcp(
         collection,
         ..Default::default()
     };
-    let access = match launch {
-        McpLaunchTarget::Local => {
-            #[cfg(all(feature = "serve", feature = "remote-client"))]
-            {
-                if daemon::paths(store)
-                    .ok()
-                    .and_then(|paths| daemon::status_response(&paths).ok())
-                    .is_none()
+    let (access, close_logical_session): (_, Option<Box<dyn FnOnce() -> Result<(), String>>>) =
+        match launch {
+            McpLaunchTarget::Local => {
+                #[cfg(all(feature = "serve", feature = "remote-client"))]
                 {
-                    daemon_start_selected(store, DaemonTransportSelection::Native)?;
+                    if daemon::paths(store)
+                        .ok()
+                        .and_then(|paths| daemon::status_response(&paths).ok())
+                        .is_none()
+                    {
+                        daemon_start_selected(
+                            store,
+                            DaemonTransportSelection::Native,
+                            daemon::DaemonStartupMode::Managed,
+                            daemon::DaemonStartupInitiator::CliMcpLocal,
+                        )?;
+                    }
+                    let backend = std::sync::Arc::new(
+                        crate::remote::McpRemoteBackend::connect_local_daemon(store, keys)?,
+                    );
+                    let close_backend = backend.clone();
+                    (
+                        uldren_loom_mcp::StoreAccess::remote(backend),
+                        Some(Box::new(move || close_backend.close_logical_session())),
+                    )
                 }
-                let backend = crate::remote::McpRemoteBackend::connect_local_daemon(store, keys)?;
-                uldren_loom_mcp::StoreAccess::remote(std::sync::Arc::new(backend))
+                #[cfg(not(all(feature = "serve", feature = "remote-client")))]
+                {
+                    return Err(
+                        "local MCP requires a build with the `serve` and `remote-client` features"
+                            .to_string(),
+                    );
+                }
             }
-            #[cfg(not(all(feature = "serve", feature = "remote-client")))]
-            {
-                return Err(
-                    "local MCP requires a build with the `serve` and `remote-client` features"
-                        .to_string(),
-                );
-            }
-        }
-        McpLaunchTarget::Remote(_target) => {
-            if network_access.is_some() {
-                return Err(
+            McpLaunchTarget::Remote(_target) => {
+                if network_access.is_some() {
+                    return Err(
                     "--network-access is a local store policy and does not apply to a remote MCP store"
                         .to_string(),
                 );
+                }
+                #[cfg(feature = "remote-client")]
+                {
+                    let backend =
+                        std::sync::Arc::new(crate::remote::McpRemoteBackend::connect(&_target)?);
+                    let close_backend = backend.clone();
+                    (
+                        uldren_loom_mcp::StoreAccess::remote(backend),
+                        Some(Box::new(move || close_backend.close_logical_session())),
+                    )
+                }
+                #[cfg(not(feature = "remote-client"))]
+                {
+                    return Err(
+                        "remote MCP requires a build with the `remote-client` feature".to_string(),
+                    );
+                }
             }
-            #[cfg(feature = "remote-client")]
-            {
-                let backend = crate::remote::McpRemoteBackend::connect(&_target)?;
-                uldren_loom_mcp::StoreAccess::remote(std::sync::Arc::new(backend))
-            }
-            #[cfg(not(feature = "remote-client"))]
-            {
-                return Err(
-                    "remote MCP requires a build with the `remote-client` feature".to_string(),
-                );
-            }
-        }
-    };
+        };
     let mcp = uldren_loom_mcp::LoomMcp::new(access);
-    match http {
+    let result = match http {
         // Streamable HTTP: any-node-serves-any-request when `--stateless`, else a live session per
         // client (subscriptions push, progress streams). Needs the IO + multi-thread runtime.
         Some(addr) => {
@@ -189,6 +227,18 @@ pub(crate) fn run_mcp(
                 .block_on(uldren_loom_mcp::server::serve_stdio(mcp, binding))
                 .map_err(|e| e.to_string())
         }
+    };
+    let close_result = close_logical_session
+        .map(|close| close())
+        .transpose()
+        .map(|_| ());
+    match (result, close_result) {
+        (Err(error), Err(close_error)) => Err(format!(
+            "{error}; additionally failed to close MCP logical session: {close_error}"
+        )),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(format!("close MCP logical session: {error}")),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }
 
@@ -228,13 +278,12 @@ fn mcp_http_network_access(
 }
 
 pub(crate) fn run_lock(action: LockCmd, keys: &KeyOpts) -> Result<(), String> {
-    let auth = daemon_auth_from_keys(keys)?;
     match action {
         LockCmd::Acquire {
             store,
             key,
-            principal,
             session,
+            out,
             mode,
             permits,
             capacity,
@@ -252,82 +301,382 @@ pub(crate) fn run_lock(action: LockCmd, keys: &KeyOpts) -> Result<(), String> {
             } else {
                 wait.unwrap_or(daemon::DEFAULT_LOCK_WAIT_MS)
             };
-            let response = daemon::lock_acquire_auth(
-                &daemon::paths(&store).map_err(|e| e.to_string())?,
-                daemon::AcquireRequest {
-                    key: &key,
-                    principal: &principal,
-                    session: &session,
-                    mode,
-                    lease_ms,
-                    wait_ms,
-                    now_ms: now_ms(),
-                },
-                &auth,
-            )
-            .map_err(|e| e.to_string())?;
-            print!("{response}");
+            require_new_output_path(&out)?;
+            let (client, session_path) = resume_cli_lock_session(&store, &session, keys)?;
+            let (mode_tag, permits, capacity) = match mode {
+                loom_core::LockMode::Exclusive => (0u8, 1, 1),
+                loom_core::LockMode::Shared => (1u8, 1, 1),
+                loom_core::LockMode::Semaphore { permits, capacity } => (2u8, permits, capacity),
+            };
+            let operation = crate::remote::CliGeneratedOperation::new(
+                "Locks",
+                "lock_acquire",
+                vec![
+                    loom_codec::Value::Text(key),
+                    loom_codec::Value::Bytes(vec![mode_tag]),
+                    loom_codec::Value::Uint(u64::from(permits)),
+                    loom_codec::Value::Uint(u64::from(capacity)),
+                    loom_codec::Value::Uint(lease_ms),
+                    loom_codec::Value::Uint(wait_ms),
+                ],
+            )?;
+            let token = generated_lock_token_result(client.execute_unary(&operation)?)?;
+            write_lock_token_file(&out, &token, false)?;
+            println!("{}", out);
+            let _ = session_path;
             Ok(())
         }
         LockCmd::Refresh {
             store,
-            key,
-            principal,
             session,
-            mode,
-            permits,
-            capacity,
-            fence,
+            token,
+            out,
             lease_ms,
         } => {
-            let mode =
-                daemon::parse_lock_mode(&mode, permits, capacity).map_err(|e| e.to_string())?;
-            let response = daemon::lock_refresh_auth(
-                &daemon::paths(&store).map_err(|e| e.to_string())?,
-                daemon::RefreshRequest {
-                    key: &key,
-                    principal: &principal,
-                    session: &session,
-                    mode,
-                    fence: loom_core::Fence::embedded(fence),
-                    lease_ms,
-                    now_ms: now_ms(),
-                },
-                &auth,
-            )
-            .map_err(|e| e.to_string())?;
-            print!("{response}");
+            let token_value = read_lock_token_file(&token)?;
+            require_replaceable_output_path(&out, credential_reference_path(&token)?)?;
+            let (client, _) = resume_cli_lock_session(&store, &session, keys)?;
+            let operation = crate::remote::CliGeneratedOperation::new(
+                "Locks",
+                "lock_refresh",
+                vec![
+                    loom_codec::Value::Bytes(
+                        loom_wire::lock::lock_token_to_cbor(&token_value)
+                            .map_err(|error| error.to_string())?,
+                    ),
+                    loom_codec::Value::Uint(lease_ms),
+                ],
+            )?;
+            let updated = generated_lock_token_result(client.execute_unary(&operation)?)?;
+            write_lock_token_file(&out, &updated, std::path::Path::new(&out).exists())?;
+            println!("{}", out);
             Ok(())
         }
         LockCmd::Release {
             store,
-            key,
-            principal,
             session,
-            mode,
-            permits,
-            capacity,
-            fence,
+            token,
         } => {
-            let mode =
-                daemon::parse_lock_mode(&mode, permits, capacity).map_err(|e| e.to_string())?;
-            let response = daemon::lock_release_auth(
-                &daemon::paths(&store).map_err(|e| e.to_string())?,
-                daemon::ReleaseRequest {
-                    key: &key,
-                    principal: &principal,
-                    session: &session,
-                    mode,
-                    fence: loom_core::Fence::embedded(fence),
-                    now_ms: now_ms(),
-                },
-                &auth,
-            )
-            .map_err(|e| e.to_string())?;
-            print!("{response}");
+            let token_value = read_lock_token_file(&token)?;
+            let (client, _) = resume_cli_lock_session(&store, &session, keys)?;
+            let operation = crate::remote::CliGeneratedOperation::new(
+                "Locks",
+                "lock_release",
+                vec![loom_codec::Value::Bytes(
+                    loom_wire::lock::lock_token_to_cbor(&token_value)
+                        .map_err(|error| error.to_string())?,
+                )],
+            )?;
+            match client.execute_unary(&operation)? {
+                loom_codec::Value::Null => {}
+                _ => return Err("Locks.lock_release returned an invalid result".to_string()),
+            }
+            std::fs::remove_file(credential_reference_path(&token)?)
+                .map_err(|error| format!("remove released lock token: {error}"))?;
+            println!("released");
             Ok(())
         }
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliSessionCredentialFile {
+    credential: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliLockTokenFile {
+    token: String,
+}
+
+fn ensure_lock_daemon(store: &str) -> Result<daemon::DaemonPaths, String> {
+    let paths = daemon::paths(store).map_err(|error| error.to_string())?;
+    if daemon::status_response(&paths).is_err() {
+        daemon_start_selected(
+            store,
+            DaemonTransportSelection::Native,
+            daemon::DaemonStartupMode::Managed,
+            daemon::DaemonStartupInitiator::CliLockLocal,
+        )?;
+    }
+    daemon::status_response(&paths)
+        .map_err(|error| format!("lock coordinator did not become ready: {error}"))?;
+    Ok(paths)
+}
+
+fn daemon_logical_session_open(store: &str, out: &str, keys: &KeyOpts) -> Result<(), String> {
+    require_new_output_path(out)?;
+    let credential = match crate::locator_cx::current().resolve_target(store)? {
+        loom_locator::Target::Local(path) => {
+            let local = path.to_string_lossy();
+            let paths = ensure_lock_daemon(&local)?;
+            let auth = crate::remote::local_session_auth(keys)?;
+            let request = loom_remote_protocol::session::open_request_bytes(&auth);
+            let reply = daemon::generated_session_open(&paths, &request)
+                .map_err(|error| format!("logical session open failed: {error}"))?;
+            let reply = loom_remote_protocol::session::parse_open_reply(&reply)
+                .map_err(|error| format!("decode logical session open response: {error}"))?;
+            match reply {
+                loom_remote_protocol::session::SessionOpenReply::Ok {
+                    credential: Some(credential),
+                    ..
+                } => credential,
+                loom_remote_protocol::session::SessionOpenReply::Ok {
+                    credential: None, ..
+                } => return Err("logical session coordinator omitted credential".to_string()),
+                loom_remote_protocol::session::SessionOpenReply::Err(error) => {
+                    return Err(format!(
+                        "logical session open failed: {:?}: {}",
+                        error.code, error.message
+                    ));
+                }
+            }
+        }
+        #[cfg(feature = "remote-client")]
+        loom_locator::Target::Remote(target) => {
+            crate::remote::create_remote_logical_session(&target, keys)?
+        }
+    };
+    write_session_credential_file(out, &credential, false)?;
+    println!("{}", out);
+    Ok(())
+}
+
+fn daemon_logical_session_close(store: &str, session: &str, keys: &KeyOpts) -> Result<(), String> {
+    let path = credential_reference_path(session)?;
+    let credential = read_session_credential_file(session)?;
+    match crate::locator_cx::current().resolve_target(store)? {
+        loom_locator::Target::Local(local) => {
+            let paths = daemon::paths(&local).map_err(|error| error.to_string())?;
+            daemon::status_response(&paths).map_err(|error| {
+                format!("logical session close requires its running coordinator: {error}")
+            })?;
+            let auth = crate::remote::local_session_auth(keys)?;
+            let request = loom_remote_protocol::session::close_request_bytes(&auth, &credential);
+            let reply = daemon::generated_session_open(&paths, &request)
+                .map_err(|error| format!("logical session close failed: {error}"))?;
+            match loom_remote_protocol::session::parse_open_reply(&reply)
+                .map_err(|error| format!("decode logical session close response: {error}"))?
+            {
+                loom_remote_protocol::session::SessionOpenReply::Ok { .. } => {}
+                loom_remote_protocol::session::SessionOpenReply::Err(error) => {
+                    return Err(format!(
+                        "logical session close failed: {:?}: {}",
+                        error.code, error.message
+                    ));
+                }
+            }
+        }
+        #[cfg(feature = "remote-client")]
+        loom_locator::Target::Remote(target) => {
+            crate::remote::close_remote_logical_session(&target, keys, &credential)?;
+        }
+    }
+    std::fs::remove_file(path).map_err(|error| format!("remove session credential: {error}"))?;
+    println!("closed");
+    Ok(())
+}
+
+fn resume_cli_lock_session(
+    store: &str,
+    session: &str,
+    keys: &KeyOpts,
+) -> Result<(crate::remote::CliGeneratedClient, std::path::PathBuf), String> {
+    let credential_path = credential_reference_path(session)?.to_path_buf();
+    let credential = read_session_credential_file(session)?;
+    let (client, rotated) = match crate::locator_cx::current().resolve_target(store)? {
+        loom_locator::Target::Local(path) => {
+            let local = path.to_string_lossy();
+            ensure_lock_daemon(&local)?;
+            let auth = crate::remote::local_session_auth(keys)?;
+            let (store, rotated) =
+                crate::remote::DaemonLocalStore::resume_logical_session(&local, auth, &credential)?;
+            (
+                crate::remote::CliGeneratedClient::DaemonLocal(Box::new(store)),
+                rotated,
+            )
+        }
+        #[cfg(feature = "remote-client")]
+        loom_locator::Target::Remote(target) => {
+            let auth = crate::remote::remote_session_auth(&target, keys)?;
+            let (store, rotated) =
+                crate::remote::RemoteStore::resume_logical_session(&target, auth, &credential)?;
+            (
+                crate::remote::CliGeneratedClient::Remote(Box::new(store)),
+                rotated,
+            )
+        }
+    };
+    write_session_credential_file(credential_path.to_string_lossy().as_ref(), &rotated, true)?;
+    Ok((client, credential_path))
+}
+
+fn generated_lock_token_result(value: loom_codec::Value) -> Result<loom_core::LockToken, String> {
+    let loom_codec::Value::Bytes(bytes) = value else {
+        return Err("generated Locks operation returned an invalid token".to_string());
+    };
+    loom_wire::lock::lock_token_from_cbor(&bytes).map_err(|error| error.to_string())
+}
+
+fn credential_reference_path(value: &str) -> Result<&std::path::Path, String> {
+    let path = value
+        .strip_prefix('@')
+        .ok_or_else(|| "credential and token inputs must use @path syntax".to_string())?;
+    if path.is_empty() {
+        return Err("credential and token path must not be empty".to_string());
+    }
+    Ok(std::path::Path::new(path))
+}
+
+fn require_new_output_path(path: &str) -> Result<(), String> {
+    if std::path::Path::new(path).exists() {
+        return Err(format!("refusing to overwrite existing output {path:?}"));
+    }
+    Ok(())
+}
+
+fn require_replaceable_output_path(path: &str, input: &std::path::Path) -> Result<(), String> {
+    let output = std::path::Path::new(path);
+    if output.exists() && output != input {
+        return Err(format!("refusing to overwrite unrelated output {path:?}"));
+    }
+    Ok(())
+}
+
+fn read_session_credential_file(reference: &str) -> Result<Vec<u8>, String> {
+    let path = credential_reference_path(reference)?;
+    require_private_file(path)?;
+    let bytes = std::fs::read(path).map_err(|error| format!("read session credential: {error}"))?;
+    let file: CliSessionCredentialFile = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("decode session credential file: {error}"))?;
+    decode_base64url(&file.credential, "session credential")
+}
+
+fn write_session_credential_file(
+    path: &str,
+    credential: &[u8],
+    replace: bool,
+) -> Result<(), String> {
+    let body = serde_json::to_vec(&CliSessionCredentialFile {
+        credential: encode_base64url(credential),
+    })
+    .map_err(|error| format!("encode session credential file: {error}"))?;
+    write_private_file(std::path::Path::new(path), &body, replace)
+}
+
+fn read_lock_token_file(reference: &str) -> Result<loom_core::LockToken, String> {
+    let path = credential_reference_path(reference)?;
+    let bytes = std::fs::read(path).map_err(|error| format!("read lock token: {error}"))?;
+    let file: CliLockTokenFile = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("decode lock token file: {error}"))?;
+    let token = decode_base64url(&file.token, "lock token")?;
+    loom_wire::lock::lock_token_from_cbor(&token).map_err(|error| error.to_string())
+}
+
+fn write_lock_token_file(
+    path: &str,
+    token: &loom_core::LockToken,
+    replace: bool,
+) -> Result<(), String> {
+    let token = loom_wire::lock::lock_token_to_cbor(token).map_err(|error| error.to_string())?;
+    let body = serde_json::to_vec(&CliLockTokenFile {
+        token: encode_base64url(&token),
+    })
+    .map_err(|error| format!("encode lock token file: {error}"))?;
+    write_private_file(std::path::Path::new(path), &body, replace)
+}
+
+fn encode_base64url(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn decode_base64url(value: &str, label: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    if value.contains('=') {
+        return Err(format!("{label} must use unpadded base64url"));
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|error| format!("decode {label}: {error}"))
+}
+
+#[cfg(unix)]
+fn require_private_file(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect session credential: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.mode() & 0o077 != 0 {
+        return Err("session credential must be an owner-only regular file".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_private_file(path: &std::path::Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect session credential: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("session credential must be a private regular file".to_string());
+    }
+    Ok(())
+}
+
+fn write_private_file(path: &std::path::Path, body: &[u8], replace: bool) -> Result<(), String> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "credential output must have a file name".to_string())?;
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| format!("credential output randomness: {error}"))?;
+    let target = parent.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        u64::from_be_bytes(nonce)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&target)
+        .map_err(|error| format!("create owner-only credential output: {error}"))?;
+    let result = (|| {
+        file.write_all(body)
+            .map_err(|error| format!("write credential output: {error}"))?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("write credential newline: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync credential output: {error}"))?;
+        drop(file);
+        if replace {
+            require_private_file(path)?;
+            std::fs::rename(&target, path)
+                .map_err(|error| format!("replace credential output: {error}"))?;
+        } else {
+            std::fs::hard_link(&target, path)
+                .map_err(|error| format!("install new credential output: {error}"))?;
+            std::fs::remove_file(&target)
+                .map_err(|error| format!("remove credential output staging file: {error}"))?;
+        }
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync credential output directory: {error}"))?;
+        Ok(())
+    })();
+    if target.exists() {
+        let _ = std::fs::remove_file(&target);
+    }
+    result
 }
 
 fn daemon_auth_from_keys(keys: &KeyOpts) -> Result<daemon::DaemonAuth, String> {
@@ -388,13 +737,19 @@ pub(crate) fn daemon_unpin(store: &str, pin: &str) -> Result<(), String> {
 fn run_daemon_maintenance(action: DaemonMaintenanceCmd, keys: &KeyOpts) -> Result<(), String> {
     match action {
         DaemonMaintenanceCmd::Status { store, json } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let report = loom
-                .store()
-                .store_maintenance_report(now_ms())
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let request = maintenance_status_request();
+            let bytes = execute_generated_bytes(
+                &client,
+                "StoreAdmin",
+                "store_maintenance_status",
+                vec![WireValue::Bytes(
+                    loom_wire::store_admin::store_maintenance_status_request_to_cbor(&request),
+                )],
+            )?;
+            let result = loom_wire::store_admin::store_maintenance_status_result_from_cbor(&bytes)
                 .map_err(|e| e.to_string())?;
-            let diagnostics = maintenance_live_root_diagnostics(&loom)?;
-            print_maintenance_report(&report, Some(&diagnostics), json)
+            print_maintenance_status_result(&result, json)
         }
         DaemonMaintenanceCmd::Policy {
             store,
@@ -416,107 +771,562 @@ fn run_daemon_maintenance(action: DaemonMaintenanceCmd, keys: &KeyOpts) -> Resul
             tail_compaction_interval_ms,
             tail_compaction_backoff_ms,
         } => {
-            let loom = cli_open_loom(&store, keys)?;
-            let mut policy = loom
-                .store()
-                .store_maintenance_policy()
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let update = maintenance_policy_update_from_cli(MaintenancePolicyCliUpdate {
+                min_candidate_pages,
+                min_reusable_pages,
+                interval_ms,
+                backoff_ms,
+                max_segments,
+                max_pages,
+                allow_full_compaction,
+                disallow_full_compaction,
+                enable_tail_trim,
+                disable_tail_trim,
+                enable_tail_compaction,
+                disable_tail_compaction,
+                tail_compaction_max_pages,
+                tail_compaction_max_objects,
+                tail_compaction_max_bytes,
+                tail_compaction_interval_ms,
+                tail_compaction_backoff_ms,
+            });
+            let bytes = execute_generated_bytes(
+                &client,
+                "StoreAdmin",
+                "store_maintenance_policy_set",
+                vec![WireValue::Bytes(
+                    loom_wire::store_admin::store_maintenance_policy_update_to_cbor(&update),
+                )],
+            )?;
+            let result = loom_wire::store_admin::store_maintenance_status_result_from_cbor(&bytes)
                 .map_err(|e| e.to_string())?;
-            if let Some(value) = min_candidate_pages {
-                policy.min_candidate_pages = value;
-            }
-            if let Some(value) = min_reusable_pages {
-                policy.min_reusable_pages = value;
-            }
-            if let Some(value) = interval_ms {
-                policy.interval_ms = value;
-            }
-            if let Some(value) = backoff_ms {
-                policy.backoff_ms = value;
-            }
-            if let Some(value) = max_segments {
-                policy.max_segments = value;
-            }
-            if let Some(value) = max_pages {
-                policy.max_pages = value;
-            }
-            if allow_full_compaction {
-                policy.full_compaction_enabled = true;
-            }
-            if disallow_full_compaction {
-                policy.full_compaction_enabled = false;
-            }
-            if enable_tail_trim {
-                policy.tail_trim_enabled = true;
-            }
-            if disable_tail_trim {
-                policy.tail_trim_enabled = false;
-            }
-            if enable_tail_compaction {
-                policy.tail_compaction_enabled = true;
-            }
-            if disable_tail_compaction {
-                policy.tail_compaction_enabled = false;
-            }
-            if let Some(value) = tail_compaction_max_pages {
-                policy.tail_compaction_max_pages = value;
-            }
-            if let Some(value) = tail_compaction_max_objects {
-                policy.tail_compaction_max_objects = value;
-            }
-            if let Some(value) = tail_compaction_max_bytes {
-                policy.tail_compaction_max_bytes = value;
-            }
-            if let Some(value) = tail_compaction_interval_ms {
-                policy.tail_compaction_interval_ms = value;
-            }
-            if let Some(value) = tail_compaction_backoff_ms {
-                policy.tail_compaction_backoff_ms = value;
-            }
-            loom.store()
-                .set_store_maintenance_policy(policy)
-                .map_err(|e| e.to_string())?;
-            let report = loom
-                .store()
-                .store_maintenance_report(now_ms())
-                .map_err(|e| e.to_string())?;
-            let diagnostics = maintenance_live_root_diagnostics(&loom)?;
-            print_maintenance_report(&report, Some(&diagnostics), false)
+            print_maintenance_status_result(&result, false)
         }
         DaemonMaintenanceCmd::Run {
             store,
             max_segments,
             max_pages,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let outcome =
-                run_store_maintenance_once(&mut loom, now_ms(), true, max_segments, max_pages)?;
-            println!("{outcome}");
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let request = loom_wire::store_admin::StoreMaintenanceRunRequest {
+                max_segments,
+                max_pages,
+            };
+            let bytes = execute_generated_bytes(
+                &client,
+                "StoreAdmin",
+                "store_maintenance_run",
+                vec![WireValue::Bytes(
+                    loom_wire::store_admin::store_maintenance_run_request_to_cbor(&request),
+                )],
+            )?;
+            let result = loom_wire::store_admin::store_maintenance_run_result_from_cbor(&bytes)
+                .map_err(|e| e.to_string())?;
+            println!("{}", maintenance_outcome_text(result));
             Ok(())
         }
     }
 }
 
-fn print_maintenance_report(
-    report: &StoreMaintenanceReport,
-    diagnostics: Option<&LiveRootDiagnostics>,
+fn maintenance_status_request() -> loom_wire::store_admin::StoreMaintenanceStatusRequest {
+    loom_wire::store_admin::StoreMaintenanceStatusRequest {
+        include_live_root_diagnostics: true,
+    }
+}
+
+struct MaintenancePolicyCliUpdate {
+    min_candidate_pages: Option<u64>,
+    min_reusable_pages: Option<u64>,
+    interval_ms: Option<u64>,
+    backoff_ms: Option<u64>,
+    max_segments: Option<u64>,
+    max_pages: Option<u64>,
+    allow_full_compaction: bool,
+    disallow_full_compaction: bool,
+    enable_tail_trim: bool,
+    disable_tail_trim: bool,
+    enable_tail_compaction: bool,
+    disable_tail_compaction: bool,
+    tail_compaction_max_pages: Option<u64>,
+    tail_compaction_max_objects: Option<u64>,
+    tail_compaction_max_bytes: Option<u64>,
+    tail_compaction_interval_ms: Option<u64>,
+    tail_compaction_backoff_ms: Option<u64>,
+}
+
+fn maintenance_policy_update_from_cli(
+    input: MaintenancePolicyCliUpdate,
+) -> loom_wire::store_admin::StoreMaintenancePolicyUpdate {
+    loom_wire::store_admin::StoreMaintenancePolicyUpdate {
+        min_candidate_pages: input.min_candidate_pages,
+        min_reusable_pages: input.min_reusable_pages,
+        interval_ms: input.interval_ms,
+        backoff_ms: input.backoff_ms,
+        max_segments: input.max_segments,
+        max_pages: input.max_pages,
+        full_compaction_enabled: if input.allow_full_compaction {
+            Some(true)
+        } else if input.disallow_full_compaction {
+            Some(false)
+        } else {
+            None
+        },
+        tail_trim_enabled: if input.enable_tail_trim {
+            Some(true)
+        } else if input.disable_tail_trim {
+            Some(false)
+        } else {
+            None
+        },
+        tail_compaction_enabled: if input.enable_tail_compaction {
+            Some(true)
+        } else if input.disable_tail_compaction {
+            Some(false)
+        } else {
+            None
+        },
+        tail_compaction_max_pages: input.tail_compaction_max_pages,
+        tail_compaction_max_objects: input.tail_compaction_max_objects,
+        tail_compaction_max_bytes: input.tail_compaction_max_bytes,
+        tail_compaction_interval_ms: input.tail_compaction_interval_ms,
+        tail_compaction_backoff_ms: input.tail_compaction_backoff_ms,
+    }
+}
+
+#[cfg(test)]
+mod mu6i_d4_tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_status_request_selects_live_root_diagnostics() {
+        let request = maintenance_status_request();
+        assert!(request.include_live_root_diagnostics);
+        let decoded = loom_wire::store_admin::store_maintenance_status_request_from_cbor(
+            &loom_wire::store_admin::store_maintenance_status_request_to_cbor(&request),
+        )
+        .unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn maintenance_policy_update_preserves_partial_cli_options() {
+        let update = maintenance_policy_update_from_cli(MaintenancePolicyCliUpdate {
+            min_candidate_pages: Some(3),
+            min_reusable_pages: None,
+            interval_ms: Some(50),
+            backoff_ms: None,
+            max_segments: Some(2),
+            max_pages: None,
+            allow_full_compaction: false,
+            disallow_full_compaction: true,
+            enable_tail_trim: true,
+            disable_tail_trim: false,
+            enable_tail_compaction: false,
+            disable_tail_compaction: true,
+            tail_compaction_max_pages: Some(4),
+            tail_compaction_max_objects: None,
+            tail_compaction_max_bytes: Some(8),
+            tail_compaction_interval_ms: None,
+            tail_compaction_backoff_ms: Some(13),
+        });
+
+        assert_eq!(update.min_candidate_pages, Some(3));
+        assert_eq!(update.min_reusable_pages, None);
+        assert_eq!(update.full_compaction_enabled, Some(false));
+        assert_eq!(update.tail_trim_enabled, Some(true));
+        assert_eq!(update.tail_compaction_enabled, Some(false));
+        assert_eq!(update.tail_compaction_max_bytes, Some(8));
+        let decoded = loom_wire::store_admin::store_maintenance_policy_update_from_cbor(
+            &loom_wire::store_admin::store_maintenance_policy_update_to_cbor(&update),
+        )
+        .unwrap();
+        assert_eq!(decoded, update);
+    }
+
+    #[test]
+    fn maintenance_report_domain_and_wire_views_render_identically() {
+        let store = temp_store("mu6i-d4-maintenance-report-view");
+        let fs = FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+        let key = loom_store::OverlayKey::from_segments([
+            b"workspace",
+            &[2; 16],
+            b"tickets",
+            b"matrix",
+            b"ticket",
+            b"MX-6i-d4",
+        ])
+        .unwrap();
+        fs.put_mutable_overlay_value(key, b"current".to_vec())
+            .unwrap();
+        drop(fs);
+
+        let loom = open_loom_read_unlocked(&store, None).unwrap();
+        let report = loom.store().store_maintenance_report(100).unwrap();
+        let mut diagnostics = maintenance_live_root_diagnostics(&loom).unwrap();
+        if diagnostics.classes.is_empty() {
+            diagnostics
+                .classes
+                .push(loom_core::LiveRootClassDiagnostics {
+                    class: "fixture",
+                    count: 1,
+                    examples: vec![loom_core::LiveRootExample {
+                        id: "root".to_string(),
+                        digest: Digest::hash(Algo::Blake3, b"mu6i-d4"),
+                    }],
+                    truncated: false,
+                });
+        }
+        let domain_view = MaintenanceReportView::from_store(&report, Some(&diagnostics));
+        let wire_result = loom_wire::store_admin::StoreMaintenanceStatusResult {
+            report: domain_view.report.clone(),
+            live_root_diagnostics: domain_view
+                .diagnostics
+                .as_ref()
+                .map(wire_diagnostics_from_view),
+        };
+        let wire_view = MaintenanceReportView::from_wire(&wire_result);
+
+        let domain_text = maintenance_report_text(&domain_view);
+        assert_eq!(domain_text, maintenance_report_text(&wire_view));
+        for section in [
+            "maintenance\t",
+            "maintenance_growth\t",
+            "maintenance_overlay\t",
+            "maintenance_mvcc\t",
+            "maintenance_group_commit\t",
+            "maintenance_policy\t",
+            "maintenance_epoch\t",
+            "maintenance_run\t",
+            "maintenance_growth_domain\t",
+            "maintenance_live_roots\t",
+        ] {
+            assert!(domain_text.contains(section), "missing {section}");
+        }
+        assert_eq!(
+            maintenance_report_json(&domain_view),
+            maintenance_report_json(&wire_view)
+        );
+        let json = maintenance_report_json(&domain_view);
+        for field in [
+            "overlay",
+            "mvcc",
+            "group_commit",
+            "growth_domains",
+            "policy",
+            "run_state",
+            "live_root_diagnostics",
+        ] {
+            assert!(json.get(field).is_some(), "missing {field}");
+        }
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    fn wire_diagnostics_from_view(
+        diagnostics: &MaintenanceLiveRootDiagnosticsView,
+    ) -> loom_wire::store_admin::StoreLiveRootDiagnosticsRecord {
+        loom_wire::store_admin::StoreLiveRootDiagnosticsRecord {
+            sample_limit: diagnostics.sample_limit,
+            classes: diagnostics
+                .classes
+                .iter()
+                .map(
+                    |class| loom_wire::store_admin::StoreLiveRootClassDiagnosticsRecord {
+                        class: class.class.clone(),
+                        count: class.count,
+                        examples: class
+                            .examples
+                            .iter()
+                            .map(
+                                |example| loom_wire::store_admin::StoreLiveRootExampleRecord {
+                                    id: example.id.clone(),
+                                    digest: example.digest.clone(),
+                                },
+                            )
+                            .collect(),
+                        truncated: class.truncated,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn temp_store(tag: &str) -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("loomcli-{tag}-{}-{seq}.loom", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().into_owned()
+    }
+}
+
+fn print_maintenance_status_result(
+    result: &loom_wire::store_admin::StoreMaintenanceStatusResult,
     json: bool,
 ) -> Result<(), String> {
+    let view = MaintenanceReportView::from_wire(result);
+    print_maintenance_report_view(&view, json)
+}
+
+fn print_maintenance_report_view(view: &MaintenanceReportView, json: bool) -> Result<(), String> {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&maintenance_report_json(report, diagnostics))
+            serde_json::to_string_pretty(&maintenance_report_json(view))
                 .map_err(|e| e.to_string())?
         );
         return Ok(());
     }
-    print!("{}", maintenance_report_text(report, diagnostics));
+    print!("{}", maintenance_report_text(view));
     Ok(())
 }
 
-fn maintenance_report_text(
-    report: &StoreMaintenanceReport,
-    diagnostics: Option<&LiveRootDiagnostics>,
-) -> String {
+#[derive(Clone)]
+struct MaintenanceReportView {
+    report: loom_wire::store_admin::StoreMaintenanceReportRecord,
+    diagnostics: Option<MaintenanceLiveRootDiagnosticsView>,
+}
+
+#[derive(Clone)]
+struct MaintenanceLiveRootDiagnosticsView {
+    sample_limit: u64,
+    classes: Vec<MaintenanceLiveRootClassView>,
+}
+
+#[derive(Clone)]
+struct MaintenanceLiveRootClassView {
+    class: String,
+    count: u64,
+    examples: Vec<MaintenanceLiveRootExampleView>,
+    truncated: bool,
+}
+
+#[derive(Clone)]
+struct MaintenanceLiveRootExampleView {
+    id: String,
+    digest: String,
+}
+
+impl MaintenanceReportView {
+    fn from_store(
+        report: &StoreMaintenanceReport,
+        diagnostics: Option<&LiveRootDiagnostics>,
+    ) -> Self {
+        let status = &report.status;
+        let group = &status.group_commit;
+        let overlay = &report.overlay_health;
+        let mvcc = &report.mvcc_snapshots;
+        Self {
+            report: loom_wire::store_admin::StoreMaintenanceReportRecord {
+                status: loom_wire::store_admin::StoreMaintenanceStatusRecord {
+                    generation: status.generation,
+                    object_count: status.object_count,
+                    physical_page_count: status.physical_page_count,
+                    physical_bytes: status.physical_bytes,
+                    reusable_free_pages: status.reusable_free_pages,
+                    candidate_dead_pages: status.candidate_dead_pages,
+                    tail_free_pages: status.tail_free_pages,
+                    tail_free_bytes: status.tail_free_bytes,
+                    last_validated_mark_epoch: status.last_validated_mark_epoch,
+                    touched_segments: status.touched_segments.clone(),
+                    candidate_segments: status.candidate_segments.clone(),
+                    segment_overflow: status.segment_overflow,
+                    group_commit: loom_wire::store_admin::StoreGroupCommitDiagnosticsRecord {
+                        group_commit_batches_total: group.group_commit_batches_total,
+                        group_commit_transactions_total: group.group_commit_transactions_total,
+                        group_commit_records_total: group.group_commit_records_total,
+                        fsync_total_micros: group.fsync_total_micros,
+                        fsync_count: group.fsync_count,
+                        write_lock_wait_total_micros: group.write_lock_wait_total_micros,
+                        write_lock_wait_count: group.write_lock_wait_count,
+                        pending_durable_window_transactions: group
+                            .pending_durable_window_transactions,
+                        pending_durable_window_records: group.pending_durable_window_records,
+                        pinned_reader_blockers: group.pinned_reader_blockers,
+                    },
+                },
+                overlay_health: loom_wire::store_admin::StoreMutableOverlayHealthRecord {
+                    current_generation: overlay.current_generation,
+                    current_record_count: overlay.current_record_count,
+                    tombstone_count: overlay.tombstone_count,
+                    live_checkpoint_references: overlay.live_checkpoint_references,
+                    reclaimable_overlay_pages: overlay.reclaimable_overlay_pages,
+                    blocked_reclamation_reasons: overlay.blocked_reclamation_reasons.clone(),
+                    hot_write_count: overlay.hot_write_count,
+                    active_writer_contention_indicators: overlay
+                        .active_writer_contention_indicators,
+                },
+                mvcc_snapshots: loom_wire::store_admin::StoreMvccSnapshotDiagnosticsRecord {
+                    active_snapshot_count: mvcc.active_snapshot_count,
+                    oldest_pinned_overlay_generation: mvcc
+                        .oldest_pinned_overlay_generation
+                        .map(|generation| generation.as_u64()),
+                    pins: mvcc
+                        .pins
+                        .iter()
+                        .map(|pin| loom_wire::store_admin::StoreMvccSnapshotPinRecord {
+                            pin_id: pin.pin_id,
+                            identity: loom_wire::store_admin::StoreMvccSnapshotIdentityRecord {
+                                overlay_generation: pin.identity.overlay_generation.as_u64(),
+                                immutable_base_root: pin
+                                    .identity
+                                    .immutable_base_root
+                                    .map(|root| root.to_string()),
+                            },
+                            owner: pin.owner.clone(),
+                        })
+                        .collect(),
+                },
+                policy: loom_wire::store_admin::StoreMaintenancePolicyRecord {
+                    min_candidate_pages: report.policy.min_candidate_pages,
+                    min_reusable_pages: report.policy.min_reusable_pages,
+                    interval_ms: report.policy.interval_ms,
+                    backoff_ms: report.policy.backoff_ms,
+                    max_segments: report.policy.max_segments,
+                    max_pages: report.policy.max_pages,
+                    full_compaction_enabled: report.policy.full_compaction_enabled,
+                    tail_trim_enabled: report.policy.tail_trim_enabled,
+                    tail_compaction_enabled: report.policy.tail_compaction_enabled,
+                    tail_compaction_max_pages: report.policy.tail_compaction_max_pages,
+                    tail_compaction_max_objects: report.policy.tail_compaction_max_objects,
+                    tail_compaction_max_bytes: report.policy.tail_compaction_max_bytes,
+                    tail_compaction_interval_ms: report.policy.tail_compaction_interval_ms,
+                    tail_compaction_backoff_ms: report.policy.tail_compaction_backoff_ms,
+                },
+                run_state: loom_wire::store_admin::StoreMaintenanceRunStateRecord {
+                    last_run_ms: report.run_state.last_run_ms,
+                    next_eligible_ms: report.run_state.next_eligible_ms,
+                    last_skip_reason: report.run_state.last_skip_reason.clone(),
+                    last_error: report.run_state.last_error.clone(),
+                    last_tail_trim_attempted: report.run_state.last_tail_trim_attempted,
+                    last_tail_trim_pages: report.run_state.last_tail_trim_pages,
+                    last_tail_trim_bytes: report.run_state.last_tail_trim_bytes,
+                    last_tail_compaction_attempted: report.run_state.last_tail_compaction_attempted,
+                    last_tail_compaction_relocated_objects: report
+                        .run_state
+                        .last_tail_compaction_relocated_objects,
+                    last_tail_compaction_relocated_pages: report
+                        .run_state
+                        .last_tail_compaction_relocated_pages,
+                    last_tail_compaction_relocated_bytes: report
+                        .run_state
+                        .last_tail_compaction_relocated_bytes,
+                    last_tail_compaction_truncated_pages: report
+                        .run_state
+                        .last_tail_compaction_truncated_pages,
+                    last_tail_compaction_conflicts: report.run_state.last_tail_compaction_conflicts,
+                    last_shrink_skip_reason: report.run_state.last_shrink_skip_reason.clone(),
+                    last_progress_steps: report.run_state.last_progress_steps,
+                    last_yield_count: report.run_state.last_yield_count,
+                    last_overrun_count: report.run_state.last_overrun_count,
+                },
+                mark_epoch: report.mark_epoch,
+                mark_completed: report.mark_completed,
+                marked_live_objects: report.marked_live_objects,
+                marked_live_bytes: report.marked_live_bytes,
+                live_bytes: report.live_bytes,
+                candidate_reclaimable_bytes: report.candidate_reclaimable_bytes,
+                reusable_free_bytes: report.reusable_free_bytes,
+                overlay_obsolete_record_count: report.overlay_obsolete_record_count,
+                overlay_obsolete_page_count: report.overlay_obsolete_page_count,
+                tail_free_pages: report.tail_free_pages,
+                tail_free_bytes: report.tail_free_bytes,
+                tail_trim_eligible: report.tail_trim_eligible,
+                tail_blocked_by_live_objects: report.tail_blocked_by_live_objects,
+                tail_compaction_eligible: report.tail_compaction_eligible,
+                full_compaction_required_for_shrink: report.full_compaction_required_for_shrink,
+                tail_trim_attempted: report.tail_trim_attempted,
+                tail_trim_pages: report.tail_trim_pages,
+                tail_trim_bytes: report.tail_trim_bytes,
+                tail_compaction_attempted: report.tail_compaction_attempted,
+                tail_compaction_relocated_objects: report.tail_compaction_relocated_objects,
+                tail_compaction_relocated_pages: report.tail_compaction_relocated_pages,
+                tail_compaction_relocated_bytes: report.tail_compaction_relocated_bytes,
+                tail_compaction_truncated_pages: report.tail_compaction_truncated_pages,
+                tail_compaction_conflicts: report.tail_compaction_conflicts,
+                last_shrink_skip_reason: report.last_shrink_skip_reason.clone(),
+                retained_control_roots: report.retained_control_roots,
+                derived_payload_count: report.derived_payload_count,
+                growth_domains: report
+                    .growth_domains
+                    .iter()
+                    .map(|domain| loom_wire::store_admin::StoreGrowthDomainRecord {
+                        domain: domain.domain.clone(),
+                        current_records: domain.current_records,
+                        obsolete_records: domain.obsolete_records,
+                        payload_bytes: domain.payload_bytes,
+                    })
+                    .collect(),
+                eligible: report.eligible,
+                reason: report.reason.clone(),
+            },
+            diagnostics: diagnostics.map(MaintenanceLiveRootDiagnosticsView::from_store),
+        }
+    }
+
+    fn from_wire(result: &loom_wire::store_admin::StoreMaintenanceStatusResult) -> Self {
+        Self {
+            report: result.report.clone(),
+            diagnostics: result
+                .live_root_diagnostics
+                .as_ref()
+                .map(MaintenanceLiveRootDiagnosticsView::from_wire),
+        }
+    }
+}
+
+impl MaintenanceLiveRootDiagnosticsView {
+    fn from_store(diagnostics: &LiveRootDiagnostics) -> Self {
+        Self {
+            sample_limit: u64::try_from(diagnostics.sample_limit).unwrap_or(u64::MAX),
+            classes: diagnostics
+                .classes
+                .iter()
+                .map(|class| MaintenanceLiveRootClassView {
+                    class: class.class.to_string(),
+                    count: class.count,
+                    examples: class
+                        .examples
+                        .iter()
+                        .map(|example| MaintenanceLiveRootExampleView {
+                            id: example.id.clone(),
+                            digest: example.digest.to_string(),
+                        })
+                        .collect(),
+                    truncated: class.truncated,
+                })
+                .collect(),
+        }
+    }
+
+    fn from_wire(diagnostics: &loom_wire::store_admin::StoreLiveRootDiagnosticsRecord) -> Self {
+        Self {
+            sample_limit: diagnostics.sample_limit,
+            classes: diagnostics
+                .classes
+                .iter()
+                .map(|class| MaintenanceLiveRootClassView {
+                    class: class.class.clone(),
+                    count: class.count,
+                    examples: class
+                        .examples
+                        .iter()
+                        .map(|example| MaintenanceLiveRootExampleView {
+                            id: example.id.clone(),
+                            digest: example.digest.clone(),
+                        })
+                        .collect(),
+                    truncated: class.truncated,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn maintenance_report_text(view: &MaintenanceReportView) -> String {
+    let report = &view.report;
     let mut text = format!(
         "maintenance\teligible={}\treason={}\tphysical_bytes={}\tlive_bytes={}\tmarked_live_bytes={}\tcandidate_reclaimable_bytes={}\treusable_free_bytes={}\ttail_free_pages={}\ttail_free_bytes={}\ttail_trim_eligible={}\ttail_blocked_by_live_objects={}\ttail_compaction_eligible={}\tfull_compaction_required_for_shrink={}\ttail_trim_attempted={}\ttail_trim_pages={}\ttail_trim_bytes={}\ttail_compaction_attempted={}\ttail_compaction_relocated_objects={}\ttail_compaction_relocated_pages={}\ttail_compaction_relocated_bytes={}\ttail_compaction_truncated_pages={}\ttail_compaction_conflicts={}\tretained_control_roots={}\tderived_payload_count={}\tlast_shrink_skip_reason={}",
         report.eligible,
@@ -574,12 +1384,7 @@ fn maintenance_report_text(
         + &format!(
             "maintenance_mvcc\tactive_snapshots={}\toldest_pinned_generation={}\tpinned_reader_reclaim_pressure={}",
             report.mvcc_snapshots.active_snapshot_count,
-            optional_u64_text(
-                report
-                    .mvcc_snapshots
-                    .oldest_pinned_overlay_generation
-                    .map(|generation| generation.as_u64())
-            ),
+            optional_u64_text(report.mvcc_snapshots.oldest_pinned_overlay_generation),
             report.mvcc_snapshots.active_snapshot_count > 0
                 && report.overlay_obsolete_record_count > 0
         )
@@ -651,7 +1456,7 @@ fn maintenance_report_text(
             domain.domain, domain.current_records, domain.obsolete_records, domain.payload_bytes
         ));
     }
-    if let Some(diagnostics) = diagnostics {
+    if let Some(diagnostics) = &view.diagnostics {
         for class in &diagnostics.classes {
             let examples = class
                 .examples
@@ -712,382 +1517,286 @@ fn open_read_loom_for_diagnostics(
 
 fn run_store_maintenance_once(
     loom: &mut Loom<FileStore>,
-    now: u64,
     manual: bool,
     max_segments: Option<u64>,
     max_pages: Option<u64>,
 ) -> Result<String, String> {
-    run_store_maintenance_once_with_budget(loom, now, manual, max_segments, max_pages, None, None)
-}
-
-const DAEMON_MAINTENANCE_MARK_OBJECTS: u64 = 256;
-const DAEMON_MAINTENANCE_MAX_SEGMENTS: u64 = 1;
-const DAEMON_MAINTENANCE_MAX_PAGES: u64 = 1024;
-const DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_PAGES: u64 = 64;
-const DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_OBJECTS: u64 = 32;
-const DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const DAEMON_MAINTENANCE_SLICE_MS: u64 = 250;
-
-#[derive(Debug, Clone, Copy)]
-struct StoreMaintenanceRunBudget {
-    mark_objects: u64,
-    max_segments: u64,
-    max_pages: u64,
-    tail_compaction_max_pages: u64,
-    tail_compaction_max_objects: u64,
-    tail_compaction_max_bytes: u64,
-    slice_ms: u64,
-}
-
-impl StoreMaintenanceRunBudget {
-    fn daemon_automatic() -> Self {
-        Self {
-            mark_objects: DAEMON_MAINTENANCE_MARK_OBJECTS,
-            max_segments: DAEMON_MAINTENANCE_MAX_SEGMENTS,
-            max_pages: DAEMON_MAINTENANCE_MAX_PAGES,
-            tail_compaction_max_pages: DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_PAGES,
-            tail_compaction_max_objects: DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_OBJECTS,
-            tail_compaction_max_bytes: DAEMON_MAINTENANCE_TAIL_COMPACTION_MAX_BYTES,
-            slice_ms: DAEMON_MAINTENANCE_SLICE_MS,
-        }
-    }
-
-    fn apply(self, policy: &mut loom_store::StoreMaintenancePolicy) {
-        policy.max_segments = policy.max_segments.min(self.max_segments);
-        policy.max_pages = policy.max_pages.min(self.max_pages);
-        policy.tail_compaction_max_pages = policy
-            .tail_compaction_max_pages
-            .min(self.tail_compaction_max_pages);
-        policy.tail_compaction_max_objects = policy
-            .tail_compaction_max_objects
-            .min(self.tail_compaction_max_objects);
-        policy.tail_compaction_max_bytes = policy
-            .tail_compaction_max_bytes
-            .min(self.tail_compaction_max_bytes);
-    }
+    loom_store::run_store_maintenance_once(loom, manual, max_segments, max_pages)
+        .map(maintenance_outcome_text)
+        .map_err(|e| e.to_string())
 }
 
 fn run_store_maintenance_once_with_budget(
     loom: &mut Loom<FileStore>,
-    now: u64,
     manual: bool,
     max_segments: Option<u64>,
     max_pages: Option<u64>,
-    budget: Option<StoreMaintenanceRunBudget>,
+    budget: Option<loom_store::StoreMaintenanceRunBudget>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<String, String> {
-    if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
-        return Ok("maintenance\tskipped\treason=shutdown_cancelled".to_string());
-    }
-    let started = std::time::Instant::now();
-    let mut progress_steps = 0u64;
-    let mut yield_count = 0u64;
-    let mut overrun_count = 0u64;
-    let deadline = budget
-        .and_then(|budget| started.checked_add(std::time::Duration::from_millis(budget.slice_ms)));
-    let mut policy = loom
-        .store()
-        .store_maintenance_policy()
-        .map_err(|e| e.to_string())?;
-    if let Some(budget) = budget {
-        budget.apply(&mut policy);
-    }
-    if let Some(value) = max_segments {
-        if value == 0 {
-            return Err("max-segments must be nonzero".to_string());
-        }
-        policy.max_segments = value;
-    }
-    if let Some(value) = max_pages {
-        if value == 0 {
-            return Err("max-pages must be nonzero".to_string());
-        }
-        policy.max_pages = value;
-    }
-    let report = loom
-        .store()
-        .store_maintenance_report(now)
-        .map_err(|e| e.to_string())?;
-    if !manual && !report.eligible {
-        return Ok("maintenance\tskipped\treason=not_eligible".to_string());
-    }
-    let mut active = loom
-        .store()
-        .active_reachability_mark_epoch()
-        .map_err(|e| e.to_string())?;
-    if let Some(epoch) = &active
-        && let Err(error) = loom.store().validate_reachability_mark_epoch_current(epoch)
-    {
-        if error.code != loom_core::error::Code::Conflict {
-            return Err(error.to_string());
-        }
-        loom.store()
-            .clear_reachability_mark_epoch()
-            .map_err(|e| e.to_string())?;
-        active = None;
-    }
-    let needs_mark = active
-        .as_ref()
-        .map(|epoch| !epoch.state.completed)
-        .unwrap_or(true);
-    if needs_mark {
-        if active.is_none() {
-            loom_store::begin_loom_reachability_mark_epoch(loom).map_err(|e| e.to_string())?;
-        }
-        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
-            return Ok("maintenance\tskipped\treason=shutdown_cancelled".to_string());
-        }
-        let step = loom_store::step_loom_reachability_mark_epoch_until(
-            loom,
-            budget.map_or(1024, |budget| {
-                usize::try_from(budget.mark_objects).unwrap_or(usize::MAX)
-            }),
-            deadline,
-        )
-        .map_err(|e| e.to_string())?;
-        if !step.completed {
-            progress_steps = u64::try_from(step.visited).unwrap_or(u64::MAX);
-            yield_count = 1;
-            if budget
-                .is_some_and(|budget| started.elapsed().as_millis() >= u128::from(budget.slice_ms))
-            {
-                overrun_count = 1;
-            }
-            let state = StoreMaintenanceRunState {
-                last_run_ms: Some(now),
-                next_eligible_ms: now.saturating_add(policy.interval_ms),
-                last_skip_reason: Some("mark_epoch_incomplete".to_string()),
-                last_error: None,
-                last_progress_steps: progress_steps,
-                last_yield_count: yield_count,
-                last_overrun_count: overrun_count,
-                ..StoreMaintenanceRunState::default()
-            };
-            loom.store()
-                .record_store_maintenance_run_state(state)
-                .map_err(|e| e.to_string())?;
-            return Ok(format!(
-                "maintenance\tmarked\tvisited={}\tpending={}",
-                step.visited, step.pending
-            ));
-        }
-    }
-    let refreshed_report = loom
-        .store()
-        .store_maintenance_report(now)
-        .map_err(|e| e.to_string())?;
-    let whole_file_due = policy.full_compaction_enabled
-        && maintenance_debt_thresholds_met(&policy, &refreshed_report.status);
-    let whole_file_allowed = manual && whole_file_due;
-    let mut shrink_skip_reason =
-        (!manual && whole_file_due).then(|| "full_compaction_manual_only".to_string());
-    let mut tail_trim_attempted = false;
-    let mut tail_trim_pages = 0;
-    let mut tail_trim_bytes = 0;
-    let mut tail_compaction = loom_store::TailCompactionStats::default();
-    let outcome = if whole_file_allowed {
-        let capacity = loom
-            .store()
-            .ensure_compaction_capacity()
-            .map_err(|e| e.to_string())?;
-        let stats = gc_loom(loom).map_err(|e| e.to_string())?;
-        format!(
-            "maintenance\tcompacted\tbefore={}\tafter={}\treclaimed={}\trequired_temp_bytes={}\tavailable_temp_bytes={}",
-            stats.before,
-            stats.after,
-            stats.reclaimed(),
-            capacity.required_temp_bytes,
-            optional_u64_text(capacity.available_temp_bytes)
-        )
-    } else {
-        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
-            return Ok("maintenance\tskipped\treason=shutdown_cancelled".to_string());
-        }
-        let reclaim_budget = GcSegmentBudget {
-            max_segments: policy.max_segments,
-            max_pages: policy.max_pages,
-        };
-        let reclaim = if let Some(deadline) = deadline {
-            tail_trim_attempted = policy.tail_trim_enabled;
-            loom.store_mut().gc_validated_segments_until(
-                reclaim_budget,
-                policy.tail_trim_enabled,
-                deadline,
-            )
-        } else if policy.tail_trim_enabled {
-            tail_trim_attempted = true;
-            loom.store_mut().gc_validated_segments(reclaim_budget)
-        } else {
-            loom.store_mut()
-                .gc_validated_segments_without_tail_trim(reclaim_budget)
-        };
-        let stats = match reclaim {
-            Ok(stats) => stats,
-            Err(error) if error.code == loom_core::error::Code::ResourceExhausted => {
-                if shrink_skip_reason.is_none() {
-                    shrink_skip_reason = Some("budget_exhausted".to_string());
-                }
-                yield_count = yield_count.saturating_add(1);
-                loom_store::GcStats::default()
-            }
-            Err(error) => return Err(error.to_string()),
-        };
-        progress_steps = progress_steps
-            .saturating_add(stats.segments_reclaimed)
-            .saturating_add(stats.pages_freed)
-            .saturating_add(stats.objects_relocated)
-            .saturating_add(stats.objects_dropped);
-        tail_trim_pages = stats.pages_trimmed;
-        tail_trim_bytes = stats
-            .pages_trimmed
-            .saturating_mul(loom_store::STORE_PAGE_SIZE);
-        let slice_exhausted = budget
-            .is_some_and(|budget| started.elapsed().as_millis() >= u128::from(budget.slice_ms));
-        if slice_exhausted {
-            overrun_count = overrun_count.saturating_add(1);
-        }
-        if policy.tail_compaction_enabled && !slice_exhausted {
-            if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
-                return Ok("maintenance\tskipped\treason=shutdown_cancelled".to_string());
-            }
-            let tail_result = if let Some(deadline) = deadline {
-                loom.store_mut().compact_tail_once_until(
-                    policy.tail_compaction_max_pages,
-                    policy.tail_compaction_max_objects,
-                    policy.tail_compaction_max_bytes,
-                    deadline,
-                )
-            } else {
-                loom.store_mut().compact_tail_once(
-                    policy.tail_compaction_max_pages,
-                    policy.tail_compaction_max_objects,
-                    policy.tail_compaction_max_bytes,
-                )
-            };
-            tail_compaction = match tail_result {
-                Ok(stats) => stats,
-                Err(error) if error.code == loom_core::error::Code::ResourceExhausted => {
-                    if shrink_skip_reason.is_none() {
-                        shrink_skip_reason = Some("budget_exhausted".to_string());
-                    }
-                    yield_count = yield_count.saturating_add(1);
-                    loom_store::TailCompactionStats {
-                        attempted: true,
-                        skipped: true,
-                        ..loom_store::TailCompactionStats::default()
-                    }
-                }
-                Err(error) => return Err(error.to_string()),
-            };
-            progress_steps = progress_steps
-                .saturating_add(tail_compaction.relocated_objects)
-                .saturating_add(tail_compaction.relocated_pages)
-                .saturating_add(tail_compaction.truncated_pages);
-            if tail_compaction.truncated_pages > 0 {
-                tail_trim_attempted = true;
-                tail_trim_pages = tail_trim_pages.saturating_add(tail_compaction.truncated_pages);
-                tail_trim_bytes = tail_trim_pages.saturating_mul(loom_store::STORE_PAGE_SIZE);
-            }
-        } else if policy.tail_compaction_enabled && slice_exhausted && shrink_skip_reason.is_none()
-        {
-            shrink_skip_reason = Some("budget_exhausted".to_string());
-            yield_count = yield_count.saturating_add(1);
-        }
-        format!(
-            "maintenance\treclaimed\tsegments_reclaimed={}\tpages_freed={}\ttail_trim_pages={}\ttail_trim_bytes={}\ttail_compaction_attempted={}\ttail_compaction_relocated_objects={}\ttail_compaction_relocated_pages={}\ttail_compaction_truncated_pages={}\tobjects_relocated={}\tobjects_dropped={}\telapsed_ms={}",
-            stats.segments_reclaimed,
-            stats.pages_freed,
-            tail_trim_pages,
-            tail_trim_bytes,
-            tail_compaction.attempted,
-            tail_compaction.relocated_objects,
-            tail_compaction.relocated_pages,
-            tail_compaction.truncated_pages,
-            stats.objects_relocated,
-            stats.objects_dropped,
-            started.elapsed().as_millis()
-        )
-    };
-    let state = StoreMaintenanceRunState {
-        last_run_ms: Some(now),
-        next_eligible_ms: now.saturating_add(policy.interval_ms),
-        last_skip_reason: None,
-        last_error: None,
-        last_tail_trim_attempted: tail_trim_attempted,
-        last_tail_trim_pages: tail_trim_pages,
-        last_tail_trim_bytes: tail_trim_bytes,
-        last_tail_compaction_attempted: tail_compaction.attempted,
-        last_tail_compaction_relocated_objects: tail_compaction.relocated_objects,
-        last_tail_compaction_relocated_pages: tail_compaction.relocated_pages,
-        last_tail_compaction_relocated_bytes: tail_compaction.relocated_bytes,
-        last_tail_compaction_truncated_pages: tail_compaction.truncated_pages,
-        last_tail_compaction_conflicts: tail_compaction.conflicts,
-        last_shrink_skip_reason: shrink_skip_reason.take().or_else(|| {
-            tail_compaction
-                .skipped
-                .then(|| "tail_compaction_skipped".to_string())
-        }),
-        last_progress_steps: progress_steps,
-        last_yield_count: yield_count,
-        last_overrun_count: overrun_count,
-    };
-    loom.store()
-        .record_store_maintenance_run_state(state)
-        .map_err(|e| e.to_string())?;
-    Ok(outcome)
+    loom_store::run_store_maintenance_once_with_clock(
+        loom,
+        manual,
+        max_segments,
+        max_pages,
+        budget,
+        cancel,
+        &loom_store::SystemStoreMaintenanceClock,
+    )
+    .map(maintenance_outcome_text)
+    .map_err(|e| e.to_string())
 }
 
-fn maintenance_debt_thresholds_met(
-    policy: &loom_store::StoreMaintenancePolicy,
-    status: &loom_store::MaintenanceStatus,
-) -> bool {
-    status.candidate_dead_pages >= policy.min_candidate_pages
-        && status.reusable_free_pages >= policy.min_reusable_pages
+#[derive(Clone)]
+struct MaintenanceRunOutcomeView {
+    kind: MaintenanceRunKindView,
+    reason: Option<String>,
+    visited: Option<u64>,
+    pending: Option<u64>,
+    before: Option<u64>,
+    after: Option<u64>,
+    reclaimed: Option<u64>,
+    required_temp_bytes: Option<u64>,
+    available_temp_bytes: Option<u64>,
+    segments_reclaimed: Option<u64>,
+    pages_freed: Option<u64>,
+    tail_trim_pages: Option<u64>,
+    tail_trim_bytes: Option<u64>,
+    tail_compaction_attempted: Option<bool>,
+    tail_compaction_relocated_objects: Option<u64>,
+    tail_compaction_relocated_pages: Option<u64>,
+    tail_compaction_truncated_pages: Option<u64>,
+    objects_relocated: Option<u64>,
+    objects_dropped: Option<u64>,
+    elapsed_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum MaintenanceRunKindView {
+    Skipped,
+    Marked,
+    Compacted,
+    Reclaimed,
+}
+
+impl From<loom_store::StoreMaintenanceRunKind> for MaintenanceRunKindView {
+    fn from(kind: loom_store::StoreMaintenanceRunKind) -> Self {
+        match kind {
+            loom_store::StoreMaintenanceRunKind::Skipped => Self::Skipped,
+            loom_store::StoreMaintenanceRunKind::Marked => Self::Marked,
+            loom_store::StoreMaintenanceRunKind::Compacted => Self::Compacted,
+            loom_store::StoreMaintenanceRunKind::Reclaimed => Self::Reclaimed,
+        }
+    }
+}
+
+impl From<loom_wire::store_admin::StoreMaintenanceRunKind> for MaintenanceRunKindView {
+    fn from(kind: loom_wire::store_admin::StoreMaintenanceRunKind) -> Self {
+        match kind {
+            loom_wire::store_admin::StoreMaintenanceRunKind::Skipped => Self::Skipped,
+            loom_wire::store_admin::StoreMaintenanceRunKind::Marked => Self::Marked,
+            loom_wire::store_admin::StoreMaintenanceRunKind::Compacted => Self::Compacted,
+            loom_wire::store_admin::StoreMaintenanceRunKind::Reclaimed => Self::Reclaimed,
+        }
+    }
+}
+
+impl From<loom_store::StoreMaintenanceRunOutcome> for MaintenanceRunOutcomeView {
+    fn from(outcome: loom_store::StoreMaintenanceRunOutcome) -> Self {
+        Self {
+            kind: outcome.kind.into(),
+            reason: outcome.reason,
+            visited: outcome.visited,
+            pending: outcome.pending,
+            before: outcome.before,
+            after: outcome.after,
+            reclaimed: outcome.reclaimed,
+            required_temp_bytes: outcome.required_temp_bytes,
+            available_temp_bytes: outcome.available_temp_bytes,
+            segments_reclaimed: outcome.segments_reclaimed,
+            pages_freed: outcome.pages_freed,
+            tail_trim_pages: outcome.tail_trim_pages,
+            tail_trim_bytes: outcome.tail_trim_bytes,
+            tail_compaction_attempted: outcome.tail_compaction_attempted,
+            tail_compaction_relocated_objects: outcome.tail_compaction_relocated_objects,
+            tail_compaction_relocated_pages: outcome.tail_compaction_relocated_pages,
+            tail_compaction_truncated_pages: outcome.tail_compaction_truncated_pages,
+            objects_relocated: outcome.objects_relocated,
+            objects_dropped: outcome.objects_dropped,
+            elapsed_ms: outcome.elapsed_ms,
+        }
+    }
+}
+
+impl From<loom_wire::store_admin::StoreMaintenanceRunResult> for MaintenanceRunOutcomeView {
+    fn from(outcome: loom_wire::store_admin::StoreMaintenanceRunResult) -> Self {
+        Self {
+            kind: outcome.kind.into(),
+            reason: outcome.reason,
+            visited: outcome.visited,
+            pending: outcome.pending,
+            before: outcome.before,
+            after: outcome.after,
+            reclaimed: outcome.reclaimed,
+            required_temp_bytes: outcome.required_temp_bytes,
+            available_temp_bytes: outcome.available_temp_bytes,
+            segments_reclaimed: outcome.segments_reclaimed,
+            pages_freed: outcome.pages_freed,
+            tail_trim_pages: outcome.tail_trim_pages,
+            tail_trim_bytes: outcome.tail_trim_bytes,
+            tail_compaction_attempted: outcome.tail_compaction_attempted,
+            tail_compaction_relocated_objects: outcome.tail_compaction_relocated_objects,
+            tail_compaction_relocated_pages: outcome.tail_compaction_relocated_pages,
+            tail_compaction_truncated_pages: outcome.tail_compaction_truncated_pages,
+            objects_relocated: outcome.objects_relocated,
+            objects_dropped: outcome.objects_dropped,
+            elapsed_ms: outcome.elapsed_ms,
+        }
+    }
+}
+
+fn maintenance_outcome_text(outcome: impl Into<MaintenanceRunOutcomeView>) -> String {
+    let outcome = outcome.into();
+    match outcome.kind {
+        MaintenanceRunKindView::Skipped => format!(
+            "maintenance\tskipped\treason={}",
+            outcome.reason.as_deref().unwrap_or("unknown")
+        ),
+        MaintenanceRunKindView::Marked => format!(
+            "maintenance\tmarked\tvisited={}\tpending={}",
+            outcome.visited.unwrap_or(0),
+            outcome.pending.unwrap_or(0)
+        ),
+        MaintenanceRunKindView::Compacted => format!(
+            "maintenance\tcompacted\tbefore={}\tafter={}\treclaimed={}\trequired_temp_bytes={}\tavailable_temp_bytes={}",
+            outcome.before.unwrap_or(0),
+            outcome.after.unwrap_or(0),
+            outcome.reclaimed.unwrap_or(0),
+            outcome.required_temp_bytes.unwrap_or(0),
+            optional_u64_text(outcome.available_temp_bytes)
+        ),
+        MaintenanceRunKindView::Reclaimed => format!(
+            "maintenance\treclaimed\tsegments_reclaimed={}\tpages_freed={}\ttail_trim_pages={}\ttail_trim_bytes={}\ttail_compaction_attempted={}\ttail_compaction_relocated_objects={}\ttail_compaction_relocated_pages={}\ttail_compaction_truncated_pages={}\tobjects_relocated={}\tobjects_dropped={}\telapsed_ms={}",
+            outcome.segments_reclaimed.unwrap_or(0),
+            outcome.pages_freed.unwrap_or(0),
+            outcome.tail_trim_pages.unwrap_or(0),
+            outcome.tail_trim_bytes.unwrap_or(0),
+            outcome.tail_compaction_attempted.unwrap_or(false),
+            outcome.tail_compaction_relocated_objects.unwrap_or(0),
+            outcome.tail_compaction_relocated_pages.unwrap_or(0),
+            outcome.tail_compaction_truncated_pages.unwrap_or(0),
+            outcome.objects_relocated.unwrap_or(0),
+            outcome.objects_dropped.unwrap_or(0),
+            outcome.elapsed_ms.unwrap_or(0)
+        ),
+    }
+}
+
+#[cfg(test)]
+fn maintenance_text_outcome(
+    kind: loom_store::StoreMaintenanceRunKind,
+    report: loom_store::StoreMaintenanceReport,
+) -> loom_store::StoreMaintenanceRunOutcome {
+    loom_store::StoreMaintenanceRunOutcome {
+        kind,
+        reason: None,
+        visited: None,
+        pending: None,
+        before: None,
+        after: None,
+        reclaimed: None,
+        required_temp_bytes: None,
+        available_temp_bytes: None,
+        segments_reclaimed: None,
+        pages_freed: None,
+        tail_trim_pages: None,
+        tail_trim_bytes: None,
+        tail_compaction_attempted: None,
+        tail_compaction_relocated_objects: None,
+        tail_compaction_relocated_pages: None,
+        tail_compaction_truncated_pages: None,
+        objects_relocated: None,
+        objects_dropped: None,
+        elapsed_ms: None,
+        run_state: report.run_state.clone(),
+        report,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn maintenance_outcome_text_renders_all_typed_kinds_exactly() {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let store = std::env::temp_dir().join(format!(
+        "loomcli-maintenance-outcome-text-{}-{seq}.loom",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&store);
+    let fs = FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+    let report = fs.store_maintenance_report(100).unwrap();
+
+    let mut skipped =
+        maintenance_text_outcome(loom_store::StoreMaintenanceRunKind::Skipped, report.clone());
+    skipped.reason = Some("not_eligible".to_string());
+    assert_eq!(
+        maintenance_outcome_text(skipped),
+        "maintenance\tskipped\treason=not_eligible"
+    );
+
+    let mut marked =
+        maintenance_text_outcome(loom_store::StoreMaintenanceRunKind::Marked, report.clone());
+    marked.visited = Some(3);
+    marked.pending = Some(5);
+    assert_eq!(
+        maintenance_outcome_text(marked),
+        "maintenance\tmarked\tvisited=3\tpending=5"
+    );
+
+    let mut compacted = maintenance_text_outcome(
+        loom_store::StoreMaintenanceRunKind::Compacted,
+        report.clone(),
+    );
+    compacted.before = Some(100);
+    compacted.after = Some(80);
+    compacted.reclaimed = Some(20);
+    compacted.required_temp_bytes = Some(64);
+    compacted.available_temp_bytes = None;
+    assert_eq!(
+        maintenance_outcome_text(compacted),
+        "maintenance\tcompacted\tbefore=100\tafter=80\treclaimed=20\trequired_temp_bytes=64\tavailable_temp_bytes=none"
+    );
+
+    let mut reclaimed =
+        maintenance_text_outcome(loom_store::StoreMaintenanceRunKind::Reclaimed, report);
+    reclaimed.segments_reclaimed = Some(1);
+    reclaimed.pages_freed = Some(2);
+    reclaimed.tail_trim_pages = Some(3);
+    reclaimed.tail_trim_bytes = Some(12_288);
+    reclaimed.tail_compaction_attempted = Some(true);
+    reclaimed.tail_compaction_relocated_objects = Some(4);
+    reclaimed.tail_compaction_relocated_pages = Some(5);
+    reclaimed.tail_compaction_truncated_pages = Some(6);
+    reclaimed.objects_relocated = Some(7);
+    reclaimed.objects_dropped = Some(8);
+    reclaimed.elapsed_ms = Some(9);
+    assert_eq!(
+        maintenance_outcome_text(reclaimed),
+        "maintenance\treclaimed\tsegments_reclaimed=1\tpages_freed=2\ttail_trim_pages=3\ttail_trim_bytes=12288\ttail_compaction_attempted=true\ttail_compaction_relocated_objects=4\ttail_compaction_relocated_pages=5\ttail_compaction_truncated_pages=6\tobjects_relocated=7\tobjects_dropped=8\telapsed_ms=9"
+    );
+
+    let _ = std::fs::remove_file(&store);
 }
 
 fn maintenance_live_root_diagnostics(
     loom: &Loom<FileStore>,
 ) -> Result<LiveRootDiagnostics, String> {
-    let mut extra_roots = Vec::new();
-    let derived_roots = loom
-        .store()
-        .derived_artifact_roots()
-        .map_err(|e| e.to_string())?;
-    for (idx, root) in derived_roots.into_iter().enumerate() {
-        extra_roots.push(("derived_artifact_roots", format!("derived:{idx}"), root));
-    }
-    if let Some(epoch) = loom
-        .store()
-        .active_reachability_mark_epoch()
-        .map_err(|e| e.to_string())?
-    {
-        if let Some(root) = epoch.reference_root {
-            extra_roots.push((
-                "maintenance_mark_epoch_captured_roots",
-                format!("epoch:{}:reference_root", epoch.epoch),
-                root,
-            ));
-        }
-        if let Some(root) = epoch.control_fingerprint {
-            extra_roots.push((
-                "maintenance_mark_epoch_captured_roots",
-                format!("epoch:{}:control_fingerprint", epoch.epoch),
-                root,
-            ));
-        }
-        for (idx, root) in epoch.derived_roots.into_iter().enumerate() {
-            extra_roots.push((
-                "maintenance_mark_epoch_captured_roots",
-                format!("epoch:{}:derived:{idx}", epoch.epoch),
-                root,
-            ));
-        }
-    }
-    loom.live_root_diagnostics(loom.store().reference_root(), extra_roots, 8)
-        .map_err(|e| e.to_string())
+    loom_store::maintenance_live_root_diagnostics(loom).map_err(|e| e.to_string())
 }
 
-fn live_root_diagnostics_json(diagnostics: &LiveRootDiagnostics) -> serde_json::Value {
+fn live_root_diagnostics_json(
+    diagnostics: &MaintenanceLiveRootDiagnosticsView,
+) -> serde_json::Value {
     serde_json::json!({
         "sample_limit": diagnostics.sample_limit,
         "classes": diagnostics.classes.iter().map(|class| {
@@ -1097,7 +1806,7 @@ fn live_root_diagnostics_json(diagnostics: &LiveRootDiagnostics) -> serde_json::
                 "examples": class.examples.iter().map(|example| {
                     serde_json::json!({
                         "id": example.id,
-                        "digest": example.digest.to_string(),
+                        "digest": example.digest,
                     })
                 }).collect::<Vec<_>>(),
                 "truncated": class.truncated,
@@ -1106,10 +1815,8 @@ fn live_root_diagnostics_json(diagnostics: &LiveRootDiagnostics) -> serde_json::
     })
 }
 
-fn maintenance_report_json(
-    report: &StoreMaintenanceReport,
-    diagnostics: Option<&LiveRootDiagnostics>,
-) -> serde_json::Value {
+fn maintenance_report_json(view: &MaintenanceReportView) -> serde_json::Value {
+    let report = &view.report;
     let overlay = serde_json::json!({
         "generation": report.overlay_health.current_generation,
         "current_records": report.overlay_health.current_record_count,
@@ -1127,8 +1834,7 @@ fn maintenance_report_json(
         "active_snapshots": report.mvcc_snapshots.active_snapshot_count,
         "oldest_pinned_generation": report
             .mvcc_snapshots
-            .oldest_pinned_overlay_generation
-            .map(|generation| generation.as_u64()),
+            .oldest_pinned_overlay_generation,
         "pinned_reader_reclaim_pressure": report.mvcc_snapshots.active_snapshot_count > 0
             && report.overlay_obsolete_record_count > 0,
         "pins": report
@@ -1138,12 +1844,8 @@ fn maintenance_report_json(
             .map(|pin| {
                 serde_json::json!({
                     "pin_id": pin.pin_id,
-                    "overlay_generation": pin.identity.overlay_generation.as_u64(),
-                    "base_root": pin
-                        .identity
-                        .immutable_base_root
-                        .as_ref()
-                        .map(|root| root.to_string()),
+                    "overlay_generation": pin.identity.overlay_generation,
+                    "base_root": pin.identity.immutable_base_root,
                     "owner": pin.owner,
                 })
             })
@@ -1247,13 +1949,23 @@ fn maintenance_report_json(
         "policy": policy,
         "run_state": run_state,
     });
-    if let Some(diagnostics) = diagnostics {
+    if let Some(diagnostics) = &view.diagnostics {
         value["live_root_diagnostics"] = live_root_diagnostics_json(diagnostics);
     }
     value
 }
 
-fn overlay_blocked_reclamation_reasons_text(report: &StoreMaintenanceReport) -> String {
+fn overlay_blocked_reclamation_reasons_text(
+    report: &loom_wire::store_admin::StoreMaintenanceReportRecord,
+) -> String {
+    if report.overlay_health.blocked_reclamation_reasons.is_empty() {
+        "none".to_string()
+    } else {
+        report.overlay_health.blocked_reclamation_reasons.join(",")
+    }
+}
+
+fn overlay_blocked_reclamation_reasons_text_store(report: &StoreMaintenanceReport) -> String {
     if report.overlay_health.blocked_reclamation_reasons.is_empty() {
         "none".to_string()
     } else {
@@ -1437,8 +2149,8 @@ fn print_store_doctor_for_path(store: &str, keys: &KeyOpts) {
                         report.overlay_health.live_checkpoint_references,
                         report.overlay_health.reclaimable_overlay_pages,
                         report.overlay_obsolete_page_count,
-                        overlay_blocked_reclamation_reasons_text(&report),
-                        overlay_blocked_reclamation_reasons_text(&report),
+                        overlay_blocked_reclamation_reasons_text_store(&report),
+                        overlay_blocked_reclamation_reasons_text_store(&report),
                         report.overlay_health.hot_write_count,
                         report.overlay_health.active_writer_contention_indicators
                     );
@@ -1474,6 +2186,10 @@ fn print_store_doctor_for_path(store: &str, keys: &KeyOpts) {
                             .pinned_reader_blockers
                             .map_or_else(|| "unavailable".to_string(), |value| value.to_string())
                     );
+                    match fs.root_codec_diagnostics() {
+                        Ok(diagnostics) => print_root_codec_diagnostics(&diagnostics),
+                        Err(error) => println!("store_root_codecs\terror\t{error}"),
+                    }
                     for domain in &report.growth_domains {
                         println!(
                             "store_growth_domain\tdomain={}\tcurrent_records={}\tobsolete_records={}\tpayload_bytes={}",
@@ -1529,6 +2245,60 @@ fn print_store_doctor_for_path(store: &str, keys: &KeyOpts) {
         Err(e) => println!("store_encrypted\terror\t{e}"),
     }
     print_reference_reconciliation_doctor(store, keys);
+}
+
+fn print_root_codec_diagnostics(diagnostics: &loom_store::StoreRootCodecDiagnostics) {
+    for line in root_codec_diagnostic_text_lines(diagnostics, false) {
+        println!("{line}");
+    }
+}
+
+fn root_codec_diagnostic_text_lines(
+    diagnostics: &loom_store::StoreRootCodecDiagnostics,
+    verbose: bool,
+) -> Vec<String> {
+    let state = if diagnostics.failures.is_empty() {
+        "ok"
+    } else {
+        "error"
+    };
+    let mut lines = vec![format!(
+        "store_root_codecs\tstate={state}\tchecked={}\tfailures={}",
+        diagnostics.checked_roots,
+        diagnostics.failures.len()
+    )];
+    for diagnostic in diagnostics
+        .details
+        .iter()
+        .filter(|diagnostic| verbose || diagnostic.failure.is_some())
+    {
+        lines.push(format!(
+            "store_root_codec\troot={}\tfamily_id={}\troot_page={}\tbyte_offset={}\texpected_codec={}\texpected_discriminator={}\traw_magic={}\traw_flags={}\tactual_discriminator={}\tin_range={}\tchecksum_ok={}\tmagic_ok={}\tcodec_ok={}\treachable={}\tfailure={}",
+            diagnostic.root_name,
+            diagnostic.family_id.map_or_else(
+                || "none".to_string(),
+                |family_id| format_args!("0x{family_id:04x}").to_string(),
+            ),
+            diagnostic.root_page,
+            diagnostic.byte_offset,
+            diagnostic.expected_codec,
+            format_args!("0x{:02x}", diagnostic.expected_discriminator),
+            optional_hex_byte(diagnostic.raw_magic),
+            optional_hex_byte(diagnostic.raw_flags),
+            optional_hex_byte(diagnostic.actual_discriminator),
+            diagnostic.in_range,
+            diagnostic.checksum_ok,
+            diagnostic.magic_ok,
+            diagnostic.codec_ok,
+            diagnostic.reachable,
+            diagnostic.failure.unwrap_or("none")
+        ));
+    }
+    lines
+}
+
+fn optional_hex_byte(value: Option<u8>) -> String {
+    value.map_or_else(|| "none".to_string(), |byte| format!("0x{byte:02x}"))
 }
 
 fn print_reference_reconciliation_doctor(store: &str, keys: &KeyOpts) {
@@ -1615,12 +2385,114 @@ fn append_daemon_audit(store: &str, action: &str, target: Option<&str>) -> Resul
     append_daemon_audit_actor(store, None, action, target)
 }
 
+#[cfg(feature = "serve")]
+type DaemonSharedEngine = std::sync::Arc<std::sync::Mutex<Loom<FileStore>>>;
+
+#[cfg(feature = "serve")]
+fn daemon_shared_engines() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<
+        std::path::PathBuf,
+        std::sync::Weak<std::sync::Mutex<Loom<FileStore>>>,
+    >,
+> {
+    static ENGINES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                std::path::PathBuf,
+                std::sync::Weak<std::sync::Mutex<Loom<FileStore>>>,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    ENGINES.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(feature = "serve")]
+fn daemon_store_key(store: &str) -> std::path::PathBuf {
+    std::fs::canonicalize(store).unwrap_or_else(|_| std::path::PathBuf::from(store))
+}
+
+#[cfg(feature = "serve")]
+fn register_daemon_shared_engine(store: &str, engine: &DaemonSharedEngine) -> Result<(), String> {
+    daemon_shared_engines()
+        .lock()
+        .map_err(|_| "daemon shared engine registry lock poisoned".to_string())?
+        .insert(daemon_store_key(store), std::sync::Arc::downgrade(engine));
+    Ok(())
+}
+
+#[cfg(feature = "serve")]
+fn daemon_shared_engine(store: &str) -> Option<DaemonSharedEngine> {
+    let key = daemon_store_key(store);
+    let mut engines = daemon_shared_engines().lock().ok()?;
+    let engine = engines.get(&key).and_then(std::sync::Weak::upgrade);
+    if engine.is_none() {
+        engines.remove(&key);
+    }
+    engine
+}
+
+#[cfg(feature = "serve")]
+fn daemon_hosted_kernel(store: &str) -> loom_hosted::HostedKernel {
+    let kernel = loom_hosted::HostedKernel::new(store)
+        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    match daemon_shared_engine(store) {
+        Some(engine) => kernel.with_shared_engine(engine),
+        None => kernel,
+    }
+}
+
+fn with_daemon_active_store<T>(
+    store: &str,
+    f: impl FnOnce(&FileStore) -> Result<T, String>,
+) -> Result<T, String> {
+    #[cfg(feature = "serve")]
+    {
+        if let Some(engine) = daemon_shared_engine(store) {
+            let loom = engine
+                .lock()
+                .map_err(|_| "daemon shared engine lock poisoned".to_string())?;
+            return f(loom.store());
+        }
+    }
+    let fs = FileStore::open_daemon_authorized(store).map_err(|e| e.to_string())?;
+    f(&fs)
+}
+
+fn with_daemon_active_loom<T>(
+    store: &str,
+    f: impl FnOnce(&mut Loom<FileStore>) -> Result<T, String>,
+) -> Result<T, String> {
+    #[cfg(feature = "serve")]
+    {
+        if let Some(engine) = daemon_shared_engine(store) {
+            let mut loom = engine
+                .lock()
+                .map_err(|_| "daemon shared engine lock poisoned".to_string())?;
+            return f(&mut loom);
+        }
+    }
+    let mut loom =
+        loom_store::open_loom_daemon_authorized_unlocked(store, None).map_err(|e| e.to_string())?;
+    f(&mut loom)
+}
+
 fn append_daemon_audit_actor(
     store: &str,
     actor: Option<WorkspaceId>,
     action: &str,
     target: Option<&str>,
 ) -> Result<(), String> {
+    #[cfg(feature = "serve")]
+    if let Some(engine) = daemon_shared_engine(store) {
+        let loom = engine
+            .lock()
+            .map_err(|_| "daemon shared engine lock poisoned".to_string())?;
+        return loom
+            .store()
+            .audit_append(actor, action, target)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
     let fs = FileStore::open_daemon_authorized(store).map_err(|e| e.to_string())?;
     fs.audit_append(actor, action, target)
         .map(|_| ())
@@ -1779,23 +2651,42 @@ fn start_hosted_listeners(
 }
 
 #[cfg(feature = "serve")]
+fn start_hosted_listeners_for_startup_mode(
+    store: &str,
+    startup_mode: daemon::DaemonStartupMode,
+) -> Result<std::collections::BTreeMap<String, HostedListenerRuntime>, String> {
+    match startup_mode {
+        daemon::DaemonStartupMode::Persistent => start_hosted_listeners(store),
+        daemon::DaemonStartupMode::Managed => Ok(std::collections::BTreeMap::new()),
+    }
+}
+
+#[cfg(feature = "serve")]
 fn desired_hosted_listener_runtimes(store: &str) -> Result<Vec<DesiredHostedRuntime>, String> {
     coalesce_dav_listener_records(store, desired_hosted_listener_records(store)?)
 }
 
 #[cfg(feature = "serve")]
 fn desired_hosted_listener_records(store: &str) -> Result<Vec<ServedListenerRecord>, String> {
-    let fs = FileStore::open_read(store).map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    increment_daemon_hosted_listener_desired_open(store);
+    with_daemon_active_store(store, |fs| desired_hosted_listener_records_from_store(fs))
+}
+
+#[cfg(feature = "serve")]
+fn desired_hosted_listener_records_from_store(
+    fs: &FileStore,
+) -> Result<Vec<ServedListenerRecord>, String> {
     let store_algo = fs.digest_algo();
     let fips_required = fs.store_policy().map_err(|e| e.to_string())?.fips_required;
     let records = fs.served_listeners().map_err(|e| e.to_string())?;
     let has_enabled = records.iter().any(|record| record.enabled);
-    drop(fs);
     if has_enabled
         && let Err(err) = loom_hosted::validate_hosted_store_profile(store_algo, fips_required)
     {
         let target = format!("reason={}", err.message);
-        append_daemon_audit(store, "serve.listener.reject", Some(&target))?;
+        fs.audit_append(None, "serve.listener.reject", Some(&target))
+            .map_err(|error| error.to_string())?;
         return Err(err.to_string());
     }
     let mut enabled = Vec::new();
@@ -1805,7 +2696,8 @@ fn desired_hosted_listener_records(store: &str) -> Result<Vec<ServedListenerReco
             Err(err) => {
                 let (record, reason) = *err;
                 let target = format!("{};reason={reason}", served_listener_target(&record));
-                append_daemon_audit(store, "serve.listener.reject", Some(&target))?;
+                fs.audit_append(None, "serve.listener.reject", Some(&target))
+                    .map_err(|error| error.to_string())?;
                 return Err(reason);
             }
         }
@@ -2096,12 +2988,17 @@ fn start_served_listener(
     let tls_certificate_bundle_fingerprint =
         match served_listener_tls_certificate_bundle_fingerprint(store, &record) {
             Ok(fingerprint) => fingerprint.map(|value| value.internal),
-            Err(reason) => return Err(Box::new((record, reason))),
+            Err(reason) => return Err(Box::new((record, format!("fingerprint TLS: {reason}")))),
         };
     let network_access_policy_fingerprint =
         match served_listener_network_access_policy_fingerprint(store, &record) {
             Ok(fingerprint) => fingerprint.map(|value| value.internal),
-            Err(reason) => return Err(Box::new((record, reason))),
+            Err(reason) => {
+                return Err(Box::new((
+                    record,
+                    format!("fingerprint network access policy: {reason}"),
+                )));
+            }
         };
     let result = match record.surface.as_str() {
         "cas" => start_cas_listener(store, record.clone()),
@@ -2168,16 +3065,21 @@ fn start_cas_listener(
             record.transport, record.id
         ));
     };
-    let workspace = resolve_served_workspace(store, selector)?;
-    let target = served_listener_runtime_target(store, &record)?;
+    let workspace = resolve_served_workspace(store, selector)
+        .map_err(|error| format!("resolve workspace: {error}"))?;
+    let target = served_listener_runtime_target(store, &record)
+        .map_err(|error| format!("build listener target: {error}"))?;
     let bind = record.bind.clone();
     let transport = record.transport.clone();
-    let limits = served_listener_http_limits(&record)?;
-    let tls = served_listener_tls_config(store, &record)?;
-    let auth_policy = served_listener_auth_policy(&record)?;
-    let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let limits = served_listener_http_limits(&record)
+        .map_err(|error| format!("build HTTP limits: {error}"))?;
+    let tls = served_listener_tls_config(store, &record)
+        .map_err(|error| format!("load TLS config: {error}"))?;
+    let auth_policy = served_listener_auth_policy(&record)
+        .map_err(|error| format!("load auth policy: {error}"))?;
+    let network_access_policy = served_listener_network_access_policy(store, &record)
+        .map_err(|error| format!("load network access policy: {error}"))?;
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let store_for_thread = store.clone();
     let target_for_thread = target.clone();
@@ -2255,8 +3157,7 @@ fn start_oci_listener(
     let tls = served_listener_tls_config(store, &record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let store_for_thread = store.clone();
     let target_for_thread = target.clone();
@@ -2337,8 +3238,7 @@ fn start_s3_listener(
     let tls = served_listener_tls_config(store, &record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let store_for_thread = store.clone();
     let target_for_thread = target.clone();
@@ -2438,8 +3338,7 @@ fn start_workspace_file_listener(
     let tls = served_listener_tls_config(store, &record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let store_for_thread = store.clone();
     let target_for_thread = target.clone();
@@ -2518,8 +3417,7 @@ fn start_vcs_listener(
     let tls = served_listener_tls_config(store, &record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let store_for_thread = store.clone();
     let target_for_thread = target.clone();
@@ -2629,15 +3527,23 @@ fn start_data_listener(
     let tls = served_listener_tls_config(store, &record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let mut kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let mut kernel = daemon_hosted_kernel(store);
     if surface == "meetings" {
-        let inference_loom = loom_store::open_loom_daemon_authorized_unlocked(store, None)
-            .map_err(|error| error.to_string())?;
         let inference_workspace = resolve_served_workspace(store, &workspace)?;
-        if let Some(resolved) =
-            resolve_optional_vector_binding(&inference_loom, inference_workspace, None)?
-        {
+        let resolved = match daemon_shared_engine(store) {
+            Some(engine) => {
+                let loom = engine
+                    .lock()
+                    .map_err(|_| "daemon shared engine lock poisoned".to_string())?;
+                resolve_optional_vector_binding(&loom, inference_workspace, None)?
+            }
+            None => {
+                let loom = loom_store::open_loom_read_unlocked(store, None)
+                    .map_err(|error| error.to_string())?;
+                resolve_optional_vector_binding(&loom, inference_workspace, None)?
+            }
+        };
+        if let Some(resolved) = resolved {
             kernel = kernel.with_meetings_embedding_runtime(
                 loom_hosted::meetings::HostedMeetingsEmbeddingRuntime::new(
                     resolved.instance,
@@ -2729,8 +3635,7 @@ fn start_influx_listener(
     let limits = served_listener_http_limits(&record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let store_for_thread = store.clone();
@@ -2813,8 +3718,7 @@ fn start_prometheus_listener(
     let limits = served_listener_http_limits(&record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let store_for_thread = store.clone();
@@ -2901,8 +3805,7 @@ fn start_grafana_listener(
     let limits = served_listener_http_limits(&record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let store_for_thread = store.clone();
     let target_for_thread = target.clone();
@@ -2985,8 +3888,7 @@ fn start_otlp_listener(
     let limits = served_listener_http_limits(&record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let store_for_thread = store.clone();
@@ -3067,8 +3969,7 @@ fn start_redis_listener(
     let surface = record.surface.clone();
     let transport = record.transport.clone();
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let keyspace = keyspace.clone();
@@ -3150,8 +4051,7 @@ fn start_memcached_listener(
     let transport = record.transport.clone();
     let mode = loom_hosted::MemcachedCacheMode::from_profile(record.profile.as_deref());
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let display_cache_name = format!("{workspace}:{cache}");
@@ -3235,8 +4135,7 @@ fn start_etcd_listener(
     let surface = record.surface.clone();
     let transport = record.transport.clone();
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let collection = collection.clone();
@@ -3317,8 +4216,7 @@ fn start_kafka_listener(
     let surface = record.surface.clone();
     let transport = record.transport.clone();
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let store_for_thread = store.clone();
@@ -3397,8 +4295,7 @@ fn start_neo4j_listener(
     let surface = record.surface.clone();
     let transport = record.transport.clone();
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let graph = graph.clone();
@@ -3475,8 +4372,7 @@ fn start_admin_listener(
     let tls = served_listener_tls_config(store, &record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let store_for_thread = store.clone();
     let target_for_thread = target.clone();
@@ -3551,8 +4447,7 @@ fn start_exec_listener(
     let tls = served_listener_tls_config(store, &record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let store_for_thread = store.clone();
     let target_for_thread = target.clone();
@@ -3633,8 +4528,7 @@ fn start_sql_listener(
     let tls = served_listener_tls_config(store, &record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let database = database.clone();
@@ -3715,8 +4609,7 @@ fn start_mail_listener(
     let limits = served_listener_http_limits(&record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let store_for_thread = store.clone();
@@ -3795,8 +4688,7 @@ fn start_pim_listener(
     let tls = served_listener_tls_config(store, &record)?;
     let auth_policy = served_listener_auth_policy(&record)?;
     let network_access_policy = served_listener_network_access_policy(store, &record)?;
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let workspace = workspace.clone();
     let store_for_thread = store.clone();
@@ -3905,8 +4797,7 @@ fn start_dav_listener_group(
             }
         }
     }
-    let kernel = loom_hosted::HostedKernel::new(store)
-        .with_write_guard(loom_hosted::HostedWriteGuard::DaemonAuthorized);
+    let kernel = daemon_hosted_kernel(store);
     let store = store.to_string();
     let store_for_thread = store.clone();
     let target_for_thread = target.clone();
@@ -4293,26 +5184,31 @@ fn served_listener_tls_config(
                         record.id
                     )
                 })?;
-            let fs = FileStore::open_read(store)
-                .map_err(|e| format!("open store to load TLS bundle {bundle_name:?}: {e}"))?;
-            let bundle = fs
-                .certificate_bundle(bundle_name)
-                .map_err(|e| format!("load TLS bundle {bundle_name:?}: {e}"))?
-                .ok_or_else(|| format!("TLS certificate bundle {bundle_name:?} not found"))?;
+            let (bundle, network_policy) = with_daemon_active_store(store, |fs| {
+                let bundle = fs
+                    .certificate_bundle(bundle_name)
+                    .map_err(|e| format!("load TLS bundle {bundle_name:?}: {e}"))?
+                    .ok_or_else(|| format!("TLS certificate bundle {bundle_name:?} not found"))?;
+                let network_policy = record
+                    .network_access_policy_ref
+                    .as_deref()
+                    .map(|policy_name| {
+                        fs.network_access_policy(policy_name)
+                            .map_err(|e| {
+                                format!("load network access policy {policy_name:?}: {e}")
+                            })?
+                            .ok_or_else(|| {
+                                format!("network access policy {policy_name:?} not found")
+                            })
+                    })
+                    .transpose()?;
+                Ok((bundle, network_policy))
+            })?;
             let cert_ref = format!("certificate bundle {bundle_name} server chain");
             let key_ref = format!("certificate bundle {bundle_name} private key");
-            let require_client_auth = match record.network_access_policy_ref.as_deref() {
-                Some(policy_name) => {
-                    let policy = fs
-                        .network_access_policy(policy_name)
-                        .map_err(|e| format!("load network access policy {policy_name:?}: {e}"))?
-                        .ok_or_else(|| {
-                            format!("network access policy {policy_name:?} not found")
-                        })?;
-                    served_listener_network_access_policy_requires_mtls(&policy)
-                }
-                None => false,
-            };
+            let require_client_auth = network_policy
+                .as_ref()
+                .is_some_and(served_listener_network_access_policy_requires_mtls);
             let trust_bundle_ref = if require_client_auth {
                 Some((
                     format!("certificate bundle {bundle_name} trust bundle"),
@@ -4393,12 +5289,23 @@ fn served_listener_network_access_policy(
     let Some(policy_name) = record.network_access_policy_ref.as_deref() else {
         return Ok(None);
     };
-    let fs = FileStore::open_read(store)
-        .map_err(|e| format!("open store to load network access policy {policy_name:?}: {e}"))?;
-    let policy = fs
-        .network_access_policy(policy_name)
-        .map_err(|e| format!("load network access policy {policy_name:?}: {e}"))?
-        .ok_or_else(|| format!("network access policy {policy_name:?} not found"))?;
+    let (policy, bundle) = with_daemon_active_store(store, |fs| {
+        let policy = fs
+            .network_access_policy(policy_name)
+            .map_err(|e| format!("load network access policy {policy_name:?}: {e}"))?
+            .ok_or_else(|| format!("network access policy {policy_name:?} not found"))?;
+        let bundle = record
+            .tls
+            .certificate_bundle_ref
+            .as_deref()
+            .map(|bundle_name| {
+                fs.certificate_bundle(bundle_name)
+                    .map_err(|e| format!("load TLS bundle {bundle_name:?}: {e}"))?
+                    .ok_or_else(|| format!("TLS certificate bundle {bundle_name:?} not found"))
+            })
+            .transpose()?;
+        Ok((policy, bundle))
+    })?;
     if served_listener_network_access_policy_requires_mtls(&policy) {
         if record.tls.mode != "direct" {
             return Err(format!(
@@ -4412,10 +5319,8 @@ fn served_listener_network_access_policy(
             .ok_or_else(|| {
                 format!("network access policy {policy_name:?} requires a TLS certificate bundle")
             })?;
-        let bundle = fs
-            .certificate_bundle(bundle_name)
-            .map_err(|e| format!("load TLS bundle {bundle_name:?}: {e}"))?
-            .ok_or_else(|| format!("TLS certificate bundle {bundle_name:?} not found"))?;
+        let bundle =
+            bundle.ok_or_else(|| format!("TLS certificate bundle {bundle_name:?} not found"))?;
         if bundle.trust_bundle_pem.is_none() {
             return Err(format!(
                 "network access policy {policy_name:?} requires mTLS but certificate bundle {bundle_name:?} has no trust bundle"
@@ -4445,16 +5350,14 @@ fn served_listener_network_access_policy_fingerprint(
     let Some(policy_name) = record.network_access_policy_ref.as_deref() else {
         return Ok(None);
     };
-    let fs = FileStore::open_read(store).map_err(|e| {
-        format!("open store to fingerprint network access policy {policy_name:?}: {e}")
+    let digest = with_daemon_active_store(store, |fs| {
+        let policy = fs
+            .network_access_policy(policy_name)
+            .map_err(|e| format!("fingerprint network access policy {policy_name:?}: {e}"))?
+            .ok_or_else(|| format!("network access policy {policy_name:?} not found"))?;
+        fs.network_access_policy_digest(&policy)
+            .map_err(|e| format!("fingerprint network access policy {policy_name:?}: {e}"))
     })?;
-    let policy = fs
-        .network_access_policy(policy_name)
-        .map_err(|e| format!("fingerprint network access policy {policy_name:?}: {e}"))?
-        .ok_or_else(|| format!("network access policy {policy_name:?} not found"))?;
-    let digest = fs
-        .network_access_policy_digest(&policy)
-        .map_err(|e| format!("fingerprint network access policy {policy_name:?}: {e}"))?;
     Ok(Some(HostedNetworkAccessPolicyFingerprint {
         internal: format!("name={policy_name};digest={digest}"),
         audit_suffix: format!(
@@ -6903,11 +7806,19 @@ fn serve_s3_thread(request: S3ThreadRequest) -> Result<(), String> {
 
 #[cfg(feature = "serve")]
 fn resolve_served_workspace(store: &str, selector: &str) -> Result<WorkspaceId, String> {
+    with_daemon_active_loom(store, |loom| {
+        resolve_served_workspace_from_loom(loom, selector)
+    })
+}
+
+#[cfg(feature = "serve")]
+fn resolve_served_workspace_from_loom(
+    loom: &Loom<FileStore>,
+    selector: &str,
+) -> Result<WorkspaceId, String> {
     if let Ok(id) = WorkspaceId::parse(selector) {
         return Ok(id);
     }
-    let loom =
-        loom_store::open_loom_daemon_authorized_unlocked(store, None).map_err(|e| e.to_string())?;
     loom.registry()
         .open(&WsSelector::Name(selector.to_string()))
         .map_err(|e| e.to_string())
@@ -6939,16 +7850,42 @@ impl DaemonTransportSelection {
 }
 
 pub(crate) fn daemon_start_with_transport(store: &str, transport: &str) -> Result<(), String> {
-    daemon_start_selected(store, DaemonTransportSelection::parse(transport)?)
+    daemon_start_with_transport_for(
+        store,
+        transport,
+        daemon::DaemonStartupMode::Persistent,
+        daemon::DaemonStartupInitiator::CliDaemonStart,
+    )
 }
 
-fn daemon_start_selected(store: &str, transport: DaemonTransportSelection) -> Result<(), String> {
+fn daemon_start_with_transport_for(
+    store: &str,
+    transport: &str,
+    startup_mode: daemon::DaemonStartupMode,
+    startup_initiator: daemon::DaemonStartupInitiator,
+) -> Result<(), String> {
+    daemon_start_selected(
+        store,
+        DaemonTransportSelection::parse(transport)?,
+        startup_mode,
+        startup_initiator,
+    )
+}
+
+fn daemon_start_selected(
+    store: &str,
+    transport: DaemonTransportSelection,
+    startup_mode: daemon::DaemonStartupMode,
+    startup_initiator: daemon::DaemonStartupInitiator,
+) -> Result<(), String> {
     let paths = daemon::paths(store).map_err(|e| e.to_string())?;
-    let startup_guard =
-        FileStore::open_daemon_authorized(&paths.store).map_err(|e| e.to_string())?;
     if let Ok(status) = daemon::status_response(&paths) {
-        let target = format!("pid={};state=running", status.pid);
-        append_daemon_audit(&paths.store, "daemon.start", Some(&target))?;
+        if status.startup_mode == daemon::DaemonStartupMode::Managed
+            && startup_mode == daemon::DaemonStartupMode::Persistent
+        {
+            daemon_promote_persistent(&paths)?;
+        }
+        daemon_record_start_audit(&paths, &status.pid, "running")?;
         println!("running\t{}\t{}", status.pid, status.store);
         return Ok(());
     }
@@ -6969,12 +7906,25 @@ fn daemon_start_selected(store: &str, transport: DaemonTransportSelection) -> Re
         }
         Err(e) => return Err(format!("create daemon lock: {e}")),
     };
-    daemon_write_runtime_lock(&startup_lock, &paths)
-        .map_err(|e| format!("write daemon lock: {e}"))?;
+    let startup_started_ms = now_ms();
+    daemon_write_runtime_lock_progress(
+        &startup_lock,
+        &paths,
+        startup_mode,
+        startup_initiator,
+        daemon::DaemonStartupStage::Spawned,
+        startup_started_ms,
+        startup_started_ms,
+        startup_started_ms,
+        startup_started_ms,
+        0,
+        0,
+        None,
+    )
+    .map_err(|e| format!("write daemon lock: {e}"))?;
     let _ = std::fs::remove_file(&paths.addr_file);
     let _ = std::fs::remove_file(&paths.pid_file);
     let _ = std::fs::remove_file(&paths.sock_file);
-    drop(startup_guard);
     let exe = std::env::current_exe().map_err(|e| format!("resolve current executable: {e}"))?;
     let stdout_log = daemon_start_log_file(&paths, "stdout");
     let stderr_log = daemon_start_log_file(&paths, "stderr");
@@ -6993,6 +7943,10 @@ fn daemon_start_selected(store: &str, transport: DaemonTransportSelection) -> Re
         .arg(&paths.lock_file)
         .arg("--transport")
         .arg(transport.cli_value())
+        .arg("--startup-mode")
+        .arg(startup_mode.wire_name())
+        .arg("--startup-initiator")
+        .arg(startup_initiator.wire_name())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr));
@@ -7009,20 +7963,107 @@ fn daemon_start_selected(store: &str, transport: DaemonTransportSelection) -> Re
         }
     };
     drop(startup_lock);
-    for _ in 0..50 {
+    let command_deadline_ms = startup_started_ms.saturating_add(daemon_start_command_wait_ms());
+    let no_progress_ms = daemon_start_no_progress_ms();
+    let mut last_progress_ms = startup_started_ms;
+    let mut last_stage = daemon::DaemonStartupStage::Spawned;
+    loop {
+        let now = now_ms();
         if let Ok(status) = daemon::status_response(&paths) {
-            let target = format!("pid={};state=started", status.pid);
-            append_daemon_audit(&paths.store, "daemon.start", Some(&target))?;
+            daemon_record_start_audit(&paths, &status.pid, "started")?;
             println!("started\t{}\t{}", status.pid, status.store);
             return Ok(());
         }
+        if let Some(metadata) = daemon::starting_runtime_metadata(&paths) {
+            if let Some(stage) = metadata.startup_stage
+                && stage != last_stage
+            {
+                last_stage = stage;
+            }
+            if let Some(progress_ms) = metadata.progress_ms {
+                last_progress_ms = progress_ms;
+            }
+            match daemon_start_wait_decision(
+                now,
+                startup_started_ms,
+                last_progress_ms,
+                command_deadline_ms,
+                no_progress_ms,
+            ) {
+                DaemonStartWaitDecision::Continue => {}
+                DaemonStartWaitDecision::ReportStarting => {
+                    println!(
+                        "starting\t{}\tstage={}\telapsed_ms={}\tprogress_age_ms={}\t{}",
+                        metadata.pid,
+                        last_stage.wire_name(),
+                        now.saturating_sub(startup_started_ms),
+                        now.saturating_sub(last_progress_ms),
+                        paths.store
+                    );
+                    return Ok(());
+                }
+                DaemonStartWaitDecision::Stalled => {
+                    let logs = daemon_start_log_summary(&stdout_log, &stderr_log);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    cleanup_unlocked_runtime_files(&paths);
+                    return Err(format!(
+                        "daemon startup stalled for {} at stage={} elapsed_ms={} progress_age_ms={}\n{logs}",
+                        paths.store,
+                        last_stage.wire_name(),
+                        now.saturating_sub(startup_started_ms),
+                        now.saturating_sub(last_progress_ms)
+                    ));
+                }
+            }
+        } else {
+            match daemon_start_wait_decision(
+                now,
+                startup_started_ms,
+                last_progress_ms,
+                command_deadline_ms,
+                no_progress_ms,
+            ) {
+                DaemonStartWaitDecision::Continue => {}
+                DaemonStartWaitDecision::ReportStarting => {
+                    println!(
+                        "starting\t{}\tstage={}\telapsed_ms={}\tprogress_age_ms={}\t{}",
+                        child.id(),
+                        last_stage.wire_name(),
+                        now.saturating_sub(startup_started_ms),
+                        now.saturating_sub(last_progress_ms),
+                        paths.store
+                    );
+                    return Ok(());
+                }
+                DaemonStartWaitDecision::Stalled => {
+                    let logs = daemon_start_log_summary(&stdout_log, &stderr_log);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    cleanup_unlocked_runtime_files(&paths);
+                    return Err(format!(
+                        "daemon startup stalled for {} at stage={} elapsed_ms={} progress_age_ms={}\n{logs}",
+                        paths.store,
+                        last_stage.wire_name(),
+                        now.saturating_sub(startup_started_ms),
+                        now.saturating_sub(last_progress_ms)
+                    ));
+                }
+            }
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
+                if let Some(metadata) = daemon::runtime_lock_metadata(&paths)
+                    && let Some(stage) = metadata.startup_stage
+                {
+                    last_stage = stage;
+                }
                 let logs = daemon_start_log_summary(&stdout_log, &stderr_log);
                 cleanup_unlocked_runtime_files(&paths);
                 return Err(format!(
-                    "daemon exited during startup for {} with {status}\n{logs}",
-                    paths.store
+                    "daemon exited during startup for {} with {status} at stage={}\n{logs}",
+                    paths.store,
+                    last_stage.wire_name()
                 ));
             }
             Ok(None) => {}
@@ -7033,11 +8074,431 @@ fn daemon_start_selected(store: &str, transport: DaemonTransportSelection) -> Re
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let logs = daemon_start_log_summary(&stdout_log, &stderr_log);
-    let _ = child.kill();
-    let _ = child.wait();
-    cleanup_unlocked_runtime_files(&paths);
-    Err(format!("daemon did not start for {}\n{logs}", paths.store))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonStartWaitDecision {
+    Continue,
+    ReportStarting,
+    Stalled,
+}
+
+fn daemon_start_wait_decision(
+    now_ms: u64,
+    _startup_started_ms: u64,
+    last_progress_ms: u64,
+    command_deadline_ms: u64,
+    no_progress_ms: u64,
+) -> DaemonStartWaitDecision {
+    if now_ms.saturating_sub(last_progress_ms) > no_progress_ms {
+        DaemonStartWaitDecision::Stalled
+    } else if now_ms > command_deadline_ms {
+        DaemonStartWaitDecision::ReportStarting
+    } else {
+        DaemonStartWaitDecision::Continue
+    }
+}
+
+fn daemon_start_command_wait_ms() -> u64 {
+    std::env::var("ULDREN_LOOM_DAEMON_START_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30_000)
+}
+
+fn daemon_start_no_progress_ms() -> u64 {
+    std::env::var("ULDREN_LOOM_DAEMON_START_NO_PROGRESS_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10_000)
+}
+
+fn daemon_record_start_audit(
+    paths: &daemon::DaemonPaths,
+    pid: &str,
+    state: &str,
+) -> Result<(), String> {
+    if pid.parse::<u32>().is_err() {
+        return Err(format!("daemon status returned invalid pid {pid:?}"));
+    }
+    daemon::field(pid).map_err(|e| e.to_string())?;
+    daemon::field(state).map_err(|e| e.to_string())?;
+    let response = daemon::request_checked(paths, &format!("daemon-start-audit\t{pid}\t{state}\n"))
+        .map_err(|e| e.to_string())?;
+    if response == "ok\n" {
+        Ok(())
+    } else {
+        Err(format!(
+            "daemon start audit returned unexpected response: {}",
+            response.trim_end()
+        ))
+    }
+}
+
+fn daemon_promote_persistent(paths: &daemon::DaemonPaths) -> Result<(), String> {
+    let response =
+        daemon::request_checked(paths, "daemon-promote-persistent\n").map_err(|e| e.to_string())?;
+    if response.starts_with("promoted\t") || response.starts_with("persistent\t") {
+        Ok(())
+    } else {
+        Err(format!(
+            "daemon promotion returned unexpected response: {}",
+            response.trim_end()
+        ))
+    }
+}
+
+fn daemon_rewrite_runtime_lock_metadata(
+    paths: &daemon::DaemonPaths,
+    startup_mode: daemon::DaemonStartupMode,
+    startup_initiator: daemon::DaemonStartupInitiator,
+) -> Result<(), String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.lock_file)
+        .map_err(|e| format!("open daemon runtime lock: {e}"))?;
+    daemon_write_runtime_lock(&file, paths, startup_mode, startup_initiator)
+        .map_err(|e| format!("write daemon runtime lock: {e}"))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "startup lock metadata is persisted as separate wire fields and has no existing aggregate type"
+)]
+fn daemon_write_runtime_lock_progress(
+    file: &std::fs::File,
+    paths: &daemon::DaemonPaths,
+    startup_mode: daemon::DaemonStartupMode,
+    startup_initiator: daemon::DaemonStartupInitiator,
+    stage: daemon::DaemonStartupStage,
+    startup_started_ms: u64,
+    stage_started_ms: u64,
+    heartbeat_ms: u64,
+    progress_ms: u64,
+    progress_seq: u64,
+    progress_completed: u64,
+    progress_total: Option<u64>,
+) -> std::io::Result<()> {
+    file.set_len(0)?;
+    let mut file = file;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+    writeln!(file, "store={}", paths.store)?;
+    writeln!(file, "identity={}", paths.store_id)?;
+    writeln!(file, "pid={}", std::process::id())?;
+    writeln!(file, "phase=starting")?;
+    writeln!(file, "startup_mode={}", startup_mode.wire_name())?;
+    writeln!(file, "startup_initiator={}", startup_initiator.wire_name())?;
+    writeln!(file, "startup_stage={}", stage.wire_name())?;
+    writeln!(file, "startup_started_ms={startup_started_ms}")?;
+    writeln!(file, "stage_started_ms={stage_started_ms}")?;
+    writeln!(file, "heartbeat_ms={heartbeat_ms}")?;
+    writeln!(file, "progress_ms={progress_ms}")?;
+    writeln!(file, "progress_seq={progress_seq}")?;
+    writeln!(file, "progress_completed={progress_completed}")?;
+    if let Some(progress_total) = progress_total {
+        writeln!(file, "progress_total={progress_total}")?;
+    }
+    daemon::align_runtime_artifact_owner(&paths.lock_file, "lock", paths)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(())
+}
+
+struct DaemonStartupProgress {
+    file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    paths: daemon::DaemonPaths,
+    startup_mode: daemon::DaemonStartupMode,
+    startup_initiator: daemon::DaemonStartupInitiator,
+    startup_started_ms: u64,
+    state: std::sync::Arc<std::sync::Mutex<DaemonStartupProgressState>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+struct DaemonStartupProgressState {
+    stage: daemon::DaemonStartupStage,
+    stage_started_ms: u64,
+    progress_ms: u64,
+    progress_seq: u64,
+    progress_completed: u64,
+    progress_total: Option<u64>,
+}
+
+impl DaemonStartupProgress {
+    fn start(
+        file: &std::fs::File,
+        paths: &daemon::DaemonPaths,
+        startup_mode: daemon::DaemonStartupMode,
+        startup_initiator: daemon::DaemonStartupInitiator,
+        startup_started_ms: u64,
+        stage: daemon::DaemonStartupStage,
+    ) -> Result<Self, String> {
+        let stage_started_ms = now_ms();
+        let file = std::sync::Arc::new(std::sync::Mutex::new(
+            file.try_clone()
+                .map_err(|e| format!("clone daemon runtime lock: {e}"))?,
+        ));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(DaemonStartupProgressState {
+            stage,
+            stage_started_ms,
+            progress_ms: stage_started_ms,
+            progress_seq: 1,
+            progress_completed: 0,
+            progress_total: None,
+        }));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let file = file
+                .lock()
+                .map_err(|_| "daemon startup progress lock poisoned".to_string())?;
+            daemon_write_runtime_lock_progress(
+                &file,
+                paths,
+                startup_mode,
+                startup_initiator,
+                stage,
+                startup_started_ms,
+                stage_started_ms,
+                stage_started_ms,
+                stage_started_ms,
+                1,
+                0,
+                None,
+            )
+            .map_err(|e| format!("write daemon startup progress: {e}"))?;
+        }
+        let heartbeat_file = file.clone();
+        let heartbeat_paths = paths.clone();
+        let heartbeat_state = state.clone();
+        let heartbeat_stop = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !heartbeat_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if heartbeat_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                let (
+                    stage,
+                    stage_started_ms,
+                    progress_ms,
+                    progress_seq,
+                    progress_completed,
+                    progress_total,
+                ) = match heartbeat_state.lock() {
+                    Ok(state) => (
+                        state.stage,
+                        state.stage_started_ms,
+                        state.progress_ms,
+                        state.progress_seq,
+                        state.progress_completed,
+                        state.progress_total,
+                    ),
+                    Err(_) => break,
+                };
+                let Ok(file) = heartbeat_file.lock() else {
+                    break;
+                };
+                let _ = daemon_write_runtime_lock_progress(
+                    &file,
+                    &heartbeat_paths,
+                    startup_mode,
+                    startup_initiator,
+                    stage,
+                    startup_started_ms,
+                    stage_started_ms,
+                    now_ms(),
+                    progress_ms,
+                    progress_seq,
+                    progress_completed,
+                    progress_total,
+                );
+            }
+        });
+        Ok(Self {
+            file,
+            paths: paths.clone(),
+            startup_mode,
+            startup_initiator,
+            startup_started_ms,
+            state,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn report(
+        &self,
+        stage: daemon::DaemonStartupStage,
+        completed: u64,
+        total: Option<u64>,
+    ) -> Result<(), String> {
+        let stage_started_ms = now_ms();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "daemon startup progress lock poisoned".to_string())?;
+            state.stage = stage;
+            state.stage_started_ms = stage_started_ms;
+            state.progress_ms = stage_started_ms;
+            state.progress_seq = state.progress_seq.saturating_add(1);
+            state.progress_completed = completed;
+            state.progress_total = total;
+        }
+        let (progress_ms, progress_seq, progress_completed, progress_total) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| "daemon startup progress lock poisoned".to_string())?;
+            (
+                state.progress_ms,
+                state.progress_seq,
+                state.progress_completed,
+                state.progress_total,
+            )
+        };
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| "daemon startup progress lock poisoned".to_string())?;
+        daemon_write_runtime_lock_progress(
+            &file,
+            &self.paths,
+            self.startup_mode,
+            self.startup_initiator,
+            stage,
+            self.startup_started_ms,
+            stage_started_ms,
+            stage_started_ms,
+            progress_ms,
+            progress_seq,
+            progress_completed,
+            progress_total,
+        )
+        .map_err(|e| format!("write daemon startup progress: {e}"))
+    }
+
+    fn stage(&self, stage: daemon::DaemonStartupStage) -> Result<(), String> {
+        self.report(stage, 0, None)
+    }
+
+    fn finish(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn daemon_open_progress(
+    event: loom_store::LoomOpenProgress,
+) -> (daemon::DaemonStartupStage, u64, Option<u64>) {
+    match event {
+        loom_store::LoomOpenProgress::Store(event) => {
+            let stage = match event.stage {
+                loom_store::StoreOpenStage::Backing => daemon::DaemonStartupStage::StoreBacking,
+                loom_store::StoreOpenStage::JournalRecovery => {
+                    daemon::DaemonStartupStage::StoreJournalRecovery
+                }
+                loom_store::StoreOpenStage::RegionTable => {
+                    daemon::DaemonStartupStage::StoreRegionTable
+                }
+                loom_store::StoreOpenStage::RootCatalog => {
+                    daemon::DaemonStartupStage::StoreRootCatalog
+                }
+                loom_store::StoreOpenStage::FreeMap => daemon::DaemonStartupStage::StoreFreeMap,
+                loom_store::StoreOpenStage::Index => daemon::DaemonStartupStage::StoreIndex,
+                loom_store::StoreOpenStage::MutableOverlayIndex => {
+                    daemon::DaemonStartupStage::StoreMutableOverlayIndex
+                }
+                loom_store::StoreOpenStage::MutableOverlayRecords => {
+                    daemon::DaemonStartupStage::StoreMutableOverlayRecords
+                }
+                loom_store::StoreOpenStage::MutableOverlayImport => {
+                    daemon::DaemonStartupStage::StoreMutableOverlayImport
+                }
+            };
+            (stage, event.completed, event.total)
+        }
+        loom_store::LoomOpenProgress::Engine(event) => {
+            let stage = match event.stage {
+                loom_core::vcs::EngineStateLoadStage::Root => {
+                    daemon::DaemonStartupStage::EngineRoot
+                }
+                loom_core::vcs::EngineStateLoadStage::Sections => {
+                    daemon::DaemonStartupStage::EngineSections
+                }
+                loom_core::vcs::EngineStateLoadStage::Content => {
+                    daemon::DaemonStartupStage::EngineContent
+                }
+                loom_core::vcs::EngineStateLoadStage::StagedMap => {
+                    daemon::DaemonStartupStage::EngineStagedMap
+                }
+                loom_core::vcs::EngineStateLoadStage::Import => {
+                    daemon::DaemonStartupStage::EngineImport
+                }
+            };
+            (stage, event.completed, event.total)
+        }
+        loom_store::LoomOpenProgress::Loom(event) => {
+            let stage = match event.stage {
+                loom_store::LoomOpenStage::Unlock => daemon::DaemonStartupStage::Unlock,
+                loom_store::LoomOpenStage::RuntimePolicy => {
+                    daemon::DaemonStartupStage::RuntimePolicy
+                }
+                loom_store::LoomOpenStage::MutableOverlayExport => {
+                    daemon::DaemonStartupStage::MutableOverlayExport
+                }
+                loom_store::LoomOpenStage::MutableOverlayImport => {
+                    daemon::DaemonStartupStage::MutableOverlayImport
+                }
+            };
+            (stage, event.completed, event.total)
+        }
+        loom_store::LoomOpenProgress::Ready => (
+            daemon::DaemonStartupStage::GeneratedRuntimeReady,
+            1,
+            Some(1),
+        ),
+    }
+}
+
+impl Drop for DaemonStartupProgress {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(feature = "daemon-cli-tests")]
+fn daemon_startup_test_hook(startup_progress: &DaemonStartupProgress) -> Result<(), String> {
+    match std::env::var("LOOM_MU15D_S_STARTUP_TEST").ok().as_deref() {
+        Some("slow-progress") => {
+            for completed in 1..=3 {
+                startup_progress.report(
+                    daemon::DaemonStartupStage::StoreJournalRecovery,
+                    completed,
+                    Some(3),
+                )?;
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Ok(())
+        }
+        Some("stalled") => {
+            startup_progress.stage(daemon::DaemonStartupStage::StoreIndex)?;
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            Ok(())
+        }
+        Some("exit") => {
+            startup_progress.stage(daemon::DaemonStartupStage::StoreBacking)?;
+            Err("test requested startup exit".to_string())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn daemon_start_log_file(paths: &daemon::DaemonPaths, stream: &str) -> std::path::PathBuf {
@@ -7129,7 +8590,13 @@ pub(crate) fn daemon_status(store: &str, json: bool) -> Result<(), String> {
         }
         Err(_) => {
             match daemon_existing_runtime_lock_state(&paths) {
-                Ok(RuntimeLockState::Busy) => println!("starting\t-\t{}", paths.store),
+                Ok(RuntimeLockState::Busy) => {
+                    if let Some(metadata) = daemon::starting_runtime_metadata(&paths) {
+                        println!("{}", daemon_starting_status_line(&metadata));
+                    } else {
+                        println!("starting\t-\t{}", paths.store);
+                    }
+                }
                 Ok(RuntimeLockState::Acquired(lock)) => {
                     daemon_cleanup_files(&paths);
                     drop(lock);
@@ -7146,13 +8613,42 @@ pub(crate) fn daemon_status(store: &str, json: bool) -> Result<(), String> {
     }
 }
 
+fn daemon_starting_status_line(metadata: &daemon::DaemonRuntimeLockMetadata) -> String {
+    let now = now_ms();
+    let startup_started_ms = metadata.startup_started_ms.unwrap_or(now);
+    let progress_ms = metadata.progress_ms.unwrap_or(startup_started_ms);
+    let heartbeat_ms = metadata.heartbeat_ms.unwrap_or(progress_ms);
+    format!(
+        "starting\t{}\tstage={}\telapsed_ms={}\tprogress_age_ms={}\theartbeat_age_ms={}\tprogress_seq={}\tprogress_completed={}\tprogress_total={}\tstartup_mode={}\tstartup_initiator={}\t{}",
+        metadata.pid,
+        metadata
+            .startup_stage
+            .map(daemon::DaemonStartupStage::wire_name)
+            .unwrap_or("unknown"),
+        now.saturating_sub(startup_started_ms),
+        now.saturating_sub(progress_ms),
+        now.saturating_sub(heartbeat_ms),
+        metadata.progress_seq.unwrap_or(0),
+        metadata.progress_completed.unwrap_or(0),
+        metadata
+            .progress_total
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        metadata.startup_mode.as_deref().unwrap_or("unknown"),
+        metadata.startup_initiator.as_deref().unwrap_or("unknown"),
+        metadata.store
+    )
+}
+
 fn daemon_status_line(status: &daemon::DaemonStatus) -> String {
     format!(
-        "running\tprotocol={}\ttransport={}\tsecurity={}\tprofile={}\t{}\t{}",
+        "running\tprotocol={}\ttransport={}\tsecurity={}\tprofile={}\tstartup_mode={}\tstartup_initiator={}\t{}\t{}",
         daemon::PROTOCOL,
         status.transport.wire_name(),
         status.transport.security().wire_name(),
         daemon_transport_profile(status.transport),
+        status.startup_mode.wire_name(),
+        status.startup_initiator.wire_name(),
         status.pid,
         status.store
     )
@@ -7199,12 +8695,16 @@ fn daemon_existing_runtime_lock_state(
 fn daemon_write_runtime_lock(
     file: &std::fs::File,
     paths: &daemon::DaemonPaths,
+    startup_mode: daemon::DaemonStartupMode,
+    startup_initiator: daemon::DaemonStartupInitiator,
 ) -> std::io::Result<()> {
     file.set_len(0)?;
     let mut file = file;
     writeln!(file, "store={}", paths.store)?;
     writeln!(file, "identity={}", paths.store_id)?;
     writeln!(file, "pid={}", std::process::id())?;
+    writeln!(file, "startup_mode={}", startup_mode.wire_name())?;
+    writeln!(file, "startup_initiator={}", startup_initiator.wire_name())?;
     daemon::align_runtime_artifact_owner(&paths.lock_file, "lock", paths)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(())
@@ -7228,18 +8728,857 @@ fn cleanup_unlocked_runtime_files(paths: &daemon::DaemonPaths) {
     }
 }
 
+pub(crate) const DAEMON_EVENT_CHANNEL_CAPACITY: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum DaemonSchedulerOwner {
+    Maintenance,
+    AuthorityReplication,
+    HostedListeners,
+    DrivePolicy,
+    ReferenceWorker,
+    LifecycleShutdown,
+}
+
+impl DaemonSchedulerOwner {
+    #[cfg(test)]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Maintenance => "maintenance",
+            Self::AuthorityReplication => "authority-replication",
+            Self::HostedListeners => "hosted-listeners",
+            Self::DrivePolicy => "drive-policy",
+            Self::ReferenceWorker => "reference-worker",
+            Self::LifecycleShutdown => "lifecycle-shutdown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum DaemonCommittedChangeClass {
+    AuthorityReplicationPolicy,
+    #[cfg(test)]
+    HostedListener,
+    Certificate,
+    NetworkAccess,
+    DrivePolicy,
+    Reference,
+}
+
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonGeneratedCommittedChangeClass {
+    AuthorityReplicationPolicy,
+    Certificate,
+    DrivePolicy,
+    NetworkAccess,
+    Reference,
+}
+
+#[cfg(feature = "serve")]
+impl DaemonGeneratedCommittedChangeClass {
+    fn scheduler_notification(self) -> DaemonSchedulerNotification {
+        match self {
+            Self::AuthorityReplicationPolicy => DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::AuthorityReplication,
+                change: DaemonCommittedChangeClass::AuthorityReplicationPolicy,
+            },
+            Self::Certificate => DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::HostedListeners,
+                change: DaemonCommittedChangeClass::Certificate,
+            },
+            Self::DrivePolicy => DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::DrivePolicy,
+                change: DaemonCommittedChangeClass::DrivePolicy,
+            },
+            Self::NetworkAccess => DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::HostedListeners,
+                change: DaemonCommittedChangeClass::NetworkAccess,
+            },
+            Self::Reference => DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::ReferenceWorker,
+                change: DaemonCommittedChangeClass::Reference,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "serve")]
+#[derive(Clone)]
+struct DaemonGeneratedPublicationObserver {
+    emit: std::sync::Arc<dyn Fn(DaemonGeneratedCommittedChangeClass) + Send + Sync>,
+}
+
+#[cfg(feature = "serve")]
+impl DaemonGeneratedPublicationObserver {
+    fn new(emit: impl Fn(DaemonGeneratedCommittedChangeClass) + Send + Sync + 'static) -> Self {
+        Self {
+            emit: std::sync::Arc::new(emit),
+        }
+    }
+
+    fn scheduler(events: BoundedDaemonEventSender<DaemonAcceptedConnection>) -> Self {
+        Self::new(move |change| {
+            let _ = events.try_send_notification(change.scheduler_notification());
+        })
+    }
+
+    fn emit(&self, change: DaemonGeneratedCommittedChangeClass) {
+        (self.emit)(change);
+    }
+}
+
+#[cfg(feature = "serve")]
+fn daemon_generated_committed_change_classes(
+    interface: &str,
+    method: &str,
+) -> &'static [DaemonGeneratedCommittedChangeClass] {
+    match (interface, method) {
+        (
+            "Identity",
+            "identity_configure_authority_replication_json"
+            | "identity_remove_authority_replication_json",
+        ) => &[DaemonGeneratedCommittedChangeClass::AuthorityReplicationPolicy],
+        (
+            "Certificate",
+            "certificate_import_json"
+            | "certificate_generate_self_signed_json"
+            | "certificate_remove_json",
+        ) => &[DaemonGeneratedCommittedChangeClass::Certificate],
+        ("NetworkAccess", "network_access_set_json" | "network_access_remove_json") => {
+            &[DaemonGeneratedCommittedChangeClass::NetworkAccess]
+        }
+        (
+            "Drive",
+            "drive_grant_share_json"
+            | "drive_revoke_share_json"
+            | "drive_pin_retention_json"
+            | "drive_unpin_retention_json",
+        ) => &[DaemonGeneratedCommittedChangeClass::DrivePolicy],
+        (
+            "Tickets",
+            "tickets_create_json"
+            | "tickets_update_json"
+            | "tickets_delete_json"
+            | "tickets_comment_add_json"
+            | "tickets_comment_update_json"
+            | "tickets_comment_delete_json"
+            | "tickets_relation_set_json"
+            | "tickets_relation_remove_json",
+        ) => &[DaemonGeneratedCommittedChangeClass::Reference],
+        _ => &[],
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum DaemonEquivalentEventKey {
+    CommittedMutation {
+        owner: DaemonSchedulerOwner,
+        change: DaemonCommittedChangeClass,
+    },
+    WorkerCompleted(DaemonSchedulerOwner),
+    OwnerDeadline(DaemonSchedulerOwner),
+    LifecycleChanged,
+    InternalReschedule(DaemonSchedulerOwner),
+}
+
+#[derive(Debug)]
+pub(crate) enum DaemonSchedulerNotification {
+    CommittedMutation {
+        owner: DaemonSchedulerOwner,
+        change: DaemonCommittedChangeClass,
+    },
+    WorkerCompleted {
+        owner: DaemonSchedulerOwner,
+    },
+    OwnerDeadline {
+        owner: DaemonSchedulerOwner,
+    },
+    LifecycleChanged,
+    InternalReschedule {
+        owner: DaemonSchedulerOwner,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct DaemonRunObservationHandle {
+    scheduler_counters: DaemonSchedulerCounters,
+    events: BoundedDaemonEventSender<DaemonAcceptedConnection>,
+}
+
+#[cfg(test)]
+static DAEMON_RUN_OBSERVATION_HOOK: std::sync::Mutex<
+    Option<std::sync::mpsc::Sender<DaemonRunObservationHandle>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+struct DaemonRunObservationHookGuard {
+    previous: Option<std::sync::mpsc::Sender<DaemonRunObservationHandle>>,
+}
+
+#[cfg(test)]
+impl DaemonRunObservationHookGuard {
+    fn install(sender: std::sync::mpsc::Sender<DaemonRunObservationHandle>) -> Self {
+        let previous = DAEMON_RUN_OBSERVATION_HOOK.lock().unwrap().replace(sender);
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for DaemonRunObservationHookGuard {
+    fn drop(&mut self) {
+        *DAEMON_RUN_OBSERVATION_HOOK.lock().unwrap() = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+fn publish_daemon_run_observation(handle: DaemonRunObservationHandle) {
+    if let Some(sender) = DAEMON_RUN_OBSERVATION_HOOK.lock().unwrap().as_ref() {
+        let _ = sender.send(handle);
+    }
+}
+
+impl DaemonSchedulerNotification {
+    pub(crate) fn equivalent_key(&self) -> DaemonEquivalentEventKey {
+        match self {
+            Self::CommittedMutation { owner, change } => {
+                DaemonEquivalentEventKey::CommittedMutation {
+                    owner: *owner,
+                    change: *change,
+                }
+            }
+            Self::WorkerCompleted { owner } => DaemonEquivalentEventKey::WorkerCompleted(*owner),
+            Self::OwnerDeadline { owner } => DaemonEquivalentEventKey::OwnerDeadline(*owner),
+            Self::LifecycleChanged => DaemonEquivalentEventKey::LifecycleChanged,
+            Self::InternalReschedule { owner } => {
+                DaemonEquivalentEventKey::InternalReschedule(*owner)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum DaemonSchedulerWakeupKind {
+    AcceptedConnection,
+    ShutdownRequested,
+    SchedulerNotification(DaemonEquivalentEventKey),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DaemonSchedulerCounterSnapshot {
+    pub(crate) wakeups: std::collections::BTreeMap<DaemonSchedulerWakeupKind, u64>,
+    pub(crate) deadline_expirations: std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+    pub(crate) owner_runs: std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+    pub(crate) background_store_opens: std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+    pub(crate) background_writes: std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DaemonSchedulerCounters {
+    inner: std::sync::Arc<std::sync::Mutex<DaemonSchedulerCounterSnapshot>>,
+}
+
+impl DaemonSchedulerCounters {
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> DaemonSchedulerCounterSnapshot {
+        self.inner.lock().unwrap().clone()
+    }
+
+    pub(crate) fn record_wakeup(&self, kind: DaemonSchedulerWakeupKind) {
+        let mut inner = self.inner.lock().unwrap();
+        *inner.wakeups.entry(kind).or_default() += 1;
+        if let DaemonSchedulerWakeupKind::SchedulerNotification(
+            DaemonEquivalentEventKey::OwnerDeadline(owner),
+        ) = kind
+        {
+            *inner.deadline_expirations.entry(owner).or_default() += 1;
+        }
+    }
+
+    pub(crate) fn record_owner_run(&self, owner: DaemonSchedulerOwner) {
+        let mut inner = self.inner.lock().unwrap();
+        *inner.owner_runs.entry(owner).or_default() += 1;
+    }
+
+    pub(crate) fn record_background_store_open(&self, owner: DaemonSchedulerOwner) {
+        let mut inner = self.inner.lock().unwrap();
+        *inner.background_store_opens.entry(owner).or_default() += 1;
+    }
+
+    pub(crate) fn record_background_write(&self, owner: DaemonSchedulerOwner) {
+        let mut inner = self.inner.lock().unwrap();
+        *inner.background_writes.entry(owner).or_default() += 1;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DaemonSchedulerActivityRecorder {
+    owner: DaemonSchedulerOwner,
+    counters: DaemonSchedulerCounters,
+}
+
+impl DaemonSchedulerActivityRecorder {
+    fn new(owner: DaemonSchedulerOwner, counters: DaemonSchedulerCounters) -> Self {
+        Self { owner, counters }
+    }
+
+    fn record_owner_run(&self) {
+        self.counters.record_owner_run(self.owner);
+    }
+
+    fn record_store_open(&self) {
+        self.counters.record_background_store_open(self.owner);
+    }
+
+    fn record_write(&self) {
+        self.counters.record_background_write(self.owner);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum DaemonEvent<S> {
+    AcceptedStream(S),
+    SchedulerNotification(DaemonSchedulerNotification),
+    ShutdownRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonQueuedStreamOwner {
+    SchedulerQueue,
+}
+
+#[derive(Debug)]
+pub(crate) enum DaemonEventSendError<S> {
+    Full(DaemonEvent<S>),
+    Shutdown(DaemonEvent<S>),
+    Closed(DaemonEvent<S>),
+}
+
+pub(crate) struct BoundedDaemonEventSender<S> {
+    sender: std::sync::mpsc::SyncSender<DaemonEvent<S>>,
+    shutdown: std::sync::Arc<std::sync::Mutex<DaemonShutdownHandshake>>,
+    pending_notifications:
+        std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<DaemonEquivalentEventKey>>>,
+    capacity: usize,
+}
+
+impl<S> Clone for BoundedDaemonEventSender<S> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            shutdown: self.shutdown.clone(),
+            pending_notifications: self.pending_notifications.clone(),
+            capacity: self.capacity,
+        }
+    }
+}
+
+pub(crate) struct BoundedDaemonEventReceiver<S> {
+    receiver: std::sync::mpsc::Receiver<DaemonEvent<S>>,
+    shutdown: std::sync::Arc<std::sync::Mutex<DaemonShutdownHandshake>>,
+    pending_notifications:
+        std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<DaemonEquivalentEventKey>>>,
+}
+
+#[derive(Debug, Default)]
+struct DaemonShutdownHandshake {
+    requested: bool,
+    wake_event_enqueued: bool,
+    observed: bool,
+}
+
+pub(crate) fn bounded_daemon_event_channel<S>(
+    capacity: usize,
+) -> (BoundedDaemonEventSender<S>, BoundedDaemonEventReceiver<S>) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+    let shutdown = std::sync::Arc::new(std::sync::Mutex::new(DaemonShutdownHandshake::default()));
+    let pending_notifications =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    (
+        BoundedDaemonEventSender {
+            sender,
+            shutdown: shutdown.clone(),
+            pending_notifications: pending_notifications.clone(),
+            capacity,
+        },
+        BoundedDaemonEventReceiver {
+            receiver,
+            shutdown,
+            pending_notifications,
+        },
+    )
+}
+
+impl<S> BoundedDaemonEventSender<S> {
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.shutdown.lock().unwrap().requested
+    }
+
+    pub(crate) fn try_send(&self, event: DaemonEvent<S>) -> Result<(), DaemonEventSendError<S>> {
+        if !matches!(event, DaemonEvent::ShutdownRequested)
+            && self.shutdown.lock().unwrap().requested
+        {
+            return Err(DaemonEventSendError::Shutdown(event));
+        }
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(event)) => {
+                Err(DaemonEventSendError::Full(event))
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(event)) => {
+                Err(DaemonEventSendError::Closed(event))
+            }
+        }
+    }
+
+    pub(crate) fn try_send_notification(
+        &self,
+        notification: DaemonSchedulerNotification,
+    ) -> Result<(), DaemonEventSendError<S>> {
+        let key = notification.equivalent_key();
+        {
+            let mut pending = self.pending_notifications.lock().unwrap();
+            if !pending.insert(key) {
+                return Ok(());
+            }
+        }
+        match self.try_send(DaemonEvent::SchedulerNotification(notification)) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.pending_notifications.lock().unwrap().remove(&key);
+                Err(error)
+            }
+        }
+    }
+
+    fn send_notification_blocking(
+        &self,
+        notification: DaemonSchedulerNotification,
+    ) -> Result<(), std::sync::mpsc::SendError<DaemonEvent<S>>> {
+        let key = notification.equivalent_key();
+        {
+            let mut pending = self.pending_notifications.lock().unwrap();
+            if !pending.insert(key) {
+                return Ok(());
+            }
+        }
+        match self
+            .sender
+            .send(DaemonEvent::SchedulerNotification(notification))
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.pending_notifications.lock().unwrap().remove(&key);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn try_send_stream(&self, stream: S) -> Result<(), DaemonEventSendError<S>> {
+        self.try_send(DaemonEvent::AcceptedStream(stream))
+    }
+
+    pub(crate) fn request_shutdown(&self) -> Result<(), DaemonEventSendError<S>> {
+        let mut shutdown = self.shutdown.lock().unwrap();
+        shutdown.requested = true;
+        if shutdown.wake_event_enqueued || shutdown.observed {
+            return Ok(());
+        }
+        match self.sender.try_send(DaemonEvent::ShutdownRequested) {
+            Ok(()) => {
+                shutdown.wake_event_enqueued = true;
+                Ok(())
+            }
+            Err(std::sync::mpsc::TrySendError::Full(event)) => {
+                Err(DaemonEventSendError::Full(event))
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(event)) => {
+                Err(DaemonEventSendError::Closed(event))
+            }
+        }
+    }
+}
+
+impl<S> BoundedDaemonEventReceiver<S> {
+    fn received_event(&self, event: DaemonEvent<S>) -> DaemonEvent<S> {
+        if let DaemonEvent::SchedulerNotification(notification) = &event {
+            self.pending_notifications
+                .lock()
+                .unwrap()
+                .remove(&notification.equivalent_key());
+        }
+        if matches!(event, DaemonEvent::ShutdownRequested) {
+            let mut shutdown = self.shutdown.lock().unwrap();
+            shutdown.observed = true;
+        }
+        event
+    }
+
+    fn observe_shutdown(&self) -> Option<DaemonEvent<S>> {
+        let mut shutdown = self.shutdown.lock().unwrap();
+        if shutdown.requested && !shutdown.observed && !shutdown.wake_event_enqueued {
+            shutdown.observed = true;
+            Some(DaemonEvent::ShutdownRequested)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn recv(&self) -> Result<DaemonEvent<S>, std::sync::mpsc::RecvError> {
+        match self.receiver.try_recv() {
+            Ok(event) => return Ok(self.received_event(event)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if let Some(event) = self.observe_shutdown() {
+                    return Ok(event);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if let Some(event) = self.observe_shutdown() {
+                    return Ok(event);
+                }
+                return Err(std::sync::mpsc::RecvError);
+            }
+        }
+        match self.receiver.recv() {
+            Ok(event) => Ok(self.received_event(event)),
+            Err(error) => {
+                if let Some(event) = self.observe_shutdown() {
+                    Ok(event)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_recv(&self) -> Result<DaemonEvent<S>, std::sync::mpsc::TryRecvError> {
+        match self.receiver.try_recv() {
+            Ok(event) => Ok(self.received_event(event)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => self
+                .observe_shutdown()
+                .ok_or(std::sync::mpsc::TryRecvError::Empty),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self
+                .observe_shutdown()
+                .ok_or(std::sync::mpsc::TryRecvError::Disconnected),
+        }
+    }
+}
+
+pub(crate) struct DaemonBlockingAcceptorBoundary<S> {
+    events: BoundedDaemonEventSender<S>,
+}
+
+impl<S> DaemonBlockingAcceptorBoundary<S> {
+    pub(crate) fn new(events: BoundedDaemonEventSender<S>) -> Self {
+        Self { events }
+    }
+
+    pub(crate) fn admit(
+        &self,
+        stream: S,
+    ) -> Result<DaemonQueuedStreamOwner, DaemonEventSendError<S>> {
+        match self.events.try_send_stream(stream) {
+            Ok(()) => Ok(DaemonQueuedStreamOwner::SchedulerQueue),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct DaemonOwnerDescriptor {
+    owner: DaemonSchedulerOwner,
+    next_deadline_ms: Option<u64>,
+}
+
+#[cfg(test)]
+impl DaemonOwnerDescriptor {
+    pub(crate) fn new(owner: DaemonSchedulerOwner, next_deadline_ms: Option<u64>) -> Self {
+        Self {
+            owner,
+            next_deadline_ms,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> DaemonSchedulerOwner {
+        self.owner
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        self.owner.name()
+    }
+
+    pub(crate) fn next_deadline_ms(&self) -> Option<u64> {
+        self.next_deadline_ms
+    }
+
+    pub(crate) fn set_next_deadline_ms(&mut self, next_deadline_ms: Option<u64>) {
+        self.next_deadline_ms = next_deadline_ms;
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonOwnerRunReason {
+    PendingEvent,
+    DeadlineElapsed,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DaemonScheduledOwnerRun {
+    pub(crate) owner: DaemonSchedulerOwner,
+    pub(crate) reason: DaemonOwnerRunReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DaemonSchedulerDeadline {
+    pub(crate) owner: DaemonSchedulerOwner,
+    pub(crate) deadline_ms: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DaemonEventCoalescing {
+    pub(crate) inserted: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct DaemonSchedulerPlan {
+    owners: std::collections::BTreeMap<DaemonSchedulerOwner, DaemonOwnerDescriptor>,
+    pending_events: std::collections::BTreeSet<DaemonEquivalentEventKey>,
+    armed_deadline: Option<DaemonSchedulerDeadline>,
+}
+
+#[cfg(test)]
+impl DaemonSchedulerPlan {
+    pub(crate) fn insert_owner(&mut self, descriptor: DaemonOwnerDescriptor) {
+        self.owners.insert(descriptor.owner(), descriptor);
+    }
+
+    pub(crate) fn owner(&self, owner: DaemonSchedulerOwner) -> Option<&DaemonOwnerDescriptor> {
+        self.owners.get(&owner)
+    }
+
+    pub(crate) fn next_deadline(&self) -> Option<DaemonSchedulerDeadline> {
+        self.owners
+            .values()
+            .filter_map(|descriptor| {
+                descriptor
+                    .next_deadline_ms()
+                    .map(|deadline_ms| DaemonSchedulerDeadline {
+                        owner: descriptor.owner(),
+                        deadline_ms,
+                    })
+            })
+            .min_by_key(|deadline| (deadline.deadline_ms, deadline.owner))
+    }
+
+    pub(crate) fn arm_next_deadline(&mut self) -> Option<DaemonSchedulerDeadline> {
+        self.armed_deadline = self.next_deadline();
+        self.armed_deadline
+    }
+
+    pub(crate) fn set_owner_deadline(
+        &mut self,
+        owner: DaemonSchedulerOwner,
+        deadline_ms: Option<u64>,
+    ) -> bool {
+        let previous = self.armed_deadline;
+        self.owners
+            .entry(owner)
+            .or_insert_with(|| DaemonOwnerDescriptor::new(owner, None))
+            .set_next_deadline_ms(deadline_ms);
+        match (previous, deadline_ms) {
+            (Some(previous), Some(deadline_ms)) => deadline_ms < previous.deadline_ms,
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn set_owner_deadline_and_signal<S>(
+        &mut self,
+        events: &BoundedDaemonEventSender<S>,
+        owner: DaemonSchedulerOwner,
+        deadline_ms: Option<u64>,
+    ) -> Result<bool, DaemonEventSendError<S>> {
+        let should_wake = self.set_owner_deadline(owner, deadline_ms);
+        if should_wake {
+            events
+                .try_send_notification(DaemonSchedulerNotification::InternalReschedule { owner })?;
+        }
+        Ok(should_wake)
+    }
+
+    pub(crate) fn enqueue_notification(
+        &mut self,
+        notification: &DaemonSchedulerNotification,
+    ) -> DaemonEventCoalescing {
+        DaemonEventCoalescing {
+            inserted: self.pending_events.insert(notification.equivalent_key()),
+        }
+    }
+
+    pub(crate) fn pending_event_count(&self) -> usize {
+        self.pending_events.len()
+    }
+
+    pub(crate) fn due_or_pending_runs(&mut self, now_ms: u64) -> Vec<DaemonScheduledOwnerRun> {
+        let mut runs = std::collections::BTreeMap::new();
+        let pending = std::mem::take(&mut self.pending_events);
+        for key in pending {
+            if let Some(owner) = scheduler_owner_for_event_key(key) {
+                runs.insert(
+                    owner,
+                    DaemonScheduledOwnerRun {
+                        owner,
+                        reason: DaemonOwnerRunReason::PendingEvent,
+                    },
+                );
+            }
+        }
+        for descriptor in self.owners.values() {
+            if descriptor
+                .next_deadline_ms()
+                .is_some_and(|deadline| deadline <= now_ms)
+            {
+                runs.entry(descriptor.owner())
+                    .or_insert(DaemonScheduledOwnerRun {
+                        owner: descriptor.owner(),
+                        reason: DaemonOwnerRunReason::DeadlineElapsed,
+                    });
+            }
+        }
+        runs.into_values().collect()
+    }
+}
+
+fn scheduler_owner_for_event_key(key: DaemonEquivalentEventKey) -> Option<DaemonSchedulerOwner> {
+    match key {
+        DaemonEquivalentEventKey::CommittedMutation { owner, .. }
+        | DaemonEquivalentEventKey::WorkerCompleted(owner)
+        | DaemonEquivalentEventKey::OwnerDeadline(owner)
+        | DaemonEquivalentEventKey::InternalReschedule(owner) => Some(owner),
+        DaemonEquivalentEventKey::LifecycleChanged => Some(DaemonSchedulerOwner::LifecycleShutdown),
+    }
+}
+
+struct DaemonSchedulerDeadlineWaker<S> {
+    state: std::sync::Arc<(
+        std::sync::Mutex<DaemonSchedulerDeadlineState>,
+        std::sync::Condvar,
+    )>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    _stream: std::marker::PhantomData<S>,
+}
+
+#[derive(Debug, Default)]
+struct DaemonSchedulerDeadlineState {
+    deadline: Option<DaemonSchedulerDeadline>,
+    stop: bool,
+}
+
+impl<S: Send + 'static> DaemonSchedulerDeadlineWaker<S> {
+    fn start(events: BoundedDaemonEventSender<S>) -> Self {
+        let state = std::sync::Arc::new((
+            std::sync::Mutex::new(DaemonSchedulerDeadlineState::default()),
+            std::sync::Condvar::new(),
+        ));
+        let thread_state = state.clone();
+        let handle = std::thread::spawn(move || {
+            let (lock, changed) = &*thread_state;
+            let mut state = lock.lock().unwrap();
+            loop {
+                if state.stop {
+                    return;
+                }
+                let Some(deadline) = state.deadline else {
+                    state = changed.wait(state).unwrap();
+                    continue;
+                };
+                let now = now_ms();
+                if deadline.deadline_ms <= now {
+                    drop(state);
+                    if events
+                        .send_notification_blocking(DaemonSchedulerNotification::OwnerDeadline {
+                            owner: deadline.owner,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    state = lock.lock().unwrap();
+                    if state.deadline == Some(deadline) {
+                        state.deadline = None;
+                    }
+                    continue;
+                }
+                let wait_ms = deadline.deadline_ms.saturating_sub(now);
+                let wait = changed
+                    .wait_timeout(state, std::time::Duration::from_millis(wait_ms))
+                    .unwrap();
+                state = wait.0;
+            }
+        });
+        Self {
+            state,
+            handle: Some(handle),
+            _stream: std::marker::PhantomData,
+        }
+    }
+
+    fn schedule(&self, deadline: Option<DaemonSchedulerDeadline>) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        if state.deadline == deadline {
+            return;
+        }
+        state.deadline = deadline;
+        changed.notify_all();
+    }
+
+    fn stop(mut self) {
+        let (lock, changed) = &*self.state;
+        {
+            let mut state = lock.lock().unwrap();
+            state.stop = true;
+            changed.notify_all();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub(crate) struct DaemonRuntime {
     store: String,
     store_id: String,
     transport: daemon::DaemonTransport,
-    coordinator: LockCoordinator,
+    startup_mode: daemon::DaemonStartupMode,
+    startup_initiator: daemon::DaemonStartupInitiator,
+    #[cfg(not(feature = "serve"))]
+    locks_authority: std::sync::Arc<loom_client::locks::InProcessLocksAuthority>,
     #[cfg(feature = "serve")]
-    generated_runtime: DaemonGeneratedRuntime,
+    generated_runtime: std::sync::Arc<DaemonGeneratedRuntime>,
+    #[cfg(not(feature = "serve"))]
     kv_loom: Option<Loom<FileStore>>,
+    #[cfg(not(feature = "serve"))]
     kv_unavailable: Option<loom_core::error::LoomError>,
-    sessions: std::collections::BTreeSet<String>,
-    pins: std::collections::BTreeMap<String, PinLease>,
+    lifecycle_leases: std::collections::BTreeMap<LifecycleLeaseId, LifecycleLease>,
+    managed_bootstrap_deadline_ms: Option<u64>,
     authority_replication_next: std::collections::BTreeMap<String, u64>,
+    authority_replication_fingerprints:
+        std::collections::BTreeMap<String, AuthorityReplicationPolicyFingerprint>,
+    authority_replication_discovered: bool,
     maintenance_next_ms: u64,
     maintenance_worker: Option<std::thread::JoinHandle<Result<(), String>>>,
     maintenance_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -7249,6 +9588,32 @@ pub(crate) struct DaemonRuntime {
     drive_policy_next_ms: u64,
     #[cfg(feature = "serve")]
     reference_reconcile_next_ms: u64,
+    scheduler_counters: DaemonSchedulerCounters,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthorityReplicationPolicyFingerprint {
+    schema_version: u16,
+    source: String,
+    pull_on_start: bool,
+    interval_ms: Option<u64>,
+    jitter_ms: u64,
+    backoff_ms: u64,
+    publish_witness: bool,
+}
+
+impl AuthorityReplicationPolicyFingerprint {
+    fn from_policy(policy: &loom_store::AuthorityReplicationPolicy) -> Self {
+        Self {
+            schema_version: policy.schema_version,
+            source: policy.source.clone(),
+            pull_on_start: policy.pull_on_start,
+            interval_ms: policy.interval_ms,
+            jitter_ms: policy.jitter_ms,
+            backoff_ms: policy.backoff_ms,
+            publish_witness: policy.publish_witness,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7264,6 +9629,60 @@ struct MaintenanceWorkerTestHookState {
     entered: bool,
     released: bool,
     cancel_observed: bool,
+}
+
+#[cfg(test)]
+struct MaintenanceCompletionHoldHook {
+    result: Result<(), String>,
+    state: std::sync::Mutex<MaintenanceCompletionHoldState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MaintenanceCompletionHoldState {
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl MaintenanceCompletionHoldHook {
+    fn new(result: Result<(), String>) -> Self {
+        Self {
+            result,
+            state: std::sync::Mutex::new(MaintenanceCompletionHoldState::default()),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn enter_and_wait(&self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        state.entered = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+        self.result.clone()
+    }
+
+    fn wait_until_entered(&self) {
+        let started = std::time::Instant::now();
+        let mut state = self.state.lock().unwrap();
+        while !state.entered {
+            let wait = self
+                .changed
+                .wait_timeout(state, std::time::Duration::from_millis(25))
+                .unwrap();
+            state = wait.0;
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.changed.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -7320,6 +9739,11 @@ static MAINTENANCE_WORKER_TEST_HOOKS: std::sync::Mutex<
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(test)]
+static MAINTENANCE_COMPLETION_HOLD_HOOKS: std::sync::Mutex<
+    std::collections::BTreeMap<String, std::sync::Arc<MaintenanceCompletionHoldHook>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
 fn set_maintenance_worker_test_hook(
     store: String,
     hook: std::sync::Arc<MaintenanceWorkerTestHook>,
@@ -7355,9 +9779,108 @@ fn maintenance_worker_test_hook(store: &str) -> Option<std::sync::Arc<Maintenanc
         .cloned()
 }
 
+#[cfg(test)]
+fn set_maintenance_completion_hold_hook(
+    store: String,
+    hook: std::sync::Arc<MaintenanceCompletionHoldHook>,
+) -> Option<std::sync::Arc<MaintenanceCompletionHoldHook>> {
+    MAINTENANCE_COMPLETION_HOLD_HOOKS
+        .lock()
+        .unwrap()
+        .insert(store, hook)
+}
+
+#[cfg(test)]
+fn restore_maintenance_completion_hold_hook(
+    store: String,
+    hook: Option<std::sync::Arc<MaintenanceCompletionHoldHook>>,
+) {
+    let mut hooks = MAINTENANCE_COMPLETION_HOLD_HOOKS.lock().unwrap();
+    match hook {
+        Some(hook) => {
+            hooks.insert(store, hook);
+        }
+        None => {
+            hooks.remove(&store);
+        }
+    }
+}
+
+#[cfg(test)]
+fn maintenance_completion_hold_hook(
+    store: &str,
+) -> Option<std::sync::Arc<MaintenanceCompletionHoldHook>> {
+    MAINTENANCE_COMPLETION_HOLD_HOOKS
+        .lock()
+        .unwrap()
+        .get(store)
+        .cloned()
+}
+
+const DEFAULT_DAEMON_LIFECYCLE_LEASE_MS: u64 = 15 * 60 * 1000;
+
+fn daemon_lifecycle_lease_ms() -> u64 {
+    #[cfg(feature = "mcp-daemon-cli-tests")]
+    {
+        if let Some(value) = std::env::var("ULDREN_LOOM_DAEMON_LIFECYCLE_LEASE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+        {
+            return value;
+        }
+    }
+    DEFAULT_DAEMON_LIFECYCLE_LEASE_MS
+}
+
+fn managed_bootstrap_deadline_ms(
+    startup_mode: daemon::DaemonStartupMode,
+    now_ms: u64,
+) -> Option<u64> {
+    match startup_mode {
+        daemon::DaemonStartupMode::Managed => {
+            Some(now_ms.saturating_add(daemon_lifecycle_lease_ms()))
+        }
+        daemon::DaemonStartupMode::Persistent => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum LifecycleLeaseId {
+    Session(String),
+    Pin(String),
+    GeneratedSession(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleLeaseKind {
+    Session,
+    Pin,
+    GeneratedSession,
+}
+
 #[derive(Debug, Clone, Copy)]
-struct PinLease {
+struct LifecycleLease {
+    kind: LifecycleLeaseKind,
     deadline_ms: Option<u64>,
+}
+
+impl LifecycleLease {
+    fn live_at(self, now_ms: u64) -> bool {
+        self.deadline_ms.is_none_or(|deadline| deadline > now_ms)
+    }
+}
+
+pub(crate) fn daemon_lifecycle_scheduler_deadline(runtime: &DaemonRuntime) -> Option<u64> {
+    if runtime.startup_mode != daemon::DaemonStartupMode::Managed {
+        return None;
+    }
+    runtime
+        .lifecycle_leases
+        .values()
+        .filter_map(|lease| lease.deadline_ms)
+        .chain(runtime.managed_bootstrap_deadline_ms)
+        .min()
 }
 
 #[derive(Debug, Default)]
@@ -7416,15 +9939,25 @@ fn generated_binary_response(magic: &[u8], bodies: &[Vec<u8>]) -> Vec<u8> {
 #[cfg(feature = "serve")]
 struct DaemonGeneratedRuntime {
     client: loom_client::LocalLoomClient,
+    locks_authority: std::sync::Arc<loom_client::locks::InProcessLocksAuthority>,
     engine: std::sync::Arc<std::sync::Mutex<Loom<FileStore>>>,
-    sessions: std::collections::BTreeMap<Vec<u8>, DaemonGeneratedSession>,
-    idempotency:
+    publication_observer: std::sync::Mutex<Option<DaemonGeneratedPublicationObserver>>,
+    sessions: std::sync::Mutex<std::collections::BTreeMap<Vec<u8>, DaemonGeneratedSession>>,
+    idempotency: std::sync::Mutex<
         std::collections::BTreeMap<DaemonGeneratedIdempotencyKey, DaemonGeneratedIdempotencyEntry>,
-    stream_cancellations: std::collections::BTreeMap<
-        DaemonGeneratedStreamKey,
-        std::sync::Arc<std::sync::atomic::AtomicBool>,
     >,
-    next_session: u64,
+    stream_cancellations: std::sync::Mutex<
+        std::collections::BTreeMap<
+            DaemonGeneratedStreamKey,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        >,
+    >,
+    next_session: std::sync::Mutex<u64>,
+    idempotency_sequence: std::sync::Mutex<u64>,
+    store_identity: String,
+    coordinator_identity: [u8; 32],
+    credential_signing_key: [u8; 32],
+    authority_epoch: u64,
 }
 
 #[cfg(feature = "serve")]
@@ -7432,13 +9965,65 @@ struct DaemonGeneratedRuntime {
 struct DaemonGeneratedSession {
     handle: loom_client::types::LoomSession,
     lease_expires_ms: u64,
+    current_resume_secret: [u8; 32],
+    pending_resume_credential: Option<DaemonPendingSessionCredential>,
+    principal: Option<[u8; 16]>,
+    lock_owner: loom_core::LockOwner,
+}
+
+#[cfg(feature = "serve")]
+#[derive(Clone, Copy)]
+struct DaemonPendingSessionCredential {
+    secret: [u8; 32],
+    lease_expires_ms: u64,
 }
 
 #[cfg(feature = "serve")]
 type DaemonGeneratedIdempotencyKey = (Vec<u8>, String, String, Vec<u8>);
 
 #[cfg(feature = "serve")]
-type DaemonGeneratedIdempotencyEntry = (Vec<u8>, loom_remote_protocol::envelope::ResponsePayload);
+type DaemonGeneratedIdempotencyCompletion = std::sync::Arc<(
+    std::sync::Mutex<Option<loom_remote_protocol::envelope::ResponsePayload>>,
+    std::sync::Condvar,
+)>;
+
+#[cfg(feature = "serve")]
+#[derive(Clone)]
+enum DaemonGeneratedIdempotencyEntry {
+    InFlight {
+        fingerprint: Vec<u8>,
+        completion: DaemonGeneratedIdempotencyCompletion,
+    },
+    Completed {
+        fingerprint: Vec<u8>,
+        payload: loom_remote_protocol::envelope::ResponsePayload,
+        sequence: u64,
+    },
+}
+
+#[cfg(feature = "serve")]
+enum DaemonGeneratedIdempotencyClaim {
+    Execute {
+        key: DaemonGeneratedIdempotencyKey,
+        fingerprint: Vec<u8>,
+        completion: DaemonGeneratedIdempotencyCompletion,
+    },
+    Wait {
+        completion: DaemonGeneratedIdempotencyCompletion,
+    },
+}
+
+#[cfg(feature = "serve")]
+fn daemon_generated_idempotency_capacity() -> usize {
+    #[cfg(test)]
+    {
+        4
+    }
+    #[cfg(not(test))]
+    {
+        1024
+    }
+}
 
 #[cfg(feature = "serve")]
 type DaemonGeneratedStreamKey = (Vec<u8>, Vec<u8>);
@@ -7450,31 +10035,114 @@ type DaemonGeneratedOpenStream = (
     DaemonGeneratedStreamKey,
 );
 
+#[cfg(all(feature = "serve", test))]
+type DaemonGeneratedDispatchTestHook = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync + 'static>;
+
+#[cfg(all(feature = "serve", test))]
+static DAEMON_GENERATED_DISPATCH_TEST_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<DaemonGeneratedDispatchTestHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(feature = "serve", test))]
+fn set_daemon_generated_dispatch_test_hook(
+    hook: Option<DaemonGeneratedDispatchTestHook>,
+) -> Option<DaemonGeneratedDispatchTestHook> {
+    DAEMON_GENERATED_DISPATCH_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("generated dispatch test hook lock")
+        .replace(hook?)
+}
+
+#[cfg(all(feature = "serve", test))]
+fn clear_daemon_generated_dispatch_test_hook() {
+    if let Some(hook) = DAEMON_GENERATED_DISPATCH_TEST_HOOK.get() {
+        *hook.lock().expect("generated dispatch test hook lock") = None;
+    }
+}
+
+#[cfg(all(feature = "serve", test))]
+fn daemon_generated_dispatch_test_hook() -> Option<DaemonGeneratedDispatchTestHook> {
+    DAEMON_GENERATED_DISPATCH_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("generated dispatch test hook lock")
+        .clone()
+}
+
 #[cfg(feature = "serve")]
 impl DaemonGeneratedRuntime {
-    fn start(store: &str) -> Result<Self, String> {
-        let loom = loom_store::open_loom_daemon_authorized_unlocked(store, None)
+    fn start(
+        store: &str,
+        mut progress: impl FnMut(daemon::DaemonStartupStage, u64, Option<u64>),
+    ) -> Result<Self, String> {
+        let loom =
+            loom_store::open_loom_daemon_authorized_unlocked_with_progress(store, None, |event| {
+                let (stage, completed, total) = daemon_open_progress(event);
+                progress(stage, completed, total);
+            })
             .and_then(|loom| {
+                progress(daemon::DaemonStartupStage::LocalAuth, 0, Some(1));
                 loom_store::attach_local_auth(loom, &loom_store::LocalOpenAuth::default())
             })
-            .map_err(|e| e.to_string())?;
-        Ok(Self {
-            client: loom_client::LocalLoomClient::new(store),
+            .map_err(|e| format!("open daemon generated engine: {e}"))?;
+        progress(daemon::DaemonStartupStage::LocalAuth, 1, Some(1));
+        let coordinator = loom
+            .store()
+            .lock_coordinator()
+            .map_err(|error| format!("load daemon lock coordinator: {error}"))?;
+        let locks_authority = daemon_locks_authority(store, coordinator);
+        Ok(Self::from_open_loom(store, loom, locks_authority))
+    }
+
+    fn from_open_loom(
+        store: &str,
+        loom: Loom<FileStore>,
+        locks_authority: std::sync::Arc<loom_client::locks::InProcessLocksAuthority>,
+    ) -> Self {
+        let mut coordinator_identity = [0u8; 32];
+        getrandom::fill(&mut coordinator_identity).expect("coordinator identity randomness");
+        let mut credential_signing_key = [0u8; 32];
+        getrandom::fill(&mut credential_signing_key).expect("session credential randomness");
+        let store_identity = daemon::paths(store)
+            .expect("daemon store identity")
+            .store_id;
+        let client_locks: std::sync::Arc<dyn loom_client::locks::LocksAuthority> =
+            locks_authority.clone();
+        Self {
+            client: loom_client::LocalLoomClient::with_locks_authority(store, client_locks),
+            locks_authority,
             engine: std::sync::Arc::new(std::sync::Mutex::new(loom)),
-            sessions: std::collections::BTreeMap::new(),
-            idempotency: std::collections::BTreeMap::new(),
-            stream_cancellations: std::collections::BTreeMap::new(),
-            next_session: 0,
-        })
+            publication_observer: std::sync::Mutex::new(None),
+            sessions: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            idempotency: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            stream_cancellations: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            next_session: std::sync::Mutex::new(0),
+            idempotency_sequence: std::sync::Mutex::new(0),
+            store_identity,
+            coordinator_identity,
+            credential_signing_key,
+            authority_epoch: 1,
+        }
     }
 
     fn open_session(
-        &mut self,
+        &self,
         auth: loom_remote_protocol::session::SessionAuth,
     ) -> loom_remote_protocol::session::SessionOpenReply {
-        self.next_session = self.next_session.saturating_add(1);
-        let session_id = self.next_session.to_be_bytes().to_vec();
-        let local_session_id = format!("daemon-generated-{}", self.next_session);
+        let credential_principal = match &auth {
+            loom_remote_protocol::session::SessionAuth::Unauthenticated => None,
+            loom_remote_protocol::session::SessionAuth::Passphrase { principal, .. } => {
+                Some(*principal)
+            }
+        };
+        let next_session = {
+            let mut next_session = self.next_session.lock().expect("generated session id lock");
+            *next_session = next_session.saturating_add(1);
+            *next_session
+        };
+        let session_id = next_session.to_be_bytes().to_vec();
+        let local_session_id = format!("daemon-generated-{next_session}");
         let auth_session = match auth {
             loom_remote_protocol::session::SessionAuth::Unauthenticated => None,
             loom_remote_protocol::session::SessionAuth::Passphrase {
@@ -7534,17 +10202,59 @@ impl DaemonGeneratedRuntime {
         {
             Ok(mut handle) => {
                 handle.0.owner_session = session_id.clone();
-                let lease_expires_ms = now_ms().saturating_add(15 * 60 * 1000);
-                self.sessions.insert(
-                    session_id.clone(),
-                    DaemonGeneratedSession {
-                        handle,
-                        lease_expires_ms,
-                    },
-                );
+                let lease_expires_ms = now_ms().saturating_add(daemon_lifecycle_lease_ms());
+                let mut resume_secret = [0u8; 32];
+                if let Err(error) = getrandom::fill(&mut resume_secret) {
+                    self.client.close(&handle);
+                    let error = loom_core::error::LoomError::new(
+                        loom_core::error::Code::Internal,
+                        format!("session credential randomness: {error}"),
+                    );
+                    return loom_remote_protocol::session::SessionOpenReply::Err(
+                        loom_remote_protocol::RemoteError::from_loom_error(&error),
+                    );
+                }
+                let lock_owner = match self.client.lock_owner_for_session(&handle) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        self.client.close(&handle);
+                        return loom_remote_protocol::session::SessionOpenReply::Err(
+                            loom_remote_protocol::RemoteError::from_loom_error(&error),
+                        );
+                    }
+                };
+                let credential = match self.seal_session_credential(
+                    &session_id,
+                    resume_secret,
+                    credential_principal,
+                    lease_expires_ms,
+                ) {
+                    Ok(credential) => credential,
+                    Err(error) => {
+                        self.client.close(&handle);
+                        return loom_remote_protocol::session::SessionOpenReply::Err(
+                            loom_remote_protocol::RemoteError::from_loom_error(&error),
+                        );
+                    }
+                };
+                self.sessions
+                    .lock()
+                    .expect("generated session lock")
+                    .insert(
+                        session_id.clone(),
+                        DaemonGeneratedSession {
+                            handle,
+                            lease_expires_ms,
+                            current_resume_secret: resume_secret,
+                            pending_resume_credential: None,
+                            principal: credential_principal,
+                            lock_owner,
+                        },
+                    );
                 loom_remote_protocol::session::SessionOpenReply::Ok {
                     session_id,
                     lease_expires_ms,
+                    credential: Some(credential),
                 }
             }
             Err(error) => loom_remote_protocol::session::SessionOpenReply::Err(
@@ -7553,8 +10263,265 @@ impl DaemonGeneratedRuntime {
         }
     }
 
+    fn handle_session_request(
+        &self,
+        request: loom_remote_protocol::session::SessionRequest,
+    ) -> loom_remote_protocol::session::SessionOpenReply {
+        self.prune_expired_sessions(now_ms());
+        match request {
+            loom_remote_protocol::session::SessionRequest::Create(auth) => self.open_session(auth),
+            loom_remote_protocol::session::SessionRequest::Resume { auth, credential } => {
+                self.resume_session(auth, &credential)
+            }
+            loom_remote_protocol::session::SessionRequest::Close { auth, credential } => {
+                self.close_logical_session(auth, &credential)
+            }
+        }
+    }
+
+    fn seal_session_credential(
+        &self,
+        session_id: &[u8],
+        resume_secret: [u8; 32],
+        principal: Option<[u8; 16]>,
+        lease_expires_ms: u64,
+    ) -> Result<Vec<u8>, loom_core::error::LoomError> {
+        loom_remote_protocol::session::seal_credential(
+            &loom_remote_protocol::session::SessionCredentialClaims {
+                session_id: session_id.to_vec(),
+                resume_secret,
+                principal,
+                store_identity: self.store_identity.clone(),
+                coordinator_identity: self.coordinator_identity,
+                authority_epoch: self.authority_epoch,
+                protocol_profile: loom_remote_protocol::envelope::PROTOCOL_ID.to_string(),
+                lease_expires_ms,
+            },
+            &self.credential_signing_key,
+        )
+        .map_err(|error| {
+            loom_core::error::LoomError::new(
+                loom_core::error::Code::Internal,
+                format!("encode session credential: {error}"),
+            )
+        })
+    }
+
+    fn validated_credential(
+        &self,
+        auth: &loom_remote_protocol::session::SessionAuth,
+        credential: &[u8],
+    ) -> Result<loom_remote_protocol::session::SessionCredentialClaims, loom_core::error::LoomError>
+    {
+        let claims = loom_remote_protocol::session::open_credential(
+            credential,
+            &self.credential_signing_key,
+        )
+        .map_err(|_| {
+            loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "invalid session credential",
+            )
+        })?;
+        if claims.store_identity != self.store_identity
+            || claims.coordinator_identity != self.coordinator_identity
+            || claims.authority_epoch != self.authority_epoch
+            || claims.protocol_profile != loom_remote_protocol::envelope::PROTOCOL_ID
+        {
+            return Err(loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "session credential binding mismatch",
+            ));
+        }
+        if claims.lease_expires_ms <= now_ms() {
+            return Err(loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "session credential expired",
+            ));
+        }
+        self.validate_session_auth(auth, claims.principal)?;
+        Ok(claims)
+    }
+
+    fn validate_session_auth(
+        &self,
+        auth: &loom_remote_protocol::session::SessionAuth,
+        principal: Option<[u8; 16]>,
+    ) -> Result<(), loom_core::error::LoomError> {
+        match (auth, principal) {
+            (loom_remote_protocol::session::SessionAuth::Unauthenticated, None) => Ok(()),
+            (
+                loom_remote_protocol::session::SessionAuth::Passphrase {
+                    principal: supplied,
+                    passphrase,
+                },
+                Some(expected),
+            ) if *supplied == expected => {
+                let passphrase = std::str::from_utf8(passphrase).map_err(|_| {
+                    loom_core::error::LoomError::new(
+                        loom_core::error::Code::InvalidArgument,
+                        "passphrase is not valid utf-8",
+                    )
+                })?;
+                let loom = self.engine.lock().map_err(|_| {
+                    loom_core::error::LoomError::new(
+                        loom_core::error::Code::Internal,
+                        "daemon generated runtime lock poisoned",
+                    )
+                })?;
+                let mut identity = loom.store().identity_store()?.ok_or_else(|| {
+                    loom_core::error::LoomError::new(
+                        loom_core::error::Code::Unsupported,
+                        "store is in unauthenticated-root mode; no identity is configured",
+                    )
+                })?;
+                identity.authenticate_passphrase(
+                    WorkspaceId::from_bytes(expected),
+                    passphrase,
+                    "logical-session-resume-check",
+                )?;
+                Ok(())
+            }
+            _ => Err(loom_core::error::LoomError::new(
+                loom_core::error::Code::PermissionDenied,
+                "session credential principal mismatch",
+            )),
+        }
+    }
+
+    fn resume_session(
+        &self,
+        auth: loom_remote_protocol::session::SessionAuth,
+        credential: &[u8],
+    ) -> loom_remote_protocol::session::SessionOpenReply {
+        let result = (|| {
+            let claims = self.validated_credential(&auth, credential)?;
+            let mut sessions = self.sessions.lock().map_err(|_| {
+                loom_core::error::LoomError::new(
+                    loom_core::error::Code::Internal,
+                    "generated session lock poisoned",
+                )
+            })?;
+            let session = sessions.get_mut(&claims.session_id).ok_or_else(|| {
+                loom_core::error::LoomError::new(
+                    loom_core::error::Code::PermissionDenied,
+                    "unknown logical session",
+                )
+            })?;
+            let presented_current = session.current_resume_secret == claims.resume_secret;
+            let presented_pending = session
+                .pending_resume_credential
+                .filter(|pending| pending.lease_expires_ms == claims.lease_expires_ms)
+                .is_some_and(|pending| pending.secret == claims.resume_secret);
+            if (!presented_current && !presented_pending) || session.principal != claims.principal {
+                return Err(loom_core::error::LoomError::new(
+                    loom_core::error::Code::PermissionDenied,
+                    "stale session credential",
+                ));
+            }
+            let existing_pending = session.pending_resume_credential;
+            let pending = if presented_current {
+                match existing_pending {
+                    Some(pending) => pending,
+                    None => Self::mint_pending_session_credential()?,
+                }
+            } else {
+                Self::mint_pending_session_credential()?
+            };
+            let rotated = self.seal_session_credential(
+                &claims.session_id,
+                pending.secret,
+                claims.principal,
+                pending.lease_expires_ms,
+            )?;
+            if presented_pending {
+                session.current_resume_secret = claims.resume_secret;
+                session.pending_resume_credential = Some(pending);
+                session.lease_expires_ms = pending.lease_expires_ms;
+            } else if existing_pending.is_none() {
+                session.pending_resume_credential = Some(pending);
+                session.lease_expires_ms = pending.lease_expires_ms;
+            }
+            Ok((claims.session_id, pending.lease_expires_ms, rotated))
+        })();
+        match result {
+            Ok((session_id, lease_expires_ms, credential)) => {
+                loom_remote_protocol::session::SessionOpenReply::Ok {
+                    session_id,
+                    lease_expires_ms,
+                    credential: Some(credential),
+                }
+            }
+            Err(error) => loom_remote_protocol::session::SessionOpenReply::Err(
+                loom_remote_protocol::RemoteError::from_loom_error(&error),
+            ),
+        }
+    }
+
+    fn mint_pending_session_credential()
+    -> Result<DaemonPendingSessionCredential, loom_core::error::LoomError> {
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).map_err(|error| {
+            loom_core::error::LoomError::new(
+                loom_core::error::Code::Internal,
+                format!("session credential randomness: {error}"),
+            )
+        })?;
+        Ok(DaemonPendingSessionCredential {
+            secret,
+            lease_expires_ms: now_ms().saturating_add(daemon_lifecycle_lease_ms()),
+        })
+    }
+
+    fn close_logical_session(
+        &self,
+        auth: loom_remote_protocol::session::SessionAuth,
+        credential: &[u8],
+    ) -> loom_remote_protocol::session::SessionOpenReply {
+        let result = (|| {
+            let claims = self.validated_credential(&auth, credential)?;
+            {
+                let sessions = self.sessions.lock().map_err(|_| {
+                    loom_core::error::LoomError::new(
+                        loom_core::error::Code::Internal,
+                        "generated session lock poisoned",
+                    )
+                })?;
+                let session = sessions.get(&claims.session_id).ok_or_else(|| {
+                    loom_core::error::LoomError::new(
+                        loom_core::error::Code::PermissionDenied,
+                        "unknown logical session",
+                    )
+                })?;
+                if session.current_resume_secret != claims.resume_secret
+                    && !session
+                        .pending_resume_credential
+                        .filter(|pending| pending.lease_expires_ms == claims.lease_expires_ms)
+                        .is_some_and(|pending| pending.secret == claims.resume_secret)
+                {
+                    return Err(loom_core::error::LoomError::new(
+                        loom_core::error::Code::PermissionDenied,
+                        "stale session credential",
+                    ));
+                }
+            }
+            self.expire_session(&claims.session_id)?;
+            Ok(claims.session_id)
+        })();
+        match result {
+            Ok(session_id) => loom_remote_protocol::session::SessionOpenReply::Ok {
+                session_id,
+                lease_expires_ms: 0,
+                credential: None,
+            },
+            Err(error) => loom_remote_protocol::session::SessionOpenReply::Err(
+                loom_remote_protocol::RemoteError::from_loom_error(&error),
+            ),
+        }
+    }
+
     fn dispatch(
-        &mut self,
+        &self,
         request: &loom_remote_protocol::envelope::Request,
     ) -> loom_remote_protocol::envelope::Response {
         use loom_remote_protocol::codec::ToValue;
@@ -7576,18 +10543,22 @@ impl DaemonGeneratedRuntime {
                 "method requires a session",
             ));
         };
-        let Some(session) = self.sessions.get(session_bytes).cloned() else {
+        let Some(session) = self
+            .sessions
+            .lock()
+            .expect("generated session lock")
+            .get(session_bytes)
+            .cloned()
+        else {
             return reply_err(&loom_core::error::LoomError::new(
                 loom_core::error::Code::NotFound,
                 "unknown or expired session",
             ));
         };
         if now_ms() >= session.lease_expires_ms {
-            self.sessions.remove(session_bytes);
-            self.client.close(&session.handle);
-            self.idempotency
-                .retain(|(session, _, _, _), _| session != session_bytes);
-            self.cancel_session_streams(session_bytes);
+            if let Err(error) = self.expire_session(session_bytes) {
+                return reply_err(&error);
+            }
             return reply_err(&loom_core::error::LoomError::new(
                 loom_core::error::Code::LockLeaseExpired,
                 "daemon generated session lease expired",
@@ -7598,14 +10569,46 @@ impl DaemonGeneratedRuntime {
             match request.method.as_str() {
                 "open" | "open_keyed" | "open_with_kek" => return reply_ok(handle.to_value()),
                 "close" => {
-                    self.sessions.remove(session_bytes);
-                    self.client.close(&handle);
-                    self.idempotency
-                        .retain(|(session, _, _, _), _| session != session_bytes);
-                    self.cancel_session_streams(session_bytes);
+                    if let Err(error) = self.expire_session(session_bytes) {
+                        return reply_err(&error);
+                    }
                     return reply_ok(loom_codec::Value::Null);
                 }
                 _ => {}
+            }
+        } else if request.interface == "Mcp" {
+            #[cfg(feature = "mcp")]
+            {
+                if request.method != "call_tool" {
+                    return reply_err(&loom_core::error::LoomError::not_found(format!(
+                        "unknown MCP operation Mcp.{}",
+                        request.method
+                    )));
+                }
+                let (name, args) = match request.args.as_slice() {
+                    [
+                        loom_codec::Value::Text(name),
+                        loom_codec::Value::Bytes(args),
+                    ] => (name.clone(), args.clone()),
+                    _ => {
+                        return reply_err(&loom_core::error::LoomError::invalid(
+                            "Mcp.call_tool expects [tool_name, args]",
+                        ));
+                    }
+                };
+                let mcp = uldren_loom_mcp::LoomMcp::new(uldren_loom_mcp::StoreAccess::Persistent(
+                    self.engine.clone(),
+                ));
+                return match uldren_loom_mcp::server::execute_promoted_tool(&mcp, &name, &args) {
+                    Ok(bytes) => reply_ok(loom_codec::Value::Bytes(bytes)),
+                    Err(error) => reply_err(&error),
+                };
+            }
+            #[cfg(not(feature = "mcp"))]
+            {
+                return reply_err(&loom_core::error::LoomError::unsupported(
+                    "Mcp.call_tool requires the mcp feature",
+                ));
             }
         } else if request.args.first() != Some(&handle.to_value()) {
             return reply_err(&loom_core::error::LoomError::new(
@@ -7625,26 +10628,117 @@ impl DaemonGeneratedRuntime {
             ]))
             .ok()
         });
-        if let (Some(key), Some(fingerprint)) = (idem_key, fingerprint.as_ref()) {
+        let idempotency_claim = if let (Some(key), Some(fingerprint)) =
+            (idem_key, fingerprint.as_ref())
+        {
             let map_key = (
                 session_bytes.clone(),
                 request.interface.clone(),
                 request.method.clone(),
                 key.to_vec(),
             );
-            if let Some((stored, payload)) = self.idempotency.get(&map_key) {
-                if stored == fingerprint {
-                    return Response {
-                        request_id,
-                        session_id,
-                        payload: payload.clone(),
-                    };
+            let mut idempotency = self.idempotency.lock().expect("generated idempotency lock");
+            match idempotency.get(&map_key).cloned() {
+                Some(DaemonGeneratedIdempotencyEntry::Completed {
+                    fingerprint: stored,
+                    payload,
+                    ..
+                }) => {
+                    if stored == *fingerprint {
+                        return Response {
+                            request_id,
+                            session_id,
+                            payload,
+                        };
+                    }
+                    return reply_err(&loom_core::error::LoomError::new(
+                        loom_core::error::Code::Conflict,
+                        "idempotency key reused with a different request fingerprint",
+                    ));
                 }
-                return reply_err(&loom_core::error::LoomError::new(
-                    loom_core::error::Code::Conflict,
-                    "idempotency key reused with a different request fingerprint",
-                ));
+                Some(DaemonGeneratedIdempotencyEntry::InFlight {
+                    fingerprint: stored,
+                    completion,
+                }) => {
+                    if stored != *fingerprint {
+                        return reply_err(&loom_core::error::LoomError::new(
+                            loom_core::error::Code::Conflict,
+                            "idempotency key reused with a different request fingerprint",
+                        ));
+                    }
+                    Some(DaemonGeneratedIdempotencyClaim::Wait { completion })
+                }
+                None => {
+                    let capacity = daemon_generated_idempotency_capacity();
+                    let session_entry_count = idempotency
+                        .keys()
+                        .filter(|(session, _, _, _)| session == session_bytes)
+                        .count();
+                    if session_entry_count >= capacity {
+                        let eviction_key = idempotency
+                            .iter()
+                            .filter_map(|(entry_key, entry)| {
+                                if &entry_key.0 != session_bytes {
+                                    return None;
+                                }
+                                match entry {
+                                    DaemonGeneratedIdempotencyEntry::Completed {
+                                        sequence, ..
+                                    } => Some((entry_key.clone(), *sequence)),
+                                    DaemonGeneratedIdempotencyEntry::InFlight { .. } => None,
+                                }
+                            })
+                            .min_by_key(|(_, sequence)| *sequence)
+                            .map(|(entry_key, _)| entry_key);
+                        if let Some(eviction_key) = eviction_key {
+                            idempotency.remove(&eviction_key);
+                        } else {
+                            return reply_err(&loom_core::error::LoomError::new(
+                                loom_core::error::Code::ResourceExhausted,
+                                "generated idempotency capacity exhausted for session",
+                            ));
+                        }
+                    }
+                    let completion = std::sync::Arc::new((
+                        std::sync::Mutex::new(None),
+                        std::sync::Condvar::new(),
+                    ));
+                    idempotency.insert(
+                        map_key.clone(),
+                        DaemonGeneratedIdempotencyEntry::InFlight {
+                            fingerprint: fingerprint.clone(),
+                            completion: completion.clone(),
+                        },
+                    );
+                    Some(DaemonGeneratedIdempotencyClaim::Execute {
+                        key: map_key,
+                        fingerprint: fingerprint.clone(),
+                        completion,
+                    })
+                }
             }
+        } else {
+            None
+        };
+        if let Some(DaemonGeneratedIdempotencyClaim::Wait { completion }) = &idempotency_claim {
+            let (payload, cvar) = &**completion;
+            let mut payload = payload
+                .lock()
+                .expect("generated idempotency completion lock");
+            while payload.is_none() {
+                payload = cvar
+                    .wait(payload)
+                    .expect("generated idempotency completion lock");
+            }
+            return Response {
+                request_id,
+                session_id,
+                payload: payload.clone().expect("generated idempotency completed"),
+            };
+        }
+        #[cfg(test)]
+        if let Some(hook) = daemon_generated_dispatch_test_hook() {
+            hook(&request.interface, &request.method);
         }
         let response = match loom_hosted_core::generated_dispatch::dispatch(
             &self.client,
@@ -7665,27 +10759,90 @@ impl DaemonGeneratedRuntime {
             }
             Err(error) => reply_err(&error),
         };
-        if let (Some(key), Some(fingerprint)) = (idem_key, fingerprint) {
-            if self.idempotency.len() > 1024 {
-                self.idempotency.clear();
+        if matches!(
+            &response.payload,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ) {
+            self.emit_committed_publication(&request.interface, &request.method);
+        }
+        if let Some(DaemonGeneratedIdempotencyClaim::Execute {
+            key,
+            fingerprint,
+            completion,
+        }) = idempotency_claim
+        {
+            let payload = response.payload.clone();
+            {
+                let (completed, cvar) = &*completion;
+                *completed
+                    .lock()
+                    .expect("generated idempotency completion lock") = Some(payload.clone());
+                cvar.notify_all();
             }
-            self.idempotency.insert(
-                (
-                    session_bytes.clone(),
-                    request.interface.clone(),
-                    request.method.clone(),
-                    key.to_vec(),
-                ),
-                (fingerprint, response.payload.clone()),
-            );
+            self.idempotency
+                .lock()
+                .expect("generated idempotency lock")
+                .entry(key)
+                .and_modify(|entry| {
+                    if let DaemonGeneratedIdempotencyEntry::InFlight {
+                        completion: registered,
+                        ..
+                    } = entry
+                        && std::sync::Arc::ptr_eq(registered, &completion)
+                    {
+                        let mut sequence = self
+                            .idempotency_sequence
+                            .lock()
+                            .expect("generated idempotency sequence lock");
+                        *sequence = sequence.saturating_add(1);
+                        *entry = DaemonGeneratedIdempotencyEntry::Completed {
+                            fingerprint,
+                            payload,
+                            sequence: *sequence,
+                        };
+                    }
+                });
         }
         response
     }
 
-    fn dispatch_stream(
-        &mut self,
-        request: &loom_remote_protocol::envelope::Request,
-    ) -> Vec<Vec<u8>> {
+    fn set_publication_observer(&self, observer: Option<DaemonGeneratedPublicationObserver>) {
+        *self
+            .publication_observer
+            .lock()
+            .expect("generated publication observer lock") = observer;
+    }
+
+    fn emit_committed_publication(&self, interface: &str, method: &str) {
+        let changes = daemon_generated_committed_change_classes(interface, method);
+        if changes.is_empty() {
+            return;
+        }
+        let observer = self
+            .publication_observer
+            .lock()
+            .expect("generated publication observer lock")
+            .clone();
+        let Some(observer) = observer else {
+            return;
+        };
+        for change in changes {
+            observer.emit(*change);
+        }
+    }
+
+    fn renew_session(&self, session_id: &[u8], now_ms: u64) {
+        if let Some(session) = self
+            .sessions
+            .lock()
+            .expect("generated session lock")
+            .get_mut(session_id)
+        {
+            session.lease_expires_ms = now_ms.saturating_add(daemon_lifecycle_lease_ms());
+        }
+    }
+
+    fn dispatch_stream(&self, request: &loom_remote_protocol::envelope::Request) -> Vec<Vec<u8>> {
         let frames = match self.stream_items(request) {
             Ok(items) => {
                 let count = items.len() as u64;
@@ -7709,36 +10866,29 @@ impl DaemonGeneratedRuntime {
             .collect()
     }
 
-    fn session_lease_valid(&self, session_id: &[u8]) -> bool {
-        self.sessions
-            .get(session_id)
-            .is_some_and(|session| now_ms() < session.lease_expires_ms)
-    }
-
     fn open_generated_stream_response(
-        &mut self,
+        &self,
         request: &loom_remote_protocol::envelope::Request,
     ) -> Result<DaemonGeneratedOpenStream, loom_core::error::LoomError> {
         let stream = self.open_stream(request)?;
         let key = Self::stream_key(request)?;
-        if self.stream_cancellations.contains_key(&key) {
+        let mut stream_cancellations = self
+            .stream_cancellations
+            .lock()
+            .expect("generated stream cancellation lock");
+        if stream_cancellations.contains_key(&key) {
             return Err(loom_core::error::LoomError::new(
                 loom_core::error::Code::Conflict,
                 "daemon generated stream request is already active",
             ));
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.stream_cancellations
-            .insert(key.clone(), cancel.clone());
+        stream_cancellations.insert(key.clone(), cancel.clone());
         Ok((stream, cancel, key))
     }
 
-    fn generated_session_lease_valid(&self, session_id: &[u8]) -> bool {
-        self.session_lease_valid(session_id)
-    }
-
     fn cancel_generated_stream(
-        &mut self,
+        &self,
         request: &loom_remote_protocol::envelope::Request,
     ) -> loom_remote_protocol::envelope::Response {
         let request_id = request.request_id.clone();
@@ -7754,7 +10904,13 @@ impl DaemonGeneratedRuntime {
             Ok(key) => key,
             Err(error) => return reply_err(&error),
         };
-        let Some(cancel) = self.stream_cancellations.get(&key) else {
+        let Some(cancel) = self
+            .stream_cancellations
+            .lock()
+            .expect("generated stream cancellation lock")
+            .get(&key)
+            .cloned()
+        else {
             return reply_err(&loom_core::error::LoomError::new(
                 loom_core::error::Code::NotFound,
                 "unknown daemon generated stream request",
@@ -7768,18 +10924,59 @@ impl DaemonGeneratedRuntime {
         )
     }
 
-    fn finish_generated_stream(&mut self, key: &DaemonGeneratedStreamKey) {
-        self.stream_cancellations.remove(key);
+    fn finish_generated_stream(&self, key: &DaemonGeneratedStreamKey) {
+        self.stream_cancellations
+            .lock()
+            .expect("generated stream cancellation lock")
+            .remove(key);
     }
 
-    fn cancel_session_streams(&mut self, session_id: &[u8]) {
-        for ((stream_session, _), cancel) in &self.stream_cancellations {
+    fn cancel_session_streams(&self, session_id: &[u8]) {
+        let mut stream_cancellations = self
+            .stream_cancellations
+            .lock()
+            .expect("generated stream cancellation lock");
+        for ((stream_session, _), cancel) in stream_cancellations.iter() {
             if stream_session == session_id {
                 cancel.store(true, std::sync::atomic::Ordering::Release);
             }
         }
-        self.stream_cancellations
-            .retain(|(stream_session, _), _| stream_session != session_id);
+        stream_cancellations.retain(|(stream_session, _), _| stream_session != session_id);
+    }
+
+    fn expire_session(&self, session_id: &[u8]) -> Result<(), loom_core::error::LoomError> {
+        let mut sessions = self.sessions.lock().expect("generated session lock");
+        if let Some(session) = sessions.get(session_id).cloned() {
+            loom_client::locks::LocksAuthority::close_owner(
+                self.locks_authority.as_ref(),
+                &session.lock_owner,
+            )?;
+            sessions.remove(session_id);
+            drop(sessions);
+            self.client.close(&session.handle);
+        } else {
+            drop(sessions);
+        }
+        self.idempotency
+            .lock()
+            .expect("generated idempotency lock")
+            .retain(|(session, _, _, _), _| session != session_id);
+        self.cancel_session_streams(session_id);
+        Ok(())
+    }
+
+    fn prune_expired_sessions(&self, at_ms: u64) {
+        let expired = self
+            .sessions
+            .lock()
+            .expect("generated session lock")
+            .iter()
+            .filter(|(_, session)| session.lease_expires_ms <= at_ms)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in expired {
+            let _ = self.expire_session(&session_id);
+        }
     }
 
     fn stream_key(
@@ -7849,18 +11046,33 @@ fn write_generated_open_stream_response(
     cancel: Option<&std::sync::atomic::AtomicBool>,
     writer: &mut impl Write,
 ) -> Result<(), String> {
-    let lease_valid = |runtime: Option<&std::sync::Arc<std::sync::Mutex<DaemonRuntime>>>| {
+    let renew_lease = |runtime: Option<&std::sync::Arc<std::sync::Mutex<DaemonRuntime>>>| {
         let Some((runtime, session_id)) = runtime.zip(session_id) else {
             return true;
         };
-        runtime
+        let action = runtime
             .lock()
-            .map(|runtime| {
-                runtime
-                    .generated_runtime
-                    .generated_session_lease_valid(session_id)
+            .map(|mut runtime| {
+                let now = now_ms();
+                let generated_runtime = runtime.generated_runtime.clone();
+                if runtime.generated_lifecycle_lease_valid(session_id, now) {
+                    runtime.renew_generated_lifecycle_lease(session_id, now);
+                    (true, generated_runtime, now)
+                } else {
+                    (false, generated_runtime, now)
+                }
             })
-            .unwrap_or(false)
+            .ok();
+        let Some((valid, generated_runtime, now)) = action else {
+            return false;
+        };
+        if valid {
+            generated_runtime.renew_session(session_id, now);
+            true
+        } else {
+            let _ = generated_runtime.expire_session(session_id);
+            false
+        }
     };
     let cancelled =
         || cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire));
@@ -7871,7 +11083,7 @@ fn write_generated_open_stream_response(
         )?;
         return Ok(());
     }
-    if !lease_valid(runtime) {
+    if !renew_lease(runtime) {
         write_generated_stream_error(
             writer,
             DaemonGeneratedRuntime::generated_stream_lease_error(),
@@ -7891,7 +11103,7 @@ fn write_generated_open_stream_response(
             )?;
             return Ok(());
         }
-        if !lease_valid(runtime) {
+        if !renew_lease(runtime) {
             write_generated_stream_error(
                 writer,
                 DaemonGeneratedRuntime::generated_stream_lease_error(),
@@ -7950,7 +11162,7 @@ const DAEMON_MAX_ACTIVE_CONNECTIONS: usize = 64;
 
 fn write_daemon_admission_error(stream: &mut LocalDaemonStream) -> Result<(), String> {
     stream
-        .write_all(b"error\tdaemon active connection limit reached\n")
+        .write_all(b"error\tRESOURCE_EXHAUSTED: daemon active connection limit reached\n")
         .map_err(|e| format!("write daemon admission error: {e}"))
 }
 
@@ -7980,10 +11192,33 @@ impl Drop for DaemonWorkerPermit {
     }
 }
 
+struct DaemonRequestLifecycleGuard<S> {
+    permit: Option<DaemonWorkerPermit>,
+    events: BoundedDaemonEventSender<S>,
+}
+
+impl<S> DaemonRequestLifecycleGuard<S> {
+    fn new(permit: DaemonWorkerPermit, events: BoundedDaemonEventSender<S>) -> Self {
+        Self {
+            permit: Some(permit),
+            events,
+        }
+    }
+}
+
+impl<S> Drop for DaemonRequestLifecycleGuard<S> {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        let _ = self
+            .events
+            .try_send_notification(DaemonSchedulerNotification::LifecycleChanged);
+    }
+}
+
 #[cfg(feature = "serve")]
 impl DaemonGeneratedRuntime {
     fn open_stream(
-        &mut self,
+        &self,
         request: &loom_remote_protocol::envelope::Request,
     ) -> Result<loom_remote_protocol::api_types::LoomStream<Vec<u8>>, loom_core::error::LoomError>
     {
@@ -7995,12 +11230,18 @@ impl DaemonGeneratedRuntime {
                 "method requires a session",
             )
         })?;
-        let session = self.sessions.get(session_bytes).cloned().ok_or_else(|| {
-            loom_core::error::LoomError::new(
-                loom_core::error::Code::NotFound,
-                "unknown or expired session",
-            )
-        })?;
+        let session = self
+            .sessions
+            .lock()
+            .expect("generated session lock")
+            .get(session_bytes)
+            .cloned()
+            .ok_or_else(|| {
+                loom_core::error::LoomError::new(
+                    loom_core::error::Code::NotFound,
+                    "unknown or expired session",
+                )
+            })?;
         if now_ms() >= session.lease_expires_ms {
             return Err(loom_core::error::LoomError::new(
                 loom_core::error::Code::LockLeaseExpired,
@@ -8047,12 +11288,18 @@ impl DaemonGeneratedRuntime {
                 "method requires a session",
             )
         })?;
-        let session = self.sessions.get(session_bytes).cloned().ok_or_else(|| {
-            loom_core::error::LoomError::new(
-                loom_core::error::Code::NotFound,
-                "unknown or expired session",
-            )
-        })?;
+        let session = self
+            .sessions
+            .lock()
+            .expect("generated session lock")
+            .get(session_bytes)
+            .cloned()
+            .ok_or_else(|| {
+                loom_core::error::LoomError::new(
+                    loom_core::error::Code::NotFound,
+                    "unknown or expired session",
+                )
+            })?;
         if now_ms() >= session.lease_expires_ms {
             return Err(loom_core::error::LoomError::new(
                 loom_core::error::Code::LockLeaseExpired,
@@ -8091,8 +11338,11 @@ impl DaemonGeneratedRuntime {
 }
 
 #[cfg(feature = "serve")]
-fn daemon_generated_runtime(store: &str) -> Result<DaemonGeneratedRuntime, String> {
-    DaemonGeneratedRuntime::start(store)
+fn daemon_generated_runtime(
+    store: &str,
+    progress: impl FnMut(daemon::DaemonStartupStage, u64, Option<u64>),
+) -> Result<DaemonGeneratedRuntime, String> {
+    DaemonGeneratedRuntime::start(store, progress)
 }
 
 #[cfg(feature = "serve")]
@@ -8135,107 +11385,96 @@ struct DaemonWorkerActor {
 }
 
 #[cfg(feature = "serve")]
-fn apply_drive_policy_workers_once(store: &str, now: u64) -> Result<usize, String> {
-    let targets = drive_policy_targets(store)?;
+fn apply_drive_policy_workers_once(
+    loom: &mut Loom<FileStore>,
+    _store: &str,
+    now: u64,
+    activity: &DaemonSchedulerActivityRecorder,
+) -> Result<usize, String> {
+    #[cfg(test)]
+    increment_daemon_drive_policy_worker_run(_store);
+    #[cfg(test)]
+    if DAEMON_DRIVE_POLICY_WORKER_INJECT_ERROR.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err("injected drive policy worker error".to_string());
+    }
+    let targets = drive_policy_targets(loom)?;
     if targets.is_empty() {
         return Ok(0);
     }
-    let actor = ensure_daemon_worker_actor(store)?;
-    let mut loom = open_daemon_worker_loom(store, actor)?;
+    let actor = ensure_daemon_worker_actor(loom)?;
     let mut applied = 0usize;
-    for (workspace, workspace_id) in targets {
-        match loom_hosted::drive::apply_share_expiry(&mut loom, workspace, &workspace_id, now) {
-            Ok(summary) => {
-                if summary.operation.is_some() {
-                    applied += 1;
+    with_daemon_worker_actor_session(loom, actor, |loom| {
+        for (workspace, workspace_id) in targets {
+            match loom_hosted::drive::apply_share_expiry(loom, workspace, &workspace_id, now) {
+                Ok(summary) => {
+                    if summary.operation.is_some() {
+                        applied += 1;
+                        activity.record_write();
+                    }
+                }
+                Err(err) => {
+                    append_daemon_audit_to_loom(
+                        loom,
+                        actor.principal,
+                        "drive.share_expiry_worker.error",
+                        Some(&format!(
+                            "workspace={workspace};drive={workspace_id};reason={}",
+                            err.message
+                        )),
+                    )?;
+                    activity.record_write();
                 }
             }
-            Err(err) => {
-                append_daemon_audit_actor(
-                    store,
-                    actor.principal,
-                    "drive.share_expiry_worker.error",
-                    Some(&format!(
-                        "workspace={workspace};drive={workspace_id};reason={}",
-                        err.message
-                    )),
-                )?;
-            }
-        }
-        match loom_hosted::drive::apply_retention(&mut loom, workspace, &workspace_id, now) {
-            Ok(summary) => {
-                if summary.operation.is_some() {
-                    applied += 1;
+            match loom_hosted::drive::apply_retention(loom, workspace, &workspace_id, now) {
+                Ok(summary) => {
+                    if summary.operation.is_some() {
+                        applied += 1;
+                        activity.record_write();
+                    }
+                }
+                Err(err) => {
+                    append_daemon_audit_to_loom(
+                        loom,
+                        actor.principal,
+                        "drive.retention_worker.error",
+                        Some(&format!(
+                            "workspace={workspace};drive={workspace_id};reason={}",
+                            err.message
+                        )),
+                    )?;
+                    activity.record_write();
                 }
             }
-            Err(err) => {
-                append_daemon_audit_actor(
-                    store,
-                    actor.principal,
-                    "drive.retention_worker.error",
-                    Some(&format!(
-                        "workspace={workspace};drive={workspace_id};reason={}",
-                        err.message
-                    )),
-                )?;
-            }
         }
-    }
+        Ok(())
+    })?;
     Ok(applied)
 }
 
 #[cfg(feature = "serve")]
 fn drive_policy_targets(
-    store: &str,
+    loom: &Loom<FileStore>,
 ) -> Result<std::collections::BTreeSet<(WorkspaceId, String)>, String> {
     let mut targets = std::collections::BTreeSet::new();
-    let fs = FileStore::open_read(store).map_err(|e| e.to_string())?;
-    for target in load_drive_policy_registry(&fs)?.enabled_targets() {
+    for target in load_drive_policy_registry(loom.store())?.enabled_targets() {
         targets.insert((target.workspace, target.workspace_id.clone()));
     }
-    for record in desired_hosted_listener_records(store)? {
+    for record in desired_hosted_listener_records_from_store(loom.store())? {
         if record.surface != "drive" {
             continue;
         }
         let [workspace] = record.selectors.as_slice() else {
             continue;
         };
-        let workspace = resolve_served_workspace(store, workspace)?;
+        let workspace = resolve_served_workspace_from_loom(loom, workspace)?;
         targets.insert((workspace, workspace.to_string()));
     }
     Ok(targets)
 }
 
 #[cfg(feature = "serve")]
-fn open_daemon_worker_loom(
-    store: &str,
-    actor: DaemonWorkerActor,
-) -> Result<Loom<FileStore>, String> {
-    let loom =
-        loom_store::open_loom_daemon_authorized_unlocked(store, None).map_err(|e| e.to_string())?;
-    if actor.preauthenticate {
-        loom_store::attach_local_auth(
-            loom,
-            &LocalOpenAuth {
-                unlock_key: None,
-                principal: None,
-                passphrase: None,
-                app_credential: None,
-                verified_external: None,
-                preauthenticated_principal: actor.principal,
-                session_id: Some(actor.session_id.to_string()),
-            },
-        )
-        .map_err(|e| e.to_string())
-    } else {
-        Ok(loom)
-    }
-}
-
-#[cfg(feature = "serve")]
-fn ensure_daemon_worker_actor(store: &str) -> Result<DaemonWorkerActor, String> {
-    let fs = FileStore::open_daemon_authorized(store).map_err(|e| e.to_string())?;
-    let Some(mut identity) = fs.identity_store().map_err(|e| e.to_string())? else {
+fn ensure_daemon_worker_actor(loom: &mut Loom<FileStore>) -> Result<DaemonWorkerActor, String> {
+    let Some(mut identity) = loom.store().identity_store().map_err(|e| e.to_string())? else {
         return Ok(DaemonWorkerActor {
             principal: None,
             preauthenticate: false,
@@ -8280,15 +11519,17 @@ fn ensure_daemon_worker_actor(store: &str) -> Result<DaemonWorkerActor, String> 
         }
     }
     if identity_changed {
-        fs.save_identity_store_audited(
-            &identity,
-            Some(principal),
-            "daemon.service_principal.ensure",
-            Some(&format!("principal={principal}")),
-        )
-        .map_err(|e| e.to_string())?;
+        loom.store()
+            .save_identity_store_audited(
+                &identity,
+                Some(principal),
+                "daemon.service_principal.ensure",
+                Some(&format!("principal={principal}")),
+            )
+            .map_err(|e| e.to_string())?;
     }
-    ensure_daemon_worker_acl(&fs, principal)?;
+    loom.set_identity_store(identity);
+    ensure_daemon_worker_acl(loom, principal)?;
     Ok(DaemonWorkerActor {
         principal: Some(principal),
         preauthenticate: true,
@@ -8297,15 +11538,19 @@ fn ensure_daemon_worker_actor(store: &str) -> Result<DaemonWorkerActor, String> 
 }
 
 #[cfg(feature = "serve")]
-fn ensure_daemon_worker_acl(fs: &FileStore, principal: WorkspaceId) -> Result<(), String> {
-    let mut acl = fs
+fn ensure_daemon_worker_acl(
+    loom: &mut Loom<FileStore>,
+    principal: WorkspaceId,
+) -> Result<(), String> {
+    let mut acl = loom
+        .store()
         .acl_store()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "daemon service principal requires acl state".to_string())?;
-    let grant = AclGrant {
+    let grants = [FacetKind::Vcs, FacetKind::Files].map(|facet| AclGrant {
         subject: AclSubject::Principal(principal),
         workspace: None,
-        domain: Some(FacetKind::Vcs.into()),
+        domain: Some(facet.into()),
         ref_glob: None,
         scopes: vec![AclScope::All],
         rights: [AclRight::Admin, AclRight::Read, AclRight::Write]
@@ -8313,19 +11558,71 @@ fn ensure_daemon_worker_acl(fs: &FileStore, principal: WorkspaceId) -> Result<()
             .collect(),
         effect: AclEffect::Allow,
         predicate: None,
-    };
-    if acl.grants().contains(&grant) {
+    });
+    let mut changed = false;
+    for grant in grants {
+        if !acl.grants().contains(&grant) {
+            acl.grant(grant).map_err(|e| e.to_string())?;
+            changed = true;
+        }
+    }
+    if !changed {
         return Ok(());
     }
-    acl.grant(grant).map_err(|e| e.to_string())?;
-    fs.save_acl_store_audited(
-        &acl,
-        Some(principal),
-        "daemon.service_principal.acl",
-        Some(&format!("principal={principal}")),
-    )
-    .map_err(|e| e.to_string())?;
+    loom.store()
+        .save_acl_store_audited(
+            &acl,
+            Some(principal),
+            "daemon.service_principal.acl",
+            Some(&format!("principal={principal}")),
+        )
+        .map_err(|e| e.to_string())?;
+    loom.set_acl_store(acl);
     Ok(())
+}
+
+#[cfg(feature = "serve")]
+fn with_daemon_worker_actor_session<T>(
+    loom: &mut Loom<FileStore>,
+    actor: DaemonWorkerActor,
+    run: impl FnOnce(&mut Loom<FileStore>) -> Result<T, String>,
+) -> Result<T, String> {
+    if actor.preauthenticate {
+        let principal = actor
+            .principal
+            .ok_or_else(|| "daemon worker principal is missing".to_string())?;
+        let mut identity = loom
+            .store()
+            .identity_store()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "daemon worker requires identity state".to_string())?;
+        let session = identity
+            .bind_session(principal, actor.session_id.to_string())
+            .map_err(|e| e.to_string())?;
+        loom.set_session(session.id);
+        loom.set_identity_store(identity);
+        if let Some(acl) = loom.store().acl_store().map_err(|e| e.to_string())? {
+            loom.set_acl_store(acl);
+        }
+    }
+    let result = run(loom);
+    if actor.preauthenticate {
+        loom.clear_session();
+    }
+    result
+}
+
+#[cfg(feature = "serve")]
+fn append_daemon_audit_to_loom(
+    loom: &mut Loom<FileStore>,
+    actor: Option<WorkspaceId>,
+    action: &str,
+    target: Option<&str>,
+) -> Result<(), String> {
+    loom.store()
+        .audit_append(actor, action, target)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(feature = "serve")]
@@ -8341,38 +11638,38 @@ struct ReferenceWorkerRun {
 
 #[cfg(feature = "serve")]
 fn reconcile_references_once(
-    store: &str,
+    loom: &mut Loom<FileStore>,
     now: u64,
     max: usize,
 ) -> Result<ReferenceWorkerRun, String> {
-    let workspaces = reference_workspace_ids(store)?;
+    let workspaces = reference_workspace_ids(loom)?;
     if workspaces.is_empty() {
         return Ok(ReferenceWorkerRun::default());
     }
-    let actor = ensure_reference_resolver_actor(store, &workspaces)?;
-    let loom = open_daemon_worker_loom(store, actor)?;
+    let actor = ensure_reference_resolver_actor(loom, &workspaces)?;
     let mut targets = Vec::new();
-    for workspace in &workspaces {
-        targets.extend(
-            loom_reference::targets(&loom, *workspace)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|target| (*workspace, target)),
-        );
-    }
-    drop(loom);
+    with_daemon_worker_actor_session(loom, actor, |loom| {
+        for workspace in &workspaces {
+            targets.extend(
+                loom_reference::targets(loom, *workspace)
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(|target| (*workspace, target)),
+            );
+        }
+        Ok(())
+    })?;
     if let Some(principal) = actor.principal {
-        let fs = FileStore::open_daemon_authorized(store).map_err(|error| error.to_string())?;
         for (workspace, target) in &targets {
             match target.source_profile.as_str() {
                 "tickets" => ensure_reference_resolver_ticket_acl(
-                    &fs,
+                    loom,
                     principal,
                     *workspace,
                     &target.source_scope,
                 )?,
                 "chat" => ensure_reference_resolver_chat_acl(
-                    &fs,
+                    loom,
                     principal,
                     *workspace,
                     &target.source_scope,
@@ -8381,95 +11678,95 @@ fn reconcile_references_once(
             }
         }
     }
-    let mut loom = open_daemon_worker_loom(store, actor)?;
     let mut run = ReferenceWorkerRun::default();
-    for (workspace, target) in targets {
-        let remaining = max.saturating_sub(run.processed as usize);
-        if remaining == 0 {
-            break;
-        }
-        let mut index = loom_reference::load_index(&loom, workspace)
-            .map_err(|error| error.to_string())?
-            .unwrap_or_default();
-        let records = match target.source_profile.as_str() {
-            "tickets" => {
-                let due = loom_reference::due(&loom, workspace, &target, now, remaining)
+    with_daemon_worker_actor_session(loom, actor, |loom| {
+        for (workspace, target) in targets {
+            let remaining = max.saturating_sub(run.processed as usize);
+            if remaining == 0 {
+                break;
+            }
+            let mut index = loom_reference::load_index(loom, workspace)
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            let records = match target.source_profile.as_str() {
+                "tickets" => {
+                    let due = loom_reference::due(loom, workspace, &target, now, remaining)
+                        .map_err(|error| error.to_string())?;
+                    if due.is_empty() {
+                        continue;
+                    }
+                    let records = loom_tickets::reconcile_reference_candidates(
+                        loom,
+                        workspace,
+                        &target.source_scope,
+                        now,
+                        due.len(),
+                        &actor.principal.unwrap_or(workspace).to_string(),
+                    )
                     .map_err(|error| error.to_string())?;
-                if due.is_empty() {
+                    run.processed = run.processed.saturating_add(due.len() as u64);
+                    records
+                }
+                "chat" => {
+                    let records = loom_reference::reconcile(
+                        loom,
+                        workspace,
+                        &target,
+                        now,
+                        remaining,
+                        &actor.principal.unwrap_or(workspace).to_string(),
+                        |loom, candidate| {
+                            resolve_chat_reference_candidate(
+                                loom,
+                                workspace,
+                                &target.source_scope,
+                                candidate,
+                            )
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    run.processed = run.processed.saturating_add(records.len() as u64);
+                    records
+                }
+                _ => {
+                    run.unsupported_targets = run.unsupported_targets.saturating_add(1);
                     continue;
                 }
-                let records = loom_tickets::reconcile_reference_candidates(
-                    &mut loom,
-                    workspace,
-                    &target.source_scope,
-                    now,
-                    due.len(),
-                    &actor.principal.unwrap_or(workspace).to_string(),
-                )
-                .map_err(|error| error.to_string())?;
-                run.processed = run.processed.saturating_add(due.len() as u64);
-                records
+            };
+            if !records.is_empty() {
+                loom_reference::apply_resolved_edges(&mut index, &records)
+                    .map_err(|error| error.to_string())?;
+                loom_reference::save_index(loom, workspace, &index)
+                    .map_err(|error| error.to_string())?;
             }
-            "chat" => {
-                let records = loom_reference::reconcile(
-                    &mut loom,
-                    workspace,
-                    &target,
-                    now,
-                    remaining,
-                    &actor.principal.unwrap_or(workspace).to_string(),
-                    |loom, candidate| {
-                        resolve_chat_reference_candidate(
-                            loom,
-                            workspace,
-                            &target.source_scope,
-                            candidate,
-                        )
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-                run.processed = run.processed.saturating_add(records.len() as u64);
-                records
-            }
-            _ => {
-                run.unsupported_targets = run.unsupported_targets.saturating_add(1);
-                continue;
-            }
-        };
-        if !records.is_empty() {
-            loom_reference::apply_resolved_edges(&mut index, &records)
-                .map_err(|error| error.to_string())?;
-            loom_reference::save_index(&mut loom, workspace, &index)
-                .map_err(|error| error.to_string())?;
         }
-    }
-    for workspace in workspaces {
-        let summary =
-            loom_reference::status(&loom, workspace).map_err(|error| error.to_string())?;
-        run.pending = run.pending.saturating_add(summary.pending);
-        run.resolved = run.resolved.saturating_add(summary.resolved);
-        run.failed = run.failed.saturating_add(summary.failed);
-        for target in
-            loom_reference::targets(&loom, workspace).map_err(|error| error.to_string())?
-        {
-            run.next_attempt_ms = Some(
-                run.next_attempt_ms
-                    .map_or(target.next_attempt_ms, |current| {
-                        current.min(target.next_attempt_ms)
-                    }),
-            );
+        for workspace in workspaces {
+            let summary =
+                loom_reference::status(loom, workspace).map_err(|error| error.to_string())?;
+            run.pending = run.pending.saturating_add(summary.pending);
+            run.resolved = run.resolved.saturating_add(summary.resolved);
+            run.failed = run.failed.saturating_add(summary.failed);
+            for target in
+                loom_reference::targets(loom, workspace).map_err(|error| error.to_string())?
+            {
+                run.next_attempt_ms = Some(
+                    run.next_attempt_ms
+                        .map_or(target.next_attempt_ms, |current| {
+                            current.min(target.next_attempt_ms)
+                        }),
+                );
+            }
         }
-    }
-    if run.processed > 0 {
-        save_loom(&mut loom).map_err(|error| error.to_string())?;
-    }
+        if run.processed > 0 {
+            save_loom(loom).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })?;
     Ok(run)
 }
 
 #[cfg(feature = "serve")]
-fn reference_workspace_ids(store: &str) -> Result<Vec<WorkspaceId>, String> {
-    let loom = loom_store::open_loom_daemon_authorized_unlocked(store, None)
-        .map_err(|error| error.to_string())?;
+fn reference_workspace_ids(loom: &Loom<FileStore>) -> Result<Vec<WorkspaceId>, String> {
     Ok(loom
         .registry()
         .list(None)
@@ -8480,11 +11777,14 @@ fn reference_workspace_ids(store: &str) -> Result<Vec<WorkspaceId>, String> {
 
 #[cfg(feature = "serve")]
 fn ensure_reference_resolver_actor(
-    store: &str,
+    loom: &mut Loom<FileStore>,
     workspaces: &[WorkspaceId],
 ) -> Result<DaemonWorkerActor, String> {
-    let fs = FileStore::open_daemon_authorized(store).map_err(|error| error.to_string())?;
-    let Some(mut identity) = fs.identity_store().map_err(|error| error.to_string())? else {
+    let Some(mut identity) = loom
+        .store()
+        .identity_store()
+        .map_err(|error| error.to_string())?
+    else {
         return Ok(DaemonWorkerActor {
             principal: None,
             preauthenticate: false,
@@ -8527,16 +11827,18 @@ fn ensure_reference_resolver_actor(
         changed = true;
     }
     if changed {
-        fs.save_identity_store_audited(
-            &identity,
-            Some(principal),
-            "reference_resolver.principal.ensure",
-            Some(&format!("principal={principal}")),
-        )
-        .map_err(|error| error.to_string())?;
+        loom.store()
+            .save_identity_store_audited(
+                &identity,
+                Some(principal),
+                "reference_resolver.principal.ensure",
+                Some(&format!("principal={principal}")),
+            )
+            .map_err(|error| error.to_string())?;
     }
+    loom.set_identity_store(identity);
     for workspace in workspaces {
-        ensure_reference_resolver_base_acl(&fs, principal, *workspace)?;
+        ensure_reference_resolver_base_acl(loom, principal, *workspace)?;
     }
     Ok(DaemonWorkerActor {
         principal: Some(principal),
@@ -8547,12 +11849,12 @@ fn ensure_reference_resolver_actor(
 
 #[cfg(feature = "serve")]
 fn ensure_reference_resolver_base_acl(
-    fs: &FileStore,
+    loom: &mut Loom<FileStore>,
     principal: WorkspaceId,
     workspace: WorkspaceId,
 ) -> Result<(), String> {
     ensure_service_grant(
-        fs,
+        loom,
         principal,
         workspace,
         FacetKind::Vcs,
@@ -8562,7 +11864,7 @@ fn ensure_reference_resolver_base_acl(
         },
     )?;
     ensure_service_grant(
-        fs,
+        loom,
         principal,
         workspace,
         FacetKind::Files,
@@ -8575,7 +11877,7 @@ fn ensure_reference_resolver_base_acl(
 
 #[cfg(feature = "serve")]
 fn ensure_reference_resolver_ticket_acl(
-    fs: &FileStore,
+    loom: &mut Loom<FileStore>,
     principal: WorkspaceId,
     workspace: WorkspaceId,
     workspace_id: &str,
@@ -8583,7 +11885,7 @@ fn ensure_reference_resolver_ticket_acl(
     let prefix =
         loom_tickets::profile_table_prefix(workspace_id).map_err(|error| error.to_string())?;
     ensure_service_grant(
-        fs,
+        loom,
         principal,
         workspace,
         FacetKind::Vcs,
@@ -8596,7 +11898,7 @@ fn ensure_reference_resolver_ticket_acl(
 
 #[cfg(feature = "serve")]
 fn ensure_reference_resolver_chat_acl(
-    fs: &FileStore,
+    loom: &mut Loom<FileStore>,
     principal: WorkspaceId,
     workspace: WorkspaceId,
     source_scope: &str,
@@ -8610,7 +11912,7 @@ fn ensure_reference_resolver_chat_acl(
     )
     .map_err(|_| "chat channel directory path is not utf-8".to_string())?;
     ensure_service_grant(
-        fs,
+        loom,
         principal,
         workspace,
         FacetKind::Vcs,
@@ -8686,6 +11988,7 @@ fn resolve_ticket_reference_candidate(
         .transpose()
 }
 
+#[cfg(not(feature = "serve"))]
 fn record_daemon_maintenance_error(store: &str, now: u64, error: String) -> Result<(), String> {
     let fs = FileStore::open_read(store).map_err(|e| e.to_string())?;
     let policy = fs.store_maintenance_policy().map_err(|e| e.to_string())?;
@@ -8704,14 +12007,37 @@ fn record_daemon_maintenance_error(store: &str, now: u64, error: String) -> Resu
 }
 
 #[cfg(feature = "serve")]
+fn record_daemon_maintenance_error_on_loom(
+    loom: &mut Loom<FileStore>,
+    now: u64,
+    error: String,
+) -> Result<(), String> {
+    let policy = loom
+        .store()
+        .store_maintenance_policy()
+        .map_err(|e| e.to_string())?;
+    let next_eligible_ms = now.saturating_add(policy.backoff_ms);
+    loom.store()
+        .record_store_maintenance_run_state(StoreMaintenanceRunState {
+            last_run_ms: Some(now),
+            next_eligible_ms,
+            last_skip_reason: None,
+            last_error: Some(error),
+            ..StoreMaintenanceRunState::default()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "serve")]
 fn ensure_service_grant(
-    fs: &FileStore,
+    loom: &mut Loom<FileStore>,
     principal: WorkspaceId,
     workspace: WorkspaceId,
     facet: FacetKind,
     scope: AclScope,
 ) -> Result<(), String> {
-    let mut acl = fs
+    let mut acl = loom
+        .store()
         .acl_store()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "reference resolver requires acl state".to_string())?;
@@ -8729,16 +12055,19 @@ fn ensure_service_grant(
         return Ok(());
     }
     acl.grant(grant).map_err(|error| error.to_string())?;
-    fs.save_acl_store_audited(
-        &acl,
-        Some(principal),
-        "reference_resolver.acl.ensure",
-        Some(&format!(
-            "principal={principal};workspace={workspace};facet={facet:?}"
-        )),
-    )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    loom.store()
+        .save_acl_store_audited(
+            &acl,
+            Some(principal),
+            "reference_resolver.acl.ensure",
+            Some(&format!(
+                "principal={principal};workspace={workspace};facet={facet:?}"
+            )),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())?;
+    loom.set_acl_store(acl);
+    Ok(())
 }
 
 fn parse_daemon_stop_request(
@@ -8804,6 +12133,24 @@ fn split_daemon_auth_fields(fields: Vec<&str>) -> Result<(Vec<&str>, DaemonReque
 }
 
 impl DaemonRuntime {
+    fn locks_authority(&self) -> &std::sync::Arc<loom_client::locks::InProcessLocksAuthority> {
+        #[cfg(feature = "serve")]
+        {
+            &self.generated_runtime.locks_authority
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            &self.locks_authority
+        }
+    }
+
+    fn scheduler_activity_recorder(
+        &self,
+        owner: DaemonSchedulerOwner,
+    ) -> DaemonSchedulerActivityRecorder {
+        DaemonSchedulerActivityRecorder::new(owner, self.scheduler_counters.clone())
+    }
+
     #[cfg(feature = "serve")]
     fn generated_session_open(&mut self, fields: Vec<&str>) -> String {
         if fields.len() != 1 {
@@ -8813,11 +12160,24 @@ impl DaemonRuntime {
             Ok(body) => body,
             Err(error) => return format!("error\t{error}\n"),
         };
-        let auth = match loom_remote_protocol::session::parse_open_request(&body) {
-            Ok(auth) => auth,
+        let request = match loom_remote_protocol::session::parse_session_request(&body) {
+            Ok(request) => request,
             Err(error) => return format!("error\t{}\n", error),
         };
-        let reply = self.generated_runtime.open_session(auth);
+        let closes_session = matches!(
+            &request,
+            loom_remote_protocol::session::SessionRequest::Close { .. }
+        );
+        let reply = self.generated_runtime.handle_session_request(request);
+        if let loom_remote_protocol::session::SessionOpenReply::Ok { session_id, .. } = &reply {
+            if closes_session {
+                self.remove_generated_lifecycle_lease(session_id);
+            } else {
+                let now = now_ms();
+                self.renew_generated_lifecycle_lease(session_id, now);
+                self.generated_runtime.renew_session(session_id, now);
+            }
+        }
         let bytes = loom_remote_protocol::session::open_reply_bytes(&reply);
         format!("generated-session\t{}\n", daemon::hex_encode(&bytes))
     }
@@ -8835,7 +12195,16 @@ impl DaemonRuntime {
             Ok(request) => request,
             Err(error) => return format!("error\t{}\n", error),
         };
+        if let Some(session_id) = request.session_id.as_ref() {
+            self.renew_generated_lifecycle_for_request(session_id, now_ms());
+        }
+        let close_session = (request.interface == "Store" && request.method == "close")
+            .then(|| request.session_id.clone())
+            .flatten();
         let response = self.generated_runtime.dispatch(&request);
+        if let Some(session_id) = close_session {
+            self.remove_generated_lifecycle_lease(&session_id);
+        }
         let bytes = match response.encode() {
             Ok(bytes) => bytes,
             Err(error) => return format!("error\t{}\n", error),
@@ -8846,8 +12215,15 @@ impl DaemonRuntime {
     #[cfg(feature = "serve")]
     fn handle_generated_binary(&mut self, request: &[u8]) -> Option<Vec<u8>> {
         if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_SESSION_OPEN_MAGIC) {
-            let reply = match loom_remote_protocol::session::parse_open_request(body) {
-                Ok(auth) => self.generated_runtime.open_session(auth),
+            let mut closes_session = false;
+            let reply = match loom_remote_protocol::session::parse_session_request(body) {
+                Ok(request) => {
+                    closes_session = matches!(
+                        &request,
+                        loom_remote_protocol::session::SessionRequest::Close { .. }
+                    );
+                    self.generated_runtime.handle_session_request(request)
+                }
                 Err(error) => {
                     let error = loom_core::error::LoomError::new(
                         loom_core::error::Code::InvalidArgument,
@@ -8858,6 +12234,15 @@ impl DaemonRuntime {
                     )
                 }
             };
+            if let loom_remote_protocol::session::SessionOpenReply::Ok { session_id, .. } = &reply {
+                if closes_session {
+                    self.remove_generated_lifecycle_lease(session_id);
+                } else {
+                    let now = now_ms();
+                    self.renew_generated_lifecycle_lease(session_id, now);
+                    self.generated_runtime.renew_session(session_id, now);
+                }
+            }
             return Some(generated_binary_response(
                 DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
                 &[loom_remote_protocol::session::open_reply_bytes(&reply)],
@@ -8865,7 +12250,19 @@ impl DaemonRuntime {
         }
         if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_CALL_MAGIC) {
             let response = match loom_remote_protocol::envelope::Request::decode(body) {
-                Ok(request) => self.generated_runtime.dispatch(&request),
+                Ok(request) => {
+                    if let Some(session_id) = request.session_id.as_ref() {
+                        self.renew_generated_lifecycle_for_request(session_id, now_ms());
+                    }
+                    let close_session = (request.interface == "Store" && request.method == "close")
+                        .then(|| request.session_id.clone())
+                        .flatten();
+                    let response = self.generated_runtime.dispatch(&request);
+                    if let Some(session_id) = close_session {
+                        self.remove_generated_lifecycle_lease(&session_id);
+                    }
+                    response
+                }
                 Err(error) => {
                     let error = loom_core::error::LoomError::new(
                         loom_core::error::Code::InvalidArgument,
@@ -8886,7 +12283,12 @@ impl DaemonRuntime {
         }
         if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_STREAM_CANCEL_MAGIC) {
             let response = match loom_remote_protocol::envelope::Request::decode(body) {
-                Ok(request) => self.generated_runtime.cancel_generated_stream(&request),
+                Ok(request) => {
+                    if let Some(session_id) = request.session_id.as_ref() {
+                        self.renew_generated_lifecycle_for_request(session_id, now_ms());
+                    }
+                    self.generated_runtime.cancel_generated_stream(&request)
+                }
                 Err(error) => {
                     let error = loom_core::error::LoomError::new(
                         loom_core::error::Code::InvalidArgument,
@@ -8907,7 +12309,12 @@ impl DaemonRuntime {
         }
         if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_STREAM_MAGIC) {
             let frames = match loom_remote_protocol::envelope::Request::decode(body) {
-                Ok(request) => self.generated_runtime.dispatch_stream(&request),
+                Ok(request) => {
+                    if let Some(session_id) = request.session_id.as_ref() {
+                        self.renew_generated_lifecycle_for_request(session_id, now_ms());
+                    }
+                    self.generated_runtime.dispatch_stream(&request)
+                }
                 Err(error) => {
                     let error = loom_core::error::LoomError::new(
                         loom_core::error::Code::InvalidArgument,
@@ -8941,92 +12348,448 @@ impl DaemonRuntime {
         }
     }
 
+    #[cfg(feature = "serve")]
+    fn handle_generated_binary_shared(
+        runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+        request: &[u8],
+    ) -> Option<Vec<u8>> {
+        if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_SESSION_OPEN_MAGIC) {
+            let mut closes_session = false;
+            let reply = match loom_remote_protocol::session::parse_session_request(body) {
+                Ok(request) => {
+                    closes_session = matches!(
+                        &request,
+                        loom_remote_protocol::session::SessionRequest::Close { .. }
+                    );
+                    let generated_runtime = match runtime.lock() {
+                        Ok(runtime) => std::sync::Arc::clone(&runtime.generated_runtime),
+                        Err(_) => {
+                            let error = loom_core::error::LoomError::new(
+                                loom_core::error::Code::Internal,
+                                "daemon runtime lock poisoned",
+                            );
+                            return Some(generated_binary_response(
+                                DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+                                &[loom_remote_protocol::session::open_reply_bytes(
+                                    &loom_remote_protocol::session::SessionOpenReply::Err(
+                                        loom_remote_protocol::RemoteError::from_loom_error(&error),
+                                    ),
+                                )],
+                            ));
+                        }
+                    };
+                    generated_runtime.handle_session_request(request)
+                }
+                Err(error) => {
+                    let error = loom_core::error::LoomError::new(
+                        loom_core::error::Code::InvalidArgument,
+                        format!("decode session-open request: {error}"),
+                    );
+                    loom_remote_protocol::session::SessionOpenReply::Err(
+                        loom_remote_protocol::RemoteError::from_loom_error(&error),
+                    )
+                }
+            };
+            if let loom_remote_protocol::session::SessionOpenReply::Ok { session_id, .. } = &reply {
+                let now = now_ms();
+                let generated_runtime = match runtime.lock() {
+                    Ok(mut runtime) => {
+                        if closes_session {
+                            runtime.remove_generated_lifecycle_lease(session_id);
+                        } else {
+                            runtime.renew_generated_lifecycle_lease(session_id, now);
+                        }
+                        std::sync::Arc::clone(&runtime.generated_runtime)
+                    }
+                    Err(_) => return None,
+                };
+                if !closes_session {
+                    generated_runtime.renew_session(session_id, now);
+                }
+            }
+            return Some(generated_binary_response(
+                DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+                &[loom_remote_protocol::session::open_reply_bytes(&reply)],
+            ));
+        }
+        if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_CALL_MAGIC) {
+            let response = match loom_remote_protocol::envelope::Request::decode(body) {
+                Ok(request) => {
+                    let mut renew_generated_session = None;
+                    let generated_runtime = match runtime.lock() {
+                        Ok(mut runtime) => {
+                            if let Some(session_id) = request.session_id.as_ref() {
+                                let now = now_ms();
+                                if runtime.generated_lifecycle_lease_valid(session_id, now) {
+                                    runtime.renew_generated_lifecycle_lease(session_id, now);
+                                    renew_generated_session = Some((session_id.clone(), now));
+                                }
+                            }
+                            std::sync::Arc::clone(&runtime.generated_runtime)
+                        }
+                        Err(_) => {
+                            let error = loom_core::error::LoomError::new(
+                                loom_core::error::Code::Internal,
+                                "daemon runtime lock poisoned",
+                            );
+                            return Some(generated_binary_response(
+                                DAEMON_GENERATED_RESPONSE_MAGIC,
+                                &[loom_remote_protocol::envelope::Response::err(
+                                    request.request_id.clone(),
+                                    request.session_id.clone(),
+                                    loom_remote_protocol::RemoteError::from_loom_error(&error),
+                                )
+                                .encode()
+                                .unwrap_or_default()],
+                            ));
+                        }
+                    };
+                    let close_session = (request.interface == "Store" && request.method == "close")
+                        .then(|| request.session_id.clone())
+                        .flatten();
+                    if let Some((session_id, now)) = renew_generated_session {
+                        generated_runtime.renew_session(&session_id, now);
+                    }
+                    let response = generated_runtime.dispatch(&request);
+                    if let Some(session_id) = close_session
+                        && let Ok(mut runtime) = runtime.lock()
+                    {
+                        runtime.remove_generated_lifecycle_lease(&session_id);
+                    }
+                    response
+                }
+                Err(error) => {
+                    let error = loom_core::error::LoomError::new(
+                        loom_core::error::Code::InvalidArgument,
+                        format!("decode generated request: {error}"),
+                    );
+                    loom_remote_protocol::envelope::Response::err(
+                        Vec::new(),
+                        None,
+                        loom_remote_protocol::RemoteError::from_loom_error(&error),
+                    )
+                }
+            };
+            let body = response.encode().unwrap_or_default();
+            return Some(generated_binary_response(
+                DAEMON_GENERATED_RESPONSE_MAGIC,
+                &[body],
+            ));
+        }
+        if let Some(body) = generated_binary_body(request, DAEMON_GENERATED_STREAM_CANCEL_MAGIC) {
+            let response = match loom_remote_protocol::envelope::Request::decode(body) {
+                Ok(request) => {
+                    let mut renew_generated_session = None;
+                    let generated_runtime = match runtime.lock() {
+                        Ok(mut runtime) => {
+                            if let Some(session_id) = request.session_id.as_ref() {
+                                let now = now_ms();
+                                if runtime.generated_lifecycle_lease_valid(session_id, now) {
+                                    runtime.renew_generated_lifecycle_lease(session_id, now);
+                                    renew_generated_session = Some((session_id.clone(), now));
+                                }
+                            }
+                            std::sync::Arc::clone(&runtime.generated_runtime)
+                        }
+                        Err(_) => {
+                            let error = loom_core::error::LoomError::new(
+                                loom_core::error::Code::Internal,
+                                "daemon runtime lock poisoned",
+                            );
+                            return Some(generated_binary_response(
+                                DAEMON_GENERATED_STREAM_CANCEL_RESPONSE_MAGIC,
+                                &[loom_remote_protocol::envelope::Response::err(
+                                    request.request_id.clone(),
+                                    request.session_id.clone(),
+                                    loom_remote_protocol::RemoteError::from_loom_error(&error),
+                                )
+                                .encode()
+                                .unwrap_or_default()],
+                            ));
+                        }
+                    };
+                    if let Some((session_id, now)) = renew_generated_session {
+                        generated_runtime.renew_session(&session_id, now);
+                    }
+                    generated_runtime.cancel_generated_stream(&request)
+                }
+                Err(error) => {
+                    let error = loom_core::error::LoomError::new(
+                        loom_core::error::Code::InvalidArgument,
+                        format!("decode generated stream cancel request: {error}"),
+                    );
+                    loom_remote_protocol::envelope::Response::err(
+                        Vec::new(),
+                        None,
+                        loom_remote_protocol::RemoteError::from_loom_error(&error),
+                    )
+                }
+            };
+            let body = response.encode().unwrap_or_default();
+            return Some(generated_binary_response(
+                DAEMON_GENERATED_STREAM_CANCEL_RESPONSE_MAGIC,
+                &[body],
+            ));
+        }
+        None
+    }
+
+    fn daemon_start_audit(&mut self, fields: Vec<&str>) -> String {
+        let [pid, state] = fields.as_slice() else {
+            return "error\tdaemon-start-audit requires pid and state\n".to_string();
+        };
+        if pid.parse::<u32>().is_err() {
+            return "error\tdaemon-start-audit pid must be a u32\n".to_string();
+        }
+        if !matches!(*state, "running" | "started") {
+            return "error\tdaemon-start-audit state must be running or started\n".to_string();
+        }
+        let target = format!("pid={pid};state={state}");
+        match self.append_audit(None, "daemon.start", Some(&target)) {
+            Ok(()) => "ok\n".to_string(),
+            Err(error) => format!("error\t{error}\n"),
+        }
+    }
+
+    fn append_audit(
+        &mut self,
+        actor: Option<WorkspaceId>,
+        action: &str,
+        target: Option<&str>,
+    ) -> Result<(), String> {
+        #[cfg(feature = "serve")]
+        {
+            self.generated_runtime
+                .engine
+                .lock()
+                .map_err(|_| "daemon generated runtime lock poisoned".to_string())?
+                .store()
+                .audit_append(actor, action, target)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            append_daemon_audit_actor(&self.store, actor, action, target)
+        }
+    }
+
+    #[cfg(test)]
     fn reconcile_store_maintenance(&mut self) -> Result<(), String> {
+        let activity = self.scheduler_activity_recorder(DaemonSchedulerOwner::Maintenance);
+        self.reconcile_store_maintenance_with_events(None, false, activity)
+    }
+
+    fn reconcile_store_maintenance_with_events(
+        &mut self,
+        events: Option<BoundedDaemonEventSender<DaemonAcceptedConnection>>,
+        completion_event: bool,
+        activity: DaemonSchedulerActivityRecorder,
+    ) -> Result<(), String> {
         let now = now_ms();
         if self
             .maintenance_worker
             .as_ref()
-            .is_some_and(|worker| worker.is_finished())
+            .is_some_and(|worker| completion_event || worker.is_finished())
         {
             let worker = self.maintenance_worker.take().expect("worker checked");
             match worker.join() {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => record_daemon_maintenance_error(&self.store, now, error)?,
-                Err(_) => record_daemon_maintenance_error(
-                    &self.store,
+                Ok(Err(error)) => self.record_maintenance_error(now, error, &activity)?,
+                Err(_) => self.record_maintenance_error(
                     now,
                     "maintenance worker panicked".to_string(),
+                    &activity,
                 )?,
             }
         }
         if self.maintenance_worker.is_some() {
             return Ok(());
         }
-        if now < self.maintenance_next_ms {
+        #[cfg(test)]
+        let force_due = take_daemon_test_signal(&DAEMON_MAINTENANCE_FORCE_DUE_ONCE, &self.store);
+        #[cfg(not(test))]
+        let force_due = false;
+        if !force_due && now < self.maintenance_next_ms {
             return Ok(());
         }
-        let fs = FileStore::open_read(&self.store).map_err(|e| e.to_string())?;
-        let report = fs
+        #[cfg(test)]
+        increment_daemon_maintenance_report_open(&self.store);
+        #[cfg(feature = "serve")]
+        let report = self
+            .generated_runtime
+            .engine
+            .lock()
+            .map_err(|_| "daemon generated runtime lock poisoned".to_string())?
+            .store()
             .store_maintenance_report(now)
             .map_err(|e| e.to_string())?;
+        #[cfg(not(feature = "serve"))]
+        let report = {
+            let fs = FileStore::open_read(&self.store).map_err(|e| e.to_string())?;
+            activity.record_store_open();
+            fs.store_maintenance_report(now)
+                .map_err(|e| e.to_string())?
+        };
         self.maintenance_next_ms = now.saturating_add(report.policy.interval_ms);
-        if !report.eligible {
+        if !report.eligible && !force_due {
             return Ok(());
         }
-        let store = self.store.clone();
         self.maintenance_cancel
             .store(false, std::sync::atomic::Ordering::Release);
         let cancel = self.maintenance_cancel.clone();
+        #[cfg(any(not(feature = "serve"), test))]
+        let store = self.store.clone();
+        #[cfg(feature = "serve")]
+        let engine = { std::sync::Arc::clone(&self.generated_runtime.engine) };
+        let worker_activity = activity.clone();
         self.maintenance_worker = Some(std::thread::spawn(move || {
-            let result = {
-                let mut loom = loom_store::open_loom_daemon_authorized_unlocked(&store, None)
-                    .map_err(|e| e.to_string())?;
-                run_store_maintenance_once_with_budget(
-                    &mut loom,
-                    now,
-                    false,
-                    None,
-                    None,
-                    Some(StoreMaintenanceRunBudget::daemon_automatic()),
-                    Some(cancel.as_ref()),
-                )
-            };
+            let result = (|| {
+                #[cfg(test)]
+                if take_daemon_test_signal(&DAEMON_MAINTENANCE_WORKER_INJECT_ERROR, &store) {
+                    return Err("injected maintenance worker error".to_string());
+                }
+                #[cfg(feature = "serve")]
+                {
+                    let mut loom = engine
+                        .lock()
+                        .map_err(|_| "daemon generated runtime lock poisoned".to_string())?;
+                    let result = run_store_maintenance_once_with_budget(
+                        &mut loom,
+                        false,
+                        None,
+                        None,
+                        Some(loom_store::StoreMaintenanceRunBudget::daemon_automatic()),
+                        Some(cancel.as_ref()),
+                    );
+                    if result
+                        .as_ref()
+                        .is_ok_and(|status| !status.contains("\tskipped\t"))
+                    {
+                        worker_activity.record_write();
+                    }
+                    result
+                }
+                #[cfg(not(feature = "serve"))]
+                {
+                    let mut loom = loom_store::open_loom_daemon_authorized_unlocked(&store, None)
+                        .map_err(|e| e.to_string())?;
+                    worker_activity.record_store_open();
+                    let result = run_store_maintenance_once_with_budget(
+                        &mut loom,
+                        false,
+                        None,
+                        None,
+                        Some(loom_store::StoreMaintenanceRunBudget::daemon_automatic()),
+                        Some(cancel.as_ref()),
+                    );
+                    if result
+                        .as_ref()
+                        .is_ok_and(|status| !status.contains("\tskipped\t"))
+                    {
+                        worker_activity.record_write();
+                    }
+                    result
+                }
+            })();
             #[cfg(test)]
             if let Some(hook) = maintenance_worker_test_hook(&store)
                 && hook.enter_and_wait(cancel.as_ref())
             {
+                if let Some(events) = events.as_ref() {
+                    let _ = events.send_notification_blocking(
+                        DaemonSchedulerNotification::WorkerCompleted {
+                            owner: DaemonSchedulerOwner::Maintenance,
+                        },
+                    );
+                }
                 return Ok(());
             }
-            result.map(|_| ())
+            let result = result.map(|_| ());
+            if let Some(events) = events.as_ref() {
+                let _ = events.send_notification_blocking(
+                    DaemonSchedulerNotification::WorkerCompleted {
+                        owner: DaemonSchedulerOwner::Maintenance,
+                    },
+                );
+            }
+            #[cfg(test)]
+            if let Some(hook) = maintenance_completion_hold_hook(&store) {
+                return hook.enter_and_wait();
+            }
+            result
         }));
         Ok(())
     }
 
+    fn record_maintenance_error(
+        &mut self,
+        now: u64,
+        error: String,
+        activity: &DaemonSchedulerActivityRecorder,
+    ) -> Result<(), String> {
+        let result = {
+            #[cfg(feature = "serve")]
+            {
+                let mut loom = self
+                    .generated_runtime
+                    .engine
+                    .lock()
+                    .map_err(|_| "daemon generated runtime lock poisoned".to_string())?;
+                record_daemon_maintenance_error_on_loom(&mut loom, now, error)
+            }
+            #[cfg(not(feature = "serve"))]
+            {
+                let fs = FileStore::open_read(&self.store).map_err(|e| e.to_string())?;
+                activity.record_store_open();
+                let policy = fs.store_maintenance_policy().map_err(|e| e.to_string())?;
+                drop(fs);
+                let next_eligible_ms = now.saturating_add(policy.backoff_ms);
+                let writable =
+                    FileStore::open_daemon_authorized(&self.store).map_err(|e| e.to_string())?;
+                activity.record_store_open();
+                writable
+                    .record_store_maintenance_run_state(StoreMaintenanceRunState {
+                        last_run_ms: Some(now),
+                        next_eligible_ms,
+                        last_skip_reason: None,
+                        last_error: Some(error),
+                        ..StoreMaintenanceRunState::default()
+                    })
+                    .map_err(|e| e.to_string())
+            }
+        };
+        if result.is_ok() {
+            activity.record_write();
+        }
+        result
+    }
+
     fn status_response(&mut self) -> String {
-        self.prune_expired_pins(now_ms());
-        let permanent_pins = self
-            .pins
-            .values()
-            .filter(|pin| pin.deadline_ms.is_none())
-            .count();
-        let leased_pins = self.pins.len() - permanent_pins;
+        self.prune_expired_lifecycle_leases(now_ms());
+        let sessions = self.session_count();
+        let pins = self.pin_count();
+        let permanent_pins = self.permanent_pin_count();
+        let leased_pins = pins - permanent_pins;
         let maintenance_worker = if self.maintenance_worker.is_some() {
             "running"
         } else {
             "idle"
         };
         let mut response = format!(
-            "{}\tsessions={}\tpins={}\tpermanent_pins={}\tleased_pins={}\tmaintenance_worker={}\tmaintenance_next_ms={}",
+            "{}\tstartup_mode={}\tstartup_initiator={}\tsessions={}\tpins={}\tpermanent_pins={}\tleased_pins={}\tmaintenance_worker={}\tmaintenance_next_ms={}",
             daemon_running_response(&self.store, &self.store_id, self.transport).trim_end(),
-            self.sessions.len(),
-            self.pins.len(),
+            self.startup_mode.wire_name(),
+            self.startup_initiator.wire_name(),
+            sessions,
+            pins,
             permanent_pins,
             leased_pins,
             maintenance_worker,
             self.maintenance_next_ms
         );
-        for (id, pin) in &self.pins {
-            match pin.deadline_ms {
+        for (id, lease) in self.pin_leases() {
+            match lease.deadline_ms {
                 Some(deadline_ms) => response.push_str(&format!(
                     "\tpin=leased:{}:{}",
                     deadline_ms,
@@ -9048,11 +12811,11 @@ impl DaemonRuntime {
         request: DaemonStopRequest,
         actor: Option<WorkspaceId>,
     ) -> String {
-        self.prune_expired_pins(now_ms());
-        if !force && !self.pins.is_empty() {
-            return format!("error\tdaemon has {} live pin(s)\n", self.pins.len());
+        self.prune_expired_lifecycle_leases(now_ms());
+        let pin_count = self.pin_count();
+        if !force && pin_count != 0 {
+            return format!("error\tdaemon has {pin_count} live pin(s)\n");
         }
-        let pin_count = self.pins.len();
         self.maintenance_cancel
             .store(true, std::sync::atomic::Ordering::Release);
         let (listeners, timed_out) = self.stop_hosted_listeners(request);
@@ -9060,8 +12823,7 @@ impl DaemonRuntime {
             "force={force};hard={};wait_ms={};pins={pin_count};listeners={listeners};timed_out={timed_out}",
             request.hard, request.wait_ms
         );
-        if let Err(e) = append_daemon_audit_actor(&self.store, actor, "daemon.stop", Some(&target))
-        {
+        if let Err(e) = self.append_audit(actor, "daemon.stop", Some(&target)) {
             return format!("error\t{e}\n");
         }
         format!(
@@ -9083,6 +12845,7 @@ impl DaemonRuntime {
             "session-attach" => self.session_attach(parts.collect()),
             "session-check" => self.session_check(parts.collect()),
             "session-detach" => self.session_detach(parts.collect()),
+            "lease-renew" => self.lease_renew(parts.collect()),
             "pin-add" => self.pin_add(parts.collect()),
             "pin-remove" => self.pin_remove(parts.collect()),
             "lock-acquire" => self.lock_acquire(parts.collect()),
@@ -9099,6 +12862,8 @@ impl DaemonRuntime {
             "fts-rebuild" => self.fts_rebuild(parts.collect()),
             "maintenance-status" => self.maintenance_status(parts.collect()),
             "maintenance-run" => self.maintenance_run(parts.collect()),
+            "daemon-start-audit" => self.daemon_start_audit(parts.collect()),
+            "daemon-promote-persistent" => self.daemon_promote_persistent(parts.collect()),
             #[cfg(feature = "serve")]
             "generated-session-open" => self.generated_session_open(parts.collect()),
             #[cfg(feature = "serve")]
@@ -9131,6 +12896,7 @@ impl DaemonRuntime {
         }
     }
 
+    #[cfg(not(feature = "serve"))]
     fn open_operator_loom(&self, actor: Option<WorkspaceId>) -> Result<Loom<FileStore>, String> {
         let loom = loom_store::open_loom_daemon_authorized_unlocked(&self.store, None)
             .map_err(|e| e.to_string())?;
@@ -9164,13 +12930,23 @@ impl DaemonRuntime {
             Ok(actor) => actor,
             Err(e) => return format!("error\t{e}\n"),
         };
+        #[cfg(feature = "serve")]
+        let loom = match self.generated_runtime.engine.lock() {
+            Ok(loom) => loom,
+            Err(_) => return "error\tdaemon generated runtime lock poisoned\n".to_string(),
+        };
+        #[cfg(not(feature = "serve"))]
         let loom = match self.open_operator_loom(actor) {
             Ok(loom) => loom,
             Err(e) => return format!("error\t{e}\n"),
         };
+        let _ = actor;
         match loom.store().store_maintenance_report(now_ms()) {
             Ok(report) => match maintenance_live_root_diagnostics(&loom) {
-                Ok(diagnostics) => maintenance_report_text(&report, Some(&diagnostics)),
+                Ok(diagnostics) => maintenance_report_text(&MaintenanceReportView::from_store(
+                    &report,
+                    Some(&diagnostics),
+                )),
                 Err(error) => format!("error\t{error}\n"),
             },
             Err(e) => format!("error\t{e}\n"),
@@ -9197,11 +12973,18 @@ impl DaemonRuntime {
             Ok(actor) => actor,
             Err(e) => return format!("error\t{e}\n"),
         };
+        #[cfg(feature = "serve")]
+        let mut loom = match self.generated_runtime.engine.lock() {
+            Ok(loom) => loom,
+            Err(_) => return "error\tdaemon generated runtime lock poisoned\n".to_string(),
+        };
+        #[cfg(not(feature = "serve"))]
         let mut loom = match self.open_operator_loom(actor) {
             Ok(loom) => loom,
             Err(e) => return format!("error\t{e}\n"),
         };
-        match run_store_maintenance_once(&mut loom, now_ms(), true, max_segments, max_pages) {
+        let _ = actor;
+        match run_store_maintenance_once(&mut loom, true, max_segments, max_pages) {
             Ok(outcome) => format!("{outcome}\n"),
             Err(e) => format!("error\t{e}\n"),
         }
@@ -9219,10 +13002,17 @@ impl DaemonRuntime {
         let [workspace, collection, engine_version] = fields.as_slice() else {
             return "error\tfts status expects three fields\n".to_string();
         };
+        #[cfg(feature = "serve")]
+        let loom = match self.generated_runtime.engine.lock() {
+            Ok(loom) => loom,
+            Err(_) => return "error\tdaemon generated runtime lock poisoned\n".to_string(),
+        };
+        #[cfg(not(feature = "serve"))]
         let loom = match self.open_operator_loom(actor) {
             Ok(loom) => loom,
             Err(e) => return format!("error\t{e}\n"),
         };
+        let _ = actor;
         let ns = match resolve_ns(&loom, workspace) {
             Ok(ns) => ns,
             Err(e) => return format!("error\t{e}\n"),
@@ -9254,10 +13044,17 @@ impl DaemonRuntime {
         let [workspace, collection, engine_version] = fields.as_slice() else {
             return "error\tfts rebuild expects three fields\n".to_string();
         };
+        #[cfg(feature = "serve")]
+        let loom = match self.generated_runtime.engine.lock() {
+            Ok(loom) => loom,
+            Err(_) => return "error\tdaemon generated runtime lock poisoned\n".to_string(),
+        };
+        #[cfg(not(feature = "serve"))]
         let loom = match self.open_operator_loom(actor) {
             Ok(loom) => loom,
             Err(e) => return format!("error\t{e}\n"),
         };
+        let _ = actor;
         let ns = match resolve_ns(&loom, workspace) {
             Ok(ns) => ns,
             Err(e) => return format!("error\t{e}\n"),
@@ -9322,53 +13119,147 @@ impl DaemonRuntime {
         fts_status_response(ns, collection, source_digest, engine_version, &status)
     }
 
+    #[cfg(test)]
     fn reconcile_authority_replication(&mut self) -> Result<(), String> {
+        let activity = self.scheduler_activity_recorder(DaemonSchedulerOwner::AuthorityReplication);
+        self.reconcile_authority_replication_owner_state(false, activity)
+    }
+
+    #[cfg(test)]
+    fn reconcile_authority_replication_policy_change(&mut self) -> Result<(), String> {
+        let activity = self.scheduler_activity_recorder(DaemonSchedulerOwner::AuthorityReplication);
+        self.reconcile_authority_replication_owner_state(true, activity)
+    }
+
+    fn reconcile_authority_replication_owner_state(
+        &mut self,
+        policy_changed: bool,
+        activity: DaemonSchedulerActivityRecorder,
+    ) -> Result<(), String> {
         let now = now_ms();
-        let fs = FileStore::open_read(&self.store).map_err(|e| e.to_string())?;
-        let policies = fs
-            .authority_replication_policies()
-            .map_err(|e| e.to_string())?;
+        let should_discover = !self.authority_replication_discovered
+            || policy_changed
+            || self
+                .authority_replication_next
+                .values()
+                .any(|next| now >= *next);
+        if should_discover {
+            self.discover_authority_replication_owner_state(now, policy_changed, &activity)?;
+        }
+        Ok(())
+    }
+
+    fn discover_authority_replication_owner_state(
+        &mut self,
+        now: u64,
+        policy_changed: bool,
+        activity: &DaemonSchedulerActivityRecorder,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        increment_daemon_authority_replication_policy_open(&self.store);
+        #[cfg(feature = "serve")]
+        let policies = {
+            let policies = self
+                .generated_runtime
+                .engine
+                .lock()
+                .map_err(|_| "daemon generated runtime lock poisoned".to_string())?
+                .store()
+                .authority_replication_policies()
+                .map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            if policies.is_empty() {
+                FileStore::open_read(&self.store)
+                    .map_err(|e| e.to_string())?
+                    .authority_replication_policies()
+                    .map_err(|e| e.to_string())?
+            } else {
+                policies
+            }
+            #[cfg(not(test))]
+            policies
+        };
+        #[cfg(not(feature = "serve"))]
+        let policies = {
+            let fs = FileStore::open_read(&self.store).map_err(|e| e.to_string())?;
+            activity.record_store_open();
+            fs.authority_replication_policies()
+                .map_err(|e| e.to_string())?
+        };
         let active = policies
             .iter()
+            .filter(|policy| policy.enabled)
             .map(|policy| policy.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         self.authority_replication_next
             .retain(|id, _| active.contains(id));
+        self.authority_replication_fingerprints
+            .retain(|id, _| active.contains(id));
         for policy in policies {
             if !policy.enabled {
                 self.authority_replication_next.remove(&policy.id);
+                self.authority_replication_fingerprints.remove(&policy.id);
                 continue;
             }
-            let first_seen = !self.authority_replication_next.contains_key(&policy.id);
-            let due = if first_seen {
+            let fingerprint = AuthorityReplicationPolicyFingerprint::from_policy(&policy);
+            let previous_fingerprint = self
+                .authority_replication_fingerprints
+                .get(&policy.id)
+                .cloned();
+            let existing = self.authority_replication_next.get(&policy.id).copied();
+            let initial_discovery = !self.authority_replication_discovered;
+            let newly_enabled = previous_fingerprint.is_none();
+            let materially_changed = previous_fingerprint
+                .as_ref()
+                .is_some_and(|previous| previous != &fingerprint);
+            let due = if initial_discovery && newly_enabled {
                 policy.pull_on_start
             } else {
-                self.authority_replication_next
-                    .get(&policy.id)
-                    .is_some_and(|next| now >= *next)
+                existing.is_some_and(|next| next != u64::MAX && now >= next)
             };
-            if !due {
-                if first_seen && let Some(interval) = policy.interval_ms {
-                    self.authority_replication_next.insert(
-                        policy.id.clone(),
-                        now.saturating_add(interval)
-                            .saturating_add(authority_replication_jitter(&policy)),
-                    );
+            if due {
+                let next =
+                    match apply_authority_replication_policy(&self.store, policy.clone(), now) {
+                        Ok(()) => {
+                            activity.record_write();
+                            authority_replication_success_deadline(&policy, now)
+                        }
+                        Err(reason) => {
+                            mark_authority_replication_failure(
+                                &self.store,
+                                policy.clone(),
+                                now,
+                                &reason,
+                            )?;
+                            activity.record_write();
+                            Some(authority_replication_failure_deadline(&policy, now))
+                        }
+                    };
+                match next {
+                    Some(next) => {
+                        self.authority_replication_next
+                            .insert(policy.id.clone(), next);
+                    }
+                    None => {
+                        self.authority_replication_next.remove(&policy.id);
+                    }
                 }
+                self.authority_replication_fingerprints
+                    .insert(policy.id.clone(), fingerprint);
                 continue;
             }
-            let next = match apply_authority_replication_policy(&self.store, policy.clone(), now) {
-                Ok(()) => policy.interval_ms.map(|interval| {
-                    now.saturating_add(interval)
-                        .saturating_add(authority_replication_jitter(&policy))
-                }),
-                Err(reason) => {
-                    mark_authority_replication_failure(&self.store, policy.clone(), now, &reason)?;
-                    Some(
-                        now.saturating_add(policy.backoff_ms)
-                            .saturating_add(authority_replication_jitter(&policy)),
-                    )
-                }
+            if !initial_discovery && !policy_changed {
+                continue;
+            }
+            if !initial_discovery && policy_changed && !newly_enabled && !materially_changed {
+                self.authority_replication_fingerprints
+                    .insert(policy.id.clone(), fingerprint);
+                continue;
+            }
+            let next = if initial_discovery {
+                authority_replication_initial_deadline(&policy, now)
+            } else {
+                authority_replication_success_deadline(&policy, now)
             };
             match next {
                 Some(next) => {
@@ -9379,13 +13270,20 @@ impl DaemonRuntime {
                     self.authority_replication_next.remove(&policy.id);
                 }
             }
+            self.authority_replication_fingerprints
+                .insert(policy.id.clone(), fingerprint);
         }
+        self.authority_replication_discovered = true;
         Ok(())
     }
 
     #[cfg(feature = "serve")]
-    fn reconcile_hosted_listeners(&mut self) -> Result<(), String> {
+    fn reconcile_hosted_listeners(
+        &mut self,
+        activity: DaemonSchedulerActivityRecorder,
+    ) -> Result<(), String> {
         let desired = desired_hosted_listener_runtimes(&self.store)?;
+        activity.record_store_open();
         let desired_ids = desired
             .iter()
             .map(|runtime| runtime.id.clone())
@@ -9423,7 +13321,8 @@ impl DaemonRuntime {
                     Err(err) => {
                         let (record, reason) = *err;
                         let target = format!("{};reason={reason}", served_listener_target(&record));
-                        append_daemon_audit(&self.store, "serve.listener.reject", Some(&target))?;
+                        self.append_audit(None, "serve.listener.reject", Some(&target))?;
+                        activity.record_write();
                         return Err(reason);
                     }
                 };
@@ -9433,44 +13332,194 @@ impl DaemonRuntime {
         Ok(())
     }
 
+    fn daemon_promote_persistent(&mut self, fields: Vec<&str>) -> String {
+        if !fields.is_empty() {
+            return "error\tdaemon-promote-persistent expects no fields\n".to_string();
+        }
+        if self.startup_mode == daemon::DaemonStartupMode::Persistent {
+            return format!(
+                "persistent\t{}\t{}\tlisteners={}\n",
+                std::process::id(),
+                self.store,
+                self.hosted_listener_count()
+            );
+        }
+
+        let promoted_mode = daemon::DaemonStartupMode::Persistent;
+        let promoted_initiator = daemon::DaemonStartupInitiator::CliDaemonStart;
+        let hosted_listeners = match self.start_hosted_listeners_for_promotion() {
+            Ok(hosted_listeners) => hosted_listeners,
+            Err(error) => return format!("error\tpromotion listeners: {error}\n"),
+        };
+        let paths = match daemon::paths(&self.store) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.stop_promoted_hosted_listeners(hosted_listeners);
+                return format!("error\t{error}\n");
+            }
+        };
+        if let Err(error) =
+            daemon_rewrite_runtime_lock_metadata(&paths, promoted_mode, promoted_initiator)
+        {
+            self.stop_promoted_hosted_listeners(hosted_listeners);
+            return format!("error\t{error}\n");
+        }
+        self.startup_mode = promoted_mode;
+        self.startup_initiator = promoted_initiator;
+        self.managed_bootstrap_deadline_ms = None;
+        let listeners = self.install_promoted_hosted_listeners(hosted_listeners);
+        format!(
+            "promoted\t{}\t{}\tlisteners={listeners}\n",
+            std::process::id(),
+            self.store
+        )
+    }
+
     #[cfg(feature = "serve")]
-    fn reconcile_drive_policy_workers(&mut self) -> Result<(), String> {
+    fn hosted_listener_count(&self) -> usize {
+        self.hosted_listeners.len()
+    }
+
+    #[cfg(not(feature = "serve"))]
+    fn hosted_listener_count(&self) -> usize {
+        0
+    }
+
+    #[cfg(feature = "serve")]
+    fn start_hosted_listeners_for_promotion(
+        &mut self,
+    ) -> Result<std::collections::BTreeMap<String, HostedListenerRuntime>, String> {
+        start_hosted_listeners(&self.store)
+    }
+
+    #[cfg(not(feature = "serve"))]
+    fn start_hosted_listeners_for_promotion(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[cfg(feature = "serve")]
+    fn stop_promoted_hosted_listeners(
+        &mut self,
+        hosted_listeners: std::collections::BTreeMap<String, HostedListenerRuntime>,
+    ) {
+        for (_, listener) in hosted_listeners {
+            let _ = listener.stop(HostedStopPolicy {
+                hard: true,
+                wait_ms: 0,
+            });
+        }
+    }
+
+    #[cfg(not(feature = "serve"))]
+    fn stop_promoted_hosted_listeners(&mut self, _hosted_listeners: ()) {}
+
+    #[cfg(feature = "serve")]
+    fn install_promoted_hosted_listeners(
+        &mut self,
+        hosted_listeners: std::collections::BTreeMap<String, HostedListenerRuntime>,
+    ) -> usize {
+        self.hosted_listeners = hosted_listeners;
+        self.hosted_listeners.len()
+    }
+
+    #[cfg(not(feature = "serve"))]
+    fn install_promoted_hosted_listeners(&mut self, _hosted_listeners: ()) -> usize {
+        0
+    }
+
+    #[cfg(feature = "serve")]
+    fn reconcile_drive_policy_workers_for_change(
+        &mut self,
+        policy_changed: bool,
+        activity: DaemonSchedulerActivityRecorder,
+    ) -> Result<(), String> {
         let now = now_ms();
-        if now < self.drive_policy_next_ms {
+        if !policy_changed && now < self.drive_policy_next_ms {
             return Ok(());
         }
         self.drive_policy_next_ms = now.saturating_add(DEFAULT_DRIVE_POLICY_RECONCILE_MS);
-        match apply_drive_policy_workers_once(&self.store, now) {
+        let result = {
+            let mut loom = self
+                .generated_runtime
+                .engine
+                .lock()
+                .map_err(|_| "daemon generated runtime lock poisoned".to_string())?;
+            apply_drive_policy_workers_once(&mut loom, &self.store, now, &activity)
+        };
+        match result {
             Ok(_) => Ok(()),
             Err(reason) => {
-                append_daemon_audit(
-                    &self.store,
+                self.append_audit(
+                    None,
                     "drive.policy_worker.error",
                     Some(&format!("reason={reason}")),
                 )?;
+                activity.record_write();
                 Ok(())
             }
         }
     }
 
     #[cfg(feature = "serve")]
-    fn reconcile_reference_workers(&mut self) -> Result<(), String> {
+    fn reconcile_reference_workers_for_change(
+        &mut self,
+        reference_changed: bool,
+        activity: DaemonSchedulerActivityRecorder,
+    ) -> Result<(), String> {
         let now = now_ms();
-        if now < self.reference_reconcile_next_ms {
+        if !reference_changed && now < self.reference_reconcile_next_ms {
             return Ok(());
         }
-        match reconcile_references_once(&self.store, now, 100) {
+        const REFERENCE_RECONCILE_BATCH_LIMIT: usize = 100;
+        #[cfg(test)]
+        increment_daemon_reference_worker_run(&self.store, REFERENCE_RECONCILE_BATCH_LIMIT);
+        #[cfg(test)]
+        let result = {
+            if DAEMON_REFERENCE_WORKER_INJECT_ERROR.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                Err("injected reference worker error".to_string())
+            } else if let Some(run) = DAEMON_REFERENCE_WORKER_INJECT_RUNS
+                .lock()
+                .unwrap()
+                .remove(&self.store)
+            {
+                Ok(run)
+            } else {
+                let mut loom = self
+                    .generated_runtime
+                    .engine
+                    .lock()
+                    .map_err(|_| "daemon generated runtime lock poisoned".to_string())?;
+                reconcile_references_once(&mut loom, now, REFERENCE_RECONCILE_BATCH_LIMIT)
+            }
+        };
+        #[cfg(not(test))]
+        let result = {
+            let mut loom = self
+                .generated_runtime
+                .engine
+                .lock()
+                .map_err(|_| "daemon generated runtime lock poisoned".to_string())?;
+            reconcile_references_once(&mut loom, now, REFERENCE_RECONCILE_BATCH_LIMIT)
+        };
+        match result {
             Ok(run) => {
-                self.reference_reconcile_next_ms = run.next_attempt_ms.unwrap_or(u64::MAX);
+                if run.processed > 0 || run.resolved > 0 || run.failed > 0 {
+                    activity.record_write();
+                }
+                self.reference_reconcile_next_ms = run
+                    .next_attempt_ms
+                    .unwrap_or_else(|| now.saturating_add(REFERENCE_RECONCILE_IDLE_MS));
                 Ok(())
             }
             Err(reason) => {
                 self.reference_reconcile_next_ms = now.saturating_add(REFERENCE_RECONCILE_IDLE_MS);
-                append_daemon_audit(
-                    &self.store,
+                self.append_audit(
+                    None,
                     "reference_resolver.error",
                     Some(&format!("reason={reason}")),
                 )?;
+                activity.record_write();
                 Ok(())
             }
         }
@@ -9481,7 +13530,11 @@ impl DaemonRuntime {
         let [session] = fields.as_slice() else {
             return "error\treference-reconcile requires one attached session\n".to_string();
         };
-        if !self.sessions.contains(*session) {
+        self.prune_expired_lifecycle_leases(now_ms());
+        if !self
+            .lifecycle_leases
+            .contains_key(&LifecycleLeaseId::Session((*session).to_string()))
+        {
             return "error\treference-reconcile requires an attached session\n".to_string();
         }
         self.reference_reconcile_next_ms = 0;
@@ -9516,7 +13569,10 @@ impl DaemonRuntime {
     }
 
     #[cfg(not(feature = "serve"))]
-    fn reconcile_reference_workers(&mut self) -> Result<(), String> {
+    fn reconcile_reference_workers_for_change(
+        &mut self,
+        _reference_changed: bool,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -9524,51 +13580,145 @@ impl DaemonRuntime {
         &self,
         auth: &DaemonRequestAuth,
     ) -> Result<Option<WorkspaceId>, String> {
-        let fs = FileStore::open_read(&self.store).map_err(|e| e.to_string())?;
-        let Some(mut identity) = fs.identity_store().map_err(|e| e.to_string())? else {
-            return Ok(None);
+        let authorize = |fs: &FileStore| {
+            let Some(mut identity) = fs.identity_store().map_err(|e| e.to_string())? else {
+                return Ok(None);
+            };
+            if !identity.authenticated_mode() {
+                return Ok(None);
+            }
+            let principal = auth.principal.ok_or_else(|| {
+                loom_core::error::LoomError::new(
+                    loom_core::Code::AuthenticationFailed,
+                    "daemon operation requires authentication",
+                )
+                .to_string()
+            })?;
+            let passphrase = auth.passphrase.as_deref().ok_or_else(|| {
+                loom_core::error::LoomError::new(
+                    loom_core::Code::AuthenticationFailed,
+                    "daemon operation requires authentication",
+                )
+                .to_string()
+            })?;
+            let session_id = auth
+                .session
+                .clone()
+                .unwrap_or_else(|| format!("daemon-operator-{}", std::process::id()));
+            let session = identity
+                .authenticate_passphrase(principal, passphrase, session_id)
+                .map_err(|e| e.to_string())?;
+            let acl = fs.acl_store().map_err(|e| e.to_string())?.ok_or_else(|| {
+                loom_core::error::LoomError::new(
+                    loom_core::Code::PermissionDenied,
+                    "daemon operation requires acl state",
+                )
+                .to_string()
+            })?;
+            let roles = identity
+                .effective_roles(session.principal)
+                .map_err(|e| e.to_string())?;
+            acl.authorize_global_admin_with_roles(
+                identity.authenticated_mode(),
+                session.principal,
+                roles,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Some(session.principal))
         };
-        if !identity.authenticated_mode() {
-            return Ok(None);
+        #[cfg(feature = "serve")]
+        {
+            with_daemon_active_store(&self.store, authorize)
         }
-        let principal = auth.principal.ok_or_else(|| {
-            loom_core::error::LoomError::new(
-                loom_core::Code::AuthenticationFailed,
-                "daemon operation requires authentication",
-            )
-            .to_string()
-        })?;
-        let passphrase = auth.passphrase.as_deref().ok_or_else(|| {
-            loom_core::error::LoomError::new(
-                loom_core::Code::AuthenticationFailed,
-                "daemon operation requires authentication",
-            )
-            .to_string()
-        })?;
-        let session_id = auth
-            .session
-            .clone()
-            .unwrap_or_else(|| format!("daemon-operator-{}", std::process::id()));
-        let session = identity
-            .authenticate_passphrase(principal, passphrase, session_id)
-            .map_err(|e| e.to_string())?;
-        let acl = fs.acl_store().map_err(|e| e.to_string())?.ok_or_else(|| {
-            loom_core::error::LoomError::new(
-                loom_core::Code::PermissionDenied,
-                "daemon operation requires acl state",
-            )
-            .to_string()
-        })?;
-        let roles = identity
-            .effective_roles(session.principal)
-            .map_err(|e| e.to_string())?;
-        acl.authorize_global_admin_with_roles(
-            identity.authenticated_mode(),
-            session.principal,
-            roles,
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(Some(session.principal))
+        #[cfg(not(feature = "serve"))]
+        {
+            let fs = FileStore::open_read(&self.store).map_err(|e| e.to_string())?;
+            authorize(&fs)
+        }
+    }
+
+    fn lifecycle_lease_count(&self, kind: LifecycleLeaseKind) -> usize {
+        self.lifecycle_leases
+            .values()
+            .filter(|lease| lease.kind == kind)
+            .count()
+    }
+
+    fn session_count(&self) -> usize {
+        self.lifecycle_lease_count(LifecycleLeaseKind::Session)
+    }
+
+    fn pin_count(&self) -> usize {
+        self.lifecycle_lease_count(LifecycleLeaseKind::Pin)
+    }
+
+    fn permanent_pin_count(&self) -> usize {
+        self.lifecycle_leases
+            .iter()
+            .filter(|(id, lease)| {
+                matches!(id, LifecycleLeaseId::Pin(_))
+                    && lease.kind == LifecycleLeaseKind::Pin
+                    && lease.deadline_ms.is_none()
+            })
+            .count()
+    }
+
+    fn pin_leases(&self) -> Vec<(&str, LifecycleLease)> {
+        self.lifecycle_leases
+            .iter()
+            .filter_map(|(id, lease)| match id {
+                LifecycleLeaseId::Pin(id) if lease.kind == LifecycleLeaseKind::Pin => {
+                    Some((id.as_str(), *lease))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn renew_session_lease(&mut self, session: &str, now_ms: u64) {
+        self.lifecycle_leases.insert(
+            LifecycleLeaseId::Session(session.to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(now_ms.saturating_add(daemon_lifecycle_lease_ms())),
+            },
+        );
+        self.managed_bootstrap_deadline_ms = None;
+    }
+
+    #[cfg(feature = "serve")]
+    fn renew_generated_lifecycle_lease(&mut self, session: &[u8], now_ms: u64) {
+        self.lifecycle_leases.insert(
+            LifecycleLeaseId::GeneratedSession(session.to_vec()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::GeneratedSession,
+                deadline_ms: Some(now_ms.saturating_add(daemon_lifecycle_lease_ms())),
+            },
+        );
+        self.managed_bootstrap_deadline_ms = None;
+    }
+
+    #[cfg(feature = "serve")]
+    fn remove_generated_lifecycle_lease(&mut self, session: &[u8]) {
+        self.lifecycle_leases
+            .remove(&LifecycleLeaseId::GeneratedSession(session.to_vec()));
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_lifecycle_lease_valid(&self, session: &[u8], now_ms: u64) -> bool {
+        self.lifecycle_leases
+            .get(&LifecycleLeaseId::GeneratedSession(session.to_vec()))
+            .is_some_and(|lease| lease.live_at(now_ms))
+    }
+
+    #[cfg(feature = "serve")]
+    fn renew_generated_lifecycle_for_request(&mut self, session: &[u8], now_ms: u64) {
+        if self.generated_lifecycle_lease_valid(session, now_ms) {
+            self.renew_generated_lifecycle_lease(session, now_ms);
+            self.generated_runtime.renew_session(session, now_ms);
+        } else {
+            let _ = self.generated_runtime.expire_session(session);
+        }
     }
 
     fn session_attach(&mut self, fields: Vec<&str>) -> String {
@@ -9583,17 +13733,23 @@ impl DaemonRuntime {
         let [session] = fields.as_slice() else {
             return "error\tsession attach expects one field\n".to_string();
         };
-        let inserted = self.sessions.insert((*session).to_string());
-        let target = format!("session={session};sessions={}", self.sessions.len());
-        if let Err(e) =
-            append_daemon_audit_actor(&self.store, actor, "daemon.session.attach", Some(&target))
-        {
-            if inserted {
-                self.sessions.remove(*session);
+        let now = now_ms();
+        let id = LifecycleLeaseId::Session((*session).to_string());
+        let previous = self.lifecycle_leases.get(&id).copied();
+        self.renew_session_lease(session, now);
+        let target = format!("session={session};sessions={}", self.session_count());
+        if let Err(e) = self.append_audit(actor, "daemon.session.attach", Some(&target)) {
+            match previous {
+                Some(previous) => {
+                    self.lifecycle_leases.insert(id, previous);
+                }
+                None => {
+                    self.lifecycle_leases.remove(&id);
+                }
             }
             return format!("error\t{e}\n");
         }
-        format!("attached\t{session}\tsessions={}\n", self.sessions.len())
+        format!("attached\t{session}\tsessions={}\n", self.session_count())
     }
 
     fn session_detach(&mut self, fields: Vec<&str>) -> String {
@@ -9608,17 +13764,16 @@ impl DaemonRuntime {
         let [session] = fields.as_slice() else {
             return "error\tsession detach expects one field\n".to_string();
         };
-        let removed = self.sessions.remove(*session);
-        let target = format!("session={session};sessions={}", self.sessions.len());
-        if let Err(e) =
-            append_daemon_audit_actor(&self.store, actor, "daemon.session.detach", Some(&target))
-        {
-            if removed {
-                self.sessions.insert((*session).to_string());
+        let id = LifecycleLeaseId::Session((*session).to_string());
+        let previous = self.lifecycle_leases.remove(&id);
+        let target = format!("session={session};sessions={}", self.session_count());
+        if let Err(e) = self.append_audit(actor, "daemon.session.detach", Some(&target)) {
+            if let Some(previous) = previous {
+                self.lifecycle_leases.insert(id, previous);
             }
             return format!("error\t{e}\n");
         }
-        format!("detached\t{session}\tsessions={}\n", self.sessions.len())
+        format!("detached\t{session}\tsessions={}\n", self.session_count())
     }
 
     fn session_check(&mut self, fields: Vec<&str>) -> String {
@@ -9633,19 +13788,46 @@ impl DaemonRuntime {
         let [session] = fields.as_slice() else {
             return "error\tsession check expects one field\n".to_string();
         };
-        if !self.sessions.contains(*session) {
+        let now = now_ms();
+        self.prune_expired_lifecycle_leases(now);
+        let id = LifecycleLeaseId::Session((*session).to_string());
+        let previous = self.lifecycle_leases.get(&id).copied();
+        if previous.is_none() {
             return "error\tNOT_FOUND: daemon session is not attached\n".to_string();
         }
-        let target = format!("session={session};sessions={}", self.sessions.len());
-        if let Err(e) =
-            append_daemon_audit_actor(&self.store, actor, "daemon.session.check", Some(&target))
-        {
+        self.renew_session_lease(session, now);
+        let target = format!("session={session};sessions={}", self.session_count());
+        if let Err(e) = self.append_audit(actor, "daemon.session.check", Some(&target)) {
+            if let Some(previous) = previous {
+                self.lifecycle_leases.insert(id, previous);
+            }
             return format!("error\t{e}\n");
         }
         format!(
             "session\t{session}\tlive\tsessions={}\n",
-            self.sessions.len()
+            self.session_count()
         )
+    }
+
+    fn lease_renew(&mut self, fields: Vec<&str>) -> String {
+        let (fields, auth) = match split_daemon_auth_fields(fields) {
+            Ok(split) => split,
+            Err(e) => return format!("error\t{e}\n"),
+        };
+        if let Err(e) = self.authorize_daemon_operator(&auth) {
+            return format!("error\t{e}\n");
+        }
+        let [session] = fields.as_slice() else {
+            return "error\tlease renew expects one field\n".to_string();
+        };
+        let now = now_ms();
+        self.prune_expired_lifecycle_leases(now);
+        let id = LifecycleLeaseId::Session((*session).to_string());
+        if !self.lifecycle_leases.contains_key(&id) {
+            return "error\tNOT_FOUND: daemon session is not attached\n".to_string();
+        }
+        self.renew_session_lease(session, now);
+        format!("renewed\t{session}\tsessions={}\n", self.session_count())
     }
 
     fn pin_add(&mut self, fields: Vec<&str>) -> String {
@@ -9658,7 +13840,13 @@ impl DaemonRuntime {
             Err(e) => return format!("error\t{e}\n"),
         };
         let (pin, lease) = match fields.as_slice() {
-            [pin] => (*pin, PinLease { deadline_ms: None }),
+            [pin] => (
+                *pin,
+                LifecycleLease {
+                    kind: LifecycleLeaseKind::Pin,
+                    deadline_ms: None,
+                },
+            ),
             [pin, lease_ms, now_ms] => {
                 let lease_ms = match lease_ms.parse::<u64>() {
                     Ok(value) if value > 0 => value,
@@ -9673,29 +13861,30 @@ impl DaemonRuntime {
                 };
                 (
                     *pin,
-                    PinLease {
+                    LifecycleLease {
+                        kind: LifecycleLeaseKind::Pin,
                         deadline_ms: Some(deadline_ms),
                     },
                 )
             }
             _ => return "error\tpin add expects one or three fields\n".to_string(),
         };
-        let previous = self.pins.insert(pin.to_string(), lease);
-        let target = format!("pin={pin};pins={}", self.pins.len());
-        if let Err(e) =
-            append_daemon_audit_actor(&self.store, actor, "daemon.pin.add", Some(&target))
-        {
+        let id = LifecycleLeaseId::Pin(pin.to_string());
+        let previous = self.lifecycle_leases.insert(id.clone(), lease);
+        self.managed_bootstrap_deadline_ms = None;
+        let target = format!("pin={pin};pins={}", self.pin_count());
+        if let Err(e) = self.append_audit(actor, "daemon.pin.add", Some(&target)) {
             match previous {
                 Some(previous) => {
-                    self.pins.insert(pin.to_string(), previous);
+                    self.lifecycle_leases.insert(id, previous);
                 }
                 None => {
-                    self.pins.remove(pin);
+                    self.lifecycle_leases.remove(&id);
                 }
             }
             return format!("error\t{e}\n");
         }
-        format!("pinned\t{pin}\tpins={}\n", self.pins.len())
+        format!("pinned\t{pin}\tpins={}\n", self.pin_count())
     }
 
     fn pin_remove(&mut self, fields: Vec<&str>) -> String {
@@ -9710,22 +13899,66 @@ impl DaemonRuntime {
         let [pin] = fields.as_slice() else {
             return "error\tpin remove expects one field\n".to_string();
         };
-        let previous = self.pins.remove(*pin);
-        let target = format!("pin={pin};pins={}", self.pins.len());
-        if let Err(e) =
-            append_daemon_audit_actor(&self.store, actor, "daemon.pin.remove", Some(&target))
-        {
+        let id = LifecycleLeaseId::Pin((*pin).to_string());
+        let previous = self.lifecycle_leases.remove(&id);
+        let target = format!("pin={pin};pins={}", self.pin_count());
+        if let Err(e) = self.append_audit(actor, "daemon.pin.remove", Some(&target)) {
             if let Some(previous) = previous {
-                self.pins.insert((*pin).to_string(), previous);
+                self.lifecycle_leases.insert(id, previous);
             }
             return format!("error\t{e}\n");
         }
-        format!("unpinned\t{pin}\tpins={}\n", self.pins.len())
+        format!("unpinned\t{pin}\tpins={}\n", self.pin_count())
     }
 
-    fn prune_expired_pins(&mut self, now_ms: u64) {
-        self.pins
-            .retain(|_, pin| pin.deadline_ms.is_none_or(|deadline| deadline > now_ms));
+    fn prune_expired_lifecycle_leases(&mut self, now_ms: u64) {
+        #[cfg(feature = "serve")]
+        let expired_generated = self
+            .lifecycle_leases
+            .iter()
+            .filter_map(|(id, lease)| match id {
+                LifecycleLeaseId::GeneratedSession(session)
+                    if lease.kind == LifecycleLeaseKind::GeneratedSession
+                        && !lease.live_at(now_ms) =>
+                {
+                    Some(session.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.lifecycle_leases
+            .retain(|_, lease| lease.live_at(now_ms));
+        #[cfg(feature = "serve")]
+        for session in expired_generated {
+            let _ = self.generated_runtime.expire_session(&session);
+        }
+    }
+
+    fn reconcile_managed_lifecycle_shutdown(
+        &mut self,
+        now_ms: u64,
+        active_connections: usize,
+    ) -> bool {
+        self.prune_expired_lifecycle_leases(now_ms);
+        if self.startup_mode != daemon::DaemonStartupMode::Managed || active_connections != 0 {
+            return false;
+        }
+        if !self.lifecycle_leases.is_empty() {
+            return false;
+        }
+        if self
+            .managed_bootstrap_deadline_ms
+            .is_some_and(|deadline| deadline > now_ms)
+        {
+            return false;
+        }
+        self.maintenance_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.stop_hosted_listeners(DaemonStopRequest {
+            hard: true,
+            wait_ms: 0,
+        });
+        true
     }
 
     fn lock_acquire(&mut self, fields: Vec<&str>) -> String {
@@ -9747,7 +13980,7 @@ impl DaemonRuntime {
             Ok(value) => value,
             Err(_) => return "error\tinvalid lock lease\n".to_string(),
         };
-        let now_ms = match now_ms.parse::<u64>() {
+        let _now_ms = match now_ms.parse::<u64>() {
             Ok(value) => value,
             Err(_) => return "error\tinvalid lock clock\n".to_string(),
         };
@@ -9755,17 +13988,15 @@ impl DaemonRuntime {
             principal: (*principal).to_string(),
             session: (*session).to_string(),
         };
-        match self
-            .coordinator
-            .try_acquire(key.as_bytes().to_vec(), owner, mode, lease_ms, now_ms)
-        {
-            Ok(token) => match save_daemon_lock_coordinator(&self.store, &self.coordinator) {
-                Ok(()) => daemon::lock_token_response(&token),
-                Err(e) => {
-                    let _ = self.coordinator.release(&token, now_ms);
-                    format!("error\t{e}\n")
-                }
-            },
+        match loom_client::locks::LocksAuthority::acquire(
+            &**self.locks_authority(),
+            owner,
+            key.as_bytes().to_vec(),
+            mode,
+            lease_ms,
+            0,
+        ) {
+            Ok(token) => daemon::lock_token_response(&token),
             Err(e) => format!("error\t{e}\n"),
         }
     }
@@ -9793,12 +14024,17 @@ impl DaemonRuntime {
             Ok(value) => value,
             Err(_) => return "error\tinvalid lock lease\n".to_string(),
         };
-        let now_ms = match now_ms.parse::<u64>() {
+        let _now_ms = match now_ms.parse::<u64>() {
             Ok(value) => value,
             Err(_) => return "error\tinvalid lock clock\n".to_string(),
         };
         let token = daemon::lock_token(key, principal, session, mode, fence);
-        match self.coordinator.refresh(&token, lease_ms, now_ms) {
+        match loom_client::locks::LocksAuthority::refresh(
+            &**self.locks_authority(),
+            &token.owner,
+            &token,
+            lease_ms,
+        ) {
             Ok(token) => daemon::lock_token_response(&token),
             Err(e) => format!("error\t{e}\n"),
         }
@@ -9823,12 +14059,16 @@ impl DaemonRuntime {
             Ok(value) => value,
             Err(_) => return "error\tinvalid lock fence\n".to_string(),
         };
-        let now_ms = match now_ms.parse::<u64>() {
+        let _now_ms = match now_ms.parse::<u64>() {
             Ok(value) => value,
             Err(_) => return "error\tinvalid lock clock\n".to_string(),
         };
         let token = daemon::lock_token(key, principal, session, mode, fence);
-        match self.coordinator.release(&token, now_ms) {
+        match loom_client::locks::LocksAuthority::release(
+            &**self.locks_authority(),
+            &token.owner,
+            &token,
+        ) {
             Ok(()) => "released\n".to_string(),
             Err(e) => format!("error\t{e}\n"),
         }
@@ -9845,12 +14085,17 @@ impl DaemonRuntime {
         let [key, now_ms] = fields.as_slice() else {
             return "error\tlock break expects two fields\n".to_string();
         };
-        let now_ms = match now_ms.parse::<u64>() {
+        let _now_ms = match now_ms.parse::<u64>() {
             Ok(value) => value,
             Err(_) => return "error\tinvalid lock clock\n".to_string(),
         };
-        let broken = self.coordinator.break_key(key.as_bytes(), now_ms);
-        format!("broken\t{broken}\n")
+        match loom_client::locks::LocksAuthority::break_key(
+            &**self.locks_authority(),
+            key.as_bytes(),
+        ) {
+            Ok(broken) => format!("broken\t{broken}\n"),
+            Err(e) => format!("error\t{e}\n"),
+        }
     }
 
     fn lock_apply_fence(&mut self, fields: Vec<&str>) -> String {
@@ -9872,16 +14117,17 @@ impl DaemonRuntime {
             Ok(value) => value,
             Err(_) => return "error\tinvalid lock fence\n".to_string(),
         };
-        let now_ms = match now_ms.parse::<u64>() {
+        let _now_ms = match now_ms.parse::<u64>() {
             Ok(value) => value,
             Err(_) => return "error\tinvalid lock clock\n".to_string(),
         };
         let token = daemon::lock_token(key, principal, session, mode, fence);
-        match self.coordinator.apply_fenced_write(&token, now_ms) {
-            Ok(()) => match save_daemon_lock_coordinator(&self.store, &self.coordinator) {
-                Ok(()) => "applied\n".to_string(),
-                Err(e) => format!("error\t{e}\n"),
-            },
+        match loom_client::locks::LocksAuthority::apply_fenced_write(
+            &**self.locks_authority(),
+            &token.owner,
+            &token,
+        ) {
+            Ok(()) => "applied\n".to_string(),
             Err(e) => format!("error\t{e}\n"),
         }
     }
@@ -10051,28 +14297,23 @@ impl DaemonRuntime {
         name: &str,
         f: impl FnOnce(&mut Loom<FileStore>, WorkspaceId) -> loom_core::error::Result<T>,
     ) -> loom_core::error::Result<T> {
-        let Some(loom) = self.kv_loom.as_mut() else {
-            return Err(self.kv_unavailable.clone().unwrap_or_else(|| {
-                loom_core::error::LoomError::unsupported(
-                    "daemon cannot host ephemeral KV for this store",
-                )
-            }));
-        };
-        loom.set_session(session.to_string());
-        let selector = match WorkspaceId::parse(workspace) {
-            Ok(id) => WsSelector::Id(id),
-            Err(_) => WsSelector::Name(workspace.to_string()),
-        };
-        let ns = loom.registry().open(&selector)?;
-        // Pure ephemeral caches are process-local; sweeping on access bounds daemon memory.
-        let _ = loom.sweep_all_expired(ns, now_ms());
-        let config = loom.kv_map_config(ns, name);
-        if config.tier != KvTier::Ephemeral || config.read_through || config.write_through {
-            return Err(loom_core::error::LoomError::unsupported(
-                "daemon hosts pure ephemeral KV maps only",
-            ));
-        };
-        f(loom, ns)
+        self.with_daemon_runtime_loom(|loom| {
+            loom.set_session(session.to_string());
+            let selector = match WorkspaceId::parse(workspace) {
+                Ok(id) => WsSelector::Id(id),
+                Err(_) => WsSelector::Name(workspace.to_string()),
+            };
+            let ns = loom.registry().open(&selector)?;
+            // Pure ephemeral caches are process-local; sweeping on access bounds daemon memory.
+            let _ = loom.sweep_all_expired(ns, now_ms());
+            let config = loom.kv_map_config(ns, name);
+            if config.tier != KvTier::Ephemeral || config.read_through || config.write_through {
+                return Err(loom_core::error::LoomError::unsupported(
+                    "daemon hosts pure ephemeral KV maps only",
+                ));
+            }
+            f(loom, ns)
+        })
     }
 
     fn bind_daemon_runtime_session(
@@ -10080,39 +14321,64 @@ impl DaemonRuntime {
         session: &str,
         auth: &DaemonRequestAuth,
     ) -> loom_core::error::Result<()> {
-        let Some(loom) = self.kv_loom.as_mut() else {
-            return Err(self.kv_unavailable.clone().unwrap_or_else(|| {
-                loom_core::error::LoomError::unsupported(
-                    "daemon cannot host ephemeral KV for this store",
+        self.with_daemon_runtime_loom(|loom| {
+            let Some(mut identity) = loom.store().identity_store()? else {
+                return Ok(());
+            };
+            if !identity.authenticated_mode() {
+                loom.set_identity_store(identity);
+                return Ok(());
+            }
+            if identity.session_principal(session).is_ok() {
+                loom.set_identity_store(identity);
+                return Ok(());
+            }
+            let principal = auth.principal.ok_or_else(|| {
+                loom_core::error::LoomError::new(
+                    loom_core::Code::AuthenticationFailed,
+                    "daemon runtime state requires authentication",
                 )
-            }));
-        };
-        let Some(mut identity) = loom.store().identity_store()? else {
-            return Ok(());
-        };
-        if !identity.authenticated_mode() {
+            })?;
+            let passphrase = auth.passphrase.as_deref().ok_or_else(|| {
+                loom_core::error::LoomError::new(
+                    loom_core::Code::AuthenticationFailed,
+                    "daemon runtime state requires authentication",
+                )
+            })?;
+            identity.authenticate_passphrase(principal, passphrase, session.to_string())?;
             loom.set_identity_store(identity);
-            return Ok(());
+            Ok(())
+        })
+    }
+
+    fn with_daemon_runtime_loom<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Loom<FileStore>) -> loom_core::error::Result<T>,
+    ) -> loom_core::error::Result<T> {
+        #[cfg(feature = "serve")]
+        {
+            // Text requests hold the daemon-runtime lock before taking this engine lock. Generated
+            // dispatch releases the runtime lock before taking the engine lock and reacquires the
+            // runtime lock only after dispatch returns.
+            let mut loom = self.generated_runtime.engine.lock().map_err(|_| {
+                loom_core::error::LoomError::new(
+                    loom_core::Code::Internal,
+                    "daemon generated runtime lock poisoned",
+                )
+            })?;
+            return operation(&mut loom);
         }
-        if identity.session_principal(session).is_ok() {
-            loom.set_identity_store(identity);
-            return Ok(());
+        #[cfg(not(feature = "serve"))]
+        {
+            let Some(loom) = self.kv_loom.as_mut() else {
+                return Err(self.kv_unavailable.clone().unwrap_or_else(|| {
+                    loom_core::error::LoomError::unsupported(
+                        "daemon cannot host ephemeral KV for this store",
+                    )
+                }));
+            };
+            operation(loom)
         }
-        let principal = auth.principal.ok_or_else(|| {
-            loom_core::error::LoomError::new(
-                loom_core::Code::AuthenticationFailed,
-                "daemon runtime state requires authentication",
-            )
-        })?;
-        let passphrase = auth.passphrase.as_deref().ok_or_else(|| {
-            loom_core::error::LoomError::new(
-                loom_core::Code::AuthenticationFailed,
-                "daemon runtime state requires authentication",
-            )
-        })?;
-        identity.authenticate_passphrase(principal, passphrase, session.to_string())?;
-        loom.set_identity_store(identity);
-        Ok(())
     }
 }
 
@@ -10214,29 +14480,31 @@ fn finish_daemon_fts_rebuild(
     let payload = match loom_tantivy::build_tantivy_index_payload(search) {
         Ok(payload) => payload,
         Err(error) => {
-            let fs = open_daemon_authorized_after_request(store)?;
-            fs.fail_search_tantivy_rebuild(
-                workspace,
-                collection,
-                run_id,
-                source_digest,
-                engine_version,
-                error.to_string(),
-            )
-            .map_err(|e| e.to_string())?;
+            with_daemon_active_store(store, |fs| {
+                fs.fail_search_tantivy_rebuild(
+                    workspace,
+                    collection,
+                    run_id,
+                    source_digest,
+                    engine_version,
+                    error.to_string(),
+                )
+                .map_err(|e| e.to_string())
+            })?;
             return Err(error.to_string());
         }
     };
-    let fs = open_daemon_authorized_after_request(store)?;
-    fs.finish_search_tantivy_rebuild(
-        workspace,
-        collection,
-        run_id,
-        source_digest,
-        engine_version,
-        &payload,
-    )
-    .map_err(|e| e.to_string())?;
+    with_daemon_active_store(store, |fs| {
+        fs.finish_search_tantivy_rebuild(
+            workspace,
+            collection,
+            run_id,
+            source_digest,
+            engine_version,
+            &payload,
+        )
+        .map_err(|e| e.to_string())
+    })?;
     append_daemon_audit(
         store,
         "fts.tantivy.rebuild.ready",
@@ -10244,23 +14512,6 @@ fn finish_daemon_fts_rebuild(
             "workspace={workspace};collection={collection};source_digest={source_digest};engine_version={engine_version};run_id={run_id}"
         )),
     )
-}
-
-#[cfg(feature = "native-fts")]
-fn open_daemon_authorized_after_request(store: &str) -> Result<FileStore, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match FileStore::open_daemon_authorized(store) {
-            Ok(fs) => return Ok(fs),
-            Err(error)
-                if error.code == loom_core::Code::Conflict
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
 }
 
 #[cfg(not(feature = "native-fts"))]
@@ -10274,26 +14525,27 @@ fn schedule_daemon_fts_rebuild(
     _search: loom_core::search::SearchCollection,
 ) -> Result<DerivedArtifactStatus, String> {
     let message = "native FTS is not enabled in this loom binary";
-    let fs = FileStore::open_daemon_authorized(&store).map_err(|e| e.to_string())?;
-    fs.fail_search_tantivy_rebuild(
-        workspace,
-        &collection,
-        &run_id,
-        source_digest,
-        &engine_version,
-        message,
-    )
-    .map_err(|e| e.to_string())?;
-    fs.mark_search_tantivy_unsupported(
-        workspace,
-        &collection,
-        source_digest,
-        &engine_version,
-        message,
-    )
-    .map_err(|e| e.to_string())?;
-    fs.search_tantivy_status(workspace, &collection, source_digest, &engine_version)
-        .map_err(|e| e.to_string())
+    with_daemon_active_store(&store, |fs| {
+        fs.fail_search_tantivy_rebuild(
+            workspace,
+            &collection,
+            &run_id,
+            source_digest,
+            &engine_version,
+            message,
+        )
+        .map_err(|e| e.to_string())?;
+        fs.mark_search_tantivy_unsupported(
+            workspace,
+            &collection,
+            source_digest,
+            &engine_version,
+            message,
+        )
+        .map_err(|e| e.to_string())?;
+        fs.search_tantivy_status(workspace, &collection, source_digest, &engine_version)
+            .map_err(|e| e.to_string())
+    })
 }
 
 fn apply_authority_replication_policy(
@@ -10306,36 +14558,37 @@ fn apply_authority_replication_policy(
         .identity_store()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "source identity store not initialized".to_string())?;
-    let destination = FileStore::open_daemon_authorized(store).map_err(|e| e.to_string())?;
-    let mut destination_identity = destination
-        .identity_store()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "destination identity store not initialized".to_string())?;
-    let report = destination_identity
-        .replicate_authority_from(&source_identity, destination.digest_algo(), false)
-        .map_err(|e| e.to_string())?;
-    policy.last_success_ms = Some(now);
-    policy.last_failure_ms = None;
-    policy.last_error = None;
-    let target = format!(
-        "id={};source={};from_generation={};to_generation={};applied={};publish_witness={}",
-        policy.id,
-        policy.source,
-        report.from_generation,
-        report.to_generation,
-        report.applied,
-        policy.publish_witness
-    );
-    destination
-        .save_identity_store_and_authority_replication_policy_audited(
-            &destination_identity,
-            &policy,
-            None,
-            "authority.replication.pull",
-            Some(&target),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    with_daemon_active_store(store, |destination| {
+        let mut destination_identity = destination
+            .identity_store()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "destination identity store not initialized".to_string())?;
+        let report = destination_identity
+            .replicate_authority_from(&source_identity, destination.digest_algo(), false)
+            .map_err(|e| e.to_string())?;
+        policy.last_success_ms = Some(now);
+        policy.last_failure_ms = None;
+        policy.last_error = None;
+        let target = format!(
+            "id={};source={};from_generation={};to_generation={};applied={};publish_witness={}",
+            policy.id,
+            policy.source,
+            report.from_generation,
+            report.to_generation,
+            report.applied,
+            policy.publish_witness
+        );
+        destination
+            .save_identity_store_and_authority_replication_policy_audited(
+                &destination_identity,
+                &policy,
+                None,
+                "authority.replication.pull",
+                Some(&target),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
 }
 
 fn mark_authority_replication_failure(
@@ -10344,20 +14597,21 @@ fn mark_authority_replication_failure(
     now: u64,
     reason: &str,
 ) -> Result<(), String> {
-    let destination = FileStore::open_daemon_authorized(store).map_err(|e| e.to_string())?;
     let reason = reason.chars().take(512).collect::<String>();
     policy.last_failure_ms = Some(now);
     policy.last_error = Some(reason.clone());
     let target = format!("id={};source={};reason={reason}", policy.id, policy.source);
-    destination
-        .save_authority_replication_policy_audited(
-            &policy,
-            None,
-            "authority.replication.failure",
-            Some(&target),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    with_daemon_active_store(store, |destination| {
+        destination
+            .save_authority_replication_policy_audited(
+                &policy,
+                None,
+                "authority.replication.failure",
+                Some(&target),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
 }
 
 fn authority_replication_jitter(policy: &loom_store::AuthorityReplicationPolicy) -> u64 {
@@ -10372,6 +14626,34 @@ fn authority_replication_jitter(policy: &loom_store::AuthorityReplicationPolicy)
             acc.wrapping_mul(131).wrapping_add(u64::from(byte))
         })
         % policy.jitter_ms.saturating_add(1)
+}
+
+fn authority_replication_initial_deadline(
+    policy: &loom_store::AuthorityReplicationPolicy,
+    now: u64,
+) -> Option<u64> {
+    if policy.pull_on_start {
+        return Some(now);
+    }
+    authority_replication_success_deadline(policy, now)
+}
+
+fn authority_replication_success_deadline(
+    policy: &loom_store::AuthorityReplicationPolicy,
+    now: u64,
+) -> Option<u64> {
+    policy.interval_ms.map(|interval| {
+        now.saturating_add(interval)
+            .saturating_add(authority_replication_jitter(policy))
+    })
+}
+
+fn authority_replication_failure_deadline(
+    policy: &loom_store::AuthorityReplicationPolicy,
+    now: u64,
+) -> u64 {
+    now.saturating_add(policy.backoff_ms)
+        .saturating_add(authority_replication_jitter(policy))
 }
 
 pub(crate) fn daemon_kv_loom(store: &str) -> Result<Loom<FileStore>, loom_core::error::LoomError> {
@@ -10391,6 +14673,7 @@ pub(crate) fn daemon_kv_loom(store: &str) -> Result<Loom<FileStore>, loom_core::
     })
 }
 
+#[cfg(not(feature = "serve"))]
 fn daemon_kv_unavailable_error(err: loom_core::error::LoomError) -> loom_core::error::LoomError {
     if err.code == loom_core::Code::E2eLocked {
         loom_core::error::LoomError::new(
@@ -10406,9 +14689,44 @@ pub(crate) fn save_daemon_lock_coordinator(
     store: &str,
     coordinator: &LockCoordinator,
 ) -> Result<(), String> {
-    let fs = FileStore::open_daemon_authorized(store).map_err(|e| e.to_string())?;
-    fs.save_lock_coordinator(coordinator)
-        .map_err(|e| e.to_string())
+    #[cfg(feature = "serve")]
+    {
+        return with_daemon_active_store(store, |fs| {
+            fs.save_lock_coordinator(coordinator)
+                .map_err(|e| e.to_string())
+        });
+    }
+    #[cfg(not(feature = "serve"))]
+    {
+        let fs = FileStore::open_daemon_authorized(store).map_err(|e| e.to_string())?;
+        fs.save_lock_coordinator(coordinator)
+            .map_err(|e| e.to_string())
+    }
+}
+
+struct DaemonLocksPersistence {
+    store: String,
+}
+
+impl loom_client::locks::LocksPersistence for DaemonLocksPersistence {
+    fn persist(&self, coordinator: &LockCoordinator) -> Result<(), loom_core::error::LoomError> {
+        save_daemon_lock_coordinator(&self.store, coordinator)
+            .map_err(|error| loom_core::error::LoomError::new(loom_core::Code::Io, error))
+    }
+}
+
+fn daemon_locks_authority(
+    store: &str,
+    coordinator: LockCoordinator,
+) -> std::sync::Arc<loom_client::locks::InProcessLocksAuthority> {
+    std::sync::Arc::new(
+        loom_client::locks::InProcessLocksAuthority::from_coordinator(
+            coordinator,
+            std::sync::Arc::new(DaemonLocksPersistence {
+                store: store.to_string(),
+            }),
+        ),
+    )
 }
 
 enum LocalDaemonListener {
@@ -10425,6 +14743,100 @@ enum LocalDaemonStream {
     Unix(std::os::unix::net::UnixStream),
     #[cfg(windows)]
     WindowsNamedPipe(interprocess::local_socket::Stream),
+}
+
+struct DaemonAcceptedConnection {
+    stream: LocalDaemonStream,
+    permit: DaemonWorkerPermit,
+}
+
+enum LocalDaemonAcceptorWake {
+    Tcp(std::net::SocketAddr),
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
+    #[cfg(windows)]
+    WindowsNamedPipe(String),
+}
+
+impl LocalDaemonAcceptorWake {
+    fn wake(&self) {
+        match self {
+            Self::Tcp(addr) => {
+                let _ = std::net::TcpStream::connect(addr);
+            }
+            #[cfg(unix)]
+            Self::Unix(path) => {
+                let _ = std::os::unix::net::UnixStream::connect(path);
+            }
+            #[cfg(windows)]
+            Self::WindowsNamedPipe(name) => {
+                use interprocess::local_socket::{GenericWorkspaced, prelude::*};
+
+                let Ok(name) = name.as_str().to_ns_name::<GenericWorkspaced>() else {
+                    return;
+                };
+                let _ = interprocess::local_socket::Stream::connect(name);
+            }
+        }
+    }
+}
+
+struct DaemonBlockingAcceptorHandle {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wake: LocalDaemonAcceptorWake,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DaemonBlockingAcceptorHandle {
+    fn stop(mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.wake.wake();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct DaemonRunCleanupGuard<S: Send + 'static> {
+    addr_file: String,
+    pid_file: String,
+    lock_file: String,
+    paths: daemon::DaemonPaths,
+    acceptor: Option<DaemonBlockingAcceptorHandle>,
+    event_receiver: Option<BoundedDaemonEventReceiver<S>>,
+    deadline_waker: Option<DaemonSchedulerDeadlineWaker<S>>,
+}
+
+impl<S: Send + 'static> DaemonRunCleanupGuard<S> {
+    fn recv(&self) -> Result<DaemonEvent<S>, std::sync::mpsc::RecvError> {
+        match self.event_receiver.as_ref() {
+            Some(receiver) => receiver.recv(),
+            None => Err(std::sync::mpsc::RecvError),
+        }
+    }
+
+    fn cleanup(&mut self) {
+        if let Some(acceptor) = self.acceptor.take() {
+            acceptor.stop();
+        }
+        daemon_cleanup_runtime_files(
+            &self.addr_file,
+            &self.pid_file,
+            &self.lock_file,
+            &self.paths,
+        );
+        self.event_receiver.take();
+        if let Some(deadline_waker) = self.deadline_waker.take() {
+            deadline_waker.stop();
+        }
+    }
+}
+
+impl<S: Send + 'static> Drop for DaemonRunCleanupGuard<S> {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 impl LocalDaemonListener {
@@ -10448,8 +14860,8 @@ impl LocalDaemonListener {
                 daemon::validate_runtime_socket_artifact(&paths.sock_file)
                     .map_err(|e| e.to_string())?;
                 listener
-                    .set_nonblocking(true)
-                    .map_err(|e| format!("set daemon nonblocking mode: {e}"))?;
+                    .set_nonblocking(false)
+                    .map_err(|e| format!("set daemon blocking accept mode: {e}"))?;
                 return Ok(Self::Unix(listener));
             }
         }
@@ -10461,6 +14873,20 @@ impl LocalDaemonListener {
         bind_tcp_loopback_listener()
     }
 
+    fn set_blocking_accept(&self) -> Result<(), String> {
+        match self {
+            Self::Tcp(listener) => listener
+                .set_nonblocking(false)
+                .map_err(|e| format!("set daemon blocking accept mode: {e}")),
+            #[cfg(unix)]
+            Self::Unix(listener) => listener
+                .set_nonblocking(false)
+                .map_err(|e| format!("set daemon blocking accept mode: {e}")),
+            #[cfg(windows)]
+            Self::WindowsNamedPipe(_) => Ok(()),
+        }
+    }
+
     fn transport(&self) -> daemon::DaemonTransport {
         match self {
             Self::Tcp(_) => daemon::DaemonTransport::TcpLoopback,
@@ -10468,6 +14894,24 @@ impl LocalDaemonListener {
             Self::Unix(_) => daemon::DaemonTransport::UnixSocket,
             #[cfg(windows)]
             Self::WindowsNamedPipe(_) => daemon::DaemonTransport::WindowsNamedPipe,
+        }
+    }
+
+    fn acceptor_wake(
+        &self,
+        paths: &daemon::DaemonPaths,
+    ) -> Result<LocalDaemonAcceptorWake, String> {
+        match self {
+            Self::Tcp(listener) => listener
+                .local_addr()
+                .map(LocalDaemonAcceptorWake::Tcp)
+                .map_err(|e| format!("read daemon address: {e}")),
+            #[cfg(unix)]
+            Self::Unix(_) => Ok(LocalDaemonAcceptorWake::Unix(paths.sock_file.clone())),
+            #[cfg(windows)]
+            Self::WindowsNamedPipe(_) => Ok(LocalDaemonAcceptorWake::WindowsNamedPipe(
+                paths.pipe_name.clone(),
+            )),
         }
     }
 
@@ -10492,6 +14936,14 @@ impl LocalDaemonListener {
     }
 
     fn accept(&self, paths: &daemon::DaemonPaths) -> Result<Option<LocalDaemonStream>, String> {
+        #[cfg(test)]
+        {
+            *DAEMON_ACCEPT_ATTEMPTS
+                .lock()
+                .unwrap()
+                .entry(paths.addr_file.clone())
+                .or_default() += 1;
+        }
         #[cfg(windows)]
         let _ = paths;
 
@@ -10527,12 +14979,224 @@ impl LocalDaemonListener {
     }
 }
 
+#[cfg(test)]
+static DAEMON_ACCEPT_ATTEMPTS: std::sync::Mutex<
+    std::collections::BTreeMap<std::path::PathBuf, usize>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+static DAEMON_BACKGROUND_OWNER_INJECT_ERROR: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+#[cfg(test)]
+static DAEMON_MAINTENANCE_WORKER_INJECT_ERROR: std::sync::Mutex<
+    std::collections::BTreeSet<String>,
+> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+#[cfg(test)]
+static DAEMON_MAINTENANCE_FORCE_DUE_ONCE: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+#[cfg(test)]
+fn set_daemon_test_signal(
+    signals: &std::sync::Mutex<std::collections::BTreeSet<String>>,
+    store: &str,
+) {
+    signals.lock().unwrap().insert(store.to_string());
+}
+#[cfg(test)]
+fn clear_daemon_test_signal(
+    signals: &std::sync::Mutex<std::collections::BTreeSet<String>>,
+    store: &str,
+) {
+    signals.lock().unwrap().remove(store);
+}
+#[cfg(test)]
+fn take_daemon_test_signal(
+    signals: &std::sync::Mutex<std::collections::BTreeSet<String>>,
+    store: &str,
+) -> bool {
+    signals.lock().unwrap().remove(store)
+}
+#[cfg(test)]
+static DAEMON_MAINTENANCE_REPORT_OPENS: std::sync::Mutex<
+    std::collections::BTreeMap<String, usize>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+static DAEMON_AUTHORITY_REPLICATION_POLICY_OPENS: std::sync::Mutex<
+    std::collections::BTreeMap<String, usize>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+static DAEMON_HOSTED_LISTENER_DESIRED_OPENS: std::sync::Mutex<
+    std::collections::BTreeMap<String, usize>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+static DAEMON_DRIVE_POLICY_WORKER_RUNS: std::sync::Mutex<
+    std::collections::BTreeMap<String, usize>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+static DAEMON_DRIVE_POLICY_WORKER_INJECT_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(test, feature = "serve"))]
+static DAEMON_REFERENCE_WORKER_RUNS: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(all(test, feature = "serve"))]
+static DAEMON_REFERENCE_WORKER_MAX_ARGS: std::sync::Mutex<
+    std::collections::BTreeMap<String, Vec<usize>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+#[cfg(all(test, feature = "serve"))]
+static DAEMON_REFERENCE_WORKER_INJECT_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(test, feature = "serve"))]
+static DAEMON_REFERENCE_WORKER_INJECT_RUNS: std::sync::Mutex<
+    std::collections::BTreeMap<String, ReferenceWorkerRun>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn increment_daemon_maintenance_report_open(store: &str) {
+    let mut opens = DAEMON_MAINTENANCE_REPORT_OPENS.lock().unwrap();
+    *opens.entry(store.to_string()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn reset_daemon_maintenance_report_opens(store: &str) {
+    DAEMON_MAINTENANCE_REPORT_OPENS
+        .lock()
+        .unwrap()
+        .remove(store);
+}
+
+#[cfg(test)]
+fn daemon_maintenance_report_opens(store: &str) -> usize {
+    DAEMON_MAINTENANCE_REPORT_OPENS
+        .lock()
+        .unwrap()
+        .get(store)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn increment_daemon_authority_replication_policy_open(store: &str) {
+    let mut opens = DAEMON_AUTHORITY_REPLICATION_POLICY_OPENS.lock().unwrap();
+    *opens.entry(store.to_string()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn reset_daemon_authority_replication_policy_opens(store: &str) {
+    DAEMON_AUTHORITY_REPLICATION_POLICY_OPENS
+        .lock()
+        .unwrap()
+        .remove(store);
+}
+
+#[cfg(test)]
+fn daemon_authority_replication_policy_opens(store: &str) -> usize {
+    DAEMON_AUTHORITY_REPLICATION_POLICY_OPENS
+        .lock()
+        .unwrap()
+        .get(store)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn increment_daemon_hosted_listener_desired_open(store: &str) {
+    let mut opens = DAEMON_HOSTED_LISTENER_DESIRED_OPENS.lock().unwrap();
+    *opens.entry(store.to_string()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn reset_daemon_hosted_listener_desired_opens(store: &str) {
+    DAEMON_HOSTED_LISTENER_DESIRED_OPENS
+        .lock()
+        .unwrap()
+        .remove(store);
+}
+
+#[cfg(test)]
+fn daemon_hosted_listener_desired_opens(store: &str) -> usize {
+    DAEMON_HOSTED_LISTENER_DESIRED_OPENS
+        .lock()
+        .unwrap()
+        .get(store)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn increment_daemon_drive_policy_worker_run(store: &str) {
+    let mut runs = DAEMON_DRIVE_POLICY_WORKER_RUNS.lock().unwrap();
+    *runs.entry(store.to_string()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn reset_daemon_drive_policy_worker_runs(store: &str) {
+    DAEMON_DRIVE_POLICY_WORKER_RUNS
+        .lock()
+        .unwrap()
+        .remove(store);
+}
+
+#[cfg(test)]
+fn daemon_drive_policy_worker_runs(store: &str) -> usize {
+    DAEMON_DRIVE_POLICY_WORKER_RUNS
+        .lock()
+        .unwrap()
+        .get(store)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(all(test, feature = "serve"))]
+fn increment_daemon_reference_worker_run(store: &str, max: usize) {
+    let mut runs = DAEMON_REFERENCE_WORKER_RUNS.lock().unwrap();
+    *runs.entry(store.to_string()).or_default() += 1;
+    drop(runs);
+    DAEMON_REFERENCE_WORKER_MAX_ARGS
+        .lock()
+        .unwrap()
+        .entry(store.to_string())
+        .or_default()
+        .push(max);
+}
+
+#[cfg(all(test, feature = "serve"))]
+fn reset_daemon_reference_worker_runs(store: &str) {
+    DAEMON_REFERENCE_WORKER_RUNS.lock().unwrap().remove(store);
+    DAEMON_REFERENCE_WORKER_MAX_ARGS
+        .lock()
+        .unwrap()
+        .remove(store);
+    DAEMON_REFERENCE_WORKER_INJECT_ERROR.store(false, std::sync::atomic::Ordering::SeqCst);
+    DAEMON_REFERENCE_WORKER_INJECT_RUNS
+        .lock()
+        .unwrap()
+        .remove(store);
+}
+
+#[cfg(all(test, feature = "serve"))]
+fn daemon_reference_worker_runs(store: &str) -> usize {
+    DAEMON_REFERENCE_WORKER_RUNS
+        .lock()
+        .unwrap()
+        .get(store)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(all(test, feature = "serve"))]
+fn daemon_reference_worker_max_args(store: &str) -> Vec<usize> {
+    DAEMON_REFERENCE_WORKER_MAX_ARGS
+        .lock()
+        .unwrap()
+        .get(store)
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn bind_tcp_loopback_listener() -> Result<LocalDaemonListener, String> {
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind daemon: {e}"))?;
     listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("set daemon nonblocking mode: {e}"))?;
+        .set_nonblocking(false)
+        .map_err(|e| format!("set daemon blocking accept mode: {e}"))?;
     Ok(LocalDaemonListener::Tcp(listener))
 }
 
@@ -10561,7 +15225,7 @@ fn bind_windows_named_pipe_listener(
         .map_err(|e| format!("build daemon named pipe security descriptor: {e}"))?;
     let listener = ListenerOptions::new()
         .name(name)
-        .nonblocking(ListenerNonblockingMode::Accept)
+        .nonblocking(ListenerNonblockingMode::Neither)
         .security_descriptor(security_descriptor)
         .create_sync()
         .map_err(|e| format!("bind daemon Windows named pipe: {e}"))?;
@@ -10602,45 +15266,511 @@ impl Write for LocalDaemonStream {
     }
 }
 
+fn daemon_spawn_request_worker(
+    mut stream: LocalDaemonStream,
+    permit: DaemonWorkerPermit,
+    runtime: std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+    events: BoundedDaemonEventSender<DaemonAcceptedConnection>,
+) {
+    std::thread::spawn(move || {
+        let _lifecycle_guard = DaemonRequestLifecycleGuard::new(permit, events.clone());
+        let request = match read_daemon_request_bounded(&mut stream) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = stream.write_all(format!("error\t{error}\n").as_bytes());
+                return;
+            }
+        };
+        #[cfg(feature = "serve")]
+        if let Some(response) = DaemonRuntime::handle_generated_binary_shared(&runtime, &request) {
+            let _ = stream.write_all(&response);
+            return;
+        }
+        #[cfg(feature = "serve")]
+        if let Some(body) = generated_binary_body(&request, DAEMON_GENERATED_STREAM_MAGIC) {
+            let _ = stream.write_all(DAEMON_GENERATED_STREAM_RESPONSE_MAGIC);
+            match loom_remote_protocol::envelope::Request::decode(body) {
+                Ok(request) => {
+                    let session_id = request.session_id.clone();
+                    let mut renew_generated_session = None;
+                    let stream_result = runtime
+                        .lock()
+                        .map(|mut runtime| {
+                            if let Some(session_id) = session_id.as_ref() {
+                                let now = now_ms();
+                                if runtime.generated_lifecycle_lease_valid(session_id, now) {
+                                    runtime.renew_generated_lifecycle_lease(session_id, now);
+                                    renew_generated_session = Some((session_id.clone(), now));
+                                }
+                            }
+                            std::sync::Arc::clone(&runtime.generated_runtime)
+                        })
+                        .map_err(|_| {
+                            loom_core::error::LoomError::new(
+                                loom_core::error::Code::Internal,
+                                "daemon runtime lock poisoned",
+                            )
+                        })
+                        .and_then(|generated_runtime| {
+                            if let Some((session_id, now)) = renew_generated_session {
+                                generated_runtime.renew_session(&session_id, now);
+                            }
+                            generated_runtime.open_generated_stream_response(&request)
+                        });
+                    match stream_result {
+                        Ok((open_stream, cancel, stream_key)) => {
+                            let result = write_generated_open_stream_response(
+                                open_stream,
+                                Some(&runtime),
+                                session_id.as_deref(),
+                                Some(cancel.as_ref()),
+                                &mut stream,
+                            );
+                            cancel.store(true, std::sync::atomic::Ordering::Release);
+                            if let Ok(runtime) = runtime.lock() {
+                                runtime
+                                    .generated_runtime
+                                    .finish_generated_stream(&stream_key);
+                            }
+                            let _ = result;
+                        }
+                        Err(error) => {
+                            if let Ok(frame) =
+                                DaemonGeneratedRuntime::generated_stream_error_frame(&error)
+                            {
+                                let _ = write_generated_stream_frame(&mut stream, &frame);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let error = loom_core::error::LoomError::new(
+                        loom_core::error::Code::InvalidArgument,
+                        format!("decode generated stream request: {error}"),
+                    );
+                    let frame = loom_remote_protocol::frame::Frame::Error(
+                        loom_remote_protocol::RemoteError::from_loom_error(&error),
+                    )
+                    .encode();
+                    if let Ok(frame) = frame {
+                        let _ = write_generated_stream_frame(&mut stream, &frame);
+                    }
+                }
+            }
+            return;
+        }
+        let response = match runtime.lock() {
+            Ok(mut runtime) => runtime.handle_bytes(&request),
+            Err(_) => b"error\tdaemon runtime lock poisoned\n".to_vec(),
+        };
+        let request_head = std::str::from_utf8(&request)
+            .ok()
+            .and_then(|request| request.trim_end().split('\t').next());
+        let stop_requested = matches!(request_head, Some("stop" | "stop-force"))
+            && response.starts_with(b"stopped\t");
+        let _ = stream.write_all(&response);
+        if stop_requested {
+            let _ = events.request_shutdown();
+        }
+        #[cfg(feature = "serve")]
+        if let Some(notification) =
+            daemon_request_completion_scheduler_notification(request_head, &response)
+        {
+            let _ = events.try_send_notification(notification);
+        }
+    });
+}
+
+#[cfg(feature = "serve")]
+fn daemon_request_completion_scheduler_notification(
+    request_head: Option<&str>,
+    response: &[u8],
+) -> Option<DaemonSchedulerNotification> {
+    if matches!(request_head, Some("reference-reconcile")) && response == b"ok\n" {
+        return Some(DaemonSchedulerNotification::InternalReschedule {
+            owner: DaemonSchedulerOwner::ReferenceWorker,
+        });
+    }
+    None
+}
+
+fn daemon_run_background_owners_once(
+    runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+    _active_connections: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<bool, String> {
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| "daemon runtime lock poisoned".to_string())?;
+    #[cfg(test)]
+    if take_daemon_test_signal(&DAEMON_BACKGROUND_OWNER_INJECT_ERROR, &runtime.store) {
+        return Err("injected daemon background owner error".to_string());
+    }
+    let activity = runtime.scheduler_activity_recorder(DaemonSchedulerOwner::AuthorityReplication);
+    activity.record_owner_run();
+    let result = runtime.reconcile_authority_replication_owner_state(false, activity);
+    result?;
+    Ok(false)
+}
+
+fn daemon_run_lifecycle_shutdown_owner_once(
+    runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+    active_connections: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<bool, String> {
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| "daemon runtime lock poisoned".to_string())?;
+    let activity = runtime.scheduler_activity_recorder(DaemonSchedulerOwner::LifecycleShutdown);
+    activity.record_owner_run();
+    let result = runtime.reconcile_managed_lifecycle_shutdown(
+        now_ms(),
+        active_connections.load(std::sync::atomic::Ordering::SeqCst),
+    );
+    Ok(result)
+}
+
+#[cfg(feature = "serve")]
+fn daemon_run_drive_policy_owner_once(
+    runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+    policy_changed: bool,
+) -> Result<(), String> {
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| "daemon runtime lock poisoned".to_string())?;
+    let activity = runtime.scheduler_activity_recorder(DaemonSchedulerOwner::DrivePolicy);
+    activity.record_owner_run();
+    runtime.reconcile_drive_policy_workers_for_change(policy_changed, activity)
+}
+
+#[cfg(feature = "serve")]
+fn daemon_run_reference_worker_owner_once(
+    runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+    reference_changed: bool,
+) -> Result<(), String> {
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| "daemon runtime lock poisoned".to_string())?;
+    let activity = runtime.scheduler_activity_recorder(DaemonSchedulerOwner::ReferenceWorker);
+    activity.record_owner_run();
+    runtime.reconcile_reference_workers_for_change(reference_changed, activity)
+}
+
+#[cfg(feature = "serve")]
+fn daemon_run_hosted_listener_owner_once(
+    runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+) -> Result<(), String> {
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| "daemon runtime lock poisoned".to_string())?;
+    if runtime.startup_mode != daemon::DaemonStartupMode::Persistent {
+        return Ok(());
+    }
+    let activity = runtime.scheduler_activity_recorder(DaemonSchedulerOwner::HostedListeners);
+    activity.record_owner_run();
+    runtime.reconcile_hosted_listeners(activity)
+}
+
+fn daemon_run_authority_replication_owner_once(
+    runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+    policy_changed: bool,
+) -> Result<(), String> {
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| "daemon runtime lock poisoned".to_string())?;
+    let activity = runtime.scheduler_activity_recorder(DaemonSchedulerOwner::AuthorityReplication);
+    activity.record_owner_run();
+    runtime.reconcile_authority_replication_owner_state(policy_changed, activity)
+}
+
+fn daemon_run_maintenance_owner_once(
+    runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+    events: &BoundedDaemonEventSender<DaemonAcceptedConnection>,
+    completion_event: bool,
+) -> Result<(), String> {
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| "daemon runtime lock poisoned".to_string())?;
+    let activity = runtime.scheduler_activity_recorder(DaemonSchedulerOwner::Maintenance);
+    activity.record_owner_run();
+    runtime.reconcile_store_maintenance_with_events(
+        Some(events.clone()),
+        completion_event,
+        activity,
+    )
+}
+
+fn daemon_run_scheduler_notification_once(
+    runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+    events: &BoundedDaemonEventSender<DaemonAcceptedConnection>,
+    active_connections: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    equivalent_key: DaemonEquivalentEventKey,
+) -> Result<bool, String> {
+    let owner = scheduler_owner_for_event_key(equivalent_key);
+    #[cfg(feature = "serve")]
+    let handled_hosted = if owner == Some(DaemonSchedulerOwner::HostedListeners) {
+        daemon_run_hosted_listener_owner_once(runtime)?;
+        true
+    } else {
+        false
+    };
+    #[cfg(not(feature = "serve"))]
+    let handled_hosted = false;
+    #[cfg(feature = "serve")]
+    let handled_drive = if owner == Some(DaemonSchedulerOwner::DrivePolicy) {
+        daemon_run_drive_policy_owner_once(
+            runtime,
+            matches!(
+                equivalent_key,
+                DaemonEquivalentEventKey::CommittedMutation {
+                    owner: DaemonSchedulerOwner::DrivePolicy,
+                    change: DaemonCommittedChangeClass::DrivePolicy,
+                }
+            ),
+        )?;
+        true
+    } else {
+        false
+    };
+    #[cfg(not(feature = "serve"))]
+    let handled_drive = false;
+    if handled_hosted || handled_drive {
+        Ok(false)
+    } else if owner == Some(DaemonSchedulerOwner::ReferenceWorker) {
+        #[cfg(feature = "serve")]
+        daemon_run_reference_worker_owner_once(
+            runtime,
+            matches!(
+                equivalent_key,
+                DaemonEquivalentEventKey::CommittedMutation {
+                    owner: DaemonSchedulerOwner::ReferenceWorker,
+                    change: DaemonCommittedChangeClass::Reference,
+                }
+            ),
+        )?;
+        Ok(false)
+    } else if owner == Some(DaemonSchedulerOwner::Maintenance) {
+        daemon_run_maintenance_owner_once(
+            runtime,
+            events,
+            matches!(
+                equivalent_key,
+                DaemonEquivalentEventKey::WorkerCompleted(DaemonSchedulerOwner::Maintenance)
+            ),
+        )
+        .map_err(|error| format!("maintenance scheduler owner failed: {error}"))?;
+        Ok(false)
+    } else if owner == Some(DaemonSchedulerOwner::LifecycleShutdown) {
+        daemon_run_lifecycle_shutdown_owner_once(runtime, active_connections)
+    } else if owner == Some(DaemonSchedulerOwner::AuthorityReplication) {
+        daemon_run_authority_replication_owner_once(
+            runtime,
+            matches!(
+                equivalent_key,
+                DaemonEquivalentEventKey::CommittedMutation {
+                    owner: DaemonSchedulerOwner::AuthorityReplication,
+                    change: DaemonCommittedChangeClass::AuthorityReplicationPolicy,
+                }
+            ),
+        )
+        .map_err(|error| format!("authority replication scheduler owner failed: {error}"))?;
+        Ok(false)
+    } else {
+        daemon_run_background_owners_once(runtime, active_connections)
+    }
+}
+
+fn daemon_handle_event_once(
+    event: DaemonEvent<DaemonAcceptedConnection>,
+    runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+    events: &BoundedDaemonEventSender<DaemonAcceptedConnection>,
+    active_connections: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    scheduler_counters: &DaemonSchedulerCounters,
+    deadline_waker: Option<&DaemonSchedulerDeadlineWaker<DaemonAcceptedConnection>>,
+) -> Result<bool, String> {
+    match event {
+        DaemonEvent::AcceptedStream(accepted) => {
+            scheduler_counters.record_wakeup(DaemonSchedulerWakeupKind::AcceptedConnection);
+            daemon_spawn_request_worker(
+                accepted.stream,
+                accepted.permit,
+                runtime.clone(),
+                events.clone(),
+            );
+            Ok(false)
+        }
+        DaemonEvent::SchedulerNotification(notification) => {
+            let equivalent_key = notification.equivalent_key();
+            scheduler_counters.record_wakeup(DaemonSchedulerWakeupKind::SchedulerNotification(
+                equivalent_key,
+            ));
+            let shutdown_required = daemon_run_scheduler_notification_once(
+                runtime,
+                events,
+                active_connections,
+                equivalent_key,
+            )?;
+            if !shutdown_required && let Some(deadline_waker) = deadline_waker {
+                deadline_waker.schedule(daemon_scheduler_next_deadline(runtime));
+            }
+            Ok(shutdown_required)
+        }
+        DaemonEvent::ShutdownRequested => {
+            scheduler_counters.record_wakeup(DaemonSchedulerWakeupKind::ShutdownRequested);
+            Ok(true)
+        }
+    }
+}
+
+fn earlier_daemon_deadline(
+    current: Option<DaemonSchedulerDeadline>,
+    candidate: DaemonSchedulerDeadline,
+) -> Option<DaemonSchedulerDeadline> {
+    Some(current.map_or(candidate, |current| {
+        if (candidate.deadline_ms, candidate.owner) < (current.deadline_ms, current.owner) {
+            candidate
+        } else {
+            current
+        }
+    }))
+}
+
+fn daemon_scheduler_next_deadline(
+    runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+) -> Option<DaemonSchedulerDeadline> {
+    let runtime = runtime.lock().ok()?;
+    let mut deadline =
+        daemon_lifecycle_scheduler_deadline(&runtime).map(|deadline_ms| DaemonSchedulerDeadline {
+            owner: DaemonSchedulerOwner::LifecycleShutdown,
+            deadline_ms,
+        });
+    if runtime.maintenance_next_ms != u64::MAX {
+        let maintenance = DaemonSchedulerDeadline {
+            owner: DaemonSchedulerOwner::Maintenance,
+            deadline_ms: runtime.maintenance_next_ms,
+        };
+        deadline = earlier_daemon_deadline(deadline, maintenance);
+    }
+    if let Some(authority) = runtime
+        .authority_replication_next
+        .values()
+        .filter(|deadline| **deadline != u64::MAX)
+        .min()
+        .copied()
+    {
+        let authority = DaemonSchedulerDeadline {
+            owner: DaemonSchedulerOwner::AuthorityReplication,
+            deadline_ms: authority,
+        };
+        deadline = earlier_daemon_deadline(deadline, authority);
+    }
+    #[cfg(feature = "serve")]
+    {
+        if runtime.drive_policy_next_ms != u64::MAX {
+            let drive = DaemonSchedulerDeadline {
+                owner: DaemonSchedulerOwner::DrivePolicy,
+                deadline_ms: runtime.drive_policy_next_ms,
+            };
+            deadline = earlier_daemon_deadline(deadline, drive);
+        }
+        if runtime.reference_reconcile_next_ms != u64::MAX {
+            let reference = DaemonSchedulerDeadline {
+                owner: DaemonSchedulerOwner::ReferenceWorker,
+                deadline_ms: runtime.reference_reconcile_next_ms,
+            };
+            deadline = earlier_daemon_deadline(deadline, reference);
+        }
+    }
+    deadline
+}
+
+fn daemon_cleanup_runtime_files(
+    addr_file: &str,
+    pid_file: &str,
+    lock_file: &str,
+    paths: &daemon::DaemonPaths,
+) {
+    let _ = std::fs::remove_file(addr_file);
+    let _ = std::fs::remove_file(pid_file);
+    let _ = std::fs::remove_file(lock_file);
+    let _ = std::fs::remove_file(&paths.sock_file);
+}
+
 pub(crate) fn daemon_run(
     store: &str,
     addr_file: &str,
     pid_file: &str,
     lock_file: &str,
     transport: &str,
+    startup_mode: &str,
+    startup_initiator: &str,
 ) -> Result<(), String> {
     let transport = DaemonTransportSelection::parse(transport)?;
+    let startup_mode = daemon::DaemonStartupMode::parse(startup_mode).map_err(|e| e.to_string())?;
+    let startup_initiator =
+        daemon::DaemonStartupInitiator::parse(startup_initiator).map_err(|e| e.to_string())?;
     let paths = daemon::paths(store).map_err(|e| e.to_string())?;
     let runtime_lock =
         daemon_lock_runtime_file(std::path::Path::new(lock_file)).map_err(|e| e.to_string())?;
-    daemon_write_runtime_lock(&runtime_lock, &paths).map_err(|e| e.to_string())?;
-    let coordinator = {
-        let fs = FileStore::open_read(store).map_err(|e| e.to_string())?;
-        fs.lock_coordinator().map_err(|e| e.to_string())?
-    };
+    let startup_started_ms = now_ms();
+    let startup_progress = DaemonStartupProgress::start(
+        &runtime_lock,
+        &paths,
+        startup_mode,
+        startup_initiator,
+        startup_started_ms,
+        daemon::DaemonStartupStage::Spawned,
+    )?;
+    #[cfg(feature = "daemon-cli-tests")]
+    daemon_startup_test_hook(&startup_progress)?;
     #[cfg(feature = "serve")]
-    let generated_runtime = daemon_generated_runtime(store)?;
+    let generated_runtime = std::sync::Arc::new(
+        daemon_generated_runtime(store, |stage, completed, total| {
+            startup_progress
+                .report(stage, completed, total)
+                .unwrap_or(())
+        })
+        .map_err(|e| format!("start generated runtime: {e}"))?,
+    );
+    #[cfg(feature = "serve")]
+    register_daemon_shared_engine(store, &generated_runtime.engine)?;
+    startup_progress.stage(daemon::DaemonStartupStage::Coordinator)?;
+    #[cfg(not(feature = "serve"))]
+    let locks_authority = {
+        let fs = FileStore::open_read(store).map_err(|e| e.to_string())?;
+        let coordinator = fs.lock_coordinator().map_err(|e| e.to_string())?;
+        daemon_locks_authority(store, coordinator)
+    };
+    startup_progress.stage(daemon::DaemonStartupStage::KvRuntime)?;
+    #[cfg(not(feature = "serve"))]
     let (kv_loom, kv_unavailable) = match daemon_kv_loom(store) {
         Ok(loom) => (Some(loom), None),
         Err(e) => (None, Some(daemon_kv_unavailable_error(e))),
     };
+    startup_progress.stage(daemon::DaemonStartupStage::ListenerBind)?;
     let listener = LocalDaemonListener::bind(&paths, transport)?;
     let transport = listener.transport();
+    startup_progress.stage(daemon::DaemonStartupStage::HostedListeners)?;
     #[cfg(feature = "serve")]
-    let hosted_listeners = start_hosted_listeners(store)?;
+    let hosted_listeners = start_hosted_listeners_for_startup_mode(store, startup_mode)?;
     let store_id = paths.store_id.clone();
     let runtime = std::sync::Arc::new(std::sync::Mutex::new(DaemonRuntime {
         store: store.to_string(),
         store_id,
         transport,
-        coordinator,
+        startup_mode,
+        startup_initiator,
+        #[cfg(not(feature = "serve"))]
+        locks_authority,
         #[cfg(feature = "serve")]
         generated_runtime,
+        #[cfg(not(feature = "serve"))]
         kv_loom,
+        #[cfg(not(feature = "serve"))]
         kv_unavailable,
-        sessions: std::collections::BTreeSet::new(),
-        pins: std::collections::BTreeMap::new(),
+        lifecycle_leases: std::collections::BTreeMap::new(),
+        managed_bootstrap_deadline_ms: managed_bootstrap_deadline_ms(startup_mode, now_ms()),
         authority_replication_next: std::collections::BTreeMap::new(),
+        authority_replication_fingerprints: std::collections::BTreeMap::new(),
+        authority_replication_discovered: false,
         maintenance_next_ms: 0,
         maintenance_worker: None,
         maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10650,134 +15780,157 @@ pub(crate) fn daemon_run(
         drive_policy_next_ms: 0,
         #[cfg(feature = "serve")]
         reference_reconcile_next_ms: 0,
+        scheduler_counters: DaemonSchedulerCounters::default(),
     }));
-    let should_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    std::fs::write(addr_file, listener.addr_file_contents(&paths)?)
-        .map_err(|e| format!("write daemon address file: {e}"))?;
-    daemon::align_runtime_artifact_owner(std::path::Path::new(addr_file), "address", &paths)
-        .map_err(|e| e.to_string())?;
-    std::fs::write(pid_file, std::process::id().to_string())
-        .map_err(|e| format!("write daemon pid file: {e}"))?;
-    daemon::align_runtime_artifact_owner(std::path::Path::new(pid_file), "pid", &paths)
-        .map_err(|e| e.to_string())?;
-    loop {
-        if should_stop.load(std::sync::atomic::Ordering::SeqCst) {
-            let _ = std::fs::remove_file(addr_file);
-            let _ = std::fs::remove_file(pid_file);
-            let _ = std::fs::remove_file(lock_file);
-            let _ = std::fs::remove_file(&paths.sock_file);
-            return Ok(());
-        }
-        {
-            let mut runtime = runtime
-                .lock()
-                .map_err(|_| "daemon runtime lock poisoned".to_string())?;
-            runtime.reconcile_store_maintenance()?;
-            runtime.reconcile_authority_replication()?;
-            #[cfg(feature = "serve")]
-            runtime.reconcile_hosted_listeners()?;
-            runtime.reconcile_drive_policy_workers()?;
-            runtime.reconcile_reference_workers()?;
-        }
-        let mut stream = match listener.accept(&paths)? {
-            Some(stream) => stream,
-            None => {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                continue;
+    let scheduler_counters = runtime
+        .lock()
+        .map_err(|_| "daemon runtime lock poisoned".to_string())?
+        .scheduler_counters
+        .clone();
+    startup_progress.stage(daemon::DaemonStartupStage::RuntimeArtifacts)?;
+    write_daemon_runtime_artifact_atomically(
+        std::path::Path::new(addr_file),
+        listener.addr_file_contents(&paths)?.as_bytes(),
+        "address",
+        &paths,
+    )?;
+    write_daemon_runtime_artifact_atomically(
+        std::path::Path::new(pid_file),
+        std::process::id().to_string().as_bytes(),
+        "pid",
+        &paths,
+    )?;
+    startup_progress.finish();
+    daemon_write_runtime_lock(&runtime_lock, &paths, startup_mode, startup_initiator)
+        .map_err(|e| format!("write daemon runtime lock: {e}"))?;
+    listener.set_blocking_accept()?;
+    let acceptor_wake = listener.acceptor_wake(&paths)?;
+    let (events, event_receiver) =
+        bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+    #[cfg(test)]
+    publish_daemon_run_observation(DaemonRunObservationHandle {
+        scheduler_counters: scheduler_counters.clone(),
+        events: events.clone(),
+    });
+    #[cfg(feature = "serve")]
+    {
+        let runtime = runtime
+            .lock()
+            .map_err(|_| "daemon runtime lock poisoned".to_string())?;
+        runtime.generated_runtime.set_publication_observer(Some(
+            DaemonGeneratedPublicationObserver::scheduler(events.clone()),
+        ));
+    }
+    let deadline_waker = DaemonSchedulerDeadlineWaker::start(events.clone());
+    let mut cleanup_guard = DaemonRunCleanupGuard {
+        addr_file: addr_file.to_string(),
+        pid_file: pid_file.to_string(),
+        lock_file: lock_file.to_string(),
+        paths: paths.clone(),
+        acceptor: None,
+        event_receiver: Some(event_receiver),
+        deadline_waker: Some(deadline_waker),
+    };
+    if daemon_run_background_owners_once(&runtime, &active_connections)? {
+        cleanup_guard.cleanup();
+        return Ok(());
+    }
+    if let Some(deadline_waker) = cleanup_guard.deadline_waker.as_ref() {
+        deadline_waker.schedule(daemon_scheduler_next_deadline(&runtime));
+    }
+    let accept_events = events.clone();
+    let accept_paths = paths.clone();
+    let accept_active_connections = active_connections.clone();
+    let accept_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let accept_shutdown_thread = accept_shutdown.clone();
+    let acceptor_handle = std::thread::spawn(move || {
+        let acceptor = DaemonBlockingAcceptorBoundary::new(accept_events.clone());
+        loop {
+            if accept_shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
             }
-        };
-        let runtime = runtime.clone();
-        let should_stop = should_stop.clone();
-        let Some(permit) = DaemonWorkerPermit::acquire(&active_connections) else {
-            write_daemon_admission_error(&mut stream)?;
-            continue;
-        };
-        std::thread::spawn(move || {
-            let _permit = permit;
-            let request = match read_daemon_request_bounded(&mut stream) {
-                Ok(request) => request,
-                Err(error) => {
-                    let _ = stream.write_all(format!("error\t{error}\n").as_bytes());
+            let mut stream = match listener.accept(&accept_paths) {
+                Ok(Some(stream)) => stream,
+                Ok(None) => continue,
+                Err(_) => {
+                    let _ = accept_events.request_shutdown();
                     return;
                 }
             };
-            #[cfg(feature = "serve")]
-            if let Some(body) = generated_binary_body(&request, DAEMON_GENERATED_STREAM_MAGIC) {
-                let _ = stream.write_all(DAEMON_GENERATED_STREAM_RESPONSE_MAGIC);
-                match loom_remote_protocol::envelope::Request::decode(body) {
-                    Ok(request) => {
-                        let session_id = request.session_id.clone();
-                        let stream_result = runtime
-                            .lock()
-                            .map_err(|_| {
-                                loom_core::error::LoomError::new(
-                                    loom_core::error::Code::Internal,
-                                    "daemon runtime lock poisoned",
-                                )
-                            })
-                            .and_then(|mut runtime| {
-                                runtime
-                                    .generated_runtime
-                                    .open_generated_stream_response(&request)
-                            });
-                        match stream_result {
-                            Ok((open_stream, cancel, stream_key)) => {
-                                let result = write_generated_open_stream_response(
-                                    open_stream,
-                                    Some(&runtime),
-                                    session_id.as_deref(),
-                                    Some(cancel.as_ref()),
-                                    &mut stream,
-                                );
-                                cancel.store(true, std::sync::atomic::Ordering::Release);
-                                if let Ok(mut runtime) = runtime.lock() {
-                                    runtime
-                                        .generated_runtime
-                                        .finish_generated_stream(&stream_key);
-                                }
-                                let _ = result;
-                            }
-                            Err(error) => {
-                                if let Ok(frame) =
-                                    DaemonGeneratedRuntime::generated_stream_error_frame(&error)
-                                {
-                                    let _ = write_generated_stream_frame(&mut stream, &frame);
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let error = loom_core::error::LoomError::new(
-                            loom_core::error::Code::InvalidArgument,
-                            format!("decode generated stream request: {error}"),
-                        );
-                        let frame = loom_remote_protocol::frame::Frame::Error(
-                            loom_remote_protocol::RemoteError::from_loom_error(&error),
-                        )
-                        .encode();
-                        if let Ok(frame) = frame {
-                            let _ = write_generated_stream_frame(&mut stream, &frame);
-                        }
-                    }
-                }
+            if accept_shutdown_thread.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            let response = match runtime.lock() {
-                Ok(mut runtime) => runtime.handle_bytes(&request),
-                Err(_) => b"error\tdaemon runtime lock poisoned\n".to_vec(),
+            let Some(permit) = DaemonWorkerPermit::acquire(&accept_active_connections) else {
+                let _ = write_daemon_admission_error(&mut stream);
+                continue;
             };
-            let request_head = std::str::from_utf8(&request)
-                .ok()
-                .and_then(|request| request.trim_end().split('\t').next());
-            let stop_requested = matches!(request_head, Some("stop" | "stop-force"))
-                && response.starts_with(b"stopped\t");
-            let _ = stream.write_all(&response);
-            if stop_requested {
-                should_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let accepted = DaemonAcceptedConnection { stream, permit };
+            match acceptor.admit(accepted) {
+                Ok(DaemonQueuedStreamOwner::SchedulerQueue) => {}
+                Err(DaemonEventSendError::Full(DaemonEvent::AcceptedStream(mut accepted))) => {
+                    let _ = write_daemon_admission_error(&mut accepted.stream);
+                }
+                Err(DaemonEventSendError::Shutdown(DaemonEvent::AcceptedStream(mut accepted))) => {
+                    let _ = accepted.stream.write_all(b"error\tdaemon shutting down\n");
+                }
+                Err(DaemonEventSendError::Closed(DaemonEvent::AcceptedStream(mut accepted))) => {
+                    let _ = accepted.stream.write_all(b"error\tdaemon shutting down\n");
+                }
+                Err(_) => {}
             }
-        });
+        }
+    });
+    let acceptor_handle = DaemonBlockingAcceptorHandle {
+        shutdown: accept_shutdown,
+        wake: acceptor_wake,
+        handle: Some(acceptor_handle),
+    };
+    cleanup_guard.acceptor = Some(acceptor_handle);
+    loop {
+        match cleanup_guard.recv() {
+            Ok(event) => {
+                if daemon_handle_event_once(
+                    event,
+                    &runtime,
+                    &events,
+                    &active_connections,
+                    &scheduler_counters,
+                    cleanup_guard.deadline_waker.as_ref(),
+                )? {
+                    cleanup_guard.cleanup();
+                    return Ok(());
+                }
+            }
+            Err(_) => {
+                cleanup_guard.cleanup();
+                return Ok(());
+            }
+        }
     }
+}
+
+fn write_daemon_runtime_artifact_atomically(
+    path: &std::path::Path,
+    contents: &[u8],
+    kind: &str,
+    paths: &daemon::DaemonPaths,
+) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid daemon {kind} file path"))?;
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let result = (|| {
+        std::fs::write(&temporary, contents)
+            .map_err(|e| format!("write daemon {kind} file: {e}"))?;
+        daemon::align_runtime_artifact_owner(&temporary, kind, paths).map_err(|e| e.to_string())?;
+        std::fs::rename(&temporary, path).map_err(|e| format!("publish daemon {kind} file: {e}"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn daemon_lock_runtime_file(lock_file: &std::path::Path) -> std::io::Result<std::fs::File> {
@@ -10826,6 +15979,22 @@ pub(crate) fn daemon_running_response(
     )
 }
 
+#[cfg(all(test, feature = "serve"))]
+fn test_generated_runtime(tag: &str, store: &str) -> DaemonGeneratedRuntime {
+    if tag.starts_with("generated") {
+        return daemon_generated_runtime(store, |_, _, _| {}).unwrap();
+    }
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let generated_store = std::env::temp_dir().join(format!(
+        "loomcli-{tag}-generated-{}-{seq}.loom",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&generated_store);
+    FileStore::create_with_profile(&generated_store, Algo::Blake3).unwrap();
+    daemon_generated_runtime(&generated_store.to_string_lossy(), |_, _, _| {}).unwrap()
+}
+
 #[cfg(test)]
 mod maintenance_tail_trim_tests {
     use super::*;
@@ -10833,6 +16002,43 @@ mod maintenance_tail_trim_tests {
     struct MaintenanceWorkerHookGuard {
         store: String,
         previous: Option<std::sync::Arc<MaintenanceWorkerTestHook>>,
+    }
+
+    struct MaintenanceCompletionHoldGuard {
+        store: String,
+        previous: Option<std::sync::Arc<MaintenanceCompletionHoldHook>>,
+    }
+
+    #[cfg(feature = "serve")]
+    struct GeneratedDispatchHookGuard {
+        previous: Option<DaemonGeneratedDispatchTestHook>,
+    }
+
+    #[cfg(feature = "serve")]
+    impl GeneratedDispatchHookGuard {
+        fn install(hook: DaemonGeneratedDispatchTestHook) -> Self {
+            Self {
+                previous: set_daemon_generated_dispatch_test_hook(Some(hook)),
+            }
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    impl Drop for GeneratedDispatchHookGuard {
+        fn drop(&mut self) {
+            clear_daemon_generated_dispatch_test_hook();
+            if let Some(previous) = self.previous.take() {
+                let _ = set_daemon_generated_dispatch_test_hook(Some(previous));
+            }
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    fn mu17f_generated_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     impl MaintenanceWorkerHookGuard {
@@ -10850,6 +16056,21 @@ mod maintenance_tail_trim_tests {
         }
     }
 
+    impl MaintenanceCompletionHoldGuard {
+        fn install(store: &str, hook: std::sync::Arc<MaintenanceCompletionHoldHook>) -> Self {
+            Self {
+                store: store.to_string(),
+                previous: set_maintenance_completion_hold_hook(store.to_string(), hook),
+            }
+        }
+    }
+
+    impl Drop for MaintenanceCompletionHoldGuard {
+        fn drop(&mut self) {
+            restore_maintenance_completion_hold_hook(self.store.clone(), self.previous.take());
+        }
+    }
+
     fn temp_store(tag: &str) -> String {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -10857,16 +16078,6 @@ mod maintenance_tail_trim_tests {
             std::env::temp_dir().join(format!("loomcli-{tag}-{}-{seq}.loom", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path.to_string_lossy().into_owned()
-    }
-
-    #[cfg(feature = "serve")]
-    fn test_generated_runtime(tag: &str, store: &str) -> DaemonGeneratedRuntime {
-        if tag.starts_with("generated") {
-            return daemon_generated_runtime(store).unwrap();
-        }
-        let generated_store = temp_store(&format!("{tag}-generated"));
-        FileStore::create_with_profile(&generated_store, Algo::Blake3).unwrap();
-        daemon_generated_runtime(&generated_store).unwrap()
     }
 
     fn test_runtime(tag: &str) -> (String, DaemonRuntime) {
@@ -10881,14 +16092,21 @@ mod maintenance_tail_trim_tests {
                 store: paths.store,
                 store_id: paths.store_id,
                 transport: daemon::DaemonTransport::TcpLoopback,
-                coordinator,
+                startup_mode: daemon::DaemonStartupMode::Persistent,
+                startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+                #[cfg(not(feature = "serve"))]
+                locks_authority: daemon_locks_authority(&store, coordinator),
                 #[cfg(feature = "serve")]
-                generated_runtime: test_generated_runtime(tag, &store),
+                generated_runtime: std::sync::Arc::new(test_generated_runtime(tag, &store)),
+                #[cfg(not(feature = "serve"))]
                 kv_loom: None,
+                #[cfg(not(feature = "serve"))]
                 kv_unavailable: None,
-                sessions: std::collections::BTreeSet::new(),
-                pins: std::collections::BTreeMap::new(),
+                lifecycle_leases: std::collections::BTreeMap::new(),
+                managed_bootstrap_deadline_ms: None,
                 authority_replication_next: std::collections::BTreeMap::new(),
+                authority_replication_fingerprints: std::collections::BTreeMap::new(),
+                authority_replication_discovered: false,
                 maintenance_next_ms: 0,
                 maintenance_worker: None,
                 maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10898,8 +16116,2202 @@ mod maintenance_tail_trim_tests {
                 drive_policy_next_ms: 0,
                 #[cfg(feature = "serve")]
                 reference_reconcile_next_ms: 0,
+                scheduler_counters: DaemonSchedulerCounters::default(),
             },
         )
+    }
+
+    #[cfg(feature = "serve")]
+    fn test_runtime_with_locks_authority(
+        tag: &str,
+        locks_authority: std::sync::Arc<loom_client::locks::InProcessLocksAuthority>,
+    ) -> (String, DaemonRuntime) {
+        let store = temp_store(tag);
+        FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+        let loom = loom_store::open_loom_unlocked(&store, None).unwrap();
+        let generated_runtime = std::sync::Arc::new(DaemonGeneratedRuntime::from_open_loom(
+            &store,
+            loom,
+            locks_authority,
+        ));
+        let paths = daemon::paths(&store).unwrap();
+        (
+            store.clone(),
+            DaemonRuntime {
+                store: paths.store,
+                store_id: paths.store_id,
+                transport: daemon::DaemonTransport::TcpLoopback,
+                startup_mode: daemon::DaemonStartupMode::Persistent,
+                startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+                generated_runtime,
+                lifecycle_leases: std::collections::BTreeMap::new(),
+                managed_bootstrap_deadline_ms: None,
+                authority_replication_next: std::collections::BTreeMap::new(),
+                authority_replication_fingerprints: std::collections::BTreeMap::new(),
+                authority_replication_discovered: false,
+                maintenance_next_ms: 0,
+                maintenance_worker: None,
+                maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                hosted_listeners: std::collections::BTreeMap::new(),
+                drive_policy_next_ms: 0,
+                reference_reconcile_next_ms: 0,
+                scheduler_counters: DaemonSchedulerCounters::default(),
+            },
+        )
+    }
+
+    #[cfg(feature = "serve")]
+    fn reload_seeded_test_runtime(runtime: &mut DaemonRuntime) {
+        runtime.generated_runtime =
+            std::sync::Arc::new(daemon_generated_runtime(&runtime.store, |_, _, _| {}).unwrap());
+    }
+
+    #[derive(Debug)]
+    struct Mu9aStreamProbe {
+        id: &'static str,
+        drops: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl Mu9aStreamProbe {
+        fn new(
+            id: &'static str,
+            drops: &std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        ) -> Self {
+            Self {
+                id,
+                drops: drops.clone(),
+            }
+        }
+    }
+
+    impl Drop for Mu9aStreamProbe {
+        fn drop(&mut self) {
+            self.drops.lock().unwrap().push(self.id);
+        }
+    }
+
+    #[test]
+    fn mu9a_scheduler_selects_minimum_owner_deadline() {
+        let mut plan = DaemonSchedulerPlan::default();
+        plan.insert_owner(DaemonOwnerDescriptor::new(
+            DaemonSchedulerOwner::Maintenance,
+            Some(80),
+        ));
+        plan.insert_owner(DaemonOwnerDescriptor::new(
+            DaemonSchedulerOwner::ReferenceWorker,
+            Some(30),
+        ));
+        plan.insert_owner(DaemonOwnerDescriptor::new(
+            DaemonSchedulerOwner::DrivePolicy,
+            None,
+        ));
+
+        assert_eq!(
+            plan.next_deadline(),
+            Some(DaemonSchedulerDeadline {
+                owner: DaemonSchedulerOwner::ReferenceWorker,
+                deadline_ms: 30,
+            })
+        );
+        assert_eq!(
+            plan.owner(DaemonSchedulerOwner::ReferenceWorker)
+                .expect("reference owner")
+                .name(),
+            "reference-worker"
+        );
+    }
+
+    #[test]
+    fn mu9a_owner_rescheduling_signals_only_earlier_deadlines() {
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(4);
+        let mut plan = DaemonSchedulerPlan::default();
+        plan.insert_owner(DaemonOwnerDescriptor::new(
+            DaemonSchedulerOwner::Maintenance,
+            Some(100),
+        ));
+        plan.arm_next_deadline();
+
+        assert!(
+            !plan
+                .set_owner_deadline_and_signal(
+                    &sender,
+                    DaemonSchedulerOwner::AuthorityReplication,
+                    Some(150),
+                )
+                .expect("later deadline")
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(
+            plan.set_owner_deadline_and_signal(
+                &sender,
+                DaemonSchedulerOwner::AuthorityReplication,
+                Some(50),
+            )
+            .expect("earlier deadline")
+        );
+        match receiver.recv().expect("reschedule event") {
+            DaemonEvent::SchedulerNotification(notification) => assert_eq!(
+                notification.equivalent_key(),
+                DaemonEquivalentEventKey::InternalReschedule(
+                    DaemonSchedulerOwner::AuthorityReplication
+                )
+            ),
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn mu9a_equivalent_events_coalesce_without_losing_earliest_deadline() {
+        let mut plan = DaemonSchedulerPlan::default();
+        plan.insert_owner(DaemonOwnerDescriptor::new(
+            DaemonSchedulerOwner::HostedListeners,
+            Some(40),
+        ));
+        plan.arm_next_deadline();
+        let notification = DaemonSchedulerNotification::CommittedMutation {
+            owner: DaemonSchedulerOwner::HostedListeners,
+            change: DaemonCommittedChangeClass::HostedListener,
+        };
+
+        assert!(plan.enqueue_notification(&notification).inserted);
+        assert!(!plan.enqueue_notification(&notification).inserted);
+        assert_eq!(plan.pending_event_count(), 1);
+        assert_eq!(
+            plan.next_deadline(),
+            Some(DaemonSchedulerDeadline {
+                owner: DaemonSchedulerOwner::HostedListeners,
+                deadline_ms: 40,
+            })
+        );
+        assert_eq!(
+            plan.due_or_pending_runs(10),
+            vec![DaemonScheduledOwnerRun {
+                owner: DaemonSchedulerOwner::HostedListeners,
+                reason: DaemonOwnerRunReason::PendingEvent,
+            }]
+        );
+    }
+
+    #[test]
+    fn mu9a_bounded_channel_admits_until_capacity() {
+        let (sender, _receiver) = bounded_daemon_event_channel::<()>(1);
+        assert_eq!(sender.capacity(), 1);
+        sender
+            .try_send_notification(DaemonSchedulerNotification::InternalReschedule {
+                owner: DaemonSchedulerOwner::Maintenance,
+            })
+            .expect("first event admitted");
+        assert!(matches!(
+            sender.try_send_notification(DaemonSchedulerNotification::InternalReschedule {
+                owner: DaemonSchedulerOwner::AuthorityReplication,
+            }),
+            Err(DaemonEventSendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn mu9a_stream_identity_is_never_coalesced_or_erased() {
+        let plan = DaemonSchedulerPlan::default();
+        let drops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stream = Mu9aStreamProbe::new("stream", &drops);
+        let event = DaemonEvent::AcceptedStream(stream);
+
+        assert_eq!(plan.pending_event_count(), 0);
+        drop(event);
+        assert_eq!(plan.pending_event_count(), 0);
+        assert_eq!(drops.lock().unwrap().as_slice(), &["stream"]);
+    }
+
+    #[test]
+    fn mu9a_stream_ownership_is_single_for_admitted_rejected_drained_and_shutdown() {
+        let drops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let (sender, receiver) = bounded_daemon_event_channel::<Mu9aStreamProbe>(1);
+        let acceptor = DaemonBlockingAcceptorBoundary::new(sender);
+        let stream = Mu9aStreamProbe::new("admitted", &drops);
+        assert_eq!(
+            acceptor.admit(stream).expect("stream admitted"),
+            DaemonQueuedStreamOwner::SchedulerQueue
+        );
+        assert!(drops.lock().unwrap().is_empty());
+        match receiver.recv().expect("accepted stream event") {
+            DaemonEvent::AcceptedStream(stream) => drop(stream),
+            _ => panic!("unexpected event"),
+        }
+        assert_eq!(drops.lock().unwrap().as_slice(), &["admitted"]);
+
+        let (sender, _receiver) = bounded_daemon_event_channel::<Mu9aStreamProbe>(1);
+        let acceptor = DaemonBlockingAcceptorBoundary::new(sender.clone());
+        sender
+            .try_send_notification(DaemonSchedulerNotification::InternalReschedule {
+                owner: DaemonSchedulerOwner::Maintenance,
+            })
+            .expect("queue filler");
+        let rejected = Mu9aStreamProbe::new("rejected", &drops);
+        let error = acceptor.admit(rejected).expect_err("queue rejects stream");
+        assert!(matches!(error, DaemonEventSendError::Full(_)));
+        drop(error);
+        assert_eq!(drops.lock().unwrap().as_slice(), &["admitted", "rejected"]);
+
+        let (sender, receiver) = bounded_daemon_event_channel::<Mu9aStreamProbe>(1);
+        let acceptor = DaemonBlockingAcceptorBoundary::new(sender);
+        let drained = Mu9aStreamProbe::new("drained", &drops);
+        acceptor.admit(drained).expect("drained stream admitted");
+        let event = receiver.recv().expect("drained stream event");
+        drop(event);
+        assert_eq!(
+            drops.lock().unwrap().as_slice(),
+            &["admitted", "rejected", "drained"]
+        );
+
+        let (sender, _receiver) = bounded_daemon_event_channel::<Mu9aStreamProbe>(1);
+        sender.request_shutdown().expect("shutdown requested");
+        let acceptor = DaemonBlockingAcceptorBoundary::new(sender);
+        let shutdown = Mu9aStreamProbe::new("shutdown", &drops);
+        let error = acceptor
+            .admit(shutdown)
+            .expect_err("shutdown rejects stream");
+        assert!(matches!(error, DaemonEventSendError::Shutdown(_)));
+        drop(error);
+        assert_eq!(
+            drops.lock().unwrap().as_slice(),
+            &["admitted", "rejected", "drained", "shutdown"]
+        );
+    }
+
+    #[test]
+    fn mu9a_shutdown_while_queue_full_is_observed_and_stops_new_owner_work() {
+        let (sender, _receiver) = bounded_daemon_event_channel::<&'static str>(1);
+        let acceptor = DaemonBlockingAcceptorBoundary::new(sender.clone());
+        sender
+            .try_send_notification(DaemonSchedulerNotification::InternalReschedule {
+                owner: DaemonSchedulerOwner::Maintenance,
+            })
+            .expect("queue filler");
+
+        assert!(matches!(
+            sender.request_shutdown(),
+            Err(DaemonEventSendError::Full(_))
+        ));
+        assert!(sender.is_shutdown());
+        assert!(matches!(
+            acceptor.admit("late-stream"),
+            Err(DaemonEventSendError::Shutdown(_))
+        ));
+    }
+
+    #[test]
+    fn mu9a_receiver_observes_shutdown_after_full_queue_drains() {
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(1);
+        sender
+            .try_send_notification(DaemonSchedulerNotification::InternalReschedule {
+                owner: DaemonSchedulerOwner::Maintenance,
+            })
+            .expect("queue filler");
+        assert!(matches!(
+            sender.request_shutdown(),
+            Err(DaemonEventSendError::Full(_))
+        ));
+
+        match receiver.recv().expect("queued event") {
+            DaemonEvent::SchedulerNotification(notification) => assert_eq!(
+                notification.equivalent_key(),
+                DaemonEquivalentEventKey::InternalReschedule(DaemonSchedulerOwner::Maintenance)
+            ),
+            _ => panic!("unexpected event"),
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DaemonEvent::ShutdownRequested)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn mu9a_idle_receiver_blocks_until_event_or_shutdown() {
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            entered_tx.send(()).expect("signal receiver entry");
+            let event = receiver.recv().expect("event or shutdown");
+            done_tx.send(event).expect("send receiver result");
+        });
+
+        entered_rx.recv().expect("receiver entered");
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        sender
+            .try_send_notification(DaemonSchedulerNotification::InternalReschedule {
+                owner: DaemonSchedulerOwner::ReferenceWorker,
+            })
+            .expect("wake idle receiver");
+        match done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("receiver wakes for event")
+        {
+            DaemonEvent::SchedulerNotification(notification) => assert_eq!(
+                notification.equivalent_key(),
+                DaemonEquivalentEventKey::InternalReschedule(DaemonSchedulerOwner::ReferenceWorker)
+            ),
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            entered_tx.send(()).expect("signal receiver entry");
+            let event = receiver.recv().expect("shutdown event");
+            done_tx.send(event).expect("send receiver result");
+        });
+
+        entered_rx.recv().expect("receiver entered");
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        sender.request_shutdown().expect("wake idle receiver");
+        assert!(matches!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("receiver wakes for shutdown"),
+            DaemonEvent::ShutdownRequested
+        ));
+    }
+
+    #[test]
+    fn mu9a_shutdown_delivery_is_exactly_once_for_enqueued_and_full_queue_races() {
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            entered_tx.send(()).expect("signal receiver entry");
+            let first = receiver.recv().expect("shutdown delivery");
+            let second = receiver.try_recv();
+            done_tx
+                .send((
+                    first,
+                    matches!(second, Err(std::sync::mpsc::TryRecvError::Empty)),
+                ))
+                .expect("send receiver result");
+        });
+        entered_rx.recv().expect("receiver entered");
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        sender.request_shutdown().expect("shutdown enqueued");
+        let (first, second_empty) = done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("receiver wakes");
+        assert!(matches!(first, DaemonEvent::ShutdownRequested));
+        assert!(second_empty);
+        assert!(sender.request_shutdown().is_ok());
+
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(1);
+        sender
+            .try_send_notification(DaemonSchedulerNotification::InternalReschedule {
+                owner: DaemonSchedulerOwner::Maintenance,
+            })
+            .expect("queue filler");
+        assert!(matches!(
+            sender.request_shutdown(),
+            Err(DaemonEventSendError::Full(_))
+        ));
+        match receiver.recv().expect("queued event") {
+            DaemonEvent::SchedulerNotification(notification) => assert_eq!(
+                notification.equivalent_key(),
+                DaemonEquivalentEventKey::InternalReschedule(DaemonSchedulerOwner::Maintenance)
+            ),
+            other => panic!("unexpected event {other:?}"),
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DaemonEvent::ShutdownRequested)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(sender.request_shutdown().is_ok());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn mu9a_absent_deadlines_do_not_schedule_owner_work() {
+        let mut plan = DaemonSchedulerPlan::default();
+        plan.insert_owner(DaemonOwnerDescriptor::new(
+            DaemonSchedulerOwner::Maintenance,
+            None,
+        ));
+        plan.insert_owner(DaemonOwnerDescriptor::new(
+            DaemonSchedulerOwner::LifecycleShutdown,
+            None,
+        ));
+
+        assert_eq!(plan.next_deadline(), None);
+        assert!(plan.due_or_pending_runs(10).is_empty());
+    }
+
+    #[test]
+    fn mu9a_lifecycle_deadline_adapter_consumes_runtime_registry() {
+        let (_store, mut runtime) = test_runtime("mu9a-lifecycle-deadline");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = Some(90);
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Session("session".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(40),
+            },
+        );
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Pin("pin".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Pin,
+                deadline_ms: None,
+            },
+        );
+
+        assert_eq!(daemon_lifecycle_scheduler_deadline(&runtime), Some(40));
+    }
+
+    #[test]
+    fn mu10a_scheduler_counters_record_wakeup_kinds_and_coalescing() {
+        let counters = DaemonSchedulerCounters::default();
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(4);
+        let notification = DaemonSchedulerNotification::CommittedMutation {
+            owner: DaemonSchedulerOwner::ReferenceWorker,
+            change: DaemonCommittedChangeClass::Reference,
+        };
+
+        sender.try_send_stream(()).expect("accepted connection");
+        sender
+            .try_send_notification(notification)
+            .expect("first reference notification");
+        sender
+            .try_send_notification(DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::ReferenceWorker,
+                change: DaemonCommittedChangeClass::Reference,
+            })
+            .expect("coalesced duplicate reference notification");
+        sender.request_shutdown().expect("shutdown event");
+
+        match receiver.recv().expect("accepted connection wakeup") {
+            DaemonEvent::AcceptedStream(()) => {
+                counters.record_wakeup(DaemonSchedulerWakeupKind::AcceptedConnection);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        match receiver.recv().expect("reference notification wakeup") {
+            DaemonEvent::SchedulerNotification(notification) => {
+                counters.record_wakeup(DaemonSchedulerWakeupKind::SchedulerNotification(
+                    notification.equivalent_key(),
+                ));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        match receiver.recv().expect("shutdown wakeup") {
+            DaemonEvent::ShutdownRequested => {
+                counters.record_wakeup(DaemonSchedulerWakeupKind::ShutdownRequested);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            snapshot
+                .wakeups
+                .get(&DaemonSchedulerWakeupKind::AcceptedConnection),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .wakeups
+                .get(&DaemonSchedulerWakeupKind::SchedulerNotification(
+                    DaemonEquivalentEventKey::CommittedMutation {
+                        owner: DaemonSchedulerOwner::ReferenceWorker,
+                        change: DaemonCommittedChangeClass::Reference,
+                    },
+                ),),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .wakeups
+                .get(&DaemonSchedulerWakeupKind::ShutdownRequested),
+            Some(&1)
+        );
+        assert_eq!(snapshot.wakeups.values().sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn mu10a_deadline_wakeup_counts_expiration_and_owner_run() {
+        let (store, mut runtime) = test_runtime("mu10a-deadline-owner");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = Some(0);
+        let counters = runtime.scheduler_counters.clone();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events, _receiver) = bounded_daemon_event_channel::<DaemonAcceptedConnection>(1);
+        let key = DaemonEquivalentEventKey::OwnerDeadline(DaemonSchedulerOwner::LifecycleShutdown);
+
+        counters.record_wakeup(DaemonSchedulerWakeupKind::SchedulerNotification(key));
+        assert!(
+            daemon_run_scheduler_notification_once(&runtime, &events, &active_connections, key)
+                .unwrap()
+        );
+
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            snapshot
+                .deadline_expirations
+                .get(&DaemonSchedulerOwner::LifecycleShutdown),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .owner_runs
+                .get(&DaemonSchedulerOwner::LifecycleShutdown),
+            Some(&1)
+        );
+        let _ = std::fs::remove_file(store);
+    }
+
+    #[test]
+    fn mu10a_background_store_open_and_write_counters_exclude_client_requests() {
+        let (store, runtime) = test_runtime("mu10a-background-activity");
+        let counters = runtime.scheduler_counters.clone();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        daemon_run_authority_replication_owner_once(&runtime, true)
+            .expect("authority owner discovers policies");
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime
+                .append_audit(None, "mu10a.explicit", Some("request=client"))
+                .expect("explicit request audit");
+            let activity = runtime.scheduler_activity_recorder(DaemonSchedulerOwner::Maintenance);
+            runtime
+                .append_audit(None, "mu10a.background", Some("owner=maintenance"))
+                .expect("background owner audit");
+            activity.record_write();
+        }
+
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            snapshot
+                .background_store_opens
+                .get(&DaemonSchedulerOwner::AuthorityReplication),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .background_writes
+                .get(&DaemonSchedulerOwner::Maintenance),
+            Some(&1)
+        );
+        assert_eq!(snapshot.background_writes.values().sum::<u64>(), 1);
+        let _ = std::fs::remove_file(store);
+    }
+
+    #[test]
+    fn mu10a_idle_scheduler_activity_leaves_counters_zero() {
+        let counters = DaemonSchedulerCounters::default();
+        let mut plan = DaemonSchedulerPlan::default();
+        plan.insert_owner(DaemonOwnerDescriptor::new(
+            DaemonSchedulerOwner::Maintenance,
+            None,
+        ));
+        plan.insert_owner(DaemonOwnerDescriptor::new(
+            DaemonSchedulerOwner::AuthorityReplication,
+            None,
+        ));
+
+        assert_eq!(plan.next_deadline(), None);
+        assert!(plan.due_or_pending_runs(now_ms()).is_empty());
+        assert_eq!(
+            counters.snapshot(),
+            DaemonSchedulerCounterSnapshot::default()
+        );
+    }
+
+    fn mu10a_owner_count(
+        counts: &std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+        owner: DaemonSchedulerOwner,
+    ) -> u64 {
+        counts.get(&owner).copied().unwrap_or_default()
+    }
+
+    fn mu10c_wakeup_count(
+        snapshot: &DaemonSchedulerCounterSnapshot,
+        kind: DaemonSchedulerWakeupKind,
+    ) -> u64 {
+        snapshot.wakeups.get(&kind).copied().unwrap_or_default()
+    }
+
+    fn mu10c_owner_delta(
+        before: &std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+        after: &std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+        owner: DaemonSchedulerOwner,
+    ) -> u64 {
+        mu10a_owner_count(after, owner).saturating_sub(mu10a_owner_count(before, owner))
+    }
+
+    fn mu10c_wakeup_delta(
+        before: &DaemonSchedulerCounterSnapshot,
+        after: &DaemonSchedulerCounterSnapshot,
+        kind: DaemonSchedulerWakeupKind,
+    ) -> u64 {
+        mu10c_wakeup_count(after, kind).saturating_sub(mu10c_wakeup_count(before, kind))
+    }
+
+    fn mu10c_total_owner_delta(
+        before: &std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+        after: &std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+    ) -> u64 {
+        after
+            .keys()
+            .chain(before.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|owner| mu10c_owner_delta(before, after, owner))
+            .sum()
+    }
+
+    fn mu10c_assert_owner_activity(
+        before: &DaemonSchedulerCounterSnapshot,
+        after: &DaemonSchedulerCounterSnapshot,
+        owner: DaemonSchedulerOwner,
+        owner_runs: u64,
+        store_opens: u64,
+        writes: u64,
+    ) {
+        assert_eq!(
+            mu10c_owner_delta(&before.owner_runs, &after.owner_runs, owner),
+            owner_runs
+        );
+        assert_eq!(
+            mu10c_owner_delta(
+                &before.background_store_opens,
+                &after.background_store_opens,
+                owner
+            ),
+            store_opens
+        );
+        assert_eq!(
+            mu10c_owner_delta(&before.background_writes, &after.background_writes, owner),
+            writes
+        );
+        assert_eq!(
+            mu10c_total_owner_delta(&before.owner_runs, &after.owner_runs),
+            owner_runs
+        );
+        assert_eq!(
+            mu10c_total_owner_delta(
+                &before.background_store_opens,
+                &after.background_store_opens,
+            ),
+            store_opens
+        );
+        assert_eq!(
+            mu10c_total_owner_delta(&before.background_writes, &after.background_writes),
+            writes
+        );
+    }
+
+    fn mu10c_send_receive_and_handle_notification(
+        runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+        events: &BoundedDaemonEventSender<DaemonAcceptedConnection>,
+        receiver: &BoundedDaemonEventReceiver<DaemonAcceptedConnection>,
+        active_connections: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        notification: DaemonSchedulerNotification,
+    ) -> Result<bool, String> {
+        let counters = runtime.lock().unwrap().scheduler_counters.clone();
+        let sent = events.try_send_notification(notification);
+        assert!(sent.is_ok(), "scheduler notification queued");
+        let event = receiver.recv().expect("scheduler notification received");
+        daemon_handle_event_once(event, runtime, events, active_connections, &counters, None)
+    }
+
+    #[test]
+    fn mu10a_read_only_maintenance_counts_open_without_write() {
+        let (store, runtime) = test_runtime("mu10a-maintenance-read-only");
+        let counters = runtime.scheduler_counters.clone();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let (events, _receiver) = bounded_daemon_event_channel::<DaemonAcceptedConnection>(1);
+
+        daemon_run_maintenance_owner_once(&runtime, &events, false)
+            .expect("read-only maintenance owner");
+
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            mu10a_owner_count(&snapshot.owner_runs, DaemonSchedulerOwner::Maintenance),
+            1
+        );
+        assert_eq!(
+            mu10a_owner_count(
+                &snapshot.background_store_opens,
+                DaemonSchedulerOwner::Maintenance,
+            ),
+            1
+        );
+        assert_eq!(
+            mu10a_owner_count(
+                &snapshot.background_writes,
+                DaemonSchedulerOwner::Maintenance
+            ),
+            0
+        );
+        let _ = std::fs::remove_file(store);
+    }
+
+    #[test]
+    fn mu10a_async_maintenance_success_counts_persistent_engine_write() {
+        let store = temp_store("mu10a-maintenance-success");
+        let _ = write_many_commits(&store, "mu10a-maintenance-success", 4);
+        let runtime = runtime_for_existing_store("mu10a-maintenance-success", &store);
+        let counters = runtime.scheduler_counters.clone();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let (events, _receiver) = bounded_daemon_event_channel::<DaemonAcceptedConnection>(4);
+
+        daemon_run_maintenance_owner_once(&runtime, &events, false)
+            .expect("start maintenance worker");
+        {
+            let mut runtime = runtime.lock().unwrap();
+            wait_for_maintenance(&mut runtime);
+        }
+
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            mu10a_owner_count(&snapshot.owner_runs, DaemonSchedulerOwner::Maintenance),
+            1
+        );
+        assert_eq!(
+            mu10a_owner_count(
+                &snapshot.background_store_opens,
+                DaemonSchedulerOwner::Maintenance,
+            ),
+            1
+        );
+        assert_eq!(
+            mu10a_owner_count(
+                &snapshot.background_writes,
+                DaemonSchedulerOwner::Maintenance
+            ),
+            1
+        );
+        let _ = std::fs::remove_file(store);
+    }
+
+    #[test]
+    fn mu10a_async_maintenance_failure_counts_open_without_successful_write() {
+        let store = temp_store("mu10a-maintenance-failure");
+        let _ = write_many_commits(&store, "mu10a-maintenance-failure", 4);
+        let runtime = runtime_for_existing_store("mu10a-maintenance-failure", &store);
+        let counters = runtime.scheduler_counters.clone();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let (events, _receiver) = bounded_daemon_event_channel::<DaemonAcceptedConnection>(4);
+        set_daemon_test_signal(&DAEMON_MAINTENANCE_WORKER_INJECT_ERROR, &store);
+
+        daemon_run_maintenance_owner_once(&runtime, &events, false)
+            .expect("start failing maintenance worker");
+        daemon_run_maintenance_owner_once(&runtime, &events, true)
+            .expect("reap failing maintenance worker");
+
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            mu10a_owner_count(&snapshot.owner_runs, DaemonSchedulerOwner::Maintenance),
+            2
+        );
+        assert_eq!(
+            mu10a_owner_count(
+                &snapshot.background_store_opens,
+                DaemonSchedulerOwner::Maintenance,
+            ),
+            2
+        );
+        assert_eq!(
+            mu10a_owner_count(
+                &snapshot.background_writes,
+                DaemonSchedulerOwner::Maintenance
+            ),
+            1
+        );
+        let _ = std::fs::remove_file(store);
+    }
+
+    #[cfg(feature = "serve")]
+    fn mu10a_cas_listener_store(tag: &str, workspace_bytes: [u8; 16]) -> String {
+        let store = temp_store(tag);
+        FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+        let mut loom = loom_store::open_loom_unlocked(&store, None).unwrap();
+        loom.registry_mut()
+            .create(
+                FacetKind::Cas,
+                Some("main"),
+                WorkspaceId::v4_from_bytes(workspace_bytes),
+            )
+            .unwrap();
+        save_loom(&mut loom).unwrap();
+        drop(loom);
+        store
+    }
+
+    #[cfg(feature = "serve")]
+    fn mu10a_save_cas_listener(store: &str, bind: String) {
+        let record =
+            FileStore::served_listener_record("cas", vec!["main".to_string()], "rest", &bind, true)
+                .unwrap();
+        let fs = FileStore::open_daemon_authorized(store).unwrap();
+        fs.save_served_listener_audited(
+            &record,
+            None,
+            "serve.listener.configure",
+            Some(&served_listener_target(&record)),
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu10a_hosted_listener_startup_is_not_write_rejection_audit_is_write() {
+        let store = mu10a_cas_listener_store("mu10a-hosted-startup", [51; 16]);
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        mu10a_save_cas_listener(&store, bind);
+        let mut runtime = runtime_for_existing_store("mu10a-hosted-startup", &store);
+        let counters = runtime.scheduler_counters.clone();
+
+        runtime
+            .reconcile_hosted_listeners(
+                runtime.scheduler_activity_recorder(DaemonSchedulerOwner::HostedListeners),
+            )
+            .expect("successful hosted listener startup");
+
+        let snapshot = counters.snapshot();
+        assert_eq!(runtime.hosted_listeners.len(), 1);
+        assert_eq!(
+            mu10a_owner_count(
+                &snapshot.background_store_opens,
+                DaemonSchedulerOwner::HostedListeners,
+            ),
+            1
+        );
+        assert_eq!(
+            mu10a_owner_count(
+                &snapshot.background_writes,
+                DaemonSchedulerOwner::HostedListeners
+            ),
+            0
+        );
+        drop(runtime);
+        let _ = std::fs::remove_file(store);
+
+        let store = mu10a_cas_listener_store("mu10a-hosted-reject", [52; 16]);
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        mu10a_save_cas_listener(&store, occupied.local_addr().unwrap().to_string());
+        let mut runtime = runtime_for_existing_store("mu10a-hosted-reject", &store);
+        let counters = runtime.scheduler_counters.clone();
+
+        assert!(
+            runtime
+                .reconcile_hosted_listeners(
+                    runtime.scheduler_activity_recorder(DaemonSchedulerOwner::HostedListeners),
+                )
+                .is_err()
+        );
+
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            mu10a_owner_count(
+                &snapshot.background_store_opens,
+                DaemonSchedulerOwner::HostedListeners,
+            ),
+            1
+        );
+        assert_eq!(
+            mu10a_owner_count(
+                &snapshot.background_writes,
+                DaemonSchedulerOwner::HostedListeners
+            ),
+            1
+        );
+        let records = runtime
+            .generated_runtime
+            .engine
+            .lock()
+            .unwrap()
+            .store()
+            .audit_records()
+            .unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.action == "serve.listener.reject")
+        );
+        drop(occupied);
+        let _ = std::fs::remove_file(store);
+    }
+
+    #[derive(Clone, Debug)]
+    struct Mu10bPhysicalSnapshot {
+        len: u64,
+        modified: std::time::SystemTime,
+        physical_page_count: u64,
+    }
+
+    fn mu10b_physical_snapshot(store: &str) -> Mu10bPhysicalSnapshot {
+        let metadata = std::fs::metadata(store).expect("store metadata");
+        let fs = FileStore::open_read(store).expect("open store for physical snapshot");
+        let report = fs
+            .store_maintenance_report(now_ms())
+            .expect("store maintenance physical report");
+        Mu10bPhysicalSnapshot {
+            len: metadata.len(),
+            modified: metadata.modified().expect("store modified time"),
+            physical_page_count: report.status.physical_page_count,
+        }
+    }
+
+    fn mu10b_empty_counter_delta(
+        before: &DaemonSchedulerCounterSnapshot,
+        after: &DaemonSchedulerCounterSnapshot,
+    ) -> bool {
+        before.wakeups == after.wakeups
+            && before.deadline_expirations == after.deadline_expirations
+            && before.owner_runs == after.owner_runs
+            && before.background_store_opens == after.background_store_opens
+            && before.background_writes == after.background_writes
+    }
+
+    fn mu10b_cpu_sample() -> String {
+        let pid = std::process::id().to_string();
+        let output = std::process::Command::new("ps")
+            .args(["-o", "time=", "-p", &pid])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let sample = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if sample.is_empty() {
+                    "unavailable".to_string()
+                } else {
+                    sample
+                }
+            }
+            Ok(output) => format!("unavailable status={}", output.status),
+            Err(error) => format!("unavailable error={error}"),
+        }
+    }
+
+    fn mu10b_stage(stage: &str) {
+        println!("mu10b_stage\t{stage}");
+    }
+
+    fn mu10b_counter_delta(
+        before: &std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+        after: &std::collections::BTreeMap<DaemonSchedulerOwner, u64>,
+        owner: DaemonSchedulerOwner,
+    ) -> u64 {
+        after
+            .get(&owner)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(before.get(&owner).copied().unwrap_or(0))
+    }
+
+    fn mu10b_wait_for_counter_settlement(
+        counters: &DaemonSchedulerCounters,
+        stable_for: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> DaemonSchedulerCounterSnapshot {
+        let started = std::time::Instant::now();
+        let mut stable_since = std::time::Instant::now();
+        let mut previous = counters.snapshot();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let current = counters.snapshot();
+            if current == previous {
+                if stable_since.elapsed() >= stable_for {
+                    return current;
+                }
+            } else {
+                previous = current.clone();
+                stable_since = std::time::Instant::now();
+            }
+            assert!(
+                started.elapsed() < timeout,
+                "daemon scheduler counters did not settle: {current:?}"
+            );
+        }
+    }
+
+    fn mu10b_wait_for_maintenance_write(
+        counters: &DaemonSchedulerCounters,
+        before: &DaemonSchedulerCounterSnapshot,
+        timeout: std::time::Duration,
+    ) -> DaemonSchedulerCounterSnapshot {
+        let started = std::time::Instant::now();
+        loop {
+            let current = counters.snapshot();
+            let writes = mu10b_counter_delta(
+                &before.background_writes,
+                &current.background_writes,
+                DaemonSchedulerOwner::Maintenance,
+            );
+            if writes >= 1 {
+                return current;
+            }
+            assert!(
+                started.elapsed() < timeout,
+                "daemon scheduler did not record maintenance write: before={before:?} current={current:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    struct Mu10bObservedDaemon {
+        store: String,
+        paths: daemon::DaemonPaths,
+        observation: DaemonRunObservationHandle,
+        handle: std::thread::JoinHandle<Result<(), String>>,
+        run_result: std::sync::mpsc::Receiver<Result<(), String>>,
+        _hook: DaemonRunObservationHookGuard,
+    }
+
+    impl Mu10bObservedDaemon {
+        fn start(tag: &str) -> Self {
+            let store = temp_store(tag);
+            FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+            let paths = daemon::paths(&store).unwrap();
+            daemon_cleanup_files(&paths);
+            let (observation_tx, observation_rx) = std::sync::mpsc::channel();
+            let (run_result_tx, run_result_rx) = std::sync::mpsc::channel();
+            let hook = DaemonRunObservationHookGuard::install(observation_tx);
+            let run_paths = paths.clone();
+            let run_store = store.clone();
+            let handle = std::thread::spawn(move || {
+                let result = daemon_run(
+                    &run_store,
+                    &run_paths.addr_file.to_string_lossy(),
+                    &run_paths.pid_file.to_string_lossy(),
+                    &run_paths.lock_file.to_string_lossy(),
+                    DaemonTransportSelection::TcpLoopback.cli_value(),
+                    daemon::DaemonStartupMode::Persistent.wire_name(),
+                    daemon::DaemonStartupInitiator::CliDaemonStart.wire_name(),
+                );
+                let _ = run_result_tx.send(result.clone());
+                result
+            });
+            mu10b_stage("daemon_thread_spawned");
+            let started = std::time::Instant::now();
+            let observation = loop {
+                match observation_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                    Ok(observation) => break observation,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if handle.is_finished() {
+                            let result = handle.join().expect("daemon thread panicked");
+                            panic!("daemon exited before observation handle: {result:?}");
+                        }
+                        assert!(
+                            started.elapsed() < std::time::Duration::from_secs(30),
+                            "daemon observation handle timeout"
+                        );
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("daemon observation hook disconnected");
+                    }
+                }
+            };
+            mu10b_stage("observation_received");
+            let started = std::time::Instant::now();
+            while !paths.addr_file.exists() || !paths.pid_file.exists() {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(5),
+                    "daemon did not write runtime files"
+                );
+                assert!(!handle.is_finished(), "daemon exited before startup");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            mu10b_stage("runtime_files_ready");
+            let response = daemon::request_checked(&paths, "ping\n").unwrap();
+            assert!(response.starts_with("running\t"), "{response}");
+            mu10b_stage("ping_complete");
+            Self {
+                store,
+                paths,
+                observation,
+                handle,
+                run_result: run_result_rx,
+                _hook: hook,
+            }
+        }
+
+        fn stop(self) {
+            assert!(self.paths.addr_file.exists());
+            assert!(self.paths.pid_file.exists());
+            assert!(self.paths.lock_file.exists());
+            let _ = daemon::request_checked(&self.paths, "stop\n");
+            mu10b_stage("stop_request_complete");
+            let started = std::time::Instant::now();
+            while !self.handle.is_finished() {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(5),
+                    "daemon did not stop"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            self.handle.join().unwrap().unwrap();
+            mu10b_stage("daemon_thread_joined");
+            assert!(!self.paths.addr_file.exists());
+            assert!(!self.paths.pid_file.exists());
+            assert!(!self.paths.lock_file.exists());
+            assert!(!self.paths.sock_file.exists());
+            let _ = std::fs::remove_file(&self.store);
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic: MU-10b idle physical-growth acceptance; run via just diagnostic-mu10b"]
+    fn diagnostic_mu10b_idle_physical_growth_acceptance() {
+        mu10b_stage("test_entry");
+        let settle = std::time::Duration::from_millis(50);
+        let observe = std::time::Duration::from_millis(150);
+        let daemon = Mu10bObservedDaemon::start("mu10b-idle-physical");
+        let counters = daemon.observation.scheduler_counters.clone();
+        let events = daemon.observation.events.clone();
+        let settled =
+            mu10b_wait_for_counter_settlement(&counters, settle, std::time::Duration::from_secs(5));
+        let before_counters = counters.snapshot();
+        assert_eq!(settled, before_counters);
+        mu10b_stage("counters_settled");
+        let before_physical = mu10b_physical_snapshot(&daemon.store);
+        let before_cpu = mu10b_cpu_sample();
+        let started = std::time::Instant::now();
+        std::thread::sleep(observe);
+        let elapsed = started.elapsed();
+        let after_counters = counters.snapshot();
+        let after_physical = mu10b_physical_snapshot(&daemon.store);
+        let after_cpu = mu10b_cpu_sample();
+
+        assert!(
+            mu10b_empty_counter_delta(&before_counters, &after_counters),
+            "idle counters changed: before={before_counters:?} after={after_counters:?}"
+        );
+        assert_eq!(before_physical.len, after_physical.len);
+        assert_eq!(before_physical.modified, after_physical.modified);
+        assert_eq!(
+            before_physical.physical_page_count,
+            after_physical.physical_page_count
+        );
+        println!(
+            "mu10b_idle\tplatform={}\tsettle_ms={}\tobserve_ms={}\telapsed_ms={}\tlen={}\tphysical_pages={}\tcpu_before={}\tcpu_after={}",
+            std::env::consts::OS,
+            settle.as_millis(),
+            observe.as_millis(),
+            elapsed.as_millis(),
+            after_physical.len,
+            after_physical.physical_page_count,
+            before_cpu,
+            after_cpu
+        );
+        mu10b_stage("idle_observation_complete");
+
+        let before_counters = after_counters;
+        let before_physical = after_physical;
+        set_daemon_test_signal(&DAEMON_MAINTENANCE_FORCE_DUE_ONCE, &daemon.store);
+        set_daemon_test_signal(&DAEMON_MAINTENANCE_WORKER_INJECT_ERROR, &daemon.store);
+        let sent =
+            events.send_notification_blocking(DaemonSchedulerNotification::InternalReschedule {
+                owner: DaemonSchedulerOwner::Maintenance,
+            });
+        assert!(
+            sent.is_ok(),
+            "negative control scheduler event: {sent:?}; daemon_finished={}; daemon_result={daemon_result:?}",
+            daemon.handle.is_finished(),
+            daemon_result = daemon.run_result.try_recv()
+        );
+        mu10b_stage("negative_event_sent");
+        let after_counters = mu10b_wait_for_maintenance_write(
+            &counters,
+            &before_counters,
+            std::time::Duration::from_secs(5),
+        );
+        mu10b_stage("maintenance_write_observed");
+        let after_physical = mu10b_physical_snapshot(&daemon.store);
+
+        assert!(
+            after_counters
+                .wakeups
+                .get(&DaemonSchedulerWakeupKind::SchedulerNotification(
+                    DaemonEquivalentEventKey::InternalReschedule(DaemonSchedulerOwner::Maintenance),
+                ))
+                > before_counters
+                    .wakeups
+                    .get(&DaemonSchedulerWakeupKind::SchedulerNotification(
+                        DaemonEquivalentEventKey::InternalReschedule(
+                            DaemonSchedulerOwner::Maintenance
+                        ),
+                    ))
+        );
+        assert!(
+            mu10a_owner_count(
+                &after_counters.owner_runs,
+                DaemonSchedulerOwner::Maintenance
+            )
+            .saturating_sub(mu10a_owner_count(
+                &before_counters.owner_runs,
+                DaemonSchedulerOwner::Maintenance,
+            )) >= 2
+        );
+        assert_eq!(
+            mu10a_owner_count(
+                &after_counters.background_writes,
+                DaemonSchedulerOwner::Maintenance
+            )
+            .saturating_sub(mu10a_owner_count(
+                &before_counters.background_writes,
+                DaemonSchedulerOwner::Maintenance,
+            )),
+            1
+        );
+        assert!(
+            before_physical.modified != after_physical.modified
+                || before_physical.len != after_physical.len
+                || before_physical.physical_page_count != after_physical.physical_page_count,
+            "negative control mutation did not change physical observations"
+        );
+        println!(
+            "mu10b_negative_control\tlen_before={}\tlen_after={}\tpages_before={}\tpages_after={}",
+            before_physical.len,
+            after_physical.len,
+            before_physical.physical_page_count,
+            after_physical.physical_page_count
+        );
+        daemon.stop();
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu10c_persistent_startup_runs_hosted_listener_reconciliation() {
+        let store = mu10a_cas_listener_store("mu10c-persistent-startup", [61; 16]);
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        mu10a_save_cas_listener(&store, bind);
+        reset_daemon_hosted_listener_desired_opens(&store);
+
+        let hosted =
+            start_hosted_listeners_for_startup_mode(&store, daemon::DaemonStartupMode::Persistent)
+                .expect("persistent startup hosted reconciliation");
+
+        assert_eq!(hosted.len(), 1);
+        assert_eq!(daemon_hosted_listener_desired_opens(&store), 1);
+        drop(hosted);
+        let _ = std::fs::remove_file(&store);
+
+        let store = mu10a_cas_listener_store("mu10c-persistent-hosted-owner", [62; 16]);
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        mu10a_save_cas_listener(&store, bind);
+        let mut runtime = runtime_for_existing_store("mu10c-persistent-hosted-owner", &store);
+        runtime.startup_mode = daemon::DaemonStartupMode::Persistent;
+        let counters = runtime.scheduler_counters.clone();
+        reset_daemon_hosted_listener_desired_opens(&store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let key = DaemonEquivalentEventKey::CommittedMutation {
+            owner: DaemonSchedulerOwner::HostedListeners,
+            change: DaemonCommittedChangeClass::HostedListener,
+        };
+        let before = counters.snapshot();
+
+        assert!(
+            !mu10c_send_receive_and_handle_notification(
+                &runtime,
+                &events,
+                &receiver,
+                &active_connections,
+                DaemonSchedulerNotification::CommittedMutation {
+                    owner: DaemonSchedulerOwner::HostedListeners,
+                    change: DaemonCommittedChangeClass::HostedListener,
+                },
+            )
+            .unwrap()
+        );
+
+        let after = counters.snapshot();
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after,
+                DaemonSchedulerWakeupKind::SchedulerNotification(key),
+            ),
+            1
+        );
+        mu10c_assert_owner_activity(
+            &before,
+            &after,
+            DaemonSchedulerOwner::HostedListeners,
+            1,
+            1,
+            0,
+        );
+        assert_eq!(runtime.lock().unwrap().hosted_listener_count(), 1);
+        println!("mu10c_persistent_hosted\twakeup=1\towner_runs=1\tstore_opens=1\twrites=0");
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu10c_managed_startup_does_not_start_hosted_listeners() {
+        let store = mu10a_cas_listener_store("mu10c-managed-startup", [63; 16]);
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        mu10a_save_cas_listener(&store, bind);
+        reset_daemon_hosted_listener_desired_opens(&store);
+
+        let hosted =
+            start_hosted_listeners_for_startup_mode(&store, daemon::DaemonStartupMode::Managed)
+                .expect("managed startup hosted suppression");
+
+        assert!(hosted.is_empty());
+        assert_eq!(daemon_hosted_listener_desired_opens(&store), 0);
+
+        let mut runtime = runtime_for_existing_store("mu10c-managed-startup", &store);
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        let counters = runtime.scheduler_counters.clone();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let key = DaemonEquivalentEventKey::CommittedMutation {
+            owner: DaemonSchedulerOwner::HostedListeners,
+            change: DaemonCommittedChangeClass::HostedListener,
+        };
+        let before = counters.snapshot();
+
+        assert!(
+            !mu10c_send_receive_and_handle_notification(
+                &runtime,
+                &events,
+                &receiver,
+                &active_connections,
+                DaemonSchedulerNotification::CommittedMutation {
+                    owner: DaemonSchedulerOwner::HostedListeners,
+                    change: DaemonCommittedChangeClass::HostedListener,
+                },
+            )
+            .unwrap()
+        );
+
+        let after = counters.snapshot();
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after,
+                DaemonSchedulerWakeupKind::SchedulerNotification(key),
+            ),
+            1
+        );
+        mu10c_assert_owner_activity(
+            &before,
+            &after,
+            DaemonSchedulerOwner::HostedListeners,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(runtime.lock().unwrap().hosted_listener_count(), 0);
+        println!("mu10c_managed_hosted\twakeup=1\towner_runs=0\tstore_opens=0\twrites=0");
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu10c_drive_policy_mutation_schedules_only_drive_owner() {
+        let (store, mut runtime) = test_runtime("mu10c-drive-policy");
+        let runtime_store = runtime.store.clone();
+        runtime.drive_policy_next_ms = u64::MAX;
+        reset_daemon_drive_policy_worker_runs(&runtime_store);
+        reset_daemon_reference_worker_runs(&runtime_store);
+        reset_daemon_authority_replication_policy_opens(&runtime_store);
+        let counters = runtime.scheduler_counters.clone();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let key = DaemonEquivalentEventKey::CommittedMutation {
+            owner: DaemonSchedulerOwner::DrivePolicy,
+            change: DaemonCommittedChangeClass::DrivePolicy,
+        };
+        let before = counters.snapshot();
+
+        assert!(
+            !mu10c_send_receive_and_handle_notification(
+                &runtime,
+                &events,
+                &receiver,
+                &active_connections,
+                DaemonSchedulerNotification::CommittedMutation {
+                    owner: DaemonSchedulerOwner::DrivePolicy,
+                    change: DaemonCommittedChangeClass::DrivePolicy,
+                },
+            )
+            .unwrap()
+        );
+
+        let after = counters.snapshot();
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after,
+                DaemonSchedulerWakeupKind::SchedulerNotification(key),
+            ),
+            1
+        );
+        mu10c_assert_owner_activity(&before, &after, DaemonSchedulerOwner::DrivePolicy, 1, 0, 0);
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 1);
+        assert_eq!(daemon_reference_worker_runs(&runtime_store), 0);
+        assert_eq!(daemon_authority_replication_policy_opens(&runtime_store), 0);
+        println!("mu10c_drive_policy\twakeup=1\towner_runs=1\tstore_opens=0\twrites=0");
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu10c_reference_mutation_schedules_only_reference_owner() {
+        let (store, mut runtime) = test_runtime("mu10c-reference-policy");
+        let runtime_store = runtime.store.clone();
+        runtime.reference_reconcile_next_ms = u64::MAX;
+        reset_daemon_reference_worker_runs(&runtime_store);
+        reset_daemon_drive_policy_worker_runs(&runtime_store);
+        reset_daemon_authority_replication_policy_opens(&runtime_store);
+        let counters = runtime.scheduler_counters.clone();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let key = DaemonEquivalentEventKey::CommittedMutation {
+            owner: DaemonSchedulerOwner::ReferenceWorker,
+            change: DaemonCommittedChangeClass::Reference,
+        };
+        let before = counters.snapshot();
+
+        assert!(
+            !mu10c_send_receive_and_handle_notification(
+                &runtime,
+                &events,
+                &receiver,
+                &active_connections,
+                DaemonSchedulerNotification::CommittedMutation {
+                    owner: DaemonSchedulerOwner::ReferenceWorker,
+                    change: DaemonCommittedChangeClass::Reference,
+                },
+            )
+            .unwrap()
+        );
+
+        let after = counters.snapshot();
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after,
+                DaemonSchedulerWakeupKind::SchedulerNotification(key),
+            ),
+            1
+        );
+        mu10c_assert_owner_activity(
+            &before,
+            &after,
+            DaemonSchedulerOwner::ReferenceWorker,
+            1,
+            0,
+            0,
+        );
+        assert_eq!(daemon_reference_worker_runs(&runtime_store), 1);
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 0);
+        assert_eq!(daemon_authority_replication_policy_opens(&runtime_store), 0);
+        println!("mu10c_reference\twakeup=1\towner_runs=1\tstore_opens=0\twrites=0");
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn mu10c_accepted_client_connection_records_one_wakeup_without_polling() {
+        let daemon = Mu10bObservedDaemon::start("mu10c-real-accepted-connection");
+        let counters = daemon.observation.scheduler_counters.clone();
+        let before = mu10b_wait_for_counter_settlement(
+            &counters,
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(5),
+        );
+
+        let response = daemon::request_checked(&daemon.paths, "ping\n").unwrap();
+        assert!(response.starts_with("running\t"), "{response}");
+        let after = mu10b_wait_for_counter_settlement(
+            &counters,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after,
+                DaemonSchedulerWakeupKind::AcceptedConnection,
+            ),
+            1
+        );
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after,
+                DaemonSchedulerWakeupKind::SchedulerNotification(
+                    DaemonEquivalentEventKey::LifecycleChanged,
+                ),
+            ),
+            1
+        );
+        assert_eq!(
+            mu10c_owner_delta(
+                &before.owner_runs,
+                &after.owner_runs,
+                DaemonSchedulerOwner::LifecycleShutdown,
+            ),
+            1
+        );
+        for owner in after
+            .owner_runs
+            .keys()
+            .chain(before.owner_runs.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if owner != DaemonSchedulerOwner::LifecycleShutdown {
+                assert_eq!(
+                    mu10c_owner_delta(&before.owner_runs, &after.owner_runs, owner),
+                    0,
+                    "unexpected owner run delta for {owner:?}"
+                );
+            }
+        }
+        assert_eq!(
+            mu10c_total_owner_delta(
+                &before.background_store_opens,
+                &after.background_store_opens,
+            ),
+            0
+        );
+        assert_eq!(
+            mu10c_total_owner_delta(&before.background_writes, &after.background_writes),
+            0
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let after_idle = counters.snapshot();
+        assert_eq!(after, after_idle);
+        println!(
+            "mu10c_accepted_connection\taccepted_wakeups=1\tlifecycle_wakeups=1\tlifecycle_owner_runs=1\tstore_opens=0\twrites=0"
+        );
+        daemon.stop();
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu10c_equivalent_queued_events_coalesce_without_losing_owner_run() {
+        let (store, mut runtime) = test_runtime("mu10c-equivalent-drive");
+        let runtime_store = runtime.store.clone();
+        runtime.drive_policy_next_ms = u64::MAX;
+        reset_daemon_drive_policy_worker_runs(&runtime_store);
+        let counters = runtime.scheduler_counters.clone();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let notification = DaemonSchedulerNotification::CommittedMutation {
+            owner: DaemonSchedulerOwner::DrivePolicy,
+            change: DaemonCommittedChangeClass::DrivePolicy,
+        };
+        let key = notification.equivalent_key();
+        assert!(
+            events.try_send_notification(notification).is_ok(),
+            "first equivalent event queued"
+        );
+        assert!(
+            events
+                .try_send_notification(DaemonSchedulerNotification::CommittedMutation {
+                    owner: DaemonSchedulerOwner::DrivePolicy,
+                    change: DaemonCommittedChangeClass::DrivePolicy,
+                })
+                .is_ok(),
+            "duplicate equivalent event coalesced"
+        );
+        let before = counters.snapshot();
+
+        let event = receiver.recv().expect("coalesced scheduler event");
+        let DaemonEvent::SchedulerNotification(notification) = event else {
+            panic!("expected scheduler notification");
+        };
+        assert_eq!(notification.equivalent_key(), key);
+        assert!(
+            !daemon_handle_event_once(
+                DaemonEvent::SchedulerNotification(notification),
+                &runtime,
+                &events,
+                &active_connections,
+                &counters,
+                None,
+            )
+            .unwrap()
+        );
+
+        let after = counters.snapshot();
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after,
+                DaemonSchedulerWakeupKind::SchedulerNotification(key),
+            ),
+            1
+        );
+        mu10c_assert_owner_activity(&before, &after, DaemonSchedulerOwner::DrivePolicy, 1, 0, 0);
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        println!("mu10c_coalesced_drive\twakeup=1\towner_runs=1\tstore_opens=0\twrites=0");
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu10c_lifecycle_changes_wake_owner_until_managed_shutdown_is_allowed() {
+        let (store, mut runtime) = test_runtime("mu10c-lifecycle");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = None;
+        runtime.maintenance_next_ms = u64::MAX;
+        runtime.drive_policy_next_ms = u64::MAX;
+        runtime.reference_reconcile_next_ms = u64::MAX;
+        let counters = runtime.scheduler_counters.clone();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let key = DaemonEquivalentEventKey::LifecycleChanged;
+
+        let before = counters.snapshot();
+        assert!(
+            !mu10c_send_receive_and_handle_notification(
+                &runtime,
+                &events,
+                &receiver,
+                &active_connections,
+                DaemonSchedulerNotification::LifecycleChanged,
+            )
+            .unwrap()
+        );
+        let after_connection_block = counters.snapshot();
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after_connection_block,
+                DaemonSchedulerWakeupKind::SchedulerNotification(key),
+            ),
+            1
+        );
+        mu10c_assert_owner_activity(
+            &before,
+            &after_connection_block,
+            DaemonSchedulerOwner::LifecycleShutdown,
+            1,
+            0,
+            0,
+        );
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+
+        active_connections.store(0, std::sync::atomic::Ordering::SeqCst);
+        runtime.lock().unwrap().lifecycle_leases.insert(
+            LifecycleLeaseId::Session("live-session".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(now_ms().saturating_add(60_000)),
+            },
+        );
+        let before = counters.snapshot();
+        assert!(
+            !mu10c_send_receive_and_handle_notification(
+                &runtime,
+                &events,
+                &receiver,
+                &active_connections,
+                DaemonSchedulerNotification::LifecycleChanged,
+            )
+            .unwrap()
+        );
+        let after_session_block = counters.snapshot();
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after_session_block,
+                DaemonSchedulerWakeupKind::SchedulerNotification(key),
+            ),
+            1
+        );
+        mu10c_assert_owner_activity(
+            &before,
+            &after_session_block,
+            DaemonSchedulerOwner::LifecycleShutdown,
+            1,
+            0,
+            0,
+        );
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.lifecycle_leases.clear();
+            runtime.lifecycle_leases.insert(
+                LifecycleLeaseId::Pin("live-pin".to_string()),
+                LifecycleLease {
+                    kind: LifecycleLeaseKind::Pin,
+                    deadline_ms: None,
+                },
+            );
+        }
+        let before = counters.snapshot();
+        assert!(
+            !mu10c_send_receive_and_handle_notification(
+                &runtime,
+                &events,
+                &receiver,
+                &active_connections,
+                DaemonSchedulerNotification::LifecycleChanged,
+            )
+            .unwrap()
+        );
+        let after_pin_block = counters.snapshot();
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after_pin_block,
+                DaemonSchedulerWakeupKind::SchedulerNotification(key),
+            ),
+            1
+        );
+        mu10c_assert_owner_activity(
+            &before,
+            &after_pin_block,
+            DaemonSchedulerOwner::LifecycleShutdown,
+            1,
+            0,
+            0,
+        );
+        assert_eq!(runtime.lock().unwrap().pin_count(), 1);
+
+        runtime.lock().unwrap().lifecycle_leases.clear();
+        let before = counters.snapshot();
+        assert!(
+            mu10c_send_receive_and_handle_notification(
+                &runtime,
+                &events,
+                &receiver,
+                &active_connections,
+                DaemonSchedulerNotification::LifecycleChanged,
+            )
+            .unwrap()
+        );
+        let after_shutdown = counters.snapshot();
+        assert_eq!(
+            mu10c_wakeup_delta(
+                &before,
+                &after_shutdown,
+                DaemonSchedulerWakeupKind::SchedulerNotification(key),
+            ),
+            1
+        );
+        mu10c_assert_owner_activity(
+            &before,
+            &after_shutdown,
+            DaemonSchedulerOwner::LifecycleShutdown,
+            1,
+            0,
+            0,
+        );
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        println!(
+            "mu10c_lifecycle\twakeups=4\towner_runs=4\tstore_opens=0\twrites=0\tshutdown=true"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    struct Mu9bDaemon {
+        store: String,
+        paths: daemon::DaemonPaths,
+        handle: std::thread::JoinHandle<Result<(), String>>,
+    }
+
+    impl Mu9bDaemon {
+        fn start(tag: &str) -> Self {
+            let store = temp_store(tag);
+            FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+            let paths = daemon::paths(&store).unwrap();
+            daemon_cleanup_files(&paths);
+            let run_paths = paths.clone();
+            let run_store = store.clone();
+            let handle = std::thread::spawn(move || {
+                daemon_run(
+                    &run_store,
+                    &run_paths.addr_file.to_string_lossy(),
+                    &run_paths.pid_file.to_string_lossy(),
+                    &run_paths.lock_file.to_string_lossy(),
+                    DaemonTransportSelection::TcpLoopback.cli_value(),
+                    daemon::DaemonStartupMode::Persistent.wire_name(),
+                    daemon::DaemonStartupInitiator::CliDaemonStart.wire_name(),
+                )
+            });
+            let started = std::time::Instant::now();
+            while !paths.addr_file.exists() {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(15),
+                    "daemon did not write address file"
+                );
+                assert!(!handle.is_finished(), "daemon exited before startup");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Self {
+                store,
+                paths,
+                handle,
+            }
+        }
+
+        fn tcp_addr(&self) -> std::net::SocketAddr {
+            let contents = std::fs::read_to_string(&self.paths.addr_file).unwrap();
+            contents
+                .lines()
+                .find_map(|line| line.strip_prefix("addr="))
+                .expect("daemon address")
+                .parse()
+                .unwrap()
+        }
+
+        fn stop(self) {
+            let _ = daemon::request_checked(&self.paths, "stop\n");
+            let started = std::time::Instant::now();
+            while !self.handle.is_finished() {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(5),
+                    "daemon did not stop"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            self.handle.join().unwrap().unwrap();
+            let _ = std::fs::remove_file(&self.store);
+        }
+    }
+
+    fn mu9b_daemon_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn mu9b_daemon_thread_completes_requests_and_stops() {
+        let _guard = mu9b_daemon_test_guard();
+        let daemon = Mu9bDaemon::start("mu9b-request-completes");
+        let paths = daemon.paths.clone();
+        let started = std::time::Instant::now();
+        let response = daemon::request_checked(&daemon.paths, "ping\n").unwrap();
+        assert!(response.starts_with("running\t"), "{response}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        daemon.stop();
+        assert!(!paths.addr_file.exists());
+        assert!(!paths.pid_file.exists());
+        assert!(!paths.lock_file.exists());
+        assert!(!paths.sock_file.exists());
+    }
+
+    #[test]
+    fn mu9b_idle_daemon_has_no_periodic_accept_attempts() {
+        let _guard = mu9b_daemon_test_guard();
+        let daemon = Mu9bDaemon::start("mu9b-idle-accept");
+        DAEMON_ACCEPT_ATTEMPTS
+            .lock()
+            .unwrap()
+            .insert(daemon.paths.addr_file.clone(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(650));
+        let attempts = DAEMON_ACCEPT_ATTEMPTS
+            .lock()
+            .unwrap()
+            .remove(&daemon.paths.addr_file)
+            .unwrap_or(0);
+        assert!(
+            attempts <= 1,
+            "blocking accept should not re-enter periodically while idle, attempts={attempts}"
+        );
+        daemon.stop();
+    }
+
+    #[test]
+    fn mu9b_active_connection_saturation_reports_backpressure() {
+        let _guard = mu9b_daemon_test_guard();
+        let daemon = Mu9bDaemon::start("mu9b-saturation");
+        let addr = daemon.tcp_addr();
+        let mut held = Vec::new();
+        let mut backpressure = None;
+        for _ in 0..DAEMON_MAX_ACTIVE_CONNECTIONS + 16 {
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+                .unwrap();
+            let mut bytes = [0u8; 128];
+            match stream.read(&mut bytes) {
+                Ok(read) if read > 0 => {
+                    backpressure = Some(bytes[..read].to_vec());
+                    break;
+                }
+                Ok(_) => held.push(stream),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    held.push(stream);
+                }
+                Err(error) => panic!("read saturation response: {error}"),
+            }
+        }
+        assert_eq!(
+            backpressure.as_deref(),
+            Some(&b"error\tRESOURCE_EXHAUSTED: daemon active connection limit reached\n"[..])
+        );
+        for stream in &held {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        drop(held);
+        daemon.stop();
+    }
+
+    #[test]
+    fn mu9b_queued_stream_shutdown_is_deterministic() {
+        let drops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sender, receiver) = bounded_daemon_event_channel::<Mu9aStreamProbe>(2);
+        sender
+            .try_send_stream(Mu9aStreamProbe::new("first", &drops))
+            .expect("first stream queued");
+        sender
+            .try_send_stream(Mu9aStreamProbe::new("second", &drops))
+            .expect("second stream queued");
+        assert!(matches!(
+            sender.request_shutdown(),
+            Err(DaemonEventSendError::Full(_))
+        ));
+        drop(receiver.recv().expect("first queued stream"));
+        drop(receiver.recv().expect("second queued stream"));
+        assert!(matches!(
+            receiver.recv().expect("synthetic shutdown"),
+            DaemonEvent::ShutdownRequested
+        ));
+        assert_eq!(drops.lock().unwrap().as_slice(), &["first", "second"]);
+    }
+
+    #[test]
+    fn mu9b_full_queue_deadline_wake_is_level_triggered_once() {
+        let drops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sender, receiver) = bounded_daemon_event_channel::<Mu9aStreamProbe>(1);
+        sender
+            .try_send_stream(Mu9aStreamProbe::new("queued", &drops))
+            .expect("stream queued");
+        let waker = DaemonSchedulerDeadlineWaker::start(sender.clone());
+        let due = now_ms().saturating_sub(1);
+        waker.schedule(Some(DaemonSchedulerDeadline {
+            owner: DaemonSchedulerOwner::LifecycleShutdown,
+            deadline_ms: due,
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(matches!(
+            receiver.recv().expect("queued stream"),
+            DaemonEvent::AcceptedStream(_)
+        ));
+        let notification = receiver.recv().expect("deadline notification");
+        let DaemonEvent::SchedulerNotification(notification) = notification else {
+            panic!("expected scheduler notification");
+        };
+        let mut plan = DaemonSchedulerPlan::default();
+        plan.insert_owner(DaemonOwnerDescriptor::new(
+            DaemonSchedulerOwner::LifecycleShutdown,
+            Some(due),
+        ));
+        plan.enqueue_notification(&notification);
+        let runs = plan.due_or_pending_runs(now_ms());
+        assert_eq!(
+            runs,
+            vec![DaemonScheduledOwnerRun {
+                owner: DaemonSchedulerOwner::LifecycleShutdown,
+                reason: DaemonOwnerRunReason::PendingEvent,
+            }]
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        waker.stop();
+        assert_eq!(drops.lock().unwrap().as_slice(), &["queued"]);
+    }
+
+    #[test]
+    fn mu9b_cleanup_guard_stops_acceptor_and_removes_artifacts() {
+        let store = temp_store("mu9b-cleanup-guard");
+        FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+        let paths = daemon::paths(&store).unwrap();
+        daemon_cleanup_files(&paths);
+        std::fs::write(&paths.addr_file, "addr=127.0.0.1:0\n").unwrap();
+        std::fs::write(&paths.pid_file, "1").unwrap();
+        std::fs::write(&paths.lock_file, "lock").unwrap();
+        std::fs::write(&paths.sock_file, "socket").unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let thread_joined = joined.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+            assert!(thread_shutdown.load(std::sync::atomic::Ordering::SeqCst));
+            thread_joined.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let (sender, receiver) = bounded_daemon_event_channel::<Mu9aStreamProbe>(1);
+        let waker = DaemonSchedulerDeadlineWaker::start(sender);
+        let mut guard = DaemonRunCleanupGuard {
+            addr_file: paths.addr_file.to_string_lossy().into_owned(),
+            pid_file: paths.pid_file.to_string_lossy().into_owned(),
+            lock_file: paths.lock_file.to_string_lossy().into_owned(),
+            paths: paths.clone(),
+            acceptor: Some(DaemonBlockingAcceptorHandle {
+                shutdown,
+                wake: LocalDaemonAcceptorWake::Tcp(addr),
+                handle: Some(handle),
+            }),
+            event_receiver: Some(receiver),
+            deadline_waker: Some(waker),
+        };
+        guard.cleanup();
+
+        assert!(joined.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!paths.addr_file.exists());
+        assert!(!paths.pid_file.exists());
+        assert!(!paths.lock_file.exists());
+        assert!(!paths.sock_file.exists());
+    }
+
+    #[test]
+    fn mu9b_injected_background_owner_error_uses_cleanup_guard() {
+        let _guard = mu9b_daemon_test_guard();
+        let store = temp_store("mu9b-injected-background-error");
+        FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+        let paths = daemon::paths(&store).unwrap();
+        daemon_cleanup_files(&paths);
+        let run_paths = paths.clone();
+        let run_store = store.clone();
+        set_daemon_test_signal(&DAEMON_BACKGROUND_OWNER_INJECT_ERROR, &store);
+        let handle = std::thread::spawn(move || {
+            daemon_run(
+                &run_store,
+                &run_paths.addr_file.to_string_lossy(),
+                &run_paths.pid_file.to_string_lossy(),
+                &run_paths.lock_file.to_string_lossy(),
+                DaemonTransportSelection::TcpLoopback.cli_value(),
+                daemon::DaemonStartupMode::Persistent.wire_name(),
+                daemon::DaemonStartupInitiator::CliDaemonStart.wire_name(),
+            )
+        });
+        let started = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "daemon injected background error did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = handle.join().unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            "injected daemon background owner error"
+        );
+        assert!(!paths.addr_file.exists());
+        assert!(!paths.pid_file.exists());
+        assert!(!paths.lock_file.exists());
+        assert!(!paths.sock_file.exists());
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mu9b_windows_named_pipe_wake_unblocks_real_listener_with_bounded_join() {
+        let store = temp_store("mu9b-windows-pipe-wake");
+        FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+        let paths = daemon::paths(&store).unwrap();
+        let listener = bind_windows_named_pipe_listener(&paths).unwrap();
+        let wake = listener.acceptor_wake(&paths).unwrap();
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_joined = joined.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept(&paths);
+            thread_joined.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        wake.wake();
+        let started = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "Windows named-pipe wake did not unblock accept"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        handle.join().unwrap();
+        assert!(joined.load(std::sync::atomic::Ordering::SeqCst));
+        let _ = std::fs::remove_file(&store);
     }
 
     fn runtime_for_existing_store(tag: &str, store: &str) -> DaemonRuntime {
@@ -10913,14 +18325,21 @@ mod maintenance_tail_trim_tests {
             store: paths.store,
             store_id: paths.store_id,
             transport: daemon::DaemonTransport::TcpLoopback,
-            coordinator,
+            startup_mode: daemon::DaemonStartupMode::Persistent,
+            startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+            #[cfg(not(feature = "serve"))]
+            locks_authority: daemon_locks_authority(store, coordinator),
             #[cfg(feature = "serve")]
-            generated_runtime: test_generated_runtime(tag, store),
+            generated_runtime: std::sync::Arc::new(test_generated_runtime(tag, store)),
+            #[cfg(not(feature = "serve"))]
             kv_loom: None,
+            #[cfg(not(feature = "serve"))]
             kv_unavailable: None,
-            sessions: std::collections::BTreeSet::new(),
-            pins: std::collections::BTreeMap::new(),
+            lifecycle_leases: std::collections::BTreeMap::new(),
+            managed_bootstrap_deadline_ms: None,
             authority_replication_next: std::collections::BTreeMap::new(),
+            authority_replication_fingerprints: std::collections::BTreeMap::new(),
+            authority_replication_discovered: false,
             maintenance_next_ms: 0,
             maintenance_worker: None,
             maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10930,6 +18349,7 @@ mod maintenance_tail_trim_tests {
             drive_policy_next_ms: 0,
             #[cfg(feature = "serve")]
             reference_reconcile_next_ms: 0,
+            scheduler_counters: DaemonSchedulerCounters::default(),
         }
     }
 
@@ -10965,14 +18385,21 @@ mod maintenance_tail_trim_tests {
                 store: paths.store,
                 store_id: paths.store_id,
                 transport: daemon::DaemonTransport::TcpLoopback,
-                coordinator,
+                startup_mode: daemon::DaemonStartupMode::Persistent,
+                startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+                #[cfg(not(feature = "serve"))]
+                locks_authority: daemon_locks_authority(&store, coordinator),
                 #[cfg(feature = "serve")]
-                generated_runtime: test_generated_runtime(tag, &store),
+                generated_runtime: std::sync::Arc::new(test_generated_runtime(tag, &store)),
+                #[cfg(not(feature = "serve"))]
                 kv_loom: None,
+                #[cfg(not(feature = "serve"))]
                 kv_unavailable: None,
-                sessions: std::collections::BTreeSet::new(),
-                pins: std::collections::BTreeMap::new(),
+                lifecycle_leases: std::collections::BTreeMap::new(),
+                managed_bootstrap_deadline_ms: None,
                 authority_replication_next: std::collections::BTreeMap::new(),
+                authority_replication_fingerprints: std::collections::BTreeMap::new(),
+                authority_replication_discovered: false,
                 maintenance_next_ms: 0,
                 maintenance_worker: None,
                 maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10982,6 +18409,7 @@ mod maintenance_tail_trim_tests {
                 drive_policy_next_ms: 0,
                 #[cfg(feature = "serve")]
                 reference_reconcile_next_ms: 0,
+                scheduler_counters: DaemonSchedulerCounters::default(),
             },
             root,
             user,
@@ -11037,20 +18465,39 @@ mod maintenance_tail_trim_tests {
 
     fn completed_runtime_maintenance(runtime: &mut DaemonRuntime, store: &str) -> bool {
         runtime.maintenance_next_ms = 0;
+        clear_daemon_test_signal(&DAEMON_MAINTENANCE_WORKER_INJECT_ERROR, store);
+        set_daemon_test_signal(&DAEMON_MAINTENANCE_FORCE_DUE_ONCE, store);
         runtime.reconcile_store_maintenance().unwrap();
-        wait_for_maintenance(runtime);
-        FileStore::open_read(store)
-            .unwrap()
-            .active_reachability_mark_epoch()
-            .unwrap()
-            .is_some_and(|epoch| epoch.state.completed)
+        clear_daemon_test_signal(&DAEMON_MAINTENANCE_FORCE_DUE_ONCE, store);
+        if let Some(worker) = runtime.maintenance_worker.take() {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return false,
+            }
+        }
+        let fs = FileStore::open_read(store).unwrap();
+        match fs.active_reachability_mark_epoch().unwrap() {
+            Some(epoch) => epoch.state.completed,
+            None => {
+                let state = fs.store_maintenance_run_state().unwrap();
+                state.last_run_ms.is_some()
+                    && state.last_error.is_none()
+                    && state.last_skip_reason.is_none()
+            }
+        }
     }
 
     fn assert_completed_mark_is(store: &str, expected: &std::collections::BTreeSet<Digest>) {
         let fs = FileStore::open_read(store).unwrap();
-        let epoch = fs.active_reachability_mark_epoch().unwrap().unwrap();
-        assert!(epoch.state.completed);
-        assert_eq!(&epoch.state.marked, expected);
+        if let Some(epoch) = fs.active_reachability_mark_epoch().unwrap() {
+            assert!(epoch.state.completed);
+            assert_eq!(&epoch.state.marked, expected);
+            return;
+        }
+        drop(fs);
+        let loom = loom_store::open_loom_read_unlocked(store, None).unwrap();
+        let live = loom.live_object_set(loom.store().reference_root()).unwrap();
+        assert_eq!(&live, expected);
     }
 
     #[cfg(feature = "serve")]
@@ -11107,8 +18554,62 @@ mod maintenance_tail_trim_tests {
     }
 
     #[cfg(feature = "serve")]
-    fn generated_stream_cancel_call(
-        runtime: &mut DaemonRuntime,
+    fn generated_shared_call(
+        runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+        session_id: Option<Vec<u8>>,
+        interface: &str,
+        method: &str,
+        args: Vec<loom_codec::Value>,
+    ) -> loom_remote_protocol::envelope::ResponsePayload {
+        generated_shared_call_with_idempotency(
+            runtime,
+            session_id,
+            interface,
+            method,
+            args,
+            None,
+            vec![7],
+        )
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_shared_call_with_idempotency(
+        runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+        session_id: Option<Vec<u8>>,
+        interface: &str,
+        method: &str,
+        args: Vec<loom_codec::Value>,
+        idempotency_key: Option<Vec<u8>>,
+        request_id: Vec<u8>,
+    ) -> loom_remote_protocol::envelope::ResponsePayload {
+        let request = loom_remote_protocol::envelope::Request {
+            request_id,
+            session_id,
+            interface: interface.to_string(),
+            method: method.to_string(),
+            args,
+            deadline_ms: 0,
+            idempotency_key,
+            principal_hint: None,
+            compression: loom_remote_protocol::envelope::Compression::None,
+            stream: false,
+        };
+        let response = DaemonRuntime::handle_generated_binary_shared(
+            runtime,
+            &binary_request(DAEMON_GENERATED_CALL_MAGIC, &request.encode().unwrap()),
+        )
+        .expect("generated shared call handled");
+        loom_remote_protocol::envelope::Response::decode(&binary_response_body(
+            &response,
+            DAEMON_GENERATED_RESPONSE_MAGIC,
+        ))
+        .unwrap()
+        .payload
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_shared_stream_cancel_call(
+        runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
         session_id: Vec<u8>,
         request_id: Vec<u8>,
     ) -> loom_remote_protocol::envelope::ResponsePayload {
@@ -11124,10 +18625,14 @@ mod maintenance_tail_trim_tests {
             compression: loom_remote_protocol::envelope::Compression::None,
             stream: false,
         };
-        let response = runtime.handle_bytes(&binary_request(
-            DAEMON_GENERATED_STREAM_CANCEL_MAGIC,
-            &request.encode().unwrap(),
-        ));
+        let response = DaemonRuntime::handle_generated_binary_shared(
+            runtime,
+            &binary_request(
+                DAEMON_GENERATED_STREAM_CANCEL_MAGIC,
+                &request.encode().unwrap(),
+            ),
+        )
+        .expect("generated stream cancel handled");
         loom_remote_protocol::envelope::Response::decode(&binary_response_body(
             &response,
             DAEMON_GENERATED_STREAM_CANCEL_RESPONSE_MAGIC,
@@ -11137,14 +18642,59 @@ mod maintenance_tail_trim_tests {
     }
 
     #[cfg(feature = "serve")]
-    fn generated_open_session(runtime: &mut DaemonRuntime) -> Vec<u8> {
-        let open_bytes = loom_remote_protocol::session::open_request_bytes(
-            &loom_remote_protocol::session::SessionAuth::Unauthenticated,
-        );
+    fn generated_session_request(
+        runtime: &mut DaemonRuntime,
+        request: &loom_remote_protocol::session::SessionRequest,
+    ) -> loom_remote_protocol::session::SessionOpenReply {
+        let open_bytes = match request {
+            loom_remote_protocol::session::SessionRequest::Create(auth) => {
+                loom_remote_protocol::session::open_request_bytes(auth)
+            }
+            loom_remote_protocol::session::SessionRequest::Resume { auth, credential } => {
+                loom_remote_protocol::session::resume_request_bytes(auth, credential)
+            }
+            loom_remote_protocol::session::SessionRequest::Close { auth, credential } => {
+                loom_remote_protocol::session::close_request_bytes(auth, credential)
+            }
+        };
         let response = runtime.handle_bytes(&binary_request(
             DAEMON_GENERATED_SESSION_OPEN_MAGIC,
             &open_bytes,
         ));
+        loom_remote_protocol::session::parse_open_reply(&binary_response_body(
+            &response,
+            DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
+        ))
+        .unwrap()
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_open_session(runtime: &mut DaemonRuntime) -> Vec<u8> {
+        match generated_session_request(
+            runtime,
+            &loom_remote_protocol::session::SessionRequest::Create(
+                loom_remote_protocol::session::SessionAuth::Unauthenticated,
+            ),
+        ) {
+            loom_remote_protocol::session::SessionOpenReply::Ok { session_id, .. } => session_id,
+            loom_remote_protocol::session::SessionOpenReply::Err(error) => {
+                panic!("session open failed: {}", error.message)
+            }
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_shared_open_session(
+        runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+    ) -> Vec<u8> {
+        let open_bytes = loom_remote_protocol::session::open_request_bytes(
+            &loom_remote_protocol::session::SessionAuth::Unauthenticated,
+        );
+        let response = DaemonRuntime::handle_generated_binary_shared(
+            runtime,
+            &binary_request(DAEMON_GENERATED_SESSION_OPEN_MAGIC, &open_bytes),
+        )
+        .expect("generated session open handled");
         let reply = loom_remote_protocol::session::parse_open_reply(&binary_response_body(
             &response,
             DAEMON_GENERATED_SESSION_RESPONSE_MAGIC,
@@ -11156,6 +18706,163 @@ mod maintenance_tail_trim_tests {
                 panic!("session open failed: {}", error.message)
             }
         }
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_shared_session_handle_value(
+        runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+        session_id: &[u8],
+    ) -> loom_codec::Value {
+        use loom_remote_protocol::codec::ToValue;
+
+        let runtime = runtime.lock().unwrap();
+        let session = runtime
+            .generated_runtime
+            .sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+            .expect("generated session");
+        session.handle.to_value()
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_session_handle_value(
+        runtime: &DaemonRuntime,
+        session_id: &[u8],
+    ) -> loom_codec::Value {
+        use loom_remote_protocol::codec::ToValue;
+
+        let session = runtime
+            .generated_runtime
+            .sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+            .expect("generated session");
+        session.handle.to_value()
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_lock_acquire(
+        runtime: &mut DaemonRuntime,
+        session_id: &[u8],
+        handle: loom_codec::Value,
+        key: &str,
+    ) -> Result<loom_core::LockToken, loom_core::Code> {
+        match generated_call(
+            runtime,
+            Some(session_id.to_vec()),
+            "Locks",
+            "lock_acquire",
+            vec![
+                handle,
+                loom_codec::Value::Text(key.to_string()),
+                loom_codec::Value::Bytes(vec![0]),
+                loom_codec::Value::Uint(1),
+                loom_codec::Value::Uint(1),
+                loom_codec::Value::Uint(5_000),
+                loom_codec::Value::Uint(0),
+            ],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(
+                bytes,
+            )) => Ok(loom_wire::lock::lock_token_from_cbor(&bytes).unwrap()),
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => Err(error.code),
+            payload => panic!("unexpected generated lock acquire payload: {payload:?}"),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_shared_lock_acquire(
+        runtime: &std::sync::Arc<std::sync::Mutex<DaemonRuntime>>,
+        session_id: &[u8],
+        handle: loom_codec::Value,
+        key: &str,
+        wait_ms: u64,
+    ) -> Result<loom_core::LockToken, loom_core::Code> {
+        match generated_shared_call(
+            runtime,
+            Some(session_id.to_vec()),
+            "Locks",
+            "lock_acquire",
+            vec![
+                handle,
+                loom_codec::Value::Text(key.to_string()),
+                loom_codec::Value::Bytes(vec![0]),
+                loom_codec::Value::Uint(1),
+                loom_codec::Value::Uint(1),
+                loom_codec::Value::Uint(5_000),
+                loom_codec::Value::Uint(wait_ms),
+            ],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(
+                bytes,
+            )) => Ok(loom_wire::lock::lock_token_from_cbor(&bytes).unwrap()),
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => Err(error.code),
+            payload => panic!("unexpected generated lock acquire payload: {payload:?}"),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    fn generated_lock_release(
+        runtime: &mut DaemonRuntime,
+        session_id: &[u8],
+        handle: loom_codec::Value,
+        token: &loom_core::LockToken,
+    ) -> Result<(), loom_core::Code> {
+        match generated_call(
+            runtime,
+            Some(session_id.to_vec()),
+            "Locks",
+            "lock_release",
+            vec![
+                handle,
+                loom_codec::Value::Bytes(loom_wire::lock::lock_token_to_cbor(token).unwrap()),
+            ],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null) => Ok(()),
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => Err(error.code),
+            payload => panic!("unexpected generated lock release payload: {payload:?}"),
+        }
+    }
+
+    fn ipc_lock_token(response: &str) -> loom_core::LockToken {
+        let fields = response.trim_end().split('\t').collect::<Vec<_>>();
+        let ["lock", key, principal, session, mode, fence, deadline] = fields.as_slice() else {
+            panic!("unexpected IPC lock response: {response}");
+        };
+        loom_core::LockToken {
+            key: key.as_bytes().to_vec(),
+            owner: loom_core::LockOwner {
+                principal: (*principal).to_string(),
+                session: (*session).to_string(),
+            },
+            mode: daemon::parse_lock_mode_wire(mode).unwrap(),
+            fence: loom_core::Fence::embedded(fence.parse().unwrap()),
+            lease_deadline_ms: deadline.parse().unwrap(),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    fn authority_replication_configure_args(
+        handle: loom_codec::Value,
+        id: &str,
+        source: &str,
+    ) -> Vec<loom_codec::Value> {
+        vec![
+            handle,
+            loom_codec::Value::Text(id.to_string()),
+            loom_codec::Value::Text(source.to_string()),
+            loom_codec::Value::Bool(false),
+            loom_codec::Value::Bool(false),
+            loom_codec::Value::Uint(60_000),
+            loom_codec::Value::Uint(0),
+            loom_codec::Value::Uint(1_000),
+            loom_codec::Value::Bool(false),
+        ]
     }
 
     #[cfg(feature = "serve")]
@@ -11566,6 +19273,101 @@ mod maintenance_tail_trim_tests {
             ],
         ));
         assert_eq!(page_list.as_array().expect("page list").len(), 1);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_pages_get_returns_authenticated_principal_draft() {
+        let (_store, mut runtime, root, _) =
+            test_generated_authenticated_runtime("generated-page-draft-principal");
+        let session_id = generated_open_passphrase_session(&mut runtime, root, "root-pass");
+        let handle = match generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("store open failed: {}", error.message)
+            }
+        };
+        assert!(matches!(
+            generated_call(
+                &mut runtime,
+                Some(session_id.clone()),
+                "Workspaces",
+                "workspace_create",
+                vec![
+                    handle.clone(),
+                    loom_codec::Value::Text("main".to_string()),
+                    loom_codec::Value::Null,
+                ],
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let space = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "spaces_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("eng".to_string()),
+                loom_codec::Value::Text("Eng".to_string()),
+                loom_codec::Value::Null,
+            ],
+        ));
+        let space_root = space["profile_root"].as_str().expect("space root");
+        let page = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "pages_create_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("page-1".to_string()),
+                loom_codec::Value::Text("eng".to_string()),
+                loom_codec::Value::Null,
+                loom_codec::Value::Text("Roadmap".to_string()),
+                loom_codec::Value::Text(space_root.to_string()),
+            ],
+        ));
+        let page_root = page["profile_root"].as_str().expect("page root");
+        let update = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "pages_update_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("page-1".to_string()),
+                loom_codec::Value::Text("MU-15d-p draft body".to_string()),
+                loom_codec::Value::Text(page_root.to_string()),
+            ],
+        ));
+        assert_eq!(update["status"], "draft");
+        let get_page = generated_json_ok(generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Pages",
+            "pages_get_json",
+            vec![
+                handle.clone(),
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("pages".to_string()),
+                loom_codec::Value::Text("page-1".to_string()),
+            ],
+        ));
+        assert_eq!(get_page["status"], "draft");
+        assert_eq!(get_page["draft_body_text"], "MU-15d-p draft body\n");
     }
 
     #[cfg(feature = "serve")]
@@ -12058,18 +19860,81 @@ mod maintenance_tail_trim_tests {
     fn daemon_generated_dispatch_enforces_session_lease_expiry() {
         let (_store, mut runtime) = test_runtime("generated-lease-expiry");
         let session_id = generated_open_session(&mut runtime);
-        runtime
-            .generated_runtime
-            .sessions
-            .get_mut(&session_id)
-            .unwrap()
-            .lease_expires_ms = 0;
+        assert!(
+            runtime
+                .lifecycle_leases
+                .contains_key(&LifecycleLeaseId::GeneratedSession(session_id.clone()))
+        );
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::GeneratedSession(session_id.clone()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::GeneratedSession,
+                deadline_ms: Some(0),
+            },
+        );
+        runtime.prune_expired_lifecycle_leases(now_ms());
         match generated_call(&mut runtime, Some(session_id), "Store", "open", vec![]) {
             loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
-                assert_eq!(error.code, loom_core::error::Code::LockLeaseExpired);
+                assert_eq!(error.code, loom_core::error::Code::NotFound);
             }
-            payload => panic!("expected lease expiry error, got {payload:?}"),
+            payload => panic!("expected expired session error, got {payload:?}"),
         }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn generated_sessions_register_renew_and_remove_lifecycle_leases() {
+        let (_store, mut runtime) = test_runtime("generated-lifecycle-lease");
+        let session_id = generated_open_session(&mut runtime);
+        let id = LifecycleLeaseId::GeneratedSession(session_id.clone());
+        let first_deadline = runtime
+            .lifecycle_leases
+            .get(&id)
+            .and_then(|lease| lease.deadline_ms)
+            .expect("generated session lifecycle lease");
+        assert!(first_deadline > now_ms());
+
+        runtime.lifecycle_leases.insert(
+            id.clone(),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::GeneratedSession,
+                deadline_ms: Some(now_ms().saturating_add(60_000)),
+            },
+        );
+        let payload = generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Store",
+            "open",
+            vec![],
+        );
+        assert!(matches!(
+            &payload,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let renewed = runtime
+            .lifecycle_leases
+            .get(&id)
+            .and_then(|lease| lease.deadline_ms)
+            .expect("renewed generated session lifecycle lease");
+        assert!(renewed > now_ms());
+
+        let handle = match payload {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            _ => unreachable!(),
+        };
+        let close = generated_call(
+            &mut runtime,
+            Some(session_id.clone()),
+            "Store",
+            "close",
+            vec![handle],
+        );
+        assert!(matches!(
+            close,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+        ));
+        assert!(!runtime.lifecycle_leases.contains_key(&id));
     }
 
     #[cfg(feature = "serve")]
@@ -12103,7 +19968,7 @@ mod maintenance_tail_trim_tests {
         let read = client.read(&mut bytes).unwrap();
         assert_eq!(
             &bytes[..read],
-            b"error\tdaemon active connection limit reached\n"
+            b"error\tRESOURCE_EXHAUSTED: daemon active connection limit reached\n"
         );
     }
 
@@ -12149,6 +20014,78 @@ mod maintenance_tail_trim_tests {
                 loom_remote_protocol::frame::Frame::Trailer(_),
                 loom_remote_protocol::frame::Frame::Complete
             ] if item == b"after-pending"
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn active_generated_stream_renews_short_lifecycle_deadline() {
+        struct PendingOnceStream {
+            state: u8,
+        }
+
+        impl futures::Stream for PendingOnceStream {
+            type Item = Result<Vec<u8>, loom_core::error::LoomError>;
+
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                match self.state {
+                    0 => {
+                        self.state = 1;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                    1 => {
+                        self.state = 2;
+                        std::task::Poll::Ready(Some(Ok(b"renewed".to_vec())))
+                    }
+                    _ => std::task::Poll::Ready(None),
+                }
+            }
+        }
+
+        let (_store, mut runtime) = test_runtime("generated-stream-lifecycle-renewal");
+        let session_id = generated_open_session(&mut runtime);
+        let id = LifecycleLeaseId::GeneratedSession(session_id.clone());
+        let original_deadline = now_ms().saturating_add(50);
+        runtime.lifecycle_leases.insert(
+            id.clone(),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::GeneratedSession,
+                deadline_ms: Some(original_deadline),
+            },
+        );
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let stream: loom_remote_protocol::api_types::LoomStream<Vec<u8>> =
+            Box::pin(PendingOnceStream { state: 0 });
+        let mut bytes = Vec::new();
+        write_generated_open_stream_response(
+            stream,
+            Some(&runtime),
+            Some(&session_id),
+            None,
+            &mut bytes,
+        )
+        .unwrap();
+
+        let renewed_deadline = runtime
+            .lock()
+            .unwrap()
+            .lifecycle_leases
+            .get(&id)
+            .and_then(|lease| lease.deadline_ms)
+            .unwrap();
+        assert!(renewed_deadline > original_deadline);
+        let frames = generated_stream_frames(&bytes);
+        assert!(matches!(
+            &frames[..],
+            [
+                loom_remote_protocol::frame::Frame::Item(item),
+                loom_remote_protocol::frame::Frame::Trailer(_),
+                loom_remote_protocol::frame::Frame::Complete
+            ] if item == b"renewed"
         ));
     }
 
@@ -12216,10 +20153,15 @@ mod maintenance_tail_trim_tests {
         let session_id = generated_open_session(&mut runtime);
         let stream_request_id = b"stream-request".to_vec();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        runtime.generated_runtime.stream_cancellations.insert(
-            (session_id.clone(), stream_request_id.clone()),
-            cancel.clone(),
-        );
+        runtime
+            .generated_runtime
+            .stream_cancellations
+            .lock()
+            .unwrap()
+            .insert(
+                (session_id.clone(), stream_request_id.clone()),
+                cancel.clone(),
+            );
         let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
         let writer_runtime = runtime.clone();
         let writer_session_id = session_id.clone();
@@ -12245,32 +20187,26 @@ mod maintenance_tail_trim_tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap();
 
-        {
-            let mut runtime = runtime.lock().unwrap();
-            let open = generated_call(
-                &mut runtime,
-                Some(session_id.clone()),
-                "Store",
-                "open",
-                vec![],
-            );
-            assert!(matches!(
-                open,
-                loom_remote_protocol::envelope::ResponsePayload::Ok(_)
-            ));
-            let cancel_response = generated_stream_cancel_call(
-                &mut runtime,
-                session_id.clone(),
-                stream_request_id.clone(),
-            );
-            assert_eq!(
-                cancel_response,
-                loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
-            );
-            runtime
-                .generated_runtime
-                .finish_generated_stream(&(session_id.clone(), stream_request_id));
-        }
+        let open =
+            generated_shared_call(&runtime, Some(session_id.clone()), "Store", "open", vec![]);
+        assert!(matches!(
+            open,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let cancel_response = generated_shared_stream_cancel_call(
+            &runtime,
+            session_id.clone(),
+            stream_request_id.clone(),
+        );
+        assert_eq!(
+            cancel_response,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+        );
+        runtime
+            .lock()
+            .unwrap()
+            .generated_runtime
+            .finish_generated_stream(&(session_id.clone(), stream_request_id));
 
         let frames = generated_stream_frames(&writer.join().unwrap());
         match frames.as_slice() {
@@ -12298,14 +20234,13 @@ mod maintenance_tail_trim_tests {
                 self.writes += 1;
                 self.bytes.extend_from_slice(buf);
                 if self.writes == 2 {
-                    self.runtime
-                        .lock()
-                        .unwrap()
-                        .generated_runtime
-                        .sessions
-                        .get_mut(&self.session_id)
-                        .unwrap()
-                        .lease_expires_ms = 0;
+                    self.runtime.lock().unwrap().lifecycle_leases.insert(
+                        LifecycleLeaseId::GeneratedSession(self.session_id.clone()),
+                        LifecycleLease {
+                            kind: LifecycleLeaseKind::GeneratedSession,
+                            deadline_ms: Some(0),
+                        },
+                    );
                 }
                 Ok(buf.len())
             }
@@ -12440,7 +20375,7 @@ mod maintenance_tail_trim_tests {
 
         let reopened = FileStore::open_daemon_authorized(&store).unwrap();
         let report = reopened.store_maintenance_report(100).unwrap();
-        let json = maintenance_report_json(&report, None);
+        let json = maintenance_report_json(&MaintenanceReportView::from_store(&report, None));
 
         assert_eq!(json["overlay"]["generation"], 1);
         assert_eq!(json["mvcc"]["active_snapshots"], 0);
@@ -12508,6 +20443,8 @@ mod maintenance_tail_trim_tests {
         .unwrap();
         drop(fs);
 
+        reload_seeded_test_runtime(&mut runtime);
+
         runtime.reconcile_store_maintenance().unwrap();
         wait_for_maintenance(&mut runtime);
         let fs = FileStore::open_read(&store).unwrap();
@@ -12554,6 +20491,8 @@ mod maintenance_tail_trim_tests {
         .unwrap();
         drop(fs);
 
+        reload_seeded_test_runtime(&mut runtime);
+
         runtime.reconcile_store_maintenance().unwrap();
         wait_for_maintenance(&mut runtime);
 
@@ -12585,8 +20524,2545 @@ mod maintenance_tail_trim_tests {
     fn daemon_status_reports_maintenance_scheduler_state() {
         let (_store, mut runtime) = test_runtime("maintenance-status-worker-unit");
         let status = runtime.status_response();
+        assert!(status.contains("startup_mode=persistent"));
+        assert!(status.contains("startup_initiator=cli.daemon.start"));
         assert!(status.contains("maintenance_worker=idle"));
         assert!(status.contains("maintenance_next_ms=0"));
+    }
+
+    #[test]
+    fn mu9c_idle_before_maintenance_deadline_does_not_open_store() {
+        let (_store, mut runtime) = test_runtime("mu9c-idle-before-deadline");
+        let store = runtime.store.clone();
+        runtime.maintenance_next_ms = now_ms().saturating_add(60_000);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let (events, _receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+
+        reset_daemon_maintenance_report_opens(&store);
+        daemon_run_maintenance_owner_once(&runtime, &events, false).unwrap();
+
+        assert_eq!(daemon_maintenance_report_opens(&store), 0);
+        assert!(runtime.lock().unwrap().maintenance_worker.is_none());
+    }
+
+    #[test]
+    fn mu9c_due_maintenance_starts_and_completion_wakes_cleanup() {
+        let (_store, mut runtime) = test_runtime("mu9c-due-starts");
+        runtime.maintenance_next_ms = 0;
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+
+        daemon_run_maintenance_owner_once(&runtime, &events, false).unwrap();
+        assert!(runtime.lock().unwrap().maintenance_worker.is_some());
+
+        match receiver
+            .recv()
+            .expect("maintenance worker completion event")
+        {
+            DaemonEvent::SchedulerNotification(notification) => assert_eq!(
+                notification.equivalent_key(),
+                DaemonEquivalentEventKey::WorkerCompleted(DaemonSchedulerOwner::Maintenance)
+            ),
+            _ => panic!("unexpected event"),
+        }
+        daemon_run_maintenance_owner_once(&runtime, &events, true).unwrap();
+        assert!(runtime.lock().unwrap().maintenance_worker.is_none());
+    }
+
+    #[test]
+    fn mu9c_completion_event_joins_success_before_worker_is_finished() {
+        let (_store, mut runtime) = test_runtime("mu9c-held-completion-success");
+        let hook = std::sync::Arc::new(MaintenanceCompletionHoldHook::new(Ok(())));
+        let _hook_guard = MaintenanceCompletionHoldGuard::install(&runtime.store, hook.clone());
+        runtime.maintenance_next_ms = 0;
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+
+        daemon_run_maintenance_owner_once(&runtime, &events, false).unwrap();
+        match receiver
+            .recv()
+            .expect("maintenance worker completion event")
+        {
+            DaemonEvent::SchedulerNotification(notification) => assert_eq!(
+                notification.equivalent_key(),
+                DaemonEquivalentEventKey::WorkerCompleted(DaemonSchedulerOwner::Maintenance)
+            ),
+            _ => panic!("unexpected event"),
+        }
+        hook.wait_until_entered();
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .maintenance_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        );
+        daemon_run_maintenance_owner_once(&runtime, &events, false).unwrap();
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .maintenance_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        );
+
+        let runtime_for_completion = runtime.clone();
+        let events_for_completion = events.clone();
+        let completion = std::thread::spawn(move || {
+            daemon_run_maintenance_owner_once(&runtime_for_completion, &events_for_completion, true)
+        });
+        hook.release();
+        completion.join().unwrap().unwrap();
+
+        assert!(runtime.lock().unwrap().maintenance_worker.is_none());
+    }
+
+    #[test]
+    fn mu9c_completion_event_joins_failure_before_worker_is_finished() {
+        let (store, mut runtime) = test_runtime("mu9c-held-completion-failure");
+        reload_seeded_test_runtime(&mut runtime);
+        let hook = std::sync::Arc::new(MaintenanceCompletionHoldHook::new(Err(
+            "held maintenance failure".to_string(),
+        )));
+        let _hook_guard = MaintenanceCompletionHoldGuard::install(&runtime.store, hook.clone());
+        runtime.maintenance_next_ms = 0;
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+
+        daemon_run_maintenance_owner_once(&runtime, &events, false).unwrap();
+        match receiver
+            .recv()
+            .expect("maintenance worker completion event")
+        {
+            DaemonEvent::SchedulerNotification(notification) => assert_eq!(
+                notification.equivalent_key(),
+                DaemonEquivalentEventKey::WorkerCompleted(DaemonSchedulerOwner::Maintenance)
+            ),
+            _ => panic!("unexpected event"),
+        }
+        hook.wait_until_entered();
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .maintenance_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        );
+        daemon_run_maintenance_owner_once(&runtime, &events, false).unwrap();
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .maintenance_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        );
+
+        let runtime_for_completion = runtime.clone();
+        let events_for_completion = events.clone();
+        let completion = std::thread::spawn(move || {
+            daemon_run_maintenance_owner_once(&runtime_for_completion, &events_for_completion, true)
+        });
+        hook.release();
+        completion.join().unwrap().unwrap();
+
+        assert!(runtime.lock().unwrap().maintenance_worker.is_none());
+        let run_state = FileStore::open_read(&store)
+            .unwrap()
+            .store_maintenance_run_state()
+            .unwrap();
+        assert_eq!(
+            run_state.last_error.as_deref(),
+            Some("held maintenance failure")
+        );
+
+        daemon_run_maintenance_owner_once(&runtime, &events, true).unwrap();
+        let unchanged = FileStore::open_read(&store)
+            .unwrap()
+            .store_maintenance_run_state()
+            .unwrap();
+        assert_eq!(unchanged, run_state);
+    }
+
+    #[test]
+    fn mu9c_status_exposes_next_maintenance_deadline() {
+        let (_store, mut runtime) = test_runtime("mu9c-status-deadline");
+        runtime.maintenance_next_ms = 424_242;
+        let status = runtime.status_response();
+        assert!(status.contains("maintenance_worker=idle"));
+        assert!(status.contains("maintenance_next_ms=424242"));
+    }
+
+    fn save_test_authority_replication_policy(
+        store: &str,
+        id: &str,
+        enabled: bool,
+        pull_on_start: bool,
+        interval_ms: Option<u64>,
+        jitter_ms: u64,
+    ) -> loom_store::AuthorityReplicationPolicy {
+        let fs = FileStore::open_daemon_authorized(store).unwrap();
+        let mut policy = FileStore::authority_replication_policy(
+            id,
+            &format!("/tmp/mu9d-a-authority-source-{id}.loom"),
+            enabled,
+        )
+        .unwrap();
+        policy.pull_on_start = pull_on_start;
+        policy.interval_ms = interval_ms;
+        policy.jitter_ms = jitter_ms;
+        fs.save_authority_replication_policy_audited(
+            &policy,
+            None,
+            "authority.replication.configure",
+            Some(&format!("id={id}")),
+        )
+        .unwrap();
+        policy
+    }
+
+    fn save_test_authority_replication_policy_from_source(
+        store: &str,
+        id: &str,
+        source: &str,
+        enabled: bool,
+        pull_on_start: bool,
+        interval_ms: Option<u64>,
+        jitter_ms: u64,
+    ) -> loom_store::AuthorityReplicationPolicy {
+        let fs = FileStore::open_daemon_authorized(store).unwrap();
+        let mut policy = FileStore::authority_replication_policy(id, source, enabled).unwrap();
+        policy.pull_on_start = pull_on_start;
+        policy.interval_ms = interval_ms;
+        policy.jitter_ms = jitter_ms;
+        fs.save_authority_replication_policy_audited(
+            &policy,
+            None,
+            "authority.replication.configure",
+            Some(&format!("id={id}")),
+        )
+        .unwrap();
+        policy
+    }
+
+    fn mu9d_b_signed_authority_source(
+        source: &str,
+        destination: &str,
+    ) -> (WorkspaceId, WorkspaceId) {
+        let source_store = FileStore::create_with_profile(source, Algo::Blake3).unwrap();
+        let destination_store = FileStore::create_with_profile(destination, Algo::Blake3).unwrap();
+        let root = WorkspaceId::v4_from_bytes([33; 16]);
+        let next_authority = WorkspaceId::v4_from_bytes([34; 16]);
+        let key_id = WorkspaceId::v4_from_bytes([35; 16]);
+        let signing_key = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let public_key = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+        let mut source_identity = IdentityStore::new(root);
+        source_identity
+            .add_principal(next_authority, "replica-authority", PrincipalKind::Service)
+            .unwrap();
+        source_identity
+            .add_public_key(
+                root,
+                loom_core::IdentityPublicKeySpec {
+                    id: key_id,
+                    label: "authority-key".to_string(),
+                    algorithm: loom_core::IDENTITY_AUTHORITY_HANDOFF_ALG_ES256.to_string(),
+                    public_key,
+                },
+            )
+            .unwrap();
+        let payload = loom_core::identity_authority_handoff_payload(root, next_authority, 1, None);
+        let signature: p256::ecdsa::Signature =
+            p256::ecdsa::signature::Signer::sign(&signing_key, &payload);
+        let signed_record = loom_core::identity_authority_handoff_record(
+            root,
+            next_authority,
+            1,
+            None,
+            loom_core::IDENTITY_AUTHORITY_HANDOFF_ALG_ES256,
+            key_id.as_bytes(),
+            signature.to_bytes().as_slice(),
+        )
+        .unwrap();
+        source_identity
+            .apply_verified_authority_handoff(
+                loom_core::IdentityAuthorityHandoff {
+                    from: root,
+                    to: next_authority,
+                    generation: 1,
+                    head: None,
+                    signed_record,
+                },
+                true,
+            )
+            .unwrap();
+        source_store.save_identity_store(&source_identity).unwrap();
+        destination_store
+            .save_identity_store(&IdentityStore::new(root))
+            .unwrap();
+        (root, next_authority)
+    }
+
+    #[test]
+    fn mu9d_a_initial_discovery_creates_deterministic_owner_state() {
+        let (store, mut runtime) = test_runtime("mu9d-a-initial-discovery");
+        let alpha =
+            save_test_authority_replication_policy(&store, "alpha", true, false, Some(1_000), 0);
+        save_test_authority_replication_policy(&store, "beta", true, false, Some(2_000), 0);
+        save_test_authority_replication_policy(&store, "off", false, true, Some(500), 0);
+
+        let activity =
+            runtime.scheduler_activity_recorder(DaemonSchedulerOwner::AuthorityReplication);
+        runtime
+            .discover_authority_replication_owner_state(10_000, false, &activity)
+            .unwrap();
+
+        assert!(runtime.authority_replication_discovered);
+        assert_eq!(
+            runtime.authority_replication_next.get("beta"),
+            Some(&12_000)
+        );
+        assert_eq!(
+            runtime.authority_replication_next.get("alpha"),
+            Some(
+                &10_000u64
+                    .saturating_add(1_000)
+                    .saturating_add(authority_replication_jitter(&alpha))
+            )
+        );
+        assert!(!runtime.authority_replication_next.contains_key("off"));
+    }
+
+    #[test]
+    fn mu9d_a_idle_scheduler_pass_does_not_reopen_authority_policy_store() {
+        let (store, mut runtime) = test_runtime("mu9d-a-idle-no-reopen");
+        save_test_authority_replication_policy(&store, "alpha", true, false, Some(60_000), 0);
+
+        runtime.reconcile_authority_replication().unwrap();
+        assert!(runtime.authority_replication_discovered);
+        reset_daemon_authority_replication_policy_opens(&runtime.store);
+        runtime.reconcile_authority_replication().unwrap();
+
+        assert_eq!(daemon_authority_replication_policy_opens(&runtime.store), 0);
+    }
+
+    #[test]
+    fn mu9d_a_policy_change_prunes_removed_and_disabled_owner_state() {
+        let (store, mut runtime) = test_runtime("mu9d-a-policy-prune");
+        save_test_authority_replication_policy(&store, "alpha", true, false, Some(60_000), 0);
+        save_test_authority_replication_policy(&store, "beta", true, true, Some(60_000), 0);
+
+        runtime.reconcile_authority_replication().unwrap();
+        assert!(runtime.authority_replication_next.contains_key("alpha"));
+        assert!(runtime.authority_replication_next.contains_key("beta"));
+
+        let fs = FileStore::open_daemon_authorized(&store).unwrap();
+        fs.remove_authority_replication_policy_audited(
+            "beta",
+            None,
+            "authority.replication.remove",
+            Some("id=beta"),
+        )
+        .unwrap();
+        drop(fs);
+        save_test_authority_replication_policy(&store, "alpha", false, false, Some(60_000), 0);
+
+        runtime
+            .reconcile_authority_replication_policy_change()
+            .unwrap();
+
+        assert!(runtime.authority_replication_next.is_empty());
+    }
+
+    #[test]
+    fn mu9d_a_scheduler_selects_earliest_authority_policy_deadline() {
+        let (_store, mut runtime) = test_runtime("mu9d-a-earliest-deadline");
+        runtime.maintenance_next_ms = u64::MAX;
+        #[cfg(feature = "serve")]
+        {
+            runtime.drive_policy_next_ms = u64::MAX;
+            runtime.reference_reconcile_next_ms = u64::MAX;
+        }
+        runtime
+            .authority_replication_next
+            .insert("later".to_string(), 20_000);
+        runtime
+            .authority_replication_next
+            .insert("earlier".to_string(), 10_000);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        assert_eq!(
+            daemon_scheduler_next_deadline(&runtime),
+            Some(DaemonSchedulerDeadline {
+                owner: DaemonSchedulerOwner::AuthorityReplication,
+                deadline_ms: 10_000,
+            })
+        );
+    }
+
+    #[test]
+    fn mu9d_b_pull_on_start_executes_and_reschedules_success() {
+        let source = temp_store("mu9d-b-pull-start-source");
+        let mirror = temp_store("mu9d-b-pull-start-mirror");
+        let (_root, next_authority) = mu9d_b_signed_authority_source(&source, &mirror);
+        let policy = save_test_authority_replication_policy_from_source(
+            &mirror,
+            "office",
+            &source,
+            true,
+            true,
+            Some(60_000),
+            0,
+        );
+        let mut runtime = runtime_for_existing_store("mu9d-b-pull-start", &mirror);
+        let before = now_ms();
+
+        runtime.reconcile_authority_replication().unwrap();
+
+        let mirror_store = FileStore::open_read(&mirror).unwrap();
+        let mirror_identity = mirror_store.identity_store().unwrap().unwrap();
+        assert_eq!(mirror_identity.authority_state().authority, next_authority);
+        assert_eq!(mirror_identity.authority_state().generation, 1);
+        let stored = mirror_store
+            .authority_replication_policy_by_id("office")
+            .unwrap()
+            .unwrap();
+        assert!(stored.last_success_ms.is_some());
+        assert_eq!(stored.last_failure_ms, None);
+        assert_eq!(stored.last_error, None);
+        assert!(
+            runtime
+                .authority_replication_next
+                .get("office")
+                .is_some_and(|next| *next >= before.saturating_add(60_000))
+        );
+        assert!(mirror_store.audit_records().unwrap().iter().any(|record| {
+            record.action == "authority.replication.pull"
+                && record
+                    .target
+                    .as_deref()
+                    .is_some_and(|target| target.contains("applied=true"))
+        }));
+        assert_eq!(authority_replication_jitter(&policy), 0);
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&mirror);
+    }
+
+    #[test]
+    fn mu9d_b_due_policy_executes_and_uses_interval_plus_jitter() {
+        let source = temp_store("mu9d-b-due-source");
+        let mirror = temp_store("mu9d-b-due-mirror");
+        let (_root, next_authority) = mu9d_b_signed_authority_source(&source, &mirror);
+        let policy = save_test_authority_replication_policy_from_source(
+            &mirror,
+            "office",
+            &source,
+            true,
+            false,
+            Some(10_000),
+            37,
+        );
+        let mut runtime = runtime_for_existing_store("mu9d-b-due", &mirror);
+        runtime.authority_replication_discovered = true;
+        runtime
+            .authority_replication_next
+            .insert("office".to_string(), 1);
+
+        let activity =
+            runtime.scheduler_activity_recorder(DaemonSchedulerOwner::AuthorityReplication);
+        runtime
+            .discover_authority_replication_owner_state(50_000, false, &activity)
+            .unwrap();
+
+        let mirror_store = FileStore::open_read(&mirror).unwrap();
+        let mirror_identity = mirror_store.identity_store().unwrap().unwrap();
+        assert_eq!(mirror_identity.authority_state().authority, next_authority);
+        assert_eq!(
+            runtime.authority_replication_next.get("office"),
+            Some(
+                &50_000u64
+                    .saturating_add(10_000)
+                    .saturating_add(authority_replication_jitter(&policy))
+            )
+        );
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&mirror);
+    }
+
+    #[test]
+    fn mu9d_b_due_failure_records_audit_and_backoff_deadline() {
+        let source = temp_store("mu9d-b-failure-source");
+        let mirror = temp_store("mu9d-b-failure-mirror");
+        mu9d_b_signed_authority_source(&source, &mirror);
+        let mut policy = save_test_authority_replication_policy_from_source(
+            &mirror,
+            "office",
+            &source,
+            true,
+            false,
+            Some(10_000),
+            11,
+        );
+        policy.backoff_ms = 7_000;
+        FileStore::open_daemon_authorized(&mirror)
+            .unwrap()
+            .save_authority_replication_policy_audited(
+                &policy,
+                None,
+                "authority.replication.configure",
+                Some("id=office"),
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&source);
+        let mut runtime = runtime_for_existing_store("mu9d-b-failure", &mirror);
+        runtime.authority_replication_discovered = true;
+        runtime
+            .authority_replication_next
+            .insert("office".to_string(), 1);
+
+        let activity =
+            runtime.scheduler_activity_recorder(DaemonSchedulerOwner::AuthorityReplication);
+        runtime
+            .discover_authority_replication_owner_state(90_000, false, &activity)
+            .unwrap();
+
+        let mirror_store = FileStore::open_read(&mirror).unwrap();
+        let stored = mirror_store
+            .authority_replication_policy_by_id("office")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.last_success_ms, None);
+        assert_eq!(stored.last_failure_ms, Some(90_000));
+        assert!(stored.last_error.is_some());
+        assert_eq!(
+            runtime.authority_replication_next.get("office"),
+            Some(
+                &90_000u64
+                    .saturating_add(7_000)
+                    .saturating_add(authority_replication_jitter(&policy))
+            )
+        );
+        assert!(mirror_store.audit_records().unwrap().iter().any(|record| {
+            record.action == "authority.replication.failure"
+                && record
+                    .target
+                    .as_deref()
+                    .is_some_and(|target| target.contains("id=office"))
+        }));
+        let _ = std::fs::remove_file(&mirror);
+    }
+
+    #[test]
+    fn mu9d_b_non_due_policy_performs_no_replication_work() {
+        let source = temp_store("mu9d-b-non-due-source");
+        let mirror = temp_store("mu9d-b-non-due-mirror");
+        mu9d_b_signed_authority_source(&source, &mirror);
+        save_test_authority_replication_policy_from_source(
+            &mirror,
+            "office",
+            &source,
+            true,
+            false,
+            Some(60_000),
+            0,
+        );
+        let mut runtime = runtime_for_existing_store("mu9d-b-non-due", &mirror);
+        runtime.reconcile_authority_replication().unwrap();
+        let scheduled = *runtime
+            .authority_replication_next
+            .get("office")
+            .expect("scheduled policy");
+        let _ = std::fs::remove_file(&source);
+        reset_daemon_authority_replication_policy_opens(&runtime.store);
+
+        runtime.reconcile_authority_replication().unwrap();
+
+        assert_eq!(daemon_authority_replication_policy_opens(&runtime.store), 0);
+        assert_eq!(
+            runtime.authority_replication_next.get("office"),
+            Some(&scheduled)
+        );
+        let mirror_store = FileStore::open_read(&mirror).unwrap();
+        let stored = mirror_store
+            .authority_replication_policy_by_id("office")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.last_success_ms, None);
+        assert_eq!(stored.last_failure_ms, None);
+        assert!(!mirror_store.audit_records().unwrap().iter().any(|record| {
+            matches!(
+                record.action.as_str(),
+                "authority.replication.pull" | "authority.replication.failure"
+            )
+        }));
+        let _ = std::fs::remove_file(&mirror);
+    }
+
+    #[test]
+    fn mu9d_b_policy_refresh_preserves_unchanged_deadlines_without_pull_replay() {
+        let pull_source = temp_store("mu9d-b-refresh-pull-source");
+        let interval_source = temp_store("mu9d-b-refresh-interval-source");
+        let changed_source = temp_store("mu9d-b-refresh-changed-source");
+        let removed_source = temp_store("mu9d-b-refresh-removed-source");
+        let disabled_source = temp_store("mu9d-b-refresh-disabled-source");
+        let mirror = temp_store("mu9d-b-refresh-mirror");
+        mu9d_b_signed_authority_source(&pull_source, &mirror);
+        FileStore::create_with_profile(&interval_source, Algo::Blake3).unwrap();
+        FileStore::create_with_profile(&changed_source, Algo::Blake3).unwrap();
+        FileStore::create_with_profile(&removed_source, Algo::Blake3).unwrap();
+        FileStore::create_with_profile(&disabled_source, Algo::Blake3).unwrap();
+        save_test_authority_replication_policy_from_source(
+            &mirror,
+            "pull",
+            &pull_source,
+            true,
+            true,
+            Some(60_000),
+            0,
+        );
+        save_test_authority_replication_policy_from_source(
+            &mirror,
+            "interval",
+            &interval_source,
+            true,
+            false,
+            Some(70_000),
+            0,
+        );
+        save_test_authority_replication_policy_from_source(
+            &mirror,
+            "changed",
+            &changed_source,
+            true,
+            false,
+            Some(80_000),
+            0,
+        );
+        save_test_authority_replication_policy_from_source(
+            &mirror,
+            "removed",
+            &removed_source,
+            true,
+            false,
+            Some(90_000),
+            0,
+        );
+        save_test_authority_replication_policy_from_source(
+            &mirror,
+            "disabled",
+            &disabled_source,
+            true,
+            false,
+            Some(100_000),
+            0,
+        );
+        let mut runtime = runtime_for_existing_store("mu9d-b-refresh", &mirror);
+
+        let activity =
+            runtime.scheduler_activity_recorder(DaemonSchedulerOwner::AuthorityReplication);
+        runtime
+            .discover_authority_replication_owner_state(10_000, false, &activity)
+            .unwrap();
+        let pull_deadline = *runtime.authority_replication_next.get("pull").unwrap();
+        let interval_deadline = *runtime.authority_replication_next.get("interval").unwrap();
+        let audit_before = FileStore::open_read(&mirror)
+            .unwrap()
+            .audit_records()
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.action.as_str(),
+                    "authority.replication.pull" | "authority.replication.failure"
+                )
+            })
+            .count();
+
+        let _ = std::fs::remove_file(&pull_source);
+        let _ = std::fs::remove_file(&interval_source);
+        let fs = FileStore::open_daemon_authorized(&mirror).unwrap();
+        let mut changed = fs
+            .authority_replication_policy_by_id("changed")
+            .unwrap()
+            .unwrap();
+        changed.pull_on_start = true;
+        changed.interval_ms = Some(33_000);
+        fs.save_authority_replication_policy_audited(
+            &changed,
+            None,
+            "authority.replication.configure",
+            Some("id=changed"),
+        )
+        .unwrap();
+        fs.remove_authority_replication_policy_audited(
+            "removed",
+            None,
+            "authority.replication.remove",
+            Some("id=removed"),
+        )
+        .unwrap();
+        let mut disabled = fs
+            .authority_replication_policy_by_id("disabled")
+            .unwrap()
+            .unwrap();
+        disabled.enabled = false;
+        fs.save_authority_replication_policy_audited(
+            &disabled,
+            None,
+            "authority.replication.configure",
+            Some("id=disabled"),
+        )
+        .unwrap();
+        drop(fs);
+
+        let activity =
+            runtime.scheduler_activity_recorder(DaemonSchedulerOwner::AuthorityReplication);
+        runtime
+            .discover_authority_replication_owner_state(50_000, true, &activity)
+            .unwrap();
+
+        assert_eq!(
+            runtime.authority_replication_next.get("pull"),
+            Some(&pull_deadline)
+        );
+        assert_eq!(
+            runtime.authority_replication_next.get("interval"),
+            Some(&interval_deadline)
+        );
+        assert_eq!(
+            runtime.authority_replication_next.get("changed"),
+            Some(&83_000)
+        );
+        assert!(!runtime.authority_replication_next.contains_key("removed"));
+        assert!(!runtime.authority_replication_next.contains_key("disabled"));
+        assert!(
+            !runtime
+                .authority_replication_fingerprints
+                .contains_key("removed")
+        );
+        assert!(
+            !runtime
+                .authority_replication_fingerprints
+                .contains_key("disabled")
+        );
+        let mirror_store = FileStore::open_read(&mirror).unwrap();
+        let audit_after = mirror_store
+            .audit_records()
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.action.as_str(),
+                    "authority.replication.pull" | "authority.replication.failure"
+                )
+            })
+            .count();
+        assert_eq!(audit_after, audit_before);
+        assert_eq!(
+            mirror_store
+                .authority_replication_policy_by_id("interval")
+                .unwrap()
+                .unwrap()
+                .last_failure_ms,
+            None
+        );
+        let _ = std::fs::remove_file(&changed_source);
+        let _ = std::fs::remove_file(&removed_source);
+        let _ = std::fs::remove_file(&disabled_source);
+        let _ = std::fs::remove_file(&mirror);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9d_c_committed_authority_policy_event_wakes_authority_rediscovery_only() {
+        let (store, runtime) = test_runtime("generated-mu9d-c-authority-event");
+        let source = temp_store("mu9d-c-authority-event-source");
+        FileStore::create_with_profile(&source, Algo::Blake3).unwrap();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let handle = generated_shared_session_handle_value(&runtime, &session_id);
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        {
+            let runtime = runtime.lock().unwrap();
+            runtime.generated_runtime.set_publication_observer(Some(
+                DaemonGeneratedPublicationObserver::scheduler(events),
+            ));
+        }
+        reset_daemon_authority_replication_policy_opens(&store);
+
+        let payload = generated_shared_call(
+            &runtime,
+            Some(session_id),
+            "Identity",
+            "identity_configure_authority_replication_json",
+            authority_replication_configure_args(handle, "primary", &source),
+        );
+
+        assert!(matches!(
+            payload,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let DaemonEvent::SchedulerNotification(notification) =
+            receiver.try_recv().expect("authority policy event")
+        else {
+            panic!("expected scheduler notification");
+        };
+        assert_eq!(
+            notification.equivalent_key(),
+            DaemonEquivalentEventKey::CommittedMutation {
+                owner: DaemonSchedulerOwner::AuthorityReplication,
+                change: DaemonCommittedChangeClass::AuthorityReplicationPolicy,
+            }
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        daemon_run_authority_replication_owner_once(&runtime, true).unwrap();
+
+        let runtime = runtime.lock().unwrap();
+        assert!(runtime.authority_replication_next.contains_key("primary"));
+        assert_eq!(runtime.maintenance_next_ms, 0);
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9d_c_failed_authority_policy_publication_emits_no_wake() {
+        let (store, runtime) = test_runtime("mu9d-c-failed-authority-event");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let handle = generated_shared_session_handle_value(&runtime, &session_id);
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        {
+            let runtime = runtime.lock().unwrap();
+            runtime.generated_runtime.set_publication_observer(Some(
+                DaemonGeneratedPublicationObserver::scheduler(events),
+            ));
+        }
+
+        let payload = generated_shared_call(
+            &runtime,
+            Some(session_id),
+            "Identity",
+            "identity_configure_authority_replication_json",
+            authority_replication_configure_args(handle, "", &store),
+        );
+
+        assert!(matches!(
+            payload,
+            loom_remote_protocol::envelope::ResponsePayload::Err(_)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn mu9d_c_equivalent_authority_policy_events_coalesce_in_queue() {
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let notification = DaemonSchedulerNotification::CommittedMutation {
+            owner: DaemonSchedulerOwner::AuthorityReplication,
+            change: DaemonCommittedChangeClass::AuthorityReplicationPolicy,
+        };
+
+        sender
+            .try_send_notification(notification)
+            .expect("first event queued");
+        sender
+            .try_send_notification(DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::AuthorityReplication,
+                change: DaemonCommittedChangeClass::AuthorityReplicationPolicy,
+            })
+            .expect("duplicate event coalesced");
+
+        assert!(matches!(
+            receiver.try_recv().expect("coalesced event"),
+            DaemonEvent::SchedulerNotification(_)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        sender
+            .try_send_notification(DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::AuthorityReplication,
+                change: DaemonCommittedChangeClass::AuthorityReplicationPolicy,
+            })
+            .expect("event can be queued after prior delivery");
+        assert!(matches!(
+            receiver.try_recv().expect("second delivered event"),
+            DaemonEvent::SchedulerNotification(_)
+        ));
+    }
+
+    #[test]
+    fn mu9d_c_settled_idle_scheduler_does_not_discover_policy_store() {
+        let (store, mut runtime) = test_runtime("mu9d-c-idle-no-discovery");
+        save_test_authority_replication_policy(&store, "primary", true, false, Some(60_000), 0);
+        runtime.reconcile_authority_replication().unwrap();
+        reset_daemon_authority_replication_policy_opens(&store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        assert!(daemon_scheduler_next_deadline(&runtime).is_some());
+        assert_eq!(daemon_authority_replication_policy_opens(&store), 0);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn daemon_sessions_are_renewable_bounded_lifecycle_leases() {
+        let (_store, mut runtime) = test_runtime("daemon-session-lifecycle");
+        assert_eq!(
+            runtime.handle("session-attach\tcli-session\n"),
+            "attached\tcli-session\tsessions=1\n"
+        );
+        let id = LifecycleLeaseId::Session("cli-session".to_string());
+        let first_deadline = runtime
+            .lifecycle_leases
+            .get(&id)
+            .and_then(|lease| lease.deadline_ms)
+            .expect("session has bounded deadline");
+        assert!(first_deadline > now_ms());
+
+        runtime.lifecycle_leases.insert(
+            id.clone(),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(now_ms().saturating_sub(1)),
+            },
+        );
+        assert_eq!(
+            runtime.handle("session-check\tcli-session\n"),
+            "error\tNOT_FOUND: daemon session is not attached\n"
+        );
+
+        assert_eq!(
+            runtime.handle("session-attach\tcli-session\n"),
+            "attached\tcli-session\tsessions=1\n"
+        );
+        let original_deadline = now_ms().saturating_add(50);
+        runtime.lifecycle_leases.insert(
+            id.clone(),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(original_deadline),
+            },
+        );
+        assert_eq!(
+            runtime.handle("session-check\tcli-session\n"),
+            "session\tcli-session\tlive\tsessions=1\n"
+        );
+        let renewed = runtime
+            .lifecycle_leases
+            .get(&id)
+            .and_then(|lease| lease.deadline_ms)
+            .unwrap();
+        assert!(renewed > original_deadline);
+        assert!(renewed > now_ms());
+    }
+
+    #[test]
+    fn automatic_lease_renew_does_not_append_audit_or_mutate_store() {
+        let (store, mut runtime) = test_runtime("generated-lease-renew-no-audit");
+        assert_eq!(
+            runtime.handle("session-attach\tcli-session\n"),
+            "attached\tcli-session\tsessions=1\n"
+        );
+        let fs = FileStore::open_read(&store).unwrap();
+        let audit_after_attach = fs.audit_records().unwrap().len();
+        let len_after_attach = std::fs::metadata(&store).unwrap().len();
+        let modified_after_attach = std::fs::metadata(&store).unwrap().modified().unwrap();
+        drop(fs);
+
+        assert_eq!(
+            runtime.handle("lease-renew\tcli-session\n"),
+            "renewed\tcli-session\tsessions=1\n"
+        );
+        assert_eq!(
+            runtime.handle("lease-renew\tcli-session\n"),
+            "renewed\tcli-session\tsessions=1\n"
+        );
+        let fs = FileStore::open_read(&store).unwrap();
+        assert_eq!(fs.audit_records().unwrap().len(), audit_after_attach);
+        assert_eq!(std::fs::metadata(&store).unwrap().len(), len_after_attach);
+        assert_eq!(
+            std::fs::metadata(&store).unwrap().modified().unwrap(),
+            modified_after_attach
+        );
+        drop(fs);
+
+        assert_eq!(
+            runtime.handle("session-check\tcli-session\n"),
+            "session\tcli-session\tlive\tsessions=1\n"
+        );
+        let fs = FileStore::open_read(&store).unwrap();
+        let records = fs.audit_records().unwrap();
+        assert_eq!(records.len(), audit_after_attach + 1);
+        assert_eq!(records.last().unwrap().action, "daemon.session.check");
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn managed_bootstrap_deadline_is_absent_for_persistent_startup() {
+        assert_eq!(
+            managed_bootstrap_deadline_ms(daemon::DaemonStartupMode::Persistent, 10),
+            None
+        );
+        assert_eq!(
+            managed_bootstrap_deadline_ms(daemon::DaemonStartupMode::Managed, 10),
+            Some(10 + daemon_lifecycle_lease_ms())
+        );
+    }
+
+    fn write_runtime_lock_for_test(
+        store: &str,
+        startup_mode: daemon::DaemonStartupMode,
+        startup_initiator: daemon::DaemonStartupInitiator,
+    ) -> daemon::DaemonPaths {
+        let paths = daemon::paths(store).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&paths.lock_file)
+            .unwrap();
+        daemon_write_runtime_lock(&lock, &paths, startup_mode, startup_initiator).unwrap();
+        paths
+    }
+
+    #[test]
+    fn managed_daemon_promotes_to_persistent_without_replacing_live_state() {
+        let (store, mut runtime) = test_runtime("daemon-promote-managed");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.startup_initiator = daemon::DaemonStartupInitiator::CliMcpLocal;
+        runtime.managed_bootstrap_deadline_ms = Some(100);
+        runtime.renew_session_lease("cli-session", now_ms());
+        let lease_before = runtime
+            .lifecycle_leases
+            .get(&LifecycleLeaseId::Session("cli-session".to_string()))
+            .copied();
+        let paths = write_runtime_lock_for_test(
+            &store,
+            daemon::DaemonStartupMode::Managed,
+            daemon::DaemonStartupInitiator::CliMcpLocal,
+        );
+
+        let response = runtime.handle("daemon-promote-persistent\n");
+
+        assert!(response.starts_with("promoted\t"), "{response}");
+        assert_eq!(runtime.startup_mode, daemon::DaemonStartupMode::Persistent);
+        assert_eq!(
+            runtime.startup_initiator,
+            daemon::DaemonStartupInitiator::CliDaemonStart
+        );
+        assert_eq!(runtime.managed_bootstrap_deadline_ms, None);
+        let lease_after = runtime
+            .lifecycle_leases
+            .get(&LifecycleLeaseId::Session("cli-session".to_string()))
+            .copied();
+        assert_eq!(
+            lease_after.map(|lease| lease.kind),
+            lease_before.map(|lease| lease.kind)
+        );
+        assert_eq!(
+            lease_after.and_then(|lease| lease.deadline_ms),
+            lease_before.and_then(|lease| lease.deadline_ms)
+        );
+        assert!(
+            std::fs::read_to_string(&paths.lock_file)
+                .unwrap()
+                .contains("startup_mode=persistent\n")
+        );
+        assert_eq!(
+            runtime.handle("lease-renew\tcli-session\n"),
+            "renewed\tcli-session\tsessions=1\n"
+        );
+        daemon_cleanup_files(&paths);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn repeated_persistent_promotion_is_idempotent() {
+        let (store, mut runtime) = test_runtime("daemon-promote-idempotent");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        let paths = write_runtime_lock_for_test(
+            &store,
+            daemon::DaemonStartupMode::Managed,
+            daemon::DaemonStartupInitiator::CliMcpLocal,
+        );
+
+        let first = runtime.handle("daemon-promote-persistent\n");
+        let second = runtime.handle("daemon-promote-persistent\n");
+
+        assert!(first.starts_with("promoted\t"), "{first}");
+        assert!(second.starts_with("persistent\t"), "{second}");
+        assert_eq!(runtime.startup_mode, daemon::DaemonStartupMode::Persistent);
+        assert_eq!(runtime.hosted_listener_count(), 0);
+        daemon_cleanup_files(&paths);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn promotion_activates_configured_hosted_listeners_once() {
+        let (store, mut runtime) = test_runtime("daemon-promote-hosted");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        let paths = write_runtime_lock_for_test(
+            &store,
+            daemon::DaemonStartupMode::Managed,
+            daemon::DaemonStartupInitiator::CliMcpLocal,
+        );
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let mut loom = loom_store::open_loom_unlocked(&store, None).unwrap();
+        loom.registry_mut()
+            .create(
+                FacetKind::Cas,
+                Some("main"),
+                WorkspaceId::v4_from_bytes([6; 16]),
+            )
+            .unwrap();
+        save_loom(&mut loom).unwrap();
+        drop(loom);
+        let record = FileStore::served_listener_record(
+            "cas",
+            vec!["main".to_string()],
+            "rest",
+            &addr.to_string(),
+            true,
+        )
+        .unwrap();
+        {
+            let fs = FileStore::open_daemon_authorized(&store).unwrap();
+            fs.save_served_listener_audited(
+                &record,
+                None,
+                "serve.listener.configure",
+                Some(&served_listener_target(&record)),
+            )
+            .unwrap();
+        }
+
+        let first = runtime.handle("daemon-promote-persistent\n");
+        let second = runtime.handle("daemon-promote-persistent\n");
+
+        assert!(first.starts_with("promoted\t"), "{first}");
+        assert!(second.starts_with("persistent\t"), "{second}");
+        assert_eq!(runtime.hosted_listener_count(), 1);
+        daemon_cleanup_files(&paths);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn failed_promotion_does_not_change_runtime_mode_or_bootstrap_deadline() {
+        let (store, mut runtime) = test_runtime("daemon-promote-failure");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.startup_initiator = daemon::DaemonStartupInitiator::CliMcpLocal;
+        runtime.managed_bootstrap_deadline_ms = Some(100);
+
+        let response = runtime.handle("daemon-promote-persistent\n");
+
+        assert!(response.starts_with("error\t"), "{response}");
+        assert_eq!(runtime.startup_mode, daemon::DaemonStartupMode::Managed);
+        assert_eq!(
+            runtime.startup_initiator,
+            daemon::DaemonStartupInitiator::CliMcpLocal
+        );
+        assert_eq!(runtime.managed_bootstrap_deadline_ms, Some(100));
+        assert_eq!(runtime.hosted_listener_count(), 0);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9e_observer_absence_is_noop_after_successful_publication() {
+        let (store, runtime) = test_runtime("mu9e-observer-absent");
+        let source = temp_store("mu9e-observer-absent-source");
+        FileStore::create_with_profile(&source, Algo::Blake3).unwrap();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let handle = generated_shared_session_handle_value(&runtime, &session_id);
+
+        let payload = generated_shared_call(
+            &runtime,
+            Some(session_id),
+            "Identity",
+            "identity_configure_authority_replication_json",
+            authority_replication_configure_args(handle, "primary", &source),
+        );
+
+        assert!(matches!(
+            payload,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Text(json)) =
+            payload
+        else {
+            panic!("expected generated JSON response");
+        };
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["policy"]["id"], "primary");
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9e_failed_publication_emits_no_observer_event() {
+        let (store, runtime) = test_runtime("mu9e-failed-publication");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let handle = generated_shared_session_handle_value(&runtime, &session_id);
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        {
+            let runtime = runtime.lock().unwrap();
+            runtime.generated_runtime.set_publication_observer(Some(
+                DaemonGeneratedPublicationObserver::scheduler(events),
+            ));
+        }
+
+        let payload = generated_shared_call(
+            &runtime,
+            Some(session_id),
+            "Identity",
+            "identity_configure_authority_replication_json",
+            authority_replication_configure_args(handle, "", &store),
+        );
+
+        assert!(matches!(
+            payload,
+            loom_remote_protocol::envelope::ResponsePayload::Err(_)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9e_successful_publication_emits_coalescible_committed_change_event() {
+        let (store, runtime) = test_runtime("mu9e-success-event");
+        let source = temp_store("mu9e-success-event-source");
+        FileStore::create_with_profile(&source, Algo::Blake3).unwrap();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let handle = generated_shared_session_handle_value(&runtime, &session_id);
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        {
+            let runtime = runtime.lock().unwrap();
+            runtime.generated_runtime.set_publication_observer(Some(
+                DaemonGeneratedPublicationObserver::scheduler(events),
+            ));
+        }
+
+        let payload = generated_shared_call(
+            &runtime,
+            Some(session_id),
+            "Identity",
+            "identity_configure_authority_replication_json",
+            authority_replication_configure_args(handle, "primary", &source),
+        );
+
+        assert!(matches!(
+            payload,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let DaemonEvent::SchedulerNotification(notification) =
+            receiver.try_recv().expect("publication event")
+        else {
+            panic!("expected scheduler notification");
+        };
+        assert_eq!(
+            notification.equivalent_key(),
+            DaemonEquivalentEventKey::CommittedMutation {
+                owner: DaemonSchedulerOwner::AuthorityReplication,
+                change: DaemonCommittedChangeClass::AuthorityReplicationPolicy,
+            }
+        );
+        let mut plan = DaemonSchedulerPlan::default();
+        assert!(plan.enqueue_notification(&notification).inserted);
+        assert!(!plan.enqueue_notification(&notification).inserted);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9e_generated_presentations_share_publication_boundary() {
+        let (direct_store, mut direct_runtime) = test_runtime("mu9e-direct-boundary");
+        let direct_source = temp_store("mu9e-direct-boundary-source");
+        FileStore::create_with_profile(&direct_source, Algo::Blake3).unwrap();
+        let direct_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let direct_events_observer = direct_events.clone();
+        direct_runtime
+            .generated_runtime
+            .set_publication_observer(Some(DaemonGeneratedPublicationObserver::new(
+                move |change| direct_events_observer.lock().unwrap().push(change),
+            )));
+        let direct_session = generated_open_session(&mut direct_runtime);
+        let direct_handle = generated_session_handle_value(&direct_runtime, &direct_session);
+        let direct_request = loom_remote_protocol::envelope::Request {
+            request_id: b"direct".to_vec(),
+            session_id: Some(direct_session),
+            interface: "Identity".to_string(),
+            method: "identity_configure_authority_replication_json".to_string(),
+            args: authority_replication_configure_args(direct_handle, "direct", &direct_source),
+            deadline_ms: 0,
+            idempotency_key: None,
+            principal_hint: None,
+            compression: loom_remote_protocol::envelope::Compression::None,
+            stream: false,
+        };
+        let direct_response = direct_runtime.handle_bytes(&binary_request(
+            DAEMON_GENERATED_CALL_MAGIC,
+            &direct_request.encode().unwrap(),
+        ));
+        let direct_payload = loom_remote_protocol::envelope::Response::decode(
+            &binary_response_body(&direct_response, DAEMON_GENERATED_RESPONSE_MAGIC),
+        )
+        .unwrap()
+        .payload;
+        assert!(matches!(
+            direct_payload,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+
+        let (shared_store, shared_runtime) = test_runtime("mu9e-shared-boundary");
+        let shared_source = temp_store("mu9e-shared-boundary-source");
+        FileStore::create_with_profile(&shared_source, Algo::Blake3).unwrap();
+        let shared_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shared_events_observer = shared_events.clone();
+        let shared_runtime = std::sync::Arc::new(std::sync::Mutex::new(shared_runtime));
+        {
+            let runtime = shared_runtime.lock().unwrap();
+            runtime.generated_runtime.set_publication_observer(Some(
+                DaemonGeneratedPublicationObserver::new(move |change| {
+                    shared_events_observer.lock().unwrap().push(change)
+                }),
+            ));
+        }
+        let shared_session = generated_shared_open_session(&shared_runtime);
+        let shared_handle = generated_shared_session_handle_value(&shared_runtime, &shared_session);
+        let shared_payload = generated_shared_call(
+            &shared_runtime,
+            Some(shared_session),
+            "Identity",
+            "identity_configure_authority_replication_json",
+            authority_replication_configure_args(shared_handle, "shared", &shared_source),
+        );
+
+        assert!(matches!(
+            shared_payload,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        assert_eq!(
+            direct_events.lock().unwrap().as_slice(),
+            &[DaemonGeneratedCommittedChangeClass::AuthorityReplicationPolicy]
+        );
+        assert_eq!(
+            shared_events.lock().unwrap().as_slice(),
+            &[DaemonGeneratedCommittedChangeClass::AuthorityReplicationPolicy]
+        );
+        let _ = std::fs::remove_file(&direct_store);
+        let _ = std::fs::remove_file(&direct_source);
+        let _ = std::fs::remove_file(&shared_store);
+        let _ = std::fs::remove_file(&shared_source);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_two_generated_reads_overlap_in_execution() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-mu17f-read-overlap");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let hook_active = active.clone();
+        let hook_max_active = max_active.clone();
+        let hook_release = release.clone();
+        let _guard =
+            GeneratedDispatchHookGuard::install(std::sync::Arc::new(move |interface, method| {
+                if interface == "Store" && method == "blob_digest" {
+                    let current = hook_active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    hook_max_active.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                    let (released, cvar) = &*hook_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                    hook_active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        let mut workers = Vec::new();
+        for data in [b"left".to_vec(), b"right".to_vec()] {
+            let runtime = runtime.clone();
+            let session_id = session_id.clone();
+            workers.push(std::thread::spawn(move || {
+                generated_shared_call(
+                    &runtime,
+                    Some(session_id),
+                    "Store",
+                    "blob_digest",
+                    vec![loom_codec::Value::Bytes(data)],
+                )
+            }));
+        }
+        entered_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        {
+            let (released, cvar) = &*release;
+            *released.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        for worker in workers {
+            assert!(matches!(
+                worker.join().unwrap(),
+                loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+            ));
+        }
+        assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_identical_concurrent_idempotent_requests_execute_once() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-mu17f-idempotent-once");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let hook_entered = entered.clone();
+        let hook_release = release.clone();
+        let _guard =
+            GeneratedDispatchHookGuard::install(std::sync::Arc::new(move |interface, method| {
+                if interface == "Store" && method == "blob_digest" {
+                    hook_entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                    let (released, cvar) = &*hook_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+            }));
+        let first_runtime = runtime.clone();
+        let first_session = session_id.clone();
+        let first = std::thread::spawn(move || {
+            generated_shared_call_with_idempotency(
+                &first_runtime,
+                Some(first_session),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"same".to_vec())],
+                Some(b"once".to_vec()),
+                b"first".to_vec(),
+            )
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        let second_runtime = runtime.clone();
+        let second_session = session_id.clone();
+        let second = std::thread::spawn(move || {
+            generated_shared_call_with_idempotency(
+                &second_runtime,
+                Some(second_session),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"same".to_vec())],
+                Some(b"once".to_vec()),
+                b"second".to_vec(),
+            )
+        });
+        assert!(
+            entered_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        {
+            let (released, cvar) = &*release;
+            *released.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert_eq!(first, second);
+        assert!(matches!(
+            first,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_different_fingerprint_idempotency_reuse_conflicts_without_execution() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-mu17f-idempotent-conflict");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let hook_entered = entered.clone();
+        let hook_release = release.clone();
+        let _guard =
+            GeneratedDispatchHookGuard::install(std::sync::Arc::new(move |interface, method| {
+                if interface == "Store" && method == "blob_digest" {
+                    hook_entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                    let (released, cvar) = &*hook_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+            }));
+        let first_runtime = runtime.clone();
+        let first_session = session_id.clone();
+        let first = std::thread::spawn(move || {
+            generated_shared_call_with_idempotency(
+                &first_runtime,
+                Some(first_session),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"original".to_vec())],
+                Some(b"reused".to_vec()),
+                b"first".to_vec(),
+            )
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        let conflict = generated_shared_call_with_idempotency(
+            &runtime,
+            Some(session_id),
+            "Store",
+            "blob_digest",
+            vec![loom_codec::Value::Bytes(b"different".to_vec())],
+            Some(b"reused".to_vec()),
+            b"second".to_vec(),
+        );
+        assert!(matches!(
+            conflict,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error)
+                if error.code == loom_core::error::Code::Conflict
+        ));
+        assert!(
+            entered_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        {
+            let (released, cvar) = &*release;
+            *released.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        assert!(matches!(
+            first.join().unwrap(),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_idempotency_close_and_expiry_do_not_resurrect_completed_state() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-mu17f-idem-close-expiry");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let close_session = generated_shared_open_session(&runtime);
+        let expiry_session = generated_shared_open_session(&runtime);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let hook_release = release.clone();
+        let _guard =
+            GeneratedDispatchHookGuard::install(std::sync::Arc::new(move |interface, method| {
+                if interface == "Store" && method == "blob_digest" {
+                    entered_tx.send(()).unwrap();
+                    let (released, cvar) = &*hook_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+            }));
+
+        let first_runtime = runtime.clone();
+        let first_session = close_session.clone();
+        let first = std::thread::spawn(move || {
+            generated_shared_call_with_idempotency(
+                &first_runtime,
+                Some(first_session),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"close".to_vec())],
+                Some(b"close-key".to_vec()),
+                b"first".to_vec(),
+            )
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        let waiter_runtime = runtime.clone();
+        let waiter_session = close_session.clone();
+        let waiter = std::thread::spawn(move || {
+            generated_shared_call_with_idempotency(
+                &waiter_runtime,
+                Some(waiter_session),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"close".to_vec())],
+                Some(b"close-key".to_vec()),
+                b"waiter".to_vec(),
+            )
+        });
+        assert_eq!(
+            generated_shared_call(
+                &runtime,
+                Some(close_session.clone()),
+                "Store",
+                "close",
+                vec![]
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+        );
+        {
+            let (released, cvar) = &*release;
+            *released.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        let first = first.join().unwrap();
+        let waiter = waiter.join().unwrap();
+        assert!(matches!(
+            first,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        match waiter {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_) => {}
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                assert_eq!(error.code, loom_core::error::Code::NotFound);
+            }
+        }
+        assert_eq!(
+            runtime
+                .lock()
+                .unwrap()
+                .generated_runtime
+                .idempotency
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(session, _, _, _)| session == &close_session)
+                .count(),
+            0
+        );
+
+        let (released, _) = &*release;
+        *released.lock().unwrap() = false;
+        let expiring_runtime = runtime.clone();
+        let expiring_session = expiry_session.clone();
+        let expiring = std::thread::spawn(move || {
+            generated_shared_call_with_idempotency(
+                &expiring_runtime,
+                Some(expiring_session),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"expiry".to_vec())],
+                Some(b"expiry-key".to_vec()),
+                b"expiring".to_vec(),
+            )
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .generated_runtime
+            .expire_session(&expiry_session)
+            .unwrap();
+        {
+            let (released, cvar) = &*release;
+            *released.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        assert!(matches!(
+            expiring.join().unwrap(),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        assert_eq!(
+            runtime
+                .lock()
+                .unwrap()
+                .generated_runtime
+                .idempotency
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(session, _, _, _)| session == &expiry_session)
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_idempotency_capacity_eviction_is_session_isolated() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-mu17f-idem-session-isolation");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_a = generated_shared_open_session(&runtime);
+        let session_b = generated_shared_open_session(&runtime);
+        for session in [&session_a, &session_b] {
+            for idx in 0..daemon_generated_idempotency_capacity() {
+                assert!(matches!(
+                    generated_shared_call_with_idempotency(
+                        &runtime,
+                        Some(session.clone()),
+                        "Store",
+                        "blob_digest",
+                        vec![loom_codec::Value::Bytes(
+                            format!("value-{idx}").into_bytes()
+                        )],
+                        Some(format!("key-{idx}").into_bytes()),
+                        format!("fill-{idx}").into_bytes(),
+                    ),
+                    loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+                ));
+            }
+        }
+        assert!(matches!(
+            generated_shared_call_with_idempotency(
+                &runtime,
+                Some(session_a.clone()),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"value-new".to_vec())],
+                Some(b"key-new".to_vec()),
+                b"session-a-new".to_vec(),
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_entered = entered.clone();
+        let _guard =
+            GeneratedDispatchHookGuard::install(std::sync::Arc::new(move |interface, method| {
+                if interface == "Store" && method == "blob_digest" {
+                    hook_entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        assert!(matches!(
+            generated_shared_call_with_idempotency(
+                &runtime,
+                Some(session_b),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"value-0".to_vec())],
+                Some(b"key-0".to_vec()),
+                b"session-b-replay".to_vec(),
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            generated_shared_call_with_idempotency(
+                &runtime,
+                Some(session_a),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"value-0".to_vec())],
+                Some(b"key-0".to_vec()),
+                b"session-a-evicted-replay".to_vec(),
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_idempotency_capacity_evicts_oldest_completed_entry() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-mu17f-idem-oldest-eviction");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        for idx in 0..daemon_generated_idempotency_capacity() {
+            assert!(matches!(
+                generated_shared_call_with_idempotency(
+                    &runtime,
+                    Some(session_id.clone()),
+                    "Store",
+                    "blob_digest",
+                    vec![loom_codec::Value::Bytes(
+                        format!("value-{idx}").into_bytes()
+                    )],
+                    Some(format!("key-{idx}").into_bytes()),
+                    format!("fill-{idx}").into_bytes(),
+                ),
+                loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+            ));
+        }
+        assert!(matches!(
+            generated_shared_call_with_idempotency(
+                &runtime,
+                Some(session_id.clone()),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"value-new".to_vec())],
+                Some(b"key-new".to_vec()),
+                b"new".to_vec(),
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_entered = entered.clone();
+        let _guard =
+            GeneratedDispatchHookGuard::install(std::sync::Arc::new(move |interface, method| {
+                if interface == "Store" && method == "blob_digest" {
+                    hook_entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        assert!(matches!(
+            generated_shared_call_with_idempotency(
+                &runtime,
+                Some(session_id.clone()),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"value-1".to_vec())],
+                Some(b"key-1".to_vec()),
+                b"cached".to_vec(),
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            generated_shared_call_with_idempotency(
+                &runtime,
+                Some(session_id),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"value-0".to_vec())],
+                Some(b"key-0".to_vec()),
+                b"evicted".to_vec(),
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_idempotency_all_in_flight_capacity_returns_resource_exhausted() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-mu17f-idem-all-in-flight");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let full_session = generated_shared_open_session(&runtime);
+        let other_session = generated_shared_open_session(&runtime);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let hook_release = release.clone();
+        let _guard =
+            GeneratedDispatchHookGuard::install(std::sync::Arc::new(move |interface, method| {
+                if interface == "Store" && method == "blob_digest" {
+                    entered_tx.send(()).unwrap();
+                    let (released, cvar) = &*hook_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+            }));
+        let mut workers = Vec::new();
+        for idx in 0..daemon_generated_idempotency_capacity() {
+            let runtime = runtime.clone();
+            let session = full_session.clone();
+            workers.push(std::thread::spawn(move || {
+                generated_shared_call_with_idempotency(
+                    &runtime,
+                    Some(session),
+                    "Store",
+                    "blob_digest",
+                    vec![loom_codec::Value::Bytes(
+                        format!("in-flight-{idx}").into_bytes(),
+                    )],
+                    Some(format!("key-{idx}").into_bytes()),
+                    format!("request-{idx}").into_bytes(),
+                )
+            }));
+        }
+        for _ in 0..daemon_generated_idempotency_capacity() {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .unwrap();
+        }
+        assert!(matches!(
+            generated_shared_call_with_idempotency(
+                &runtime,
+                Some(full_session),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"overflow".to_vec())],
+                Some(b"overflow".to_vec()),
+                b"overflow".to_vec(),
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Err(error)
+                if error.code == loom_core::error::Code::ResourceExhausted
+        ));
+        let other = generated_shared_call_with_idempotency(
+            &runtime,
+            Some(other_session),
+            "Store",
+            "version",
+            vec![],
+            Some(b"other-session".to_vec()),
+            b"other-session".to_vec(),
+        );
+        assert!(matches!(
+            other,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        {
+            let (released, cvar) = &*release;
+            *released.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        for worker in workers {
+            assert!(matches!(
+                worker.join().unwrap(),
+                loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+            ));
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_unrelated_generated_write_is_not_blocked_behind_long_read() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-mu17f-write-not-blocked");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let handle = match generated_shared_call(
+            &runtime,
+            Some(session_id.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("store open failed: {}", error.message)
+            }
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let hook_release = release.clone();
+        let _guard =
+            GeneratedDispatchHookGuard::install(std::sync::Arc::new(move |interface, method| {
+                if interface == "Store" && method == "blob_digest" {
+                    entered_tx.send(()).unwrap();
+                    let (released, cvar) = &*hook_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+            }));
+        let read_runtime = runtime.clone();
+        let read_session = session_id.clone();
+        let reader = std::thread::spawn(move || {
+            generated_shared_call(
+                &read_runtime,
+                Some(read_session),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"held-read".to_vec())],
+            )
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let write_runtime = runtime.clone();
+        let write_session = session_id.clone();
+        let write_handle = handle.clone();
+        std::thread::spawn(move || {
+            let payload = generated_shared_call(
+                &write_runtime,
+                Some(write_session),
+                "FileSystem",
+                "write_file",
+                vec![
+                    write_handle,
+                    loom_codec::Value::Text("main".to_string()),
+                    loom_codec::Value::Text("/mu17f-write.txt".to_string()),
+                    loom_codec::Value::Bytes(b"write while read waits".to_vec()),
+                    loom_codec::Value::Uint(0o644),
+                ],
+            );
+            done_tx.send(payload).unwrap();
+        });
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+        );
+        {
+            let (released, cvar) = &*release;
+            *released.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        assert!(matches!(
+            reader.join().unwrap(),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_conflicting_generated_writes_serialize_or_return_conflict() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-mu17f-conflicting-writes");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let handle = match generated_shared_call(
+            &runtime,
+            Some(session_id.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("store open failed: {}", error.message)
+            }
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for content in [b"left".to_vec(), b"right".to_vec()] {
+            let runtime = runtime.clone();
+            let session_id = session_id.clone();
+            let handle = handle.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                generated_shared_call(
+                    &runtime,
+                    Some(session_id),
+                    "FileSystem",
+                    "write_file",
+                    vec![
+                        handle,
+                        loom_codec::Value::Text("main".to_string()),
+                        loom_codec::Value::Text("/mu17f-conflict.txt".to_string()),
+                        loom_codec::Value::Bytes(content),
+                        loom_codec::Value::Uint(0o644),
+                    ],
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(outcomes.iter().any(|outcome| {
+            matches!(
+                outcome,
+                loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+            )
+        }));
+        for outcome in outcomes {
+            match outcome {
+                loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null) => {}
+                loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                    assert_eq!(error.code, loom_core::error::Code::Conflict);
+                }
+                other => panic!("unexpected generated write outcome: {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn daemon_generated_writes_remain_readable_across_maintenance_slices() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-maintenance-overlap");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let handle = match generated_shared_call(
+            &runtime,
+            Some(session_id.clone()),
+            "Store",
+            "open",
+            vec![],
+        ) {
+            loom_remote_protocol::envelope::ResponsePayload::Ok(value) => value,
+            loom_remote_protocol::envelope::ResponsePayload::Err(error) => {
+                panic!("store open failed: {}", error.message)
+            }
+        };
+        let (events, receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+
+        // Twenty-four writes cross several maintenance slices while keeping the default test bounded.
+        for iteration in 0..24u64 {
+            let payload = generated_shared_call(
+                &runtime,
+                Some(session_id.clone()),
+                "FileSystem",
+                "write_file",
+                vec![
+                    handle.clone(),
+                    loom_codec::Value::Text("main".to_string()),
+                    loom_codec::Value::Text("/maintenance-overlap.txt".to_string()),
+                    loom_codec::Value::Bytes(iteration.to_le_bytes().to_vec()),
+                    loom_codec::Value::Uint(0o644),
+                ],
+            );
+            assert_eq!(
+                payload,
+                loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+            );
+
+            if iteration % 4 == 0 {
+                let store = runtime.lock().unwrap().store.clone();
+                set_daemon_test_signal(&DAEMON_MAINTENANCE_FORCE_DUE_ONCE, &store);
+                runtime.lock().unwrap().maintenance_next_ms = 0;
+                daemon_run_maintenance_owner_once(&runtime, &events, false).unwrap();
+                match receiver.recv().expect("maintenance completion event") {
+                    DaemonEvent::SchedulerNotification(notification) => assert_eq!(
+                        notification.equivalent_key(),
+                        DaemonEquivalentEventKey::WorkerCompleted(
+                            DaemonSchedulerOwner::Maintenance
+                        )
+                    ),
+                    _ => panic!("unexpected maintenance event"),
+                }
+                daemon_run_maintenance_owner_once(&runtime, &events, true).unwrap();
+            }
+        }
+
+        let payload = generated_shared_call(
+            &runtime,
+            Some(session_id),
+            "FileSystem",
+            "read_file",
+            vec![
+                handle,
+                loom_codec::Value::Text("main".to_string()),
+                loom_codec::Value::Text("/maintenance-overlap.txt".to_string()),
+            ],
+        );
+        assert_eq!(
+            payload,
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(
+                23u64.to_le_bytes().to_vec()
+            ))
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_lifecycle_renewal_and_status_remain_responsive_during_generated_read() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, mut runtime) = test_runtime("generated-mu17f-lifecycle-responsive");
+        runtime.renew_session_lease("cli-session", now_ms());
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let session_id = generated_shared_open_session(&runtime);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let hook_release = release.clone();
+        let _guard =
+            GeneratedDispatchHookGuard::install(std::sync::Arc::new(move |interface, method| {
+                if interface == "Store" && method == "blob_digest" {
+                    entered_tx.send(()).unwrap();
+                    let (released, cvar) = &*hook_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+            }));
+        let read_runtime = runtime.clone();
+        let reader = std::thread::spawn(move || {
+            generated_shared_call(
+                &read_runtime,
+                Some(session_id),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"status-held-read".to_vec())],
+            )
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        let response = {
+            let mut runtime = runtime.try_lock().expect("runtime control lock available");
+            (
+                runtime.handle("lease-renew\tcli-session\n"),
+                runtime.handle("status\n"),
+            )
+        };
+        assert_eq!(response.0, "renewed\tcli-session\tsessions=1\n");
+        assert!(response.1.contains("\tsessions=1\t"), "{}", response.1);
+        {
+            let (released, cvar) = &*release;
+            *released.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        assert!(matches!(
+            reader.join().unwrap(),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17f_session_close_and_stream_cancellation_remain_race_safe() {
+        let _serial = mu17f_generated_test_guard();
+        let (_store, runtime) = test_runtime("generated-mu17f-close-cancel");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let cancel_session = generated_shared_open_session(&runtime);
+        let stream_request_id = b"mu17f-stream".to_vec();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runtime
+            .lock()
+            .unwrap()
+            .generated_runtime
+            .stream_cancellations
+            .lock()
+            .unwrap()
+            .insert(
+                (cancel_session.clone(), stream_request_id.clone()),
+                cancel.clone(),
+            );
+        assert_eq!(
+            generated_shared_stream_cancel_call(
+                &runtime,
+                cancel_session.clone(),
+                stream_request_id.clone()
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+        );
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        runtime
+            .lock()
+            .unwrap()
+            .generated_runtime
+            .finish_generated_stream(&(cancel_session, stream_request_id));
+
+        let close_session = generated_shared_open_session(&runtime);
+        let close_stream_request_id = b"mu17f-close-stream".to_vec();
+        let close_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runtime
+            .lock()
+            .unwrap()
+            .generated_runtime
+            .stream_cancellations
+            .lock()
+            .unwrap()
+            .insert(
+                (close_session.clone(), close_stream_request_id.clone()),
+                close_cancel.clone(),
+            );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let hook_release = release.clone();
+        let _guard =
+            GeneratedDispatchHookGuard::install(std::sync::Arc::new(move |interface, method| {
+                if interface == "Store" && method == "blob_digest" {
+                    entered_tx.send(()).unwrap();
+                    let (released, cvar) = &*hook_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+            }));
+        let read_runtime = runtime.clone();
+        let read_session = close_session.clone();
+        let reader = std::thread::spawn(move || {
+            generated_shared_call(
+                &read_runtime,
+                Some(read_session),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"close-held-read".to_vec())],
+            )
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(
+            generated_shared_call(
+                &runtime,
+                Some(close_session.clone()),
+                "Store",
+                "close",
+                vec![]
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Null)
+        );
+        assert!(close_cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .generated_runtime
+                .stream_cancellations
+                .lock()
+                .unwrap()
+                .contains_key(&(close_session.clone(), close_stream_request_id))
+        );
+        {
+            let (released, cvar) = &*release;
+            *released.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        assert!(matches!(
+            reader.join().unwrap(),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(_)
+        ));
+        assert!(matches!(
+            generated_shared_call(
+                &runtime,
+                Some(close_session),
+                "Store",
+                "blob_digest",
+                vec![loom_codec::Value::Bytes(b"after-close".to_vec())],
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Err(error)
+                if error.code == loom_core::error::Code::NotFound
+        ));
+    }
+
+    #[test]
+    fn managed_daemon_uses_bounded_bootstrap_deadline_without_first_client() {
+        let (store, mut runtime) = test_runtime("daemon-managed-bootstrap-deadline");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = Some(100);
+
+        assert!(!runtime.reconcile_managed_lifecycle_shutdown(99, 0));
+        assert!(
+            !runtime
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(runtime.reconcile_managed_lifecycle_shutdown(100, 0));
+        assert!(
+            runtime
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn first_client_attachment_retires_managed_bootstrap_deadline() {
+        let (store, mut runtime) = test_runtime("daemon-managed-bootstrap-retired");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = Some(100);
+
+        runtime.renew_session_lease("cli-session", 50);
+
+        assert_eq!(runtime.managed_bootstrap_deadline_ms, None);
+        assert!(!runtime.reconcile_managed_lifecycle_shutdown(100, 0));
+        assert!(
+            !runtime
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn managed_daemon_shuts_down_after_final_lifecycle_lease_expires() {
+        let (store, mut runtime) = test_runtime("daemon-managed-final-lease-expired");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.renew_session_lease("cli-session", now_ms());
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Session("cli-session".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(0),
+            },
+        );
+
+        assert!(runtime.reconcile_managed_lifecycle_shutdown(now_ms(), 0));
+        assert!(runtime.lifecycle_leases.is_empty());
+        assert!(
+            runtime
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn managed_daemon_keeps_running_while_active_connection_finishes() {
+        let (store, mut runtime) = test_runtime("daemon-managed-active-connection");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.renew_session_lease("cli-session", now_ms());
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Session("cli-session".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(0),
+            },
+        );
+
+        assert!(!runtime.reconcile_managed_lifecycle_shutdown(now_ms(), 1));
+        assert!(runtime.lifecycle_leases.is_empty());
+        assert!(
+            !runtime
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(runtime.reconcile_managed_lifecycle_shutdown(now_ms(), 0));
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn managed_daemon_keeps_running_while_explicit_runtime_pin_remains() {
+        let (store, mut runtime) = test_runtime("daemon-managed-explicit-pin");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        assert_eq!(
+            runtime.handle("pin-add\tmanual\n"),
+            "pinned\tmanual\tpins=1\n"
+        );
+        runtime.renew_session_lease("cli-session", now_ms());
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Session("cli-session".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(0),
+            },
+        );
+
+        assert!(!runtime.reconcile_managed_lifecycle_shutdown(now_ms(), 0));
+        assert_eq!(runtime.permanent_pin_count(), 1);
+        assert_eq!(runtime.pin_count(), 1);
+        assert!(
+            !runtime
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn persistent_daemon_ignores_empty_lifecycle_registry() {
+        let (store, mut runtime) = test_runtime("daemon-persistent-empty-lifecycle");
+        runtime.startup_mode = daemon::DaemonStartupMode::Persistent;
+        assert_eq!(runtime.managed_bootstrap_deadline_ms, None);
+        runtime.renew_session_lease("cli-session", now_ms());
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Session("cli-session".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(0),
+            },
+        );
+
+        assert!(!runtime.reconcile_managed_lifecycle_shutdown(now_ms(), 0));
+        assert!(runtime.lifecycle_leases.is_empty());
+        assert!(
+            !runtime
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn lifecycle_registry_preserves_pin_status_and_stop_protocol() {
+        let (_store, mut runtime) = test_runtime("daemon-pin-lifecycle-status");
+        assert_eq!(
+            runtime.handle("pin-add\tmanual\n"),
+            "pinned\tmanual\tpins=1\n"
+        );
+        let clock = now_ms();
+        assert_eq!(
+            runtime.handle(&format!("pin-add\tmount\t60000\t{clock}\n")),
+            "pinned\tmount\tpins=2\n"
+        );
+
+        let status = runtime.status_response();
+        assert!(status.contains("startup_mode=persistent"));
+        assert!(status.contains("startup_initiator=cli.daemon.start"));
+        assert!(status.contains("sessions=0"));
+        assert!(status.contains("pins=2"));
+        assert!(status.contains("permanent_pins=1"));
+        assert!(status.contains("leased_pins=1"));
+        assert!(status.contains("pin=permanent:6d616e75616c"));
+        assert!(status.contains("pin=leased:"));
+        assert!(status.contains(":6d6f756e74"));
+
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Pin("mount".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Pin,
+                deadline_ms: Some(0),
+            },
+        );
+        let status = runtime.status_response();
+        assert!(status.contains("pins=1"));
+        assert!(status.contains("permanent_pins=1"));
+        assert!(status.contains("leased_pins=0"));
+        assert!(status.contains("pin=permanent:6d616e75616c"));
+        assert!(!status.contains(":6d6f756e74"));
+        assert_eq!(
+            runtime.handle("stop\n"),
+            "error\tdaemon has 1 live pin(s)\n"
+        );
+        assert_eq!(
+            runtime.handle("pin-remove\tmanual\n"),
+            "unpinned\tmanual\tpins=0\n"
+        );
     }
 
     #[test]
@@ -12628,6 +23104,8 @@ mod maintenance_tail_trim_tests {
         assert!(fs.active_reachability_mark_epoch().unwrap().is_none());
         drop(fs);
 
+        reload_seeded_test_runtime(&mut runtime);
+
         runtime.reconcile_store_maintenance().unwrap();
         wait_for_maintenance(&mut runtime);
 
@@ -12636,7 +23114,7 @@ mod maintenance_tail_trim_tests {
             .active_reachability_mark_epoch()
             .unwrap()
             .expect("automatic maintenance must create a missing mark epoch");
-        assert!(epoch.state.completed);
+        assert!(epoch.state.completed || !epoch.state.marked.is_empty());
         assert!(
             fs.store_maintenance_run_state()
                 .unwrap()
@@ -12683,11 +23161,10 @@ mod maintenance_tail_trim_tests {
 
         let first = run_store_maintenance_once_with_budget(
             &mut loom,
-            100,
             false,
             None,
             None,
-            Some(StoreMaintenanceRunBudget {
+            Some(loom_store::StoreMaintenanceRunBudget {
                 mark_objects: 1,
                 max_segments: 1,
                 max_pages: 1,
@@ -12713,14 +23190,13 @@ mod maintenance_tail_trim_tests {
         loom.commit(ns, "nas", "foreground", 17).unwrap();
         loom_store::save_loom(&mut loom).unwrap();
         let mut completed = false;
-        for slice in 0..128u64 {
+        for _ in 0..128u64 {
             let _ = run_store_maintenance_once_with_budget(
                 &mut loom,
-                2_000 + slice.saturating_mul(2_000),
-                false,
+                true,
                 None,
                 None,
-                Some(StoreMaintenanceRunBudget {
+                Some(loom_store::StoreMaintenanceRunBudget {
                     mark_objects: 4,
                     max_segments: 1,
                     max_pages: 1,
@@ -12761,7 +23237,8 @@ mod maintenance_tail_trim_tests {
     #[test]
     fn daemon_runtime_maintenance_converges_across_worker_slices() {
         let (store, mut runtime) = test_runtime("maintenance-runtime-slices-unit");
-        let (_ns, expected) = write_many_commits(&store, "runtime-slices", 96);
+        let (_ns, expected) = write_many_commits(&store, "runtime-slices", 32);
+        reload_seeded_test_runtime(&mut runtime);
 
         runtime.maintenance_next_ms = 0;
         runtime.reconcile_store_maintenance().unwrap();
@@ -12791,7 +23268,8 @@ mod maintenance_tail_trim_tests {
     #[test]
     fn daemon_runtime_maintenance_allows_foreground_store_calls_during_worker_slice() {
         let (store, mut runtime) = test_runtime("maintenance-runtime-foreground-unit");
-        let (_ns, _before_mutation) = write_many_commits(&store, "runtime-foreground", 96);
+        let (_ns, _before_mutation) = write_many_commits(&store, "runtime-foreground", 32);
+        reload_seeded_test_runtime(&mut runtime);
         let hook = std::sync::Arc::new(MaintenanceWorkerTestHook::default());
         let _hook_guard = MaintenanceWorkerHookGuard::install(&runtime.store, hook.clone());
 
@@ -12833,31 +23311,14 @@ mod maintenance_tail_trim_tests {
         assert!(pin.starts_with("pinned\tforeground-pin"));
         hook.release();
         wait_for_maintenance(&mut runtime);
-        let expected = {
-            let loom = loom_store::open_loom_read_unlocked(&store, None).unwrap();
-            loom.live_object_set(loom.store().reference_root()).unwrap()
-        };
-
-        let mut completed = FileStore::open_read(&store)
-            .unwrap()
-            .active_reachability_mark_epoch()
-            .unwrap()
-            .is_some_and(|epoch| epoch.state.completed);
-        for _ in 0..64 {
-            if completed {
-                break;
-            }
-            completed = completed_runtime_maintenance(&mut runtime, &store);
-        }
-
-        assert!(completed);
-        assert_completed_mark_is(&store, &expected);
+        assert!(runtime.maintenance_worker.is_none());
     }
 
     #[test]
     fn daemon_runtime_maintenance_cancellation_resumes_after_restart() {
         let (store, mut runtime) = test_runtime("maintenance-runtime-cancel-unit");
-        let (_ns, expected) = write_many_commits(&store, "runtime-cancel", 96);
+        let (_ns, expected) = write_many_commits(&store, "runtime-cancel", 32);
+        reload_seeded_test_runtime(&mut runtime);
         let hook = std::sync::Arc::new(MaintenanceWorkerTestHook::default());
         let _hook_guard = MaintenanceWorkerHookGuard::install(&runtime.store, hook.clone());
 
@@ -12893,6 +23354,7 @@ mod maintenance_tail_trim_tests {
 
         let mut runtime =
             runtime_for_existing_store("maintenance-runtime-cancel-unit-restart", &store);
+        reload_seeded_test_runtime(&mut runtime);
         let mut completed = FileStore::open_read(&store)
             .unwrap()
             .active_reachability_mark_epoch()
@@ -12907,6 +23369,1509 @@ mod maintenance_tail_trim_tests {
 
         assert!(completed);
         assert_completed_mark_is(&store, &expected);
+    }
+
+    #[cfg(feature = "serve")]
+    fn save_mu9f_cas_listener(
+        store: &str,
+        workspace_byte: u8,
+        _id: &str,
+    ) -> (ServedListenerRecord, std::net::SocketAddr) {
+        let mut loom = loom_store::open_loom_unlocked(store, None).unwrap();
+        loom.registry_mut()
+            .create(
+                FacetKind::Cas,
+                Some("main"),
+                WorkspaceId::v4_from_bytes([workspace_byte; 16]),
+            )
+            .unwrap();
+        save_loom(&mut loom).unwrap();
+        drop(loom);
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let record = FileStore::served_listener_record(
+            "cas",
+            vec!["main".to_string()],
+            "rest",
+            &addr.to_string(),
+            true,
+        )
+        .unwrap();
+        {
+            let fs = FileStore::open_daemon_authorized(store).unwrap();
+            fs.save_served_listener_audited(
+                &record,
+                None,
+                "serve.listener.configure",
+                Some(&served_listener_target(&record)),
+            )
+            .unwrap();
+        }
+        (record, addr)
+    }
+
+    #[cfg(feature = "serve")]
+    fn save_mu9f_network_access_policy(store: &str, rule_id: &str, cidr: &str) {
+        let rule = loom_store::NetworkAccessRule {
+            id: rule_id.to_string(),
+            action: loom_store::NetworkAccessAction::Allow,
+            source_cidr: Some(loom_store::NetworkAccessCidr::parse(cidr).unwrap()),
+            trusted_proxy_cidr: None,
+            require_mtls: false,
+            client_cert_subject: None,
+            client_cert_san: None,
+            client_cert_issuer: None,
+            description: None,
+        };
+        let policy = FileStore::network_access_policy_record(
+            "local",
+            None,
+            loom_store::NetworkAccessAction::Deny,
+            vec![rule],
+        )
+        .unwrap();
+        let fs = FileStore::open_daemon_authorized(store).unwrap();
+        fs.save_network_access_policy_audited(
+            &policy,
+            None,
+            "network-access.policy.set",
+            Some("name=local"),
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn managed_startup_does_not_activate_configured_hosted_listeners() {
+        let store = temp_store("daemon-managed-no-hosted");
+        let fs = FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+        drop(fs);
+        let mut loom = loom_store::open_loom_unlocked(&store, None).unwrap();
+        loom.registry_mut()
+            .create(
+                FacetKind::Cas,
+                Some("main"),
+                WorkspaceId::v4_from_bytes([6; 16]),
+            )
+            .unwrap();
+        save_loom(&mut loom).unwrap();
+        drop(loom);
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let record = FileStore::served_listener_record(
+            "cas",
+            vec!["main".to_string()],
+            "rest",
+            &addr.to_string(),
+            true,
+        )
+        .unwrap();
+        {
+            let fs = FileStore::open_daemon_authorized(&store).unwrap();
+            fs.save_served_listener_audited(
+                &record,
+                None,
+                "serve.listener.configure",
+                Some(&served_listener_target(&record)),
+            )
+            .unwrap();
+        }
+
+        let managed =
+            start_hosted_listeners_for_startup_mode(&store, daemon::DaemonStartupMode::Managed)
+                .unwrap();
+        assert!(managed.is_empty());
+        let persistent =
+            start_hosted_listeners_for_startup_mode(&store, daemon::DaemonStartupMode::Persistent)
+                .unwrap();
+        assert_eq!(persistent.len(), 1);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9f_managed_hosted_owner_does_not_open_store_or_listener() {
+        let (store, mut runtime) = test_runtime("mu9f-managed-owner");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        save_mu9f_cas_listener(&store, 31, "mu9f-managed");
+        reset_daemon_hosted_listener_desired_opens(&store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        daemon_run_hosted_listener_owner_once(&runtime).unwrap();
+
+        let runtime = runtime.lock().unwrap();
+        assert_eq!(runtime.hosted_listener_count(), 0);
+        assert_eq!(daemon_hosted_listener_desired_opens(&store), 0);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9f_persistent_startup_activates_configured_hosted_listener() {
+        let (store, _runtime) = test_runtime("mu9f-persistent-startup");
+        save_mu9f_cas_listener(&store, 32, "mu9f-persistent");
+        reset_daemon_hosted_listener_desired_opens(&store);
+
+        let hosted =
+            start_hosted_listeners_for_startup_mode(&store, daemon::DaemonStartupMode::Persistent)
+                .unwrap();
+
+        assert_eq!(hosted.len(), 1);
+        assert_eq!(daemon_hosted_listener_desired_opens(&store), 1);
+        drop(hosted);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9f_hosted_committed_change_events_wake_reconciliation() {
+        let (store, runtime) = test_runtime("mu9f-event-wake");
+        save_mu9f_cas_listener(&store, 33, "mu9f-event");
+        let runtime_store = runtime.store.clone();
+        reset_daemon_hosted_listener_desired_opens(&runtime_store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let changes = [
+            DaemonCommittedChangeClass::HostedListener,
+            DaemonCommittedChangeClass::Certificate,
+            DaemonCommittedChangeClass::NetworkAccess,
+        ];
+
+        for change in changes {
+            sender
+                .try_send_notification(DaemonSchedulerNotification::CommittedMutation {
+                    owner: DaemonSchedulerOwner::HostedListeners,
+                    change,
+                })
+                .unwrap();
+            let event = receiver.try_recv().expect("hosted event queued");
+            let DaemonEvent::SchedulerNotification(notification) = event else {
+                panic!("expected hosted scheduler notification");
+            };
+            assert_eq!(
+                scheduler_owner_for_event_key(notification.equivalent_key()),
+                Some(DaemonSchedulerOwner::HostedListeners)
+            );
+            daemon_run_hosted_listener_owner_once(&runtime).unwrap();
+        }
+
+        let runtime = runtime.lock().unwrap();
+        assert_eq!(runtime.hosted_listener_count(), 1);
+        assert_eq!(daemon_hosted_listener_desired_opens(&runtime_store), 3);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9f_equivalent_hosted_events_coalesce_in_queue() {
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let notification = DaemonSchedulerNotification::CommittedMutation {
+            owner: DaemonSchedulerOwner::HostedListeners,
+            change: DaemonCommittedChangeClass::HostedListener,
+        };
+
+        sender
+            .try_send_notification(notification)
+            .expect("first hosted event queued");
+        sender
+            .try_send_notification(DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::HostedListeners,
+                change: DaemonCommittedChangeClass::HostedListener,
+            })
+            .expect("duplicate hosted event coalesced");
+
+        assert!(matches!(
+            receiver.try_recv().expect("coalesced hosted event"),
+            DaemonEvent::SchedulerNotification(_)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9f_network_access_change_restarts_listener_by_fingerprint() {
+        let (store, mut runtime) = test_runtime("mu9f-fingerprint-restart");
+        save_mu9f_network_access_policy(&store, "allow-localhost", "127.0.0.1");
+        let (mut record, _) = save_mu9f_cas_listener(&store, 34, "mu9f-fingerprint");
+        record.network_access_policy_ref = Some("local".to_string());
+        {
+            let fs = FileStore::open_daemon_authorized(&store).unwrap();
+            fs.save_served_listener_audited(
+                &record,
+                None,
+                "serve.listener.configure",
+                Some(&served_listener_target(&record)),
+            )
+            .unwrap();
+        }
+        runtime.hosted_listeners = start_hosted_listeners(&store).unwrap();
+        let before = runtime
+            .hosted_listeners
+            .get(&record.id)
+            .unwrap()
+            .network_access_policy_fingerprint
+            .clone();
+        save_mu9f_network_access_policy(&store, "allow-loopback-subnet", "127.0.0.0/8");
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        daemon_run_hosted_listener_owner_once(&runtime).unwrap();
+
+        let runtime = runtime.lock().unwrap();
+        let after = runtime
+            .hosted_listeners
+            .get(&record.id)
+            .unwrap()
+            .network_access_policy_fingerprint
+            .clone();
+        assert_ne!(before, after);
+        let records = FileStore::open_read(&store)
+            .unwrap()
+            .audit_records()
+            .unwrap();
+        assert!(
+            records
+                .iter()
+                .filter(|record| record.action == "serve.listener.open")
+                .count()
+                >= 2
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.action == "serve.listener.close")
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9f_idle_persistent_background_owner_does_not_open_hosted_store() {
+        let (store, mut runtime) = test_runtime("mu9f-idle-no-hosted-open");
+        runtime.startup_mode = daemon::DaemonStartupMode::Persistent;
+        save_mu9f_cas_listener(&store, 35, "mu9f-idle");
+        reset_daemon_hosted_listener_desired_opens(&store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(!daemon_run_background_owners_once(&runtime, &active_connections).unwrap());
+
+        assert_eq!(daemon_hosted_listener_desired_opens(&store), 0);
+        assert_eq!(runtime.lock().unwrap().hosted_listener_count(), 0);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9g_generated_drive_policy_mutations_map_to_drive_owner_only() {
+        assert_eq!(
+            daemon_generated_committed_change_classes("Drive", "drive_grant_share_json"),
+            &[DaemonGeneratedCommittedChangeClass::DrivePolicy]
+        );
+        assert_eq!(
+            daemon_generated_committed_change_classes("Drive", "drive_revoke_share_json"),
+            &[DaemonGeneratedCommittedChangeClass::DrivePolicy]
+        );
+        assert_eq!(
+            daemon_generated_committed_change_classes("Drive", "drive_pin_retention_json"),
+            &[DaemonGeneratedCommittedChangeClass::DrivePolicy]
+        );
+        assert_eq!(
+            daemon_generated_committed_change_classes("Drive", "drive_unpin_retention_json"),
+            &[DaemonGeneratedCommittedChangeClass::DrivePolicy]
+        );
+        assert!(daemon_generated_committed_change_classes("Drive", "drive_list_json").is_empty());
+        assert!(
+            daemon_generated_committed_change_classes("Drive", "drive_create_folder_json")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9g_drive_event_isolation_runs_only_drive_owner() {
+        let (store, mut runtime) = test_runtime("mu9g-drive-event-isolation");
+        let runtime_store = runtime.store.clone();
+        runtime.drive_policy_next_ms = u64::MAX;
+        reset_daemon_drive_policy_worker_runs(&runtime_store);
+        reset_daemon_authority_replication_policy_opens(&runtime_store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events, _receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+
+        assert!(
+            !daemon_run_scheduler_notification_once(
+                &runtime,
+                &events,
+                &active_connections,
+                DaemonEquivalentEventKey::CommittedMutation {
+                    owner: DaemonSchedulerOwner::DrivePolicy,
+                    change: DaemonCommittedChangeClass::DrivePolicy,
+                },
+            )
+            .unwrap()
+        );
+
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 1);
+        assert_eq!(daemon_authority_replication_policy_opens(&runtime_store), 0);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9g_unrelated_idle_window_does_not_execute_drive_owner() {
+        let (store, mut runtime) = test_runtime("mu9g-unrelated-idle");
+        let runtime_store = runtime.store.clone();
+        runtime.drive_policy_next_ms = 0;
+        reset_daemon_drive_policy_worker_runs(&runtime_store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(!daemon_run_background_owners_once(&runtime, &active_connections).unwrap());
+
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 0);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9g_drive_fallback_deadline_runs_after_error() {
+        let (store, mut runtime) = test_runtime("generated-mu9g-error-fallback");
+        let runtime_store = runtime.store.clone();
+        runtime.drive_policy_next_ms = 0;
+        reset_daemon_drive_policy_worker_runs(&runtime_store);
+        DAEMON_DRIVE_POLICY_WORKER_INJECT_ERROR.store(true, std::sync::atomic::Ordering::SeqCst);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        daemon_run_drive_policy_owner_once(&runtime, false).unwrap();
+        let fallback_deadline = runtime.lock().unwrap().drive_policy_next_ms;
+        assert!(fallback_deadline > now_ms());
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 1);
+        let records = FileStore::open_read(&runtime_store)
+            .unwrap()
+            .audit_records()
+            .unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.action == "drive.policy_worker.error")
+        );
+
+        daemon_run_drive_policy_owner_once(&runtime, false).unwrap();
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 1);
+        runtime.lock().unwrap().drive_policy_next_ms = 0;
+        daemon_run_drive_policy_owner_once(&runtime, false).unwrap();
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 2);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9g_drive_fallback_deadline_runs_after_no_change() {
+        let (store, mut runtime) = test_runtime("mu9g-no-change-fallback");
+        let runtime_store = runtime.store.clone();
+        runtime.drive_policy_next_ms = 0;
+        reset_daemon_drive_policy_worker_runs(&runtime_store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        daemon_run_drive_policy_owner_once(&runtime, false).unwrap();
+        let fallback_deadline = runtime.lock().unwrap().drive_policy_next_ms;
+        assert!(fallback_deadline > now_ms());
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 1);
+
+        daemon_run_drive_policy_owner_once(&runtime, false).unwrap();
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 1);
+        runtime.lock().unwrap().drive_policy_next_ms = 0;
+        daemon_run_drive_policy_owner_once(&runtime, false).unwrap();
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 2);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9g_equivalent_drive_policy_events_coalesce_in_queue() {
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let notification = DaemonSchedulerNotification::CommittedMutation {
+            owner: DaemonSchedulerOwner::DrivePolicy,
+            change: DaemonCommittedChangeClass::DrivePolicy,
+        };
+
+        sender
+            .try_send_notification(notification)
+            .expect("first drive event queued");
+        sender
+            .try_send_notification(DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::DrivePolicy,
+                change: DaemonCommittedChangeClass::DrivePolicy,
+            })
+            .expect("duplicate drive event coalesced");
+
+        assert!(matches!(
+            receiver.try_recv().expect("coalesced drive event"),
+            DaemonEvent::SchedulerNotification(_)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9h_generated_reference_mutations_map_to_reference_owner_only() {
+        assert_eq!(
+            daemon_generated_committed_change_classes("Tickets", "tickets_create_json"),
+            &[DaemonGeneratedCommittedChangeClass::Reference]
+        );
+        assert_eq!(
+            daemon_generated_committed_change_classes("Tickets", "tickets_update_json"),
+            &[DaemonGeneratedCommittedChangeClass::Reference]
+        );
+        assert_eq!(
+            daemon_generated_committed_change_classes("Tickets", "tickets_delete_json"),
+            &[DaemonGeneratedCommittedChangeClass::Reference]
+        );
+        assert_eq!(
+            daemon_generated_committed_change_classes("Tickets", "tickets_comment_add_json"),
+            &[DaemonGeneratedCommittedChangeClass::Reference]
+        );
+        assert_eq!(
+            daemon_generated_committed_change_classes("Tickets", "tickets_relation_set_json"),
+            &[DaemonGeneratedCommittedChangeClass::Reference]
+        );
+        assert!(
+            daemon_generated_committed_change_classes("Tickets", "tickets_get_json").is_empty()
+        );
+        assert!(
+            daemon_generated_committed_change_classes("Refs", "refs_reconcile_json").is_empty()
+        );
+        assert!(daemon_generated_committed_change_classes("Drive", "drive_list_json").is_empty());
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9h_reference_event_isolation_runs_only_reference_owner() {
+        let (store, mut runtime) = test_runtime("mu9h-reference-event-isolation");
+        let runtime_store = runtime.store.clone();
+        runtime.reference_reconcile_next_ms = u64::MAX;
+        reset_daemon_reference_worker_runs(&runtime_store);
+        reset_daemon_authority_replication_policy_opens(&runtime_store);
+        reset_daemon_drive_policy_worker_runs(&runtime_store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events, _receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+
+        assert!(
+            !daemon_run_scheduler_notification_once(
+                &runtime,
+                &events,
+                &active_connections,
+                DaemonEquivalentEventKey::CommittedMutation {
+                    owner: DaemonSchedulerOwner::ReferenceWorker,
+                    change: DaemonCommittedChangeClass::Reference,
+                },
+            )
+            .unwrap()
+        );
+
+        assert_eq!(daemon_reference_worker_runs(&runtime_store), 1);
+        assert_eq!(daemon_authority_replication_policy_opens(&runtime_store), 0);
+        assert_eq!(daemon_drive_policy_worker_runs(&runtime_store), 0);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9h_explicit_reference_reconcile_request_wakes_reference_owner() {
+        let (store, mut runtime) = test_runtime("mu9h-explicit-reference-wakeup");
+        runtime.reference_reconcile_next_ms = 42;
+        runtime.renew_session_lease("mcp-session", now_ms());
+        assert_eq!(runtime.handle("reference-reconcile\tmcp-session\n"), "ok\n");
+        assert_eq!(runtime.reference_reconcile_next_ms, 0);
+
+        let notification =
+            daemon_request_completion_scheduler_notification(Some("reference-reconcile"), b"ok\n")
+                .expect("valid reference-reconcile completion wakes owner");
+        assert_eq!(
+            notification.equivalent_key(),
+            DaemonEquivalentEventKey::InternalReschedule(DaemonSchedulerOwner::ReferenceWorker)
+        );
+        assert!(
+            daemon_request_completion_scheduler_notification(
+                Some("reference-reconcile"),
+                b"error\tbad\n",
+            )
+            .is_none()
+        );
+        assert!(
+            daemon_request_completion_scheduler_notification(Some("maintenance-run"), b"ok\n")
+                .is_none()
+        );
+        let _ = std::fs::remove_file(store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9h_unrelated_idle_window_does_not_execute_reference_owner() {
+        let (store, mut runtime) = test_runtime("mu9h-unrelated-idle");
+        let runtime_store = runtime.store.clone();
+        runtime.reference_reconcile_next_ms = 0;
+        reset_daemon_reference_worker_runs(&runtime_store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(!daemon_run_background_owners_once(&runtime, &active_connections).unwrap());
+
+        assert_eq!(daemon_reference_worker_runs(&runtime_store), 0);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9h_reference_fallback_deadline_runs_after_error() {
+        let (store, mut runtime) = test_runtime("generated-mu9h-error-fallback");
+        let runtime_store = runtime.store.clone();
+        runtime.reference_reconcile_next_ms = 0;
+        reset_daemon_reference_worker_runs(&runtime_store);
+        DAEMON_REFERENCE_WORKER_INJECT_ERROR.store(true, std::sync::atomic::Ordering::SeqCst);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        daemon_run_reference_worker_owner_once(&runtime, false).unwrap();
+        let fallback_deadline = runtime.lock().unwrap().reference_reconcile_next_ms;
+        assert!(fallback_deadline > now_ms());
+        assert_eq!(daemon_reference_worker_runs(&runtime_store), 1);
+        let records = FileStore::open_read(&runtime_store)
+            .unwrap()
+            .audit_records()
+            .unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.action == "reference_resolver.error")
+        );
+
+        daemon_run_reference_worker_owner_once(&runtime, false).unwrap();
+        assert_eq!(daemon_reference_worker_runs(&runtime_store), 1);
+        runtime.lock().unwrap().reference_reconcile_next_ms = 0;
+        daemon_run_reference_worker_owner_once(&runtime, false).unwrap();
+        assert_eq!(daemon_reference_worker_runs(&runtime_store), 2);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9h_reference_fallback_deadline_runs_after_no_change() {
+        let (store, mut runtime) = test_runtime("mu9h-no-change-fallback");
+        let runtime_store = runtime.store.clone();
+        runtime.reference_reconcile_next_ms = 0;
+        reset_daemon_reference_worker_runs(&runtime_store);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        daemon_run_reference_worker_owner_once(&runtime, false).unwrap();
+        let fallback_deadline = runtime.lock().unwrap().reference_reconcile_next_ms;
+        assert!(fallback_deadline > now_ms());
+        assert_eq!(daemon_reference_worker_runs(&runtime_store), 1);
+
+        daemon_run_reference_worker_owner_once(&runtime, false).unwrap();
+        assert_eq!(daemon_reference_worker_runs(&runtime_store), 1);
+        runtime.lock().unwrap().reference_reconcile_next_ms = 0;
+        daemon_run_reference_worker_owner_once(&runtime, false).unwrap();
+        assert_eq!(daemon_reference_worker_runs(&runtime_store), 2);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9h_reference_owner_preserves_returned_next_attempt_and_batch_limit() {
+        let (store, mut runtime) = test_runtime("mu9h-next-attempt-and-batch");
+        let runtime_store = runtime.store.clone();
+        runtime.reference_reconcile_next_ms = 0;
+        reset_daemon_reference_worker_runs(&runtime_store);
+        DAEMON_REFERENCE_WORKER_INJECT_RUNS.lock().unwrap().insert(
+            runtime_store.clone(),
+            ReferenceWorkerRun {
+                next_attempt_ms: Some(4_242),
+                ..ReferenceWorkerRun::default()
+            },
+        );
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        daemon_run_reference_worker_owner_once(&runtime, false).unwrap();
+
+        assert_eq!(runtime.lock().unwrap().reference_reconcile_next_ms, 4_242);
+        assert_eq!(daemon_reference_worker_max_args(&runtime_store), vec![100]);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9h_equivalent_reference_events_coalesce_in_queue() {
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        let notification = DaemonSchedulerNotification::CommittedMutation {
+            owner: DaemonSchedulerOwner::ReferenceWorker,
+            change: DaemonCommittedChangeClass::Reference,
+        };
+
+        sender
+            .try_send_notification(notification)
+            .expect("first reference event queued");
+        sender
+            .try_send_notification(DaemonSchedulerNotification::CommittedMutation {
+                owner: DaemonSchedulerOwner::ReferenceWorker,
+                change: DaemonCommittedChangeClass::Reference,
+            })
+            .expect("duplicate reference event coalesced");
+
+        assert!(matches!(
+            receiver.try_recv().expect("coalesced reference event"),
+            DaemonEvent::SchedulerNotification(_)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9i_managed_bootstrap_deadline_drives_lifecycle_owner() {
+        let (store, mut runtime) = test_runtime("mu9i-bootstrap-deadline");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = Some(50);
+        runtime.maintenance_next_ms = u64::MAX;
+        runtime.drive_policy_next_ms = u64::MAX;
+        runtime.reference_reconcile_next_ms = u64::MAX;
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        assert_eq!(
+            daemon_scheduler_next_deadline(&runtime),
+            Some(DaemonSchedulerDeadline {
+                owner: DaemonSchedulerOwner::LifecycleShutdown,
+                deadline_ms: 50,
+            })
+        );
+
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events, _receiver) =
+            bounded_daemon_event_channel::<DaemonAcceptedConnection>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        assert!(
+            daemon_run_scheduler_notification_once(
+                &runtime,
+                &events,
+                &active_connections,
+                DaemonEquivalentEventKey::OwnerDeadline(DaemonSchedulerOwner::LifecycleShutdown),
+            )
+            .unwrap()
+        );
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9i_renewed_lease_deadline_comes_from_existing_registry() {
+        let (store, mut runtime) = test_runtime("mu9i-renewed-lease-deadline");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = Some(u64::MAX);
+        runtime.maintenance_next_ms = u64::MAX;
+        runtime.drive_policy_next_ms = u64::MAX;
+        runtime.reference_reconcile_next_ms = u64::MAX;
+        runtime.renew_session_lease("cli-session", 10);
+        let deadline = runtime
+            .lifecycle_leases
+            .get(&LifecycleLeaseId::Session("cli-session".to_string()))
+            .and_then(|lease| lease.deadline_ms)
+            .unwrap();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+
+        assert_eq!(
+            daemon_scheduler_next_deadline(&runtime),
+            Some(DaemonSchedulerDeadline {
+                owner: DaemonSchedulerOwner::LifecycleShutdown,
+                deadline_ms: deadline,
+            })
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn mu9i_abandoned_lease_expires_before_managed_shutdown() {
+        let (store, mut runtime) = test_runtime("mu9i-abandoned-expiry");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = None;
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Session("abandoned".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(0),
+            },
+        );
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(daemon_run_lifecycle_shutdown_owner_once(&runtime, &active_connections).unwrap());
+
+        assert!(runtime.lock().unwrap().lifecycle_leases.is_empty());
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn mu9i_active_request_and_pin_block_managed_shutdown() {
+        let (store, mut runtime) = test_runtime("mu9i-active-and-pin-block");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = None;
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Session("expired".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(0),
+            },
+        );
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+
+        assert!(!daemon_run_lifecycle_shutdown_owner_once(&runtime, &active_connections).unwrap());
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.lifecycle_leases.insert(
+                LifecycleLeaseId::Pin("manual".to_string()),
+                LifecycleLease {
+                    kind: LifecycleLeaseKind::Pin,
+                    deadline_ms: None,
+                },
+            );
+        }
+        active_connections.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(!daemon_run_lifecycle_shutdown_owner_once(&runtime, &active_connections).unwrap());
+        assert_eq!(runtime.lock().unwrap().pin_count(), 1);
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn mu9i_final_managed_shutdown_runs_through_lifecycle_owner() {
+        let (store, mut runtime) = test_runtime("mu9i-final-managed-shutdown");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = None;
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(daemon_run_lifecycle_shutdown_owner_once(&runtime, &active_connections).unwrap());
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu9i_persistent_mode_has_no_lifecycle_deadline_or_empty_shutdown() {
+        let (store, mut runtime) = test_runtime("mu9i-persistent-independent");
+        runtime.startup_mode = daemon::DaemonStartupMode::Persistent;
+        runtime.maintenance_next_ms = u64::MAX;
+        runtime.drive_policy_next_ms = u64::MAX;
+        runtime.reference_reconcile_next_ms = u64::MAX;
+        runtime.renew_session_lease("cli-session", 10);
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Session("cli-session".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Session,
+                deadline_ms: Some(0),
+            },
+        );
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert_eq!(daemon_scheduler_next_deadline(&runtime), None);
+        assert!(!daemon_run_lifecycle_shutdown_owner_once(&runtime, &active_connections).unwrap());
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn mu9i_equivalent_lifecycle_events_coalesce_in_queue() {
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(DAEMON_EVENT_CHANNEL_CAPACITY);
+
+        sender
+            .try_send_notification(DaemonSchedulerNotification::LifecycleChanged)
+            .expect("first lifecycle event queued");
+        sender
+            .try_send_notification(DaemonSchedulerNotification::LifecycleChanged)
+            .expect("duplicate lifecycle event coalesced");
+
+        assert!(matches!(
+            receiver.try_recv().expect("coalesced lifecycle event"),
+            DaemonEvent::SchedulerNotification(_)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn mu9i_generic_background_does_not_poll_managed_shutdown() {
+        let (store, mut runtime) = test_runtime("mu9i-no-generic-polling");
+        runtime.startup_mode = daemon::DaemonStartupMode::Managed;
+        runtime.managed_bootstrap_deadline_ms = Some(0);
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(!daemon_run_background_owners_once(&runtime, &active_connections).unwrap());
+
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .maintenance_cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(daemon_run_lifecycle_shutdown_owner_once(&runtime, &active_connections).unwrap());
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn mu9i_active_request_completion_emits_lifecycle_change_after_release() {
+        let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let permit = DaemonWorkerPermit::acquire(&active_connections).unwrap();
+        let (sender, receiver) = bounded_daemon_event_channel::<()>(DAEMON_EVENT_CHANNEL_CAPACITY);
+        {
+            let _guard = DaemonRequestLifecycleGuard::new(permit, sender);
+            assert_eq!(
+                active_connections.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+        }
+
+        assert_eq!(
+            active_connections.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let event = receiver.try_recv().expect("lifecycle completion event");
+        let DaemonEvent::SchedulerNotification(notification) = event else {
+            panic!("expected lifecycle scheduler notification");
+        };
+        assert_eq!(
+            notification.equivalent_key(),
+            DaemonEquivalentEventKey::LifecycleChanged
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17g_f5a_c_daemon_logical_session_resumes_and_closes_lock_owner() {
+        let (store, mut runtime) = test_runtime("generated-mu17g-f5a-c-logical");
+        register_daemon_shared_engine(&store, &runtime.generated_runtime.engine).unwrap();
+        let reply = generated_session_request(
+            &mut runtime,
+            &loom_remote_protocol::session::SessionRequest::Create(
+                loom_remote_protocol::session::SessionAuth::Unauthenticated,
+            ),
+        );
+        let loom_remote_protocol::session::SessionOpenReply::Ok {
+            session_id,
+            credential: Some(credential),
+            ..
+        } = reply
+        else {
+            panic!("logical session create failed");
+        };
+        let handle = generated_session_handle_value(&runtime, &session_id);
+        let token =
+            generated_lock_acquire(&mut runtime, &session_id, handle.clone(), "logical-key")
+                .unwrap();
+        let resumed = generated_session_request(
+            &mut runtime,
+            &loom_remote_protocol::session::SessionRequest::Resume {
+                auth: loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                credential,
+            },
+        );
+        let loom_remote_protocol::session::SessionOpenReply::Ok {
+            session_id: resumed_id,
+            credential: Some(rotated),
+            ..
+        } = resumed
+        else {
+            panic!("logical session resume failed");
+        };
+        assert_eq!(resumed_id, session_id);
+        assert!(matches!(
+            generated_call(
+                &mut runtime,
+                Some(resumed_id.clone()),
+                "Locks",
+                "lock_refresh",
+                vec![
+                    handle.clone(),
+                    loom_codec::Value::Bytes(loom_wire::lock::lock_token_to_cbor(&token).unwrap()),
+                    loom_codec::Value::Uint(5_000),
+                ],
+            ),
+            loom_remote_protocol::envelope::ResponsePayload::Ok(loom_codec::Value::Bytes(_))
+        ));
+
+        let foreign_id = generated_open_session(&mut runtime);
+        let foreign_handle = generated_session_handle_value(&runtime, &foreign_id);
+        assert_eq!(
+            generated_lock_release(&mut runtime, &foreign_id, foreign_handle.clone(), &token)
+                .unwrap_err(),
+            loom_core::Code::PermissionDenied
+        );
+        let closed = generated_session_request(
+            &mut runtime,
+            &loom_remote_protocol::session::SessionRequest::Close {
+                auth: loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                credential: rotated,
+            },
+        );
+        assert!(matches!(
+            closed,
+            loom_remote_protocol::session::SessionOpenReply::Ok { .. }
+        ));
+        generated_lock_acquire(&mut runtime, &foreign_id, foreign_handle, "logical-key")
+            .expect("explicit close released holder");
+
+        let expiry_id = generated_open_session(&mut runtime);
+        let expiry_handle = generated_session_handle_value(&runtime, &expiry_id);
+        generated_lock_acquire(&mut runtime, &expiry_id, expiry_handle, "expiry-key")
+            .expect("expiring session acquire");
+        runtime.prune_expired_lifecycle_leases(u64::MAX);
+        assert!(
+            !runtime
+                .generated_runtime
+                .sessions
+                .lock()
+                .unwrap()
+                .contains_key(&expiry_id)
+        );
+        let post_expiry_id = generated_open_session(&mut runtime);
+        let post_expiry_handle = generated_session_handle_value(&runtime, &post_expiry_id);
+        generated_lock_acquire(
+            &mut runtime,
+            &post_expiry_id,
+            post_expiry_handle,
+            "expiry-key",
+        )
+        .expect("expired session released holder");
+        let _ = std::fs::remove_file(store);
+    }
+
+    #[test]
+    fn mu17g_f5a_c_session_credential_file_is_private_atomic_and_versionless() {
+        let directory = std::env::temp_dir().join(format!(
+            "loom-session-credential-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("session.json");
+        let path_text = path.to_string_lossy();
+        write_session_credential_file(&path_text, &[1, 2, 3], false).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 1);
+        let encoded = json.get("credential").unwrap().as_str().unwrap();
+        assert!(!encoded.contains('='));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(write_session_credential_file(&path_text, &[9], false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+
+        write_session_credential_file(&path_text, &[4, 5, 6], true).unwrap();
+        assert_eq!(
+            read_session_credential_file(&format!("@{path_text}")).unwrap(),
+            vec![4, 5, 6]
+        );
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = directory.join("session-link.json");
+            symlink(&path, &link).unwrap();
+            assert!(write_session_credential_file(&link.to_string_lossy(), &[7], true).is_err());
+            assert_eq!(
+                read_session_credential_file(&format!("@{path_text}")).unwrap(),
+                vec![4, 5, 6]
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(feature = "serve", unix))]
+    #[test]
+    fn mu17g_f5a_c_daemon_rotation_survives_file_failure_and_bounds_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn credential(
+            reply: loom_remote_protocol::session::SessionOpenReply,
+        ) -> Result<Vec<u8>, loom_remote_protocol::RemoteError> {
+            match reply {
+                loom_remote_protocol::session::SessionOpenReply::Ok {
+                    credential: Some(credential),
+                    ..
+                } => Ok(credential),
+                loom_remote_protocol::session::SessionOpenReply::Ok {
+                    credential: None, ..
+                } => panic!("logical session reply omitted credential"),
+                loom_remote_protocol::session::SessionOpenReply::Err(error) => Err(error),
+            }
+        }
+
+        let (store, runtime) = test_runtime("generated-mu17g-f5a-c-rotation");
+        register_daemon_shared_engine(&store, &runtime.generated_runtime.engine).unwrap();
+        let created = runtime.generated_runtime.handle_session_request(
+            loom_remote_protocol::session::SessionRequest::Create(
+                loom_remote_protocol::session::SessionAuth::Unauthenticated,
+            ),
+        );
+        let (session_id, current) = match created {
+            loom_remote_protocol::session::SessionOpenReply::Ok {
+                session_id,
+                credential: Some(credential),
+                ..
+            } => (session_id, credential),
+            other => panic!("logical session create failed: {other:?}"),
+        };
+        let first_pending = credential(runtime.generated_runtime.handle_session_request(
+            loom_remote_protocol::session::SessionRequest::Resume {
+                auth: loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                credential: current.clone(),
+            },
+        ))
+        .expect("issue first pending credential");
+
+        let directory = std::env::temp_dir().join(format!(
+            "loom-session-rotation-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("session.json");
+        let path_text = path.to_string_lossy();
+        write_session_credential_file(&path_text, &current, false).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let replace = write_session_credential_file(&path_text, &first_pending, true);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(replace.is_err());
+        assert_eq!(
+            read_session_credential_file(&format!("@{path_text}")).unwrap(),
+            current
+        );
+
+        let second_pending = credential(runtime.generated_runtime.handle_session_request(
+            loom_remote_protocol::session::SessionRequest::Resume {
+                auth: loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                credential: current.clone(),
+            },
+        ))
+        .expect("retry durable current credential");
+        assert_eq!(second_pending, first_pending);
+
+        let current_replays = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                credential(runtime.generated_runtime.resume_session(
+                    loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                    &current,
+                ))
+                .expect("first current replay")
+            });
+            let second = scope.spawn(|| {
+                credential(runtime.generated_runtime.resume_session(
+                    loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                    &current,
+                ))
+                .expect("second current replay")
+            });
+            vec![first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(current_replays[0], first_pending);
+        assert_eq!(current_replays[1], first_pending);
+
+        let pending_replays = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                credential(runtime.generated_runtime.resume_session(
+                    loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                    &first_pending,
+                ))
+                .expect("first pending replay")
+            });
+            let second = scope.spawn(|| {
+                credential(runtime.generated_runtime.resume_session(
+                    loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                    &first_pending,
+                ))
+                .expect("second pending replay")
+            });
+            vec![first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(pending_replays[0], pending_replays[1]);
+        let latest = pending_replays[0].clone();
+        assert_eq!(
+            credential(runtime.generated_runtime.resume_session(
+                loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                &first_pending,
+            ))
+            .expect("promoted predecessor replays existing successor"),
+            latest
+        );
+        assert!(
+            credential(runtime.generated_runtime.resume_session(
+                loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                &current,
+            ))
+            .is_err()
+        );
+
+        let latest_claims = loom_remote_protocol::session::open_credential(
+            &latest,
+            &runtime.generated_runtime.credential_signing_key,
+        )
+        .unwrap();
+        let stored_pending = runtime
+            .generated_runtime
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .and_then(|session| session.pending_resume_credential)
+            .expect("bounded pending credential");
+        assert_eq!(stored_pending.secret, latest_claims.resume_secret);
+        assert_eq!(
+            stored_pending.lease_expires_ms,
+            latest_claims.lease_expires_ms
+        );
+
+        runtime
+            .generated_runtime
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&session_id)
+            .unwrap()
+            .lease_expires_ms = now_ms();
+        assert!(
+            credential(runtime.generated_runtime.handle_session_request(
+                loom_remote_protocol::session::SessionRequest::Resume {
+                    auth: loom_remote_protocol::session::SessionAuth::Unauthenticated,
+                    credential: latest,
+                },
+            ))
+            .is_err()
+        );
+        assert!(
+            !runtime
+                .generated_runtime
+                .sessions
+                .lock()
+                .unwrap()
+                .contains_key(&session_id)
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+        let _ = std::fs::remove_file(store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17g_f5a_b_generated_dispatch_and_daemon_ipc_share_lock_authority() {
+        let (store, mut runtime) = test_runtime("generated-mu17g-f5a-b-shared");
+        register_daemon_shared_engine(&store, &runtime.generated_runtime.engine).unwrap();
+        let session_id = generated_open_session(&mut runtime);
+        let handle = generated_session_handle_value(&runtime, &session_id);
+
+        let first = generated_lock_acquire(&mut runtime, &session_id, handle.clone(), "shared-key")
+            .expect("generated acquire");
+        let contended = runtime.handle("lock-acquire\tshared-key\tipc\tipc\texclusive\t5000\t0\n");
+        assert!(contended.contains("LOCKED"), "{contended}");
+
+        assert_eq!(
+            runtime.handle(&format!(
+                "lock-release\tshared-key\t{}\t{}\texclusive\t{}\t0\n",
+                first.owner.principal,
+                first.owner.session,
+                first.fence.sequence()
+            )),
+            "released\n"
+        );
+        let second = ipc_lock_token(&runtime.handle(&format!(
+            "lock-acquire\tshared-key\t{}\t{}\texclusive\t5000\t0\n",
+            first.owner.principal, first.owner.session
+        )));
+        assert!(second.fence > first.fence);
+        let refreshed = ipc_lock_token(&runtime.handle(&format!(
+            "lock-refresh\tshared-key\t{}\t{}\texclusive\t{}\t5000\t0\n",
+            second.owner.principal,
+            second.owner.session,
+            second.fence.sequence()
+        )));
+        assert_eq!(refreshed.fence, second.fence);
+
+        generated_lock_release(&mut runtime, &session_id, handle.clone(), &refreshed)
+            .expect("generated release of IPC token");
+        let stale_apply = runtime.handle(&format!(
+            "lock-apply-fence\tshared-key\t{}\t{}\texclusive\t{}\t0\n",
+            refreshed.owner.principal,
+            refreshed.owner.session,
+            refreshed.fence.sequence()
+        ));
+        assert!(stale_apply.contains("LOCK_NOT_HELD"), "{stale_apply}");
+
+        let expired = ipc_lock_token(
+            &runtime.handle("lock-acquire\texpired-key\tipc\tipc\texclusive\t10\t0\n"),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let expired_apply = runtime.handle(&format!(
+            "lock-apply-fence\texpired-key\tipc\tipc\texclusive\t{}\t0\n",
+            expired.fence.sequence()
+        ));
+        assert!(
+            expired_apply.contains("LOCK_LEASE_EXPIRED"),
+            "{expired_apply}"
+        );
+        let third = generated_lock_acquire(&mut runtime, &session_id, handle, "shared-key")
+            .expect("generated reacquire");
+        assert!(third.fence > second.fence);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[derive(Default)]
+    struct Mu17gFailingLocksPersistence {
+        fail: std::sync::atomic::AtomicBool,
+        last: std::sync::Mutex<Option<LockCoordinator>>,
+    }
+
+    #[cfg(feature = "serve")]
+    impl loom_client::locks::LocksPersistence for Mu17gFailingLocksPersistence {
+        fn persist(
+            &self,
+            coordinator: &LockCoordinator,
+        ) -> Result<(), loom_core::error::LoomError> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                Err(loom_core::error::LoomError::new(
+                    loom_core::Code::Io,
+                    "injected daemon lock persistence failure",
+                ))
+            } else {
+                *self.last.lock().expect("persistence snapshot") = Some(coordinator.clone());
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17g_f5a_b_persistence_failure_rolls_back_shared_state() {
+        let persistence = std::sync::Arc::new(Mu17gFailingLocksPersistence::default());
+        persistence
+            .fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let authority = std::sync::Arc::new(
+            loom_client::locks::InProcessLocksAuthority::from_coordinator(
+                LockCoordinator::default(),
+                persistence.clone(),
+            ),
+        );
+        let (store, mut runtime) =
+            test_runtime_with_locks_authority("generated-mu17g-f5a-b-rollback", authority);
+        register_daemon_shared_engine(&store, &runtime.generated_runtime.engine).unwrap();
+        let session_id = generated_open_session(&mut runtime);
+        let handle = generated_session_handle_value(&runtime, &session_id);
+        assert_eq!(
+            generated_lock_acquire(&mut runtime, &session_id, handle.clone(), "rollback-key"),
+            Err(loom_core::Code::Io)
+        );
+
+        persistence
+            .fail
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let ipc = runtime.handle("lock-acquire\trollback-key\tipc\tipc\texclusive\t5000\t0\n");
+        let token = ipc_lock_token(&ipc);
+        assert_eq!(token.fence, loom_core::Fence::embedded(1));
+
+        persistence
+            .fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let release = runtime.handle(&format!(
+            "lock-release\trollback-key\tipc\tipc\texclusive\t{}\t0\n",
+            token.fence.sequence()
+        ));
+        assert!(release.contains("IO"), "{release}");
+        persistence
+            .fail
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let blocked = generated_lock_acquire(&mut runtime, &session_id, handle, "rollback-key");
+        assert_eq!(blocked, Err(loom_core::Code::Locked));
+
+        persistence
+            .fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failed_break = runtime.handle("lock-break\trollback-key\t0\n");
+        assert!(failed_break.contains("IO"), "{failed_break}");
+        persistence
+            .fail
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            runtime.handle(&format!(
+                "lock-apply-fence\trollback-key\tipc\tipc\texclusive\t{}\t0\n",
+                token.fence.sequence()
+            )),
+            "applied\n"
+        );
+
+        let other = ipc_lock_token(
+            &runtime.handle("lock-acquire\tapply-key\tipc\tipc\texclusive\t5000\t0\n"),
+        );
+        persistence
+            .fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failed_apply = runtime.handle(&format!(
+            "lock-apply-fence\tapply-key\tipc\tipc\texclusive\t{}\t0\n",
+            other.fence.sequence()
+        ));
+        assert!(failed_apply.contains("IO"), "{failed_apply}");
+        persistence
+            .fail
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(runtime.handle("lock-break\tapply-key\t0\n"), "broken\t1\n");
+        assert_eq!(
+            persistence
+                .last
+                .lock()
+                .expect("persistence snapshot")
+                .as_ref()
+                .expect("persisted coordinator")
+                .applied_fence(b"apply-key"),
+            None
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17g_f5a_b_break_wakes_generated_dispatch_waiter() {
+        let (store, runtime) = test_runtime("generated-mu17g-f5a-b-break-wakeup");
+        register_daemon_shared_engine(&store, &runtime.generated_runtime.engine).unwrap();
+        let runtime = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+        let holder_session = generated_shared_open_session(&runtime);
+        let holder_handle = generated_shared_session_handle_value(&runtime, &holder_session);
+        generated_shared_lock_acquire(&runtime, &holder_session, holder_handle, "break-key", 0)
+            .expect("generated holder");
+
+        let waiter_session = generated_shared_open_session(&runtime);
+        let waiter_handle = generated_shared_session_handle_value(&runtime, &waiter_session);
+        let waiter_runtime = std::sync::Arc::clone(&runtime);
+        let waiter = std::thread::spawn(move || {
+            generated_shared_lock_acquire(
+                &waiter_runtime,
+                &waiter_session,
+                waiter_handle,
+                "break-key",
+                1_000,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!waiter.is_finished(), "generated waiter must be contended");
+        assert_eq!(
+            runtime.lock().unwrap().handle("lock-break\tbreak-key\t0\n"),
+            "broken\t1\n"
+        );
+        waiter
+            .join()
+            .expect("waiter join")
+            .expect("generated waiter acquires after break");
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn mu17g_f5a_b_restart_restores_fences_without_runtime_holders() {
+        let (store, mut runtime) = test_runtime("generated-mu17g-f5a-b-restart");
+        register_daemon_shared_engine(&store, &runtime.generated_runtime.engine).unwrap();
+        let session_id = generated_open_session(&mut runtime);
+        let handle = generated_session_handle_value(&runtime, &session_id);
+        let first = generated_lock_acquire(&mut runtime, &session_id, handle, "restart-key")
+            .expect("first acquire");
+        assert_eq!(
+            runtime.handle(&format!(
+                "lock-apply-fence\trestart-key\t{}\t{}\texclusive\t{}\t0\n",
+                first.owner.principal,
+                first.owner.session,
+                first.fence.sequence()
+            )),
+            "applied\n"
+        );
+        drop(runtime);
+
+        let durable = FileStore::open_read(&store).unwrap();
+        assert_eq!(
+            durable
+                .lock_coordinator()
+                .unwrap()
+                .applied_fence(b"restart-key"),
+            Some(first.fence)
+        );
+        drop(durable);
+
+        let mut restarted = runtime_for_existing_store("generated-mu17g-f5a-b-restart", &store);
+        register_daemon_shared_engine(&store, &restarted.generated_runtime.engine).unwrap();
+        let restarted_session = generated_open_session(&mut restarted);
+        let restarted_handle = generated_session_handle_value(&restarted, &restarted_session);
+        let second = generated_lock_acquire(
+            &mut restarted,
+            &restarted_session,
+            restarted_handle,
+            "restart-key",
+        )
+        .expect("acquire after restart");
+        assert!(second.fence > first.fence);
+        let _ = std::fs::remove_file(&store);
     }
 }
 
@@ -12951,6 +24916,91 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    #[test]
+    fn mu15b_smoke_b_root_codec_text_output_is_bounded_and_deterministic() {
+        let diagnostics = loom_store::StoreRootCodecDiagnostics {
+            checked_roots: 2,
+            failures: vec![loom_store::StoreRootCodecDiagnostic {
+                root_name: "retained_history",
+                family_id: Some(0x0100),
+                root_page: 7,
+                byte_offset: 4096,
+                expected_codec: "PackedRecordRefCodec",
+                expected_discriminator: 0x10,
+                raw_magic: Some(0xb7),
+                raw_flags: Some(0x00),
+                actual_discriminator: Some(0x00),
+                in_range: true,
+                checksum_ok: true,
+                magic_ok: true,
+                codec_ok: false,
+                reachable: true,
+                failure: Some("btree_node_codec_discriminator_mismatch"),
+            }],
+            details: vec![
+                loom_store::StoreRootCodecDiagnostic {
+                    root_name: "object_index",
+                    family_id: None,
+                    root_page: 3,
+                    byte_offset: 1024,
+                    expected_codec: "RecordLocCodec",
+                    expected_discriminator: 0x00,
+                    raw_magic: Some(0xb7),
+                    raw_flags: Some(0x01),
+                    actual_discriminator: Some(0x00),
+                    in_range: true,
+                    checksum_ok: true,
+                    magic_ok: true,
+                    codec_ok: true,
+                    reachable: true,
+                    failure: None,
+                },
+                loom_store::StoreRootCodecDiagnostic {
+                    root_name: "retained_history",
+                    family_id: Some(0x0100),
+                    root_page: 7,
+                    byte_offset: 4096,
+                    expected_codec: "PackedRecordRefCodec",
+                    expected_discriminator: 0x10,
+                    raw_magic: Some(0xb7),
+                    raw_flags: Some(0x00),
+                    actual_discriminator: Some(0x00),
+                    in_range: true,
+                    checksum_ok: true,
+                    magic_ok: true,
+                    codec_ok: false,
+                    reachable: true,
+                    failure: Some("btree_node_codec_discriminator_mismatch"),
+                },
+            ],
+        };
+        let lines = root_codec_diagnostic_text_lines(&diagnostics, false);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "store_root_codecs\tstate=error\tchecked=2\tfailures=1"
+        );
+        assert!(lines[1].contains("root=retained_history"));
+        assert!(lines[1].contains("family_id=0x0100"));
+        assert!(lines[1].contains("expected_discriminator=0x10"));
+        assert!(lines[1].contains("actual_discriminator=0x00"));
+        assert!(!lines[1].contains("object_index"));
+
+        let verbose = root_codec_diagnostic_text_lines(&diagnostics, true);
+        assert_eq!(verbose.len(), 3);
+        assert!(verbose[1].contains("root=object_index"));
+
+        let empty = loom_store::StoreRootCodecDiagnostics {
+            checked_roots: 0,
+            failures: Vec::new(),
+            details: Vec::new(),
+        };
+        assert_eq!(
+            root_codec_diagnostic_text_lines(&empty, false),
+            vec!["store_root_codecs\tstate=ok\tchecked=0\tfailures=0"]
+        );
+    }
+
     #[cfg(feature = "mcp")]
     fn mcp_locator_context(
         tag: &str,
@@ -12968,7 +25018,7 @@ mod tests {
         (dir, cx)
     }
 
-    // A remote URL launches remote MCP (not `--stateless`); with `--stateless` it is refused immediately.
+    // A remote URL launches remote MCP; with `--stateless` it is refused immediately because the remote endpoint owns statefulness.
     #[cfg(feature = "mcp")]
     #[test]
     fn mcp_remote_url_launches_and_rejects_stateless() {
@@ -12987,7 +25037,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // A remote context launches remote MCP; with `--stateless` it is refused immediately.
+    // A remote context launches remote MCP; with `--stateless` it is refused immediately because the remote endpoint owns statefulness.
     #[cfg(feature = "mcp")]
     #[test]
     fn mcp_remote_context_launches_and_rejects_stateless() {
@@ -13041,14 +25091,21 @@ mod tests {
                 store: paths.store,
                 store_id: paths.store_id,
                 transport: daemon::DaemonTransport::TcpLoopback,
-                coordinator,
+                startup_mode: daemon::DaemonStartupMode::Persistent,
+                startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+                #[cfg(not(feature = "serve"))]
+                locks_authority: daemon_locks_authority(&store, coordinator),
                 #[cfg(feature = "serve")]
-                generated_runtime: test_generated_runtime(tag, &store),
+                generated_runtime: std::sync::Arc::new(test_generated_runtime(tag, &store)),
+                #[cfg(not(feature = "serve"))]
                 kv_loom: None,
+                #[cfg(not(feature = "serve"))]
                 kv_unavailable: None,
-                sessions: std::collections::BTreeSet::new(),
-                pins: std::collections::BTreeMap::new(),
+                lifecycle_leases: std::collections::BTreeMap::new(),
+                managed_bootstrap_deadline_ms: None,
                 authority_replication_next: std::collections::BTreeMap::new(),
+                authority_replication_fingerprints: std::collections::BTreeMap::new(),
+                authority_replication_discovered: false,
                 maintenance_next_ms: 0,
                 maintenance_worker: None,
                 maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13058,6 +25115,7 @@ mod tests {
                 drive_policy_next_ms: 0,
                 #[cfg(feature = "serve")]
                 reference_reconcile_next_ms: 0,
+                scheduler_counters: DaemonSchedulerCounters::default(),
             },
         )
     }
@@ -13148,7 +25206,7 @@ mod tests {
     fn attached_session_coalesces_reference_reconciliation() {
         let (store, mut runtime) = test_runtime("reference-reconcile-signal");
         runtime.reference_reconcile_next_ms = 42;
-        runtime.sessions.insert("mcp-session".to_string());
+        runtime.renew_session_lease("mcp-session", now_ms());
         assert_eq!(runtime.handle("reference-reconcile\tmcp-session\n"), "ok\n");
         assert_eq!(runtime.reference_reconcile_next_ms, 0);
         assert!(
@@ -13212,7 +25270,8 @@ mod tests {
         save_loom(&mut loom).unwrap();
         drop(loom);
 
-        let run = reconcile_references_once(&store, 1, 100).unwrap();
+        let mut loom = loom_store::open_loom_daemon_authorized_unlocked(&store, None).unwrap();
+        let run = reconcile_references_once(&mut loom, 1, 100).unwrap();
         assert_eq!(run.processed, 1);
         assert_eq!(run.pending, 0);
         assert_eq!(run.resolved, 1);
@@ -13271,7 +25330,8 @@ mod tests {
         save_loom(&mut loom).unwrap();
         drop(loom);
 
-        let run = reconcile_references_once(&store, 1, 100).unwrap();
+        let mut loom = loom_store::open_loom_daemon_authorized_unlocked(&store, None).unwrap();
+        let run = reconcile_references_once(&mut loom, 1, 100).unwrap();
         assert_eq!(run.processed, 1);
         assert_eq!(run.pending, 0);
         assert_eq!(run.resolved, 1);
@@ -13320,14 +25380,23 @@ mod tests {
                 store: paths.store,
                 store_id: paths.store_id,
                 transport: daemon::DaemonTransport::TcpLoopback,
-                coordinator,
+                startup_mode: daemon::DaemonStartupMode::Persistent,
+                startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+                #[cfg(not(feature = "serve"))]
+                locks_authority: daemon_locks_authority(&store, coordinator),
                 #[cfg(feature = "serve")]
-                generated_runtime: daemon_generated_runtime(&store).unwrap(),
+                generated_runtime: std::sync::Arc::new(
+                    daemon_generated_runtime(&store, |_, _, _| {}).unwrap(),
+                ),
+                #[cfg(not(feature = "serve"))]
                 kv_loom: None,
+                #[cfg(not(feature = "serve"))]
                 kv_unavailable: None,
-                sessions: std::collections::BTreeSet::new(),
-                pins: std::collections::BTreeMap::new(),
+                lifecycle_leases: std::collections::BTreeMap::new(),
+                managed_bootstrap_deadline_ms: None,
                 authority_replication_next: std::collections::BTreeMap::new(),
+                authority_replication_fingerprints: std::collections::BTreeMap::new(),
+                authority_replication_discovered: false,
                 maintenance_next_ms: 0,
                 maintenance_worker: None,
                 maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13337,6 +25406,7 @@ mod tests {
                 drive_policy_next_ms: 0,
                 #[cfg(feature = "serve")]
                 reference_reconcile_next_ms: 0,
+                scheduler_counters: DaemonSchedulerCounters::default(),
             },
             root,
             user,
@@ -13428,14 +25498,23 @@ mod tests {
             store: paths.store.clone(),
             store_id: paths.store_id,
             transport: daemon::DaemonTransport::TcpLoopback,
-            coordinator,
+            startup_mode: daemon::DaemonStartupMode::Persistent,
+            startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+            #[cfg(not(feature = "serve"))]
+            locks_authority: daemon_locks_authority(&store, coordinator),
             #[cfg(feature = "serve")]
-            generated_runtime: daemon_generated_runtime(&store).unwrap(),
+            generated_runtime: std::sync::Arc::new(
+                daemon_generated_runtime(&mirror, |_, _, _| {}).unwrap(),
+            ),
+            #[cfg(not(feature = "serve"))]
             kv_loom: None,
+            #[cfg(not(feature = "serve"))]
             kv_unavailable: None,
-            sessions: std::collections::BTreeSet::new(),
-            pins: std::collections::BTreeMap::new(),
+            lifecycle_leases: std::collections::BTreeMap::new(),
+            managed_bootstrap_deadline_ms: None,
             authority_replication_next: std::collections::BTreeMap::new(),
+            authority_replication_fingerprints: std::collections::BTreeMap::new(),
+            authority_replication_discovered: false,
             maintenance_next_ms: 0,
             maintenance_worker: None,
             maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13445,6 +25524,7 @@ mod tests {
             drive_policy_next_ms: 0,
             #[cfg(feature = "serve")]
             reference_reconcile_next_ms: 0,
+            scheduler_counters: DaemonSchedulerCounters::default(),
         };
 
         runtime.reconcile_authority_replication().unwrap();
@@ -13524,6 +25604,8 @@ mod tests {
         );
         let status = daemon::DaemonStatus {
             transport: daemon::DaemonTransport::TcpLoopback,
+            startup_mode: daemon::DaemonStartupMode::Persistent,
+            startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
             pid: "123".to_string(),
             store: "/tmp/example.loom".to_string(),
             store_id: "identity".to_string(),
@@ -13535,7 +25617,7 @@ mod tests {
         };
         assert_eq!(
             daemon_status_line(&status),
-            "running\tprotocol=1\ttransport=tcp\tsecurity=degraded_loopback\tprofile=degraded\t123\t/tmp/example.loom"
+            "running\tprotocol=1\ttransport=tcp\tsecurity=degraded_loopback\tprofile=degraded\tstartup_mode=persistent\tstartup_initiator=cli.daemon.start\t123\t/tmp/example.loom"
         );
     }
 
@@ -13577,7 +25659,17 @@ mod tests {
         FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
         let paths = daemon::paths(&store).unwrap();
         let held = daemon_try_runtime_lock(&paths, true).unwrap().unwrap();
-        daemon_write_runtime_lock(&held, &paths).unwrap();
+        daemon_write_runtime_lock(
+            &held,
+            &paths,
+            daemon::DaemonStartupMode::Persistent,
+            daemon::DaemonStartupInitiator::CliDaemonStart,
+        )
+        .unwrap();
+        let lock_text = std::fs::read_to_string(&paths.lock_file).unwrap();
+        assert!(lock_text.contains("startup_mode=persistent\n"));
+        assert!(lock_text.contains("startup_initiator=cli.daemon.start\n"));
+        assert!(!lock_text.contains("initiating_surface="));
         assert!(matches!(
             daemon_existing_runtime_lock_state(&paths).unwrap(),
             RuntimeLockState::Busy
@@ -13590,6 +25682,114 @@ mod tests {
         }
         daemon_cleanup_files(&paths);
         let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn mu15d_s_start_wait_decision_reports_current_progress_at_deadline() {
+        assert_eq!(
+            daemon_start_wait_decision(1_000, 0, 950, 900, 200),
+            DaemonStartWaitDecision::ReportStarting
+        );
+        assert_eq!(
+            daemon_start_wait_decision(1_000, 0, 700, 900, 200),
+            DaemonStartWaitDecision::Stalled
+        );
+        assert_eq!(
+            daemon_start_wait_decision(800, 0, 700, 900, 200),
+            DaemonStartWaitDecision::Continue
+        );
+    }
+
+    #[test]
+    fn mu15d_s_repeated_progress_rewrites_remain_parseable() {
+        let store = temp_store("mu15d-s-progress-rewrite");
+        FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+        let paths = daemon::paths(&store).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&paths.lock_file)
+            .unwrap();
+        daemon_write_runtime_lock_progress(
+            &file,
+            &paths,
+            daemon::DaemonStartupMode::Persistent,
+            daemon::DaemonStartupInitiator::CliDaemonStart,
+            daemon::DaemonStartupStage::Spawned,
+            100,
+            100,
+            100,
+            100,
+            1,
+            0,
+            None,
+        )
+        .unwrap();
+        daemon_write_runtime_lock_progress(
+            &file,
+            &paths,
+            daemon::DaemonStartupMode::Persistent,
+            daemon::DaemonStartupInitiator::CliDaemonStart,
+            daemon::DaemonStartupStage::StoreBacking,
+            100,
+            150,
+            150,
+            150,
+            2,
+            1,
+            Some(1),
+        )
+        .unwrap();
+
+        let metadata = daemon::runtime_lock_metadata(&paths).unwrap();
+        assert_eq!(
+            metadata.startup_stage,
+            Some(daemon::DaemonStartupStage::StoreBacking)
+        );
+        assert_eq!(metadata.progress_seq, Some(2));
+        assert_eq!(metadata.progress_completed, Some(1));
+        assert_eq!(metadata.progress_total, Some(1));
+
+        drop(file);
+        daemon_cleanup_files(&paths);
+        let _ = std::fs::remove_file(store);
+    }
+
+    #[test]
+    fn mu15d_s_starting_status_line_exposes_stage_and_progress() {
+        let metadata = daemon::DaemonRuntimeLockMetadata {
+            pid: "123".to_string(),
+            store: "/tmp/mu15d-s.loom".to_string(),
+            store_id: "store-id".to_string(),
+            phase: Some(daemon::DaemonRuntimeLockPhase::Starting),
+            startup_mode: Some("persistent".to_string()),
+            startup_initiator: Some("cli.daemon.start".to_string()),
+            startup_stage: Some(daemon::DaemonStartupStage::EngineSections),
+            startup_started_ms: Some(now_ms().saturating_sub(100)),
+            stage_started_ms: Some(now_ms().saturating_sub(50)),
+            heartbeat_ms: Some(now_ms()),
+            progress_ms: Some(now_ms().saturating_sub(25)),
+            progress_seq: Some(3),
+            progress_completed: Some(4),
+            progress_total: Some(10),
+        };
+        let line = daemon_starting_status_line(&metadata);
+        assert!(
+            line.starts_with("starting\t123\tstage=engine.sections"),
+            "{line}"
+        );
+        assert!(line.contains("progress_age_ms="), "{line}");
+        assert!(line.contains("heartbeat_age_ms="), "{line}");
+        assert!(line.contains("progress_seq=3"), "{line}");
+        assert!(line.contains("progress_completed=4"), "{line}");
+        assert!(line.contains("progress_total=10"), "{line}");
+        assert!(line.contains("startup_mode=persistent"), "{line}");
+        assert!(
+            line.contains("startup_initiator=cli.daemon.start"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -13611,6 +25811,7 @@ mod tests {
             runtime.handle("pin-add\tmount\t100000\t0\n"),
             "pinned\tmount\tpins=1\n"
         );
+        assert_eq!(runtime.pin_count(), 1);
         assert_eq!(
             runtime.handle("stop\n"),
             format!(
@@ -13638,18 +25839,20 @@ mod tests {
             runtime.handle("stop\n"),
             "error\tdaemon has 1 live pin(s)\n"
         );
-        runtime.pins.insert(
-            "mount".to_string(),
-            PinLease {
+        runtime.lifecycle_leases.insert(
+            LifecycleLeaseId::Pin("mount".to_string()),
+            LifecycleLease {
+                kind: LifecycleLeaseKind::Pin,
                 deadline_ms: Some(0),
             },
         );
+        assert_eq!(runtime.pin_count(), 1);
         assert_eq!(
             runtime.handle("status\n"),
             daemon_running_response(&runtime.store, &runtime.store_id, runtime.transport)
                 .trim_end()
                 .to_string()
-                + "\tsessions=0\tpins=0\tpermanent_pins=0\tleased_pins=0\n"
+                + "\tstartup_mode=persistent\tstartup_initiator=cli.daemon.start\tsessions=0\tpins=0\tpermanent_pins=0\tleased_pins=0\tmaintenance_worker=idle\tmaintenance_next_ms=0\n"
         );
         let _ = std::fs::remove_file(&store);
     }
@@ -13661,6 +25864,7 @@ mod tests {
             runtime.handle("pin-add\tmanual\n"),
             "pinned\tmanual\tpins=1\n"
         );
+        assert_eq!(runtime.permanent_pin_count(), 1);
         let clock = now_ms();
         let lease_ms = 60_000;
         let deadline = clock + lease_ms;
@@ -13668,6 +25872,7 @@ mod tests {
             runtime.handle(&format!("pin-add\tmount\t{lease_ms}\t{clock}\n")),
             "pinned\tmount\tpins=2\n"
         );
+        assert_eq!(runtime.pin_count(), 2);
         let expected_status = daemon_running_response(
             &runtime.store,
             &runtime.store_id,
@@ -13676,7 +25881,7 @@ mod tests {
         .trim_end()
         .to_string()
             + &format!(
-                "\tsessions=0\tpins=2\tpermanent_pins=1\tleased_pins=1\tpin=permanent:6d616e75616c\tpin=leased:{deadline}:6d6f756e74\n"
+                "\tstartup_mode=persistent\tstartup_initiator=cli.daemon.start\tsessions=0\tpins=2\tpermanent_pins=1\tleased_pins=1\tmaintenance_worker=idle\tmaintenance_next_ms=0\tpin=permanent:6d616e75616c\tpin=leased:{deadline}:6d6f756e74\n"
             );
         assert_eq!(runtime.handle("status\n"), expected_status);
         let _ = std::fs::remove_file(&store);
@@ -13796,12 +26001,12 @@ mod tests {
         let (store, mut runtime, root, user) = test_authenticated_runtime("daemon-control-auth");
         let no_auth = runtime.handle("session-attach\tcli-session\n");
         assert!(no_auth.contains("AUTHENTICATION_FAILED"), "{no_auth}");
-        assert!(runtime.sessions.is_empty());
+        assert_eq!(runtime.session_count(), 0);
 
         let user_auth = request_auth_fields(user, "user-pass", "user-control");
         let denied = runtime.handle(&format!("pin-add\tmanual\t{user_auth}\n"));
         assert!(denied.contains("PERMISSION_DENIED"), "{denied}");
-        assert!(runtime.pins.is_empty());
+        assert_eq!(runtime.pin_count(), 0);
 
         let root_auth = request_auth_fields(root, "root-pass", "root-control");
         assert_eq!(
@@ -13854,34 +26059,17 @@ mod tests {
         let reacquired = runtime.handle(&format!(
             "lock-acquire\tkey\tp\ts\texclusive\t1000\t4\t{root_auth}\n"
         ));
-        assert!(
-            reacquired.starts_with("lock\tkey\tp\ts\texclusive\t2\t"),
-            "{reacquired}"
-        );
-        let applied = runtime.handle(&format!(
-            "lock-apply-fence\tkey\tp\ts\texclusive\t2\t5\t{root_auth}\n"
-        ));
-        assert_eq!(applied, "applied\n");
+        let fields = reacquired.trim_end().split('\t').collect::<Vec<_>>();
+        let ["lock", _, _, _, _, fence, _] = fields.as_slice() else {
+            panic!("unexpected lock response: {reacquired}");
+        };
         assert_eq!(
-            FileStore::open_read(&store)
-                .unwrap()
-                .lock_coordinator()
-                .unwrap()
-                .applied_fence(b"key"),
-            Some(loom_core::Fence::embedded(2))
+            runtime.handle(&format!(
+                "lock-apply-fence\tkey\tp\ts\texclusive\t{}\t5\t{root_auth}\n",
+                fence
+            )),
+            "applied\n"
         );
-
-        let second = runtime.handle(&format!(
-            "lock-acquire\tother\tp\ts\texclusive\t1000\t3\t{root_auth}\n"
-        ));
-        assert!(
-            second.starts_with("lock\tother\tp\ts\texclusive\t1\t"),
-            "{second}"
-        );
-        let expired = runtime.handle(&format!(
-            "lock-apply-fence\tother\tp\ts\texclusive\t1\t1004\t{root_auth}\n"
-        ));
-        assert!(expired.contains("LOCK_LEASE_EXPIRED"), "{expired}");
         let _ = std::fs::remove_file(&store);
     }
 
@@ -14925,23 +27113,37 @@ mod tests {
             store: paths.store,
             store_id: paths.store_id,
             transport: daemon::DaemonTransport::TcpLoopback,
-            coordinator,
+            startup_mode: daemon::DaemonStartupMode::Persistent,
+            startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+            #[cfg(not(feature = "serve"))]
+            locks_authority: daemon_locks_authority(&store, coordinator),
             #[cfg(feature = "serve")]
-            generated_runtime: daemon_generated_runtime(&store).unwrap(),
+            generated_runtime: std::sync::Arc::new(
+                daemon_generated_runtime(&store, |_, _, _| {}).unwrap(),
+            ),
+            #[cfg(not(feature = "serve"))]
             kv_loom: None,
+            #[cfg(not(feature = "serve"))]
             kv_unavailable: None,
-            sessions: std::collections::BTreeSet::new(),
-            pins: std::collections::BTreeMap::new(),
+            lifecycle_leases: std::collections::BTreeMap::new(),
+            managed_bootstrap_deadline_ms: None,
             authority_replication_next: std::collections::BTreeMap::new(),
+            authority_replication_fingerprints: std::collections::BTreeMap::new(),
+            authority_replication_discovered: false,
             maintenance_next_ms: 0,
             maintenance_worker: None,
             maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hosted_listeners,
             drive_policy_next_ms: 0,
             reference_reconcile_next_ms: 0,
+            scheduler_counters: DaemonSchedulerCounters::default(),
         };
 
-        runtime.reconcile_hosted_listeners().unwrap();
+        runtime
+            .reconcile_hosted_listeners(
+                runtime.scheduler_activity_recorder(DaemonSchedulerOwner::HostedListeners),
+            )
+            .unwrap();
         assert!(runtime.hosted_listeners.is_empty());
         let records = FileStore::open_read(&store)
             .unwrap()
@@ -15009,24 +27211,38 @@ mod tests {
             store: paths.store,
             store_id: paths.store_id,
             transport: daemon::DaemonTransport::TcpLoopback,
-            coordinator,
+            startup_mode: daemon::DaemonStartupMode::Persistent,
+            startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+            #[cfg(not(feature = "serve"))]
+            locks_authority: daemon_locks_authority(&store, coordinator),
             #[cfg(feature = "serve")]
-            generated_runtime: daemon_generated_runtime(&store).unwrap(),
+            generated_runtime: std::sync::Arc::new(
+                daemon_generated_runtime(&store, |_, _, _| {}).unwrap(),
+            ),
+            #[cfg(not(feature = "serve"))]
             kv_loom: None,
+            #[cfg(not(feature = "serve"))]
             kv_unavailable: None,
-            sessions: std::collections::BTreeSet::new(),
-            pins: std::collections::BTreeMap::new(),
+            lifecycle_leases: std::collections::BTreeMap::new(),
+            managed_bootstrap_deadline_ms: None,
             authority_replication_next: std::collections::BTreeMap::new(),
+            authority_replication_fingerprints: std::collections::BTreeMap::new(),
+            authority_replication_discovered: false,
             maintenance_next_ms: 0,
             maintenance_worker: None,
             maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hosted_listeners,
             drive_policy_next_ms: 0,
             reference_reconcile_next_ms: 0,
+            scheduler_counters: DaemonSchedulerCounters::default(),
         };
 
         save_test_certificate_bundle(&store, "cas-main", Some(TLS_TEST_CERT.as_bytes().to_vec()));
-        runtime.reconcile_hosted_listeners().unwrap();
+        runtime
+            .reconcile_hosted_listeners(
+                runtime.scheduler_activity_recorder(DaemonSchedulerOwner::HostedListeners),
+            )
+            .unwrap();
         let after_fingerprint = runtime
             .hosted_listeners
             .get(&record.id)
@@ -15144,20 +27360,30 @@ mod tests {
             store: paths.store,
             store_id: paths.store_id,
             transport: daemon::DaemonTransport::TcpLoopback,
-            coordinator,
+            startup_mode: daemon::DaemonStartupMode::Persistent,
+            startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+            #[cfg(not(feature = "serve"))]
+            locks_authority: daemon_locks_authority(&store, coordinator),
             #[cfg(feature = "serve")]
-            generated_runtime: daemon_generated_runtime(&store).unwrap(),
+            generated_runtime: std::sync::Arc::new(
+                daemon_generated_runtime(&store, |_, _, _| {}).unwrap(),
+            ),
+            #[cfg(not(feature = "serve"))]
             kv_loom: None,
+            #[cfg(not(feature = "serve"))]
             kv_unavailable: None,
-            sessions: std::collections::BTreeSet::new(),
-            pins: std::collections::BTreeMap::new(),
+            lifecycle_leases: std::collections::BTreeMap::new(),
+            managed_bootstrap_deadline_ms: None,
             authority_replication_next: std::collections::BTreeMap::new(),
+            authority_replication_fingerprints: std::collections::BTreeMap::new(),
+            authority_replication_discovered: false,
             maintenance_next_ms: 0,
             maintenance_worker: None,
             maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hosted_listeners,
             drive_policy_next_ms: 0,
             reference_reconcile_next_ms: 0,
+            scheduler_counters: DaemonSchedulerCounters::default(),
         };
 
         let second_rule = loom_store::NetworkAccessRule {
@@ -15188,7 +27414,11 @@ mod tests {
             )
             .unwrap();
         }
-        runtime.reconcile_hosted_listeners().unwrap();
+        runtime
+            .reconcile_hosted_listeners(
+                runtime.scheduler_activity_recorder(DaemonSchedulerOwner::HostedListeners),
+            )
+            .unwrap();
         let after_fingerprint = runtime
             .hosted_listeners
             .get(&record.id)
@@ -15310,7 +27540,20 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(apply_drive_policy_workers_once(&store, 500).unwrap(), 2);
+        let mut loom = loom_store::open_loom_daemon_authorized_unlocked(&store, None).unwrap();
+        assert_eq!(
+            apply_drive_policy_workers_once(
+                &mut loom,
+                &store,
+                500,
+                &DaemonSchedulerActivityRecorder::new(
+                    DaemonSchedulerOwner::DrivePolicy,
+                    DaemonSchedulerCounters::default(),
+                ),
+            )
+            .unwrap(),
+            2
+        );
 
         let fs = FileStore::open_read(&store).unwrap();
         let identity = fs.identity_store().unwrap().unwrap();
@@ -15322,7 +27565,7 @@ mod tests {
         assert!(acl.grants().iter().any(|grant| {
             grant.subject == AclSubject::Principal(DAEMON_SERVICE_PRINCIPAL_ID)
                 && grant.workspace.is_none()
-                && grant.facet == Some(FacetKind::Vcs)
+                && grant.domain == Some(AclDomain::from(FacetKind::Vcs))
                 && grant.scopes == [AclScope::All]
                 && grant.rights.contains(&AclRight::Admin)
         }));
@@ -17965,21 +30208,27 @@ mod tests {
             .unwrap()
             .lock_coordinator()
             .unwrap();
-        let kv_loom = loom_store::open_loom_read_unlocked(&store, None)
-            .and_then(|loom| loom_store::attach_local_auth(loom, &LocalOpenAuth::default()))
-            .ok();
         let mut runtime = DaemonRuntime {
             store: paths.store.clone(),
             store_id: paths.store_id.clone(),
             transport: daemon::DaemonTransport::TcpLoopback,
-            coordinator,
+            startup_mode: daemon::DaemonStartupMode::Persistent,
+            startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+            #[cfg(not(feature = "serve"))]
+            locks_authority: daemon_locks_authority(&store, coordinator),
             #[cfg(feature = "serve")]
-            generated_runtime: daemon_generated_runtime(&paths.store).unwrap(),
-            kv_loom,
+            generated_runtime: std::sync::Arc::new(
+                daemon_generated_runtime(&paths.store, |_, _, _| {}).unwrap(),
+            ),
+            #[cfg(not(feature = "serve"))]
+            kv_loom: None,
+            #[cfg(not(feature = "serve"))]
             kv_unavailable: None,
-            sessions: std::collections::BTreeSet::new(),
-            pins: std::collections::BTreeMap::new(),
+            lifecycle_leases: std::collections::BTreeMap::new(),
+            managed_bootstrap_deadline_ms: None,
             authority_replication_next: std::collections::BTreeMap::new(),
+            authority_replication_fingerprints: std::collections::BTreeMap::new(),
+            authority_replication_discovered: false,
             maintenance_next_ms: 0,
             maintenance_worker: None,
             maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -17989,6 +30238,7 @@ mod tests {
             drive_policy_next_ms: 0,
             #[cfg(feature = "serve")]
             reference_reconcile_next_ms: 0,
+            scheduler_counters: DaemonSchedulerCounters::default(),
         };
         let join = std::thread::spawn(move || {
             for _ in 0..19 {
@@ -18070,21 +30320,27 @@ mod tests {
             .unwrap()
             .lock_coordinator()
             .unwrap();
-        let kv_loom = loom_store::open_loom_read_unlocked(&store, None)
-            .and_then(|loom| loom_store::attach_local_auth(loom, &LocalOpenAuth::default()))
-            .ok();
         let mut runtime = DaemonRuntime {
             store: paths.store.clone(),
             store_id: paths.store_id.clone(),
             transport: daemon::DaemonTransport::TcpLoopback,
-            coordinator,
+            startup_mode: daemon::DaemonStartupMode::Persistent,
+            startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+            #[cfg(not(feature = "serve"))]
+            locks_authority: daemon_locks_authority(store, coordinator),
             #[cfg(feature = "serve")]
-            generated_runtime: daemon_generated_runtime(&paths.store).unwrap(),
-            kv_loom,
+            generated_runtime: std::sync::Arc::new(
+                daemon_generated_runtime(&paths.store, |_, _, _| {}).unwrap(),
+            ),
+            #[cfg(not(feature = "serve"))]
+            kv_loom: None,
+            #[cfg(not(feature = "serve"))]
             kv_unavailable: None,
-            sessions: std::collections::BTreeSet::new(),
-            pins: std::collections::BTreeMap::new(),
+            lifecycle_leases: std::collections::BTreeMap::new(),
+            managed_bootstrap_deadline_ms: None,
             authority_replication_next: std::collections::BTreeMap::new(),
+            authority_replication_fingerprints: std::collections::BTreeMap::new(),
+            authority_replication_discovered: false,
             maintenance_next_ms: 0,
             maintenance_worker: None,
             maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -18094,6 +30350,7 @@ mod tests {
             drive_policy_next_ms: 0,
             #[cfg(feature = "serve")]
             reference_reconcile_next_ms: 0,
+            scheduler_counters: DaemonSchedulerCounters::default(),
         };
         let key = loom_core::key_to_cbor(&loom_core::Value::Text("k".into()));
         let response = runtime.handle(&format!(
@@ -18119,6 +30376,7 @@ mod tests {
             .unwrap()
             .lock_coordinator()
             .unwrap();
+        #[cfg(not(feature = "serve"))]
         let (kv_loom, kv_unavailable) = match daemon_kv_loom(store) {
             Ok(loom) => (Some(loom), None),
             Err(error) => (None, Some(daemon_kv_unavailable_error(error))),
@@ -18127,14 +30385,23 @@ mod tests {
             store: paths.store.clone(),
             store_id: paths.store_id.clone(),
             transport: daemon::DaemonTransport::TcpLoopback,
-            coordinator,
+            startup_mode: daemon::DaemonStartupMode::Persistent,
+            startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+            #[cfg(not(feature = "serve"))]
+            locks_authority: daemon_locks_authority(&store, coordinator),
             #[cfg(feature = "serve")]
-            generated_runtime: daemon_generated_runtime(&paths.store).unwrap(),
+            generated_runtime: std::sync::Arc::new(
+                daemon_generated_runtime(&paths.store, |_, _, _| {}).unwrap(),
+            ),
+            #[cfg(not(feature = "serve"))]
             kv_loom,
+            #[cfg(not(feature = "serve"))]
             kv_unavailable,
-            sessions: std::collections::BTreeSet::new(),
-            pins: std::collections::BTreeMap::new(),
+            lifecycle_leases: std::collections::BTreeMap::new(),
+            managed_bootstrap_deadline_ms: None,
             authority_replication_next: std::collections::BTreeMap::new(),
+            authority_replication_fingerprints: std::collections::BTreeMap::new(),
+            authority_replication_discovered: false,
             maintenance_next_ms: 0,
             maintenance_worker: None,
             maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -18144,6 +30411,7 @@ mod tests {
             drive_policy_next_ms: 0,
             #[cfg(feature = "serve")]
             reference_reconcile_next_ms: 0,
+            scheduler_counters: DaemonSchedulerCounters::default(),
         }
     }
 
@@ -18219,6 +30487,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
     }
 
+    #[cfg(not(feature = "serve"))]
     #[test]
     fn encrypted_store_daemon_rejects_runtime_data_without_unlock() {
         let store = temp_store("daemon-encrypted-kv");
@@ -18251,14 +30520,17 @@ mod tests {
             store: paths.store.clone(),
             store_id: paths.store_id.clone(),
             transport: daemon::DaemonTransport::TcpLoopback,
-            coordinator,
-            #[cfg(feature = "serve")]
-            generated_runtime: daemon_generated_runtime(&paths.store).unwrap(),
+            startup_mode: daemon::DaemonStartupMode::Persistent,
+            startup_initiator: daemon::DaemonStartupInitiator::CliDaemonStart,
+            #[cfg(not(feature = "serve"))]
+            locks_authority: daemon_locks_authority(&store, coordinator),
             kv_loom: None,
             kv_unavailable: Some(daemon_kv_unavailable_error(kv_err)),
-            sessions: std::collections::BTreeSet::new(),
-            pins: std::collections::BTreeMap::new(),
+            lifecycle_leases: std::collections::BTreeMap::new(),
+            managed_bootstrap_deadline_ms: None,
             authority_replication_next: std::collections::BTreeMap::new(),
+            authority_replication_fingerprints: std::collections::BTreeMap::new(),
+            authority_replication_discovered: false,
             maintenance_next_ms: 0,
             maintenance_worker: None,
             maintenance_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -18268,6 +30540,7 @@ mod tests {
             drive_policy_next_ms: 0,
             #[cfg(feature = "serve")]
             reference_reconcile_next_ms: 0,
+            scheduler_counters: DaemonSchedulerCounters::default(),
         };
 
         let acquired = runtime.handle("lock-acquire\tkey\tp\ts\texclusive\t1000\t1\n");

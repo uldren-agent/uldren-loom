@@ -17,6 +17,7 @@ name = "loom_store"
 
 [features]
 integration-tests = []
+test-hooks = []
 
 [dependencies]
 # On-disk (`std::fs`) ObjectStore backend. CRC-32C is inline; the only third-party deps are the two

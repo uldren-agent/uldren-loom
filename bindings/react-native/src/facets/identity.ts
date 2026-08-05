@@ -196,6 +196,99 @@ export function identityRevokePublicKey(
   return UldrenLoom.identityRevokePublicKey(loomPath, publicKey, passphrase, kek, authPrincipal, authPassphrase);
 }
 
+export function identityForceDetachAuthorityJson(
+  loomPath: string,
+  principal: string,
+  generation: number,
+  reason: string,
+  key?: LoomKey,
+  auth?: LoomAuth
+): Promise<string> {
+  const [passphrase, kek] = keyArgs(key);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.identityForceDetachAuthorityJson(
+    loomPath,
+    principal,
+    generation,
+    reason,
+    passphrase,
+    kek,
+    authPrincipal,
+    authPassphrase
+  );
+}
+
+export function identityReplicateAuthorityJson(
+  loomPath: string,
+  source: string,
+  becomeAuthority: boolean,
+  key?: LoomKey,
+  auth?: LoomAuth
+): Promise<string> {
+  const [passphrase, kek] = keyArgs(key);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.identityReplicateAuthorityJson(
+    loomPath,
+    source,
+    becomeAuthority,
+    passphrase,
+    kek,
+    authPrincipal,
+    authPassphrase
+  );
+}
+
+export function identityConfigureAuthorityReplicationJson(
+  loomPath: string,
+  id: string,
+  source: string,
+  disabled: boolean,
+  pullOnStart: boolean,
+  intervalMs: number | undefined | null,
+  jitterMs: number,
+  backoffMs: number,
+  publishWitness: boolean,
+  key?: LoomKey,
+  auth?: LoomAuth
+): Promise<string> {
+  const [passphrase, kek] = keyArgs(key);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.identityConfigureAuthorityReplicationJson(
+    loomPath,
+    id,
+    source,
+    disabled,
+    pullOnStart,
+    intervalMs ?? 0,
+    intervalMs != null,
+    jitterMs,
+    backoffMs,
+    publishWitness,
+    passphrase,
+    kek,
+    authPrincipal,
+    authPassphrase
+  );
+}
+
+export function identityRemoveAuthorityReplicationJson(
+  loomPath: string,
+  id: string,
+  key?: LoomKey,
+  auth?: LoomAuth
+): Promise<string> {
+  const [passphrase, kek] = keyArgs(key);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.identityRemoveAuthorityReplicationJson(
+    loomPath,
+    id,
+    passphrase,
+    kek,
+    authPrincipal,
+    authPassphrase
+  );
+}
+
 export function aclListJson(loomPath: string, key?: LoomKey, auth?: LoomAuth): Promise<string> {
   const [passphrase, kek] = keyArgs(key);
   const [authPrincipal, authPassphrase] = authArgs(auth);

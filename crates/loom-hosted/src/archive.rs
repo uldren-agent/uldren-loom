@@ -27,10 +27,18 @@ pub(crate) fn fs_import(
     loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
     src_path: &str,
+    author: Option<&str>,
+    message: Option<&str>,
     commit: bool,
     dry_run: bool,
 ) -> Result<Vec<u8>> {
     let mut options = FsImportOptions::new(src_path);
+    if let Some(author) = author {
+        options.author = author.to_string();
+    }
+    if let Some(message) = message {
+        options.message = message.to_string();
+    }
     options.commit = commit;
     options.dry_run = dry_run;
     let report = import_fs(loom, workspace, Path::new(src_path), &options)?;
@@ -56,13 +64,25 @@ pub(crate) fn archive_import(
     workspace: WorkspaceId,
     src_path: &str,
     kind: &str,
+    gzip_output_path: Option<&str>,
+    commit: bool,
+    author: Option<&str>,
+    message: Option<&str>,
     dry_run: bool,
 ) -> Result<Vec<u8>> {
     let archive_kind = parse_archive_kind(kind)?;
     let mut options = ArchiveImportOptions::new(src_path);
+    options.gzip_output_path = gzip_output_path.map(str::to_string);
+    options.commit = commit;
+    if let Some(author) = author {
+        options.author = author.to_string();
+    }
+    if let Some(message) = message {
+        options.message = message.to_string();
+    }
     options.dry_run = dry_run;
     let result = import_archive(loom, workspace, Path::new(src_path), archive_kind, &options)?;
-    result.report.encode()
+    result.encode()
 }
 
 pub(crate) fn archive_export(

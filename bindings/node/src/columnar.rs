@@ -1,6 +1,8 @@
 //! Licensed under BUSL-1.1 (see the workspace `LICENSE`). (c) Uldren Technologies LLC.
 
 use super::*;
+use futures::executor::block_on;
+use loom_client::generated_api::Columnar as GeneratedColumnar;
 
 use loom_core::tabular::{CmpOp, ColumnType, cell_from, cell_value};
 use loom_core::{ColumnarAggregate, ColumnarAggregateOp, ColumnarInspect};
@@ -414,4 +416,76 @@ pub fn columnar_aggregate(
     Ok(Uint8Array::from(values_to_cbor(
         loom_core::columnar_aggregate(&loom, ns, &name, &aggregates, filter_ref).map_err(reason)?,
     )))
+}
+
+#[napi]
+pub fn columnar_import_arrow(
+    loom_path: String,
+    workspace: String,
+    name: String,
+    payload: Uint8Array,
+    target_segment_rows: BigInt,
+    replace: bool,
+    dry_run: bool,
+    store_passphrase: Option<String>,
+    auth_principal: Option<String>,
+    auth_passphrase: Option<String>,
+) -> napi::Result<Uint8Array> {
+    let target_segment_rows = bigint_to_u64(target_segment_rows, "targetSegmentRows")?;
+    let generated = generated_session::open_generated_session(
+        &loom_path,
+        store_passphrase.as_deref(),
+        auth_principal.as_deref(),
+        auth_passphrase.as_deref(),
+    )?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedColumnar>::columnar_import_arrow(
+            &generated.client,
+            generated.session.clone(),
+            workspace,
+            name,
+            payload.to_vec(),
+            target_segment_rows,
+            replace,
+            dry_run,
+        ),
+    )
+    .map(Uint8Array::from)
+    .map_err(reason)
+}
+
+#[napi]
+pub fn columnar_import_parquet(
+    loom_path: String,
+    workspace: String,
+    name: String,
+    payload: Uint8Array,
+    target_segment_rows: BigInt,
+    replace: bool,
+    dry_run: bool,
+    store_passphrase: Option<String>,
+    auth_principal: Option<String>,
+    auth_passphrase: Option<String>,
+) -> napi::Result<Uint8Array> {
+    let target_segment_rows = bigint_to_u64(target_segment_rows, "targetSegmentRows")?;
+    let generated = generated_session::open_generated_session(
+        &loom_path,
+        store_passphrase.as_deref(),
+        auth_principal.as_deref(),
+        auth_passphrase.as_deref(),
+    )?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedColumnar>::columnar_import_parquet(
+            &generated.client,
+            generated.session.clone(),
+            workspace,
+            name,
+            payload.to_vec(),
+            target_segment_rows,
+            replace,
+            dry_run,
+        ),
+    )
+    .map(Uint8Array::from)
+    .map_err(reason)
 }

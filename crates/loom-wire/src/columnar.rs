@@ -9,6 +9,18 @@ use loom_core::tabular::{CmpOp, ColumnType, Value, cell_from, cell_value};
 use loom_core::{ColumnarAggregate, ColumnarAggregateOp, ColumnarInspect, Digest};
 use loom_types::LoomError;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnarImportReport {
+    pub format: String,
+    pub columns: Vec<(String, ColumnType)>,
+    pub rows: usize,
+    pub segment_count: usize,
+    pub target_segment_rows: usize,
+    pub bytes_in: usize,
+    pub replaced: bool,
+    pub dry_run: bool,
+}
+
 /// Decode a select/aggregate comparison op tag.
 pub fn cmp_op_from_int(op: u64) -> Result<CmpOp, LoomError> {
     match op {
@@ -129,6 +141,31 @@ pub fn inspect_to_cbor(inspect: ColumnarInspect) -> Vec<u8> {
         CborValue::Uint(inspect.segment_count as u64),
         CborValue::Uint(inspect.target_segment_rows as u64),
         CborValue::Text(inspect.source_digest.to_string()),
+    ]))
+    .unwrap_or_default()
+}
+
+pub fn import_report_to_cbor(report: ColumnarImportReport) -> Vec<u8> {
+    encode(&CborValue::Array(vec![
+        CborValue::Text(report.format),
+        CborValue::Array(
+            report
+                .columns
+                .into_iter()
+                .map(|(name, ty)| {
+                    CborValue::Array(vec![
+                        CborValue::Text(name),
+                        CborValue::Uint(u64::from(ty.tag())),
+                    ])
+                })
+                .collect(),
+        ),
+        CborValue::Uint(report.rows as u64),
+        CborValue::Uint(report.segment_count as u64),
+        CborValue::Uint(report.target_segment_rows as u64),
+        CborValue::Uint(report.bytes_in as u64),
+        CborValue::Bool(report.replaced),
+        CborValue::Bool(report.dry_run),
     ]))
     .unwrap_or_default()
 }

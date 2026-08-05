@@ -12,7 +12,8 @@
 
 use loom_client::LocalLoomClient;
 use loom_remote_protocol::api_types::{
-    Digest, LoomSession, LoomStream, ResultView, RowIter, SqlBatch, SqlSession, Task, Uuid,
+    Digest, LaneTicketPlacement, LoomSession, LoomStream, ResultView, RowIter, SqlBatch,
+    SqlSession, Task, Uuid,
 };
 use loom_remote_protocol::generated_api::*;
 use loom_types::{Code, LoomError};
@@ -42,6 +43,15 @@ fn arg_err(err: ::loom_remote_protocol::codec::ArgError) -> LoomError {
 fn take(args: &[::loom_codec::Value], idx: usize) -> Result<&::loom_codec::Value, LoomError> {
     args.get(idx)
         .ok_or_else(|| LoomError::new(Code::InvalidArgument, "missing request argument"))
+}
+
+fn hosted_path_import_rejected(interface: &str, method: &str) -> LoomError {
+    LoomError::new(
+        Code::Unsupported,
+        format!(
+            "{interface}.{method} is local-only because it accepts a host filesystem path; remote import requires a byte-transfer contract"
+        ),
+    )
 }
 
 /// Poll an immediately-ready `LocalLoomClient` future once and flatten the result. In-process
@@ -81,14 +91,35 @@ pub fn drain_stream(mut stream: LoomStream<Vec<u8>>) -> Result<Vec<Vec<u8>>, Loo
     }
 }
 
-/// Decode one request onto the `LoomClient` trait implemented by `LocalLoomClient`. The wire `handle`
-/// (a `LoomSession`) is decoded-and-discarded: the runtime substitutes its resolved `engine` session.
+/// Decode one hosted request onto the `LoomClient` trait implemented by `LocalLoomClient`.
 pub fn dispatch(
     client: &LocalLoomClient,
     engine: &LoomSession,
     interface: &str,
     method: &str,
     args: &[::loom_codec::Value],
+) -> Result<Dispatched, LoomError> {
+    dispatch_with_host_path_access(client, engine, interface, method, args, false)
+}
+
+/// Decode one trusted in-process request, including methods that consume local host paths.
+pub fn dispatch_local(
+    client: &LocalLoomClient,
+    engine: &LoomSession,
+    interface: &str,
+    method: &str,
+    args: &[::loom_codec::Value],
+) -> Result<Dispatched, LoomError> {
+    dispatch_with_host_path_access(client, engine, interface, method, args, true)
+}
+
+fn dispatch_with_host_path_access(
+    client: &LocalLoomClient,
+    engine: &LoomSession,
+    interface: &str,
+    method: &str,
+    args: &[::loom_codec::Value],
+    allow_host_paths: bool,
 ) -> Result<Dispatched, LoomError> {
     match (interface, method) {
         ("Store", "version") => {
@@ -432,6 +463,24 @@ pub fn dispatch(
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }
+        ("Exec", "apply_cbor") => {
+            let request = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Exec>::apply_cbor(
+                client,
+                engine.clone(),
+                request,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
         ("Program", "program_put") => {
             let workspace = {
                 let __v = take(args, 1)?;
@@ -618,6 +667,26 @@ pub fn dispatch(
                 engine.clone(),
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("Identity", "identity_authority_witness") => {
+            let out = poll_ready(<LocalLoomClient as Identity>::identity_authority_witness(
+                client,
+                engine.clone(),
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("Identity", "identity_list_authority_replication") => {
+            let out = poll_ready(
+                <LocalLoomClient as Identity>::identity_list_authority_replication(
+                    client,
+                    engine.clone(),
+                ),
+            )?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Array(
+                out.into_iter()
+                    .map(|item| ::loom_codec::Value::Bytes(item))
+                    .collect(),
+            )))
         }
         ("Identity", "identity_add_principal") => {
             let principal_handle = {
@@ -931,6 +1000,181 @@ pub fn dispatch(
                 ),
             )?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("Identity", "identity_force_detach_authority_json") => {
+            let principal = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<Uuid, LoomError> = {
+                    <Uuid as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let generation = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<u64, LoomError> = {
+                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let reason = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as Identity>::identity_force_detach_authority_json(
+                    client,
+                    engine.clone(),
+                    principal,
+                    generation,
+                    reason,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Identity", "identity_replicate_authority_json") => {
+            let source = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let become_authority = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as Identity>::identity_replicate_authority_json(
+                    client,
+                    engine.clone(),
+                    source,
+                    become_authority,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Identity", "identity_configure_authority_replication_json") => {
+            let id = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let disabled = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let pull_on_start = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let interval_ms = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<Option<u64>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let jitter_ms = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<u64, LoomError> = {
+                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let backoff_ms = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<u64, LoomError> = {
+                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let publish_witness = {
+                let __v = take(args, 8)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as Identity>::identity_configure_authority_replication_json(
+                    client,
+                    engine.clone(),
+                    id,
+                    source,
+                    disabled,
+                    pull_on_start,
+                    interval_ms,
+                    jitter_ms,
+                    backoff_ms,
+                    publish_witness,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Identity", "identity_remove_authority_replication_json") => {
+            let id = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as Identity>::identity_remove_authority_replication_json(
+                    client,
+                    engine.clone(),
+                    id,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
         }
         ("Acl", "acl_list") => {
             let out = poll_ready(<LocalLoomClient as Acl>::acl_list(client, engine.clone()))?;
@@ -1342,6 +1586,838 @@ pub fn dispatch(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
             ))
         }
+        ("Lifecycle", "lifecycle_define_standard_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let kind = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let version = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let completion_predicate_digest = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as Lifecycle>::lifecycle_define_standard_json(
+                    client,
+                    engine.clone(),
+                    workspace,
+                    kind,
+                    version,
+                    completion_predicate_digest,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Lifecycle", "lifecycle_define_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let definition = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Lifecycle>::lifecycle_define_json(
+                client,
+                engine.clone(),
+                workspace,
+                definition,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Lifecycle", "lifecycle_instantiate_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let instance_id = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let definition_id = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let subject_refs = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Vec<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Array(items) => items
+                            .iter()
+                            .map(|item| {
+                                <String as ::loom_remote_protocol::codec::FromValue>::from_value(
+                                    item,
+                                )
+                                .map_err(arg_err)
+                            })
+                            .collect::<::core::result::Result<Vec<_>, _>>(),
+                        _ => Err(shape("list")),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Lifecycle>::lifecycle_instantiate_json(
+                client,
+                engine.clone(),
+                workspace,
+                instance_id,
+                definition_id,
+                subject_refs,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Lifecycle", "lifecycle_transition_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let instance_id = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let transition_id = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let to_stage_id = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let actor_principal_id = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let gate_evaluations_json = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let snapshot_digest = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Lifecycle>::lifecycle_transition_json(
+                client,
+                engine.clone(),
+                workspace,
+                instance_id,
+                transition_id,
+                to_stage_id,
+                actor_principal_id,
+                gate_evaluations_json,
+                snapshot_digest,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Refs", "refs_reconcile_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let max = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<u64, LoomError> = {
+                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Refs>::refs_reconcile_json(
+                client,
+                engine.clone(),
+                workspace,
+                max,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Audit", "audit_config_show_json") => {
+            let out = poll_ready(<LocalLoomClient as Audit>::audit_config_show_json(
+                client,
+                engine.clone(),
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Audit", "audit_config_set_json") => {
+            let retention_days = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<Option<u32>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <u32 as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let legal_hold = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<Option<bool>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <bool as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Audit>::audit_config_set_json(
+                client,
+                engine.clone(),
+                retention_days,
+                legal_hold,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Audit", "audit_list_json") => {
+            let out = poll_ready(<LocalLoomClient as Audit>::audit_list_json(
+                client,
+                engine.clone(),
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Audit", "audit_view_json") => {
+            let record = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Audit>::audit_view_json(
+                client,
+                engine.clone(),
+                record,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Audit", "audit_compact") => {
+            let through_seq = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<u64, LoomError> = {
+                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Audit>::audit_compact(
+                client,
+                engine.clone(),
+                through_seq,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("Certificate", "certificate_list_json") => {
+            let out = poll_ready(<LocalLoomClient as Certificate>::certificate_list_json(
+                client,
+                engine.clone(),
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Certificate", "certificate_import_json") => {
+            let name = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let cert_chain_pem = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let private_key_pem = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let trust_bundle_pem = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Option<Vec<u8>>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(match other {
+                            ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                            _ => Err(shape("bytes")),
+                        }?)),
+                    }
+                };
+                __decoded
+            }?;
+            let force = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Certificate>::certificate_import_json(
+                client,
+                engine.clone(),
+                name,
+                cert_chain_pem,
+                private_key_pem,
+                trust_bundle_pem,
+                force,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Certificate", "certificate_export") => {
+            let name = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let include_cert_chain = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let include_private_key = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let include_trust_bundle = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let force = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Certificate>::certificate_export(
+                client,
+                engine.clone(),
+                name,
+                include_cert_chain,
+                include_private_key,
+                include_trust_bundle,
+                force,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("Certificate", "certificate_generate_self_signed_json") => {
+            let name = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let dns_names = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<Vec<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Array(items) => items
+                            .iter()
+                            .map(|item| {
+                                <String as ::loom_remote_protocol::codec::FromValue>::from_value(
+                                    item,
+                                )
+                                .map_err(arg_err)
+                            })
+                            .collect::<::core::result::Result<Vec<_>, _>>(),
+                        _ => Err(shape("list")),
+                    }
+                };
+                __decoded
+            }?;
+            let ip_addresses = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<Vec<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Array(items) => items
+                            .iter()
+                            .map(|item| {
+                                <String as ::loom_remote_protocol::codec::FromValue>::from_value(
+                                    item,
+                                )
+                                .map_err(arg_err)
+                            })
+                            .collect::<::core::result::Result<Vec<_>, _>>(),
+                        _ => Err(shape("list")),
+                    }
+                };
+                __decoded
+            }?;
+            let cn = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let days = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<u32, LoomError> = {
+                    <u32 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let algorithm = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let force = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as Certificate>::certificate_generate_self_signed_json(
+                    client,
+                    engine.clone(),
+                    name,
+                    dns_names,
+                    ip_addresses,
+                    cn,
+                    days,
+                    algorithm,
+                    force,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Certificate", "certificate_remove_json") => {
+            let name = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Certificate>::certificate_remove_json(
+                client,
+                engine.clone(),
+                name,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Certificate", "certificate_audit_json") => {
+            let name = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Certificate>::certificate_audit_json(
+                client,
+                engine.clone(),
+                name,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("NetworkAccess", "network_access_list_json") => {
+            let out = poll_ready(
+                <LocalLoomClient as NetworkAccess>::network_access_list_json(
+                    client,
+                    engine.clone(),
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("NetworkAccess", "network_access_set_json") => {
+            let name = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let description = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let default_action = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let rules_json = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as NetworkAccess>::network_access_set_json(
+                client,
+                engine.clone(),
+                name,
+                description,
+                default_action,
+                rules_json,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("NetworkAccess", "network_access_remove_json") => {
+            let name = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as NetworkAccess>::network_access_remove_json(
+                    client,
+                    engine.clone(),
+                    name,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("NetworkAccess", "network_access_audit_json") => {
+            let name = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as NetworkAccess>::network_access_audit_json(
+                    client,
+                    engine.clone(),
+                    name,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("ServeConfig", "serve_listener_configure_json") => {
+            let request_json = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as ServeConfig>::serve_listener_configure_json(
+                    client,
+                    engine.clone(),
+                    request_json,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("ServeConfig", "serve_listener_list_json") => {
+            let out = poll_ready(<LocalLoomClient as ServeConfig>::serve_listener_list_json(
+                client,
+                engine.clone(),
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("ServeConfig", "serve_listener_set_enabled_json") => {
+            let listener_id = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let enabled = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as ServeConfig>::serve_listener_set_enabled_json(
+                    client,
+                    engine.clone(),
+                    listener_id,
+                    enabled,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("ServeConfig", "serve_listener_remove_json") => {
+            let listener_id = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as ServeConfig>::serve_listener_remove_json(
+                    client,
+                    engine.clone(),
+                    listener_id,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("ServeConfig", "serve_web_route_list_json") => {
+            let listener_id = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as ServeConfig>::serve_web_route_list_json(
+                client,
+                engine.clone(),
+                listener_id,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("ServeConfig", "serve_web_route_set_json") => {
+            let request_json = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as ServeConfig>::serve_web_route_set_json(
+                client,
+                engine.clone(),
+                request_json,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("ServeConfig", "serve_web_route_remove_json") => {
+            let listener_id = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let route_id = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as ServeConfig>::serve_web_route_remove_json(
+                    client,
+                    engine.clone(),
+                    listener_id,
+                    route_id,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
         ("Daemon", "daemon_start") => {
             poll_ready(<LocalLoomClient as Daemon>::daemon_start(client))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Null))
@@ -1416,14 +2492,6 @@ pub fn dispatch(
         }
         ("Locks", "lock_acquire") => {
             let key = {
-                let __v = take(args, 0)?;
-                let __decoded: ::core::result::Result<String, LoomError> = {
-                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let principal = {
                 let __v = take(args, 1)?;
                 let __decoded: ::core::result::Result<String, LoomError> = {
                     <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
@@ -1431,16 +2499,8 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
-            let session = {
-                let __v = take(args, 2)?;
-                let __decoded: ::core::result::Result<String, LoomError> = {
-                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
             let mode = {
-                let __v = take(args, 3)?;
+                let __v = take(args, 2)?;
                 let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
                     match __v {
                         ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
@@ -1450,7 +2510,7 @@ pub fn dispatch(
                 __decoded
             }?;
             let permits = {
-                let __v = take(args, 4)?;
+                let __v = take(args, 3)?;
                 let __decoded: ::core::result::Result<u32, LoomError> = {
                     <u32 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -1458,7 +2518,7 @@ pub fn dispatch(
                 __decoded
             }?;
             let capacity = {
-                let __v = take(args, 5)?;
+                let __v = take(args, 4)?;
                 let __decoded: ::core::result::Result<u32, LoomError> = {
                     <u32 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -1466,7 +2526,7 @@ pub fn dispatch(
                 __decoded
             }?;
             let lease_ms = {
-                let __v = take(args, 6)?;
+                let __v = take(args, 5)?;
                 let __decoded: ::core::result::Result<u64, LoomError> = {
                     <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -1474,7 +2534,7 @@ pub fn dispatch(
                 __decoded
             }?;
             let wait_ms = {
-                let __v = take(args, 7)?;
+                let __v = take(args, 6)?;
                 let __decoded: ::core::result::Result<u64, LoomError> = {
                     <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -1482,37 +2542,20 @@ pub fn dispatch(
                 __decoded
             }?;
             let out = poll_ready(<LocalLoomClient as Locks>::lock_acquire(
-                client, key, principal, session, mode, permits, capacity, lease_ms, wait_ms,
+                client,
+                engine.clone(),
+                key,
+                mode,
+                permits,
+                capacity,
+                lease_ms,
+                wait_ms,
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }
         ("Locks", "lock_refresh") => {
-            let key = {
-                let __v = take(args, 0)?;
-                let __decoded: ::core::result::Result<String, LoomError> = {
-                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let principal = {
+            let token = {
                 let __v = take(args, 1)?;
-                let __decoded: ::core::result::Result<String, LoomError> = {
-                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let session = {
-                let __v = take(args, 2)?;
-                let __decoded: ::core::result::Result<String, LoomError> = {
-                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let mode = {
-                let __v = take(args, 3)?;
                 let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
                     match __v {
                         ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
@@ -1521,40 +2564,8 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
-            let permits = {
-                let __v = take(args, 4)?;
-                let __decoded: ::core::result::Result<u32, LoomError> = {
-                    <u32 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let capacity = {
-                let __v = take(args, 5)?;
-                let __decoded: ::core::result::Result<u32, LoomError> = {
-                    <u32 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let fence_low = {
-                let __v = take(args, 6)?;
-                let __decoded: ::core::result::Result<u64, LoomError> = {
-                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let fence_high = {
-                let __v = take(args, 7)?;
-                let __decoded: ::core::result::Result<u64, LoomError> = {
-                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
             let lease_ms = {
-                let __v = take(args, 8)?;
+                let __v = take(args, 2)?;
                 let __decoded: ::core::result::Result<u64, LoomError> = {
                     <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -1562,38 +2573,16 @@ pub fn dispatch(
                 __decoded
             }?;
             let out = poll_ready(<LocalLoomClient as Locks>::lock_refresh(
-                client, key, principal, session, mode, permits, capacity, fence_low, fence_high,
+                client,
+                engine.clone(),
+                token,
                 lease_ms,
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }
         ("Locks", "lock_release") => {
-            let key = {
-                let __v = take(args, 0)?;
-                let __decoded: ::core::result::Result<String, LoomError> = {
-                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let principal = {
+            let token = {
                 let __v = take(args, 1)?;
-                let __decoded: ::core::result::Result<String, LoomError> = {
-                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let session = {
-                let __v = take(args, 2)?;
-                let __decoded: ::core::result::Result<String, LoomError> = {
-                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let mode = {
-                let __v = take(args, 3)?;
                 let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
                     match __v {
                         ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
@@ -1602,40 +2591,10 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
-            let permits = {
-                let __v = take(args, 4)?;
-                let __decoded: ::core::result::Result<u32, LoomError> = {
-                    <u32 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let capacity = {
-                let __v = take(args, 5)?;
-                let __decoded: ::core::result::Result<u32, LoomError> = {
-                    <u32 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let fence_low = {
-                let __v = take(args, 6)?;
-                let __decoded: ::core::result::Result<u64, LoomError> = {
-                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let fence_high = {
-                let __v = take(args, 7)?;
-                let __decoded: ::core::result::Result<u64, LoomError> = {
-                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
             poll_ready(<LocalLoomClient as Locks>::lock_release(
-                client, key, principal, session, mode, permits, capacity, fence_low, fence_high,
+                client,
+                engine.clone(),
+                token,
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Null))
         }
@@ -3188,6 +4147,9 @@ pub fn dispatch(
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }
+        ("FileSystem", "import_fs") if !allow_host_paths => {
+            Err(hosted_path_import_rejected("FileSystem", "import_fs"))
+        }
         ("FileSystem", "import_fs") => {
             let workspace = {
                 let __v = take(args, 1)?;
@@ -3205,8 +4167,34 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
-            let commit = {
+            let author = {
                 let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let message = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let commit = {
+                let __v = take(args, 5)?;
                 let __decoded: ::core::result::Result<bool, LoomError> = {
                     <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -3214,7 +4202,7 @@ pub fn dispatch(
                 __decoded
             }?;
             let dry_run = {
-                let __v = take(args, 4)?;
+                let __v = take(args, 6)?;
                 let __decoded: ::core::result::Result<bool, LoomError> = {
                     <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -3226,6 +4214,8 @@ pub fn dispatch(
                 engine.clone(),
                 workspace,
                 src_path,
+                author,
+                message,
                 commit,
                 dry_run,
             ))?;
@@ -3279,6 +4269,9 @@ pub fn dispatch(
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }
+        ("FileSystem", "import_fs_async") if !allow_host_paths => {
+            Err(hosted_path_import_rejected("FileSystem", "import_fs_async"))
+        }
         ("FileSystem", "import_fs_async") => {
             let workspace = {
                 let __v = take(args, 1)?;
@@ -3296,8 +4289,34 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
-            let commit = {
+            let author = {
                 let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let message = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let commit = {
+                let __v = take(args, 5)?;
                 let __decoded: ::core::result::Result<bool, LoomError> = {
                     <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -3305,7 +4324,7 @@ pub fn dispatch(
                 __decoded
             }?;
             let dry_run = {
-                let __v = take(args, 4)?;
+                let __v = take(args, 6)?;
                 let __decoded: ::core::result::Result<bool, LoomError> = {
                     <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -3317,6 +4336,8 @@ pub fn dispatch(
                 engine.clone(),
                 workspace,
                 src_path,
+                author,
+                message,
                 commit,
                 dry_run,
             ))?;
@@ -3374,6 +4395,9 @@ pub fn dispatch(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
             ))
         }
+        ("Archive", "archive_import") if !allow_host_paths => {
+            Err(hosted_path_import_rejected("Archive", "archive_import"))
+        }
         ("Archive", "archive_import") => {
             let workspace = {
                 let __v = take(args, 1)?;
@@ -3399,8 +4423,55 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
-            let dry_run = {
+            let gzip_output_path = {
                 let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let commit = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let author = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let message = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 8)?;
                 let __decoded: ::core::result::Result<bool, LoomError> = {
                     <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -3413,6 +4484,10 @@ pub fn dispatch(
                 workspace,
                 src_path,
                 kind,
+                gzip_output_path,
+                commit,
+                author,
+                message,
                 dry_run,
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
@@ -3474,6 +4549,9 @@ pub fn dispatch(
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }
+        ("Archive", "archive_import_async") if !allow_host_paths => Err(
+            hosted_path_import_rejected("Archive", "archive_import_async"),
+        ),
         ("Archive", "archive_import_async") => {
             let workspace = {
                 let __v = take(args, 1)?;
@@ -3499,8 +4577,55 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
-            let dry_run = {
+            let gzip_output_path = {
                 let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let commit = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let author = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let message = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 8)?;
                 let __decoded: ::core::result::Result<bool, LoomError> = {
                     <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
                         .map_err(arg_err)
@@ -3513,6 +4638,10 @@ pub fn dispatch(
                 workspace,
                 src_path,
                 kind,
+                gzip_output_path,
+                commit,
+                author,
+                message,
                 dry_run,
             ))?;
             Ok(Dispatched::Unary(
@@ -3577,6 +4706,619 @@ pub fn dispatch(
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
             ))
+        }
+        ("InterchangeProfiles", "import_table_csv") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source_scope = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let csv_payload = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let database = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let table = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let schema = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let primary_key = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let mode = {
+                let __v = take(args, 8)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let commit = {
+                let __v = take(args, 9)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let author = {
+                let __v = take(args, 10)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let message = {
+                let __v = take(args, 11)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 12)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as InterchangeProfiles>::import_table_csv(
+                client,
+                engine.clone(),
+                workspace,
+                source_scope,
+                csv_payload,
+                database,
+                table,
+                schema,
+                primary_key,
+                mode,
+                commit,
+                author,
+                message,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("InterchangeProfiles", "import_redmine") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let profile = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source_scope = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let snapshot_payload = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let field_policy = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as InterchangeProfiles>::import_redmine(
+                client,
+                engine.clone(),
+                workspace,
+                profile,
+                source_scope,
+                snapshot_payload,
+                field_policy,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("InterchangeProfiles", "import_asana") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let profile = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source_scope = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let snapshot_payload = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let field_policy = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as InterchangeProfiles>::import_asana(
+                client,
+                engine.clone(),
+                workspace,
+                profile,
+                source_scope,
+                snapshot_payload,
+                field_policy,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("InterchangeProfiles", "import_jira") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let profile = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source_scope = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let snapshot_payload = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let field_policy = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as InterchangeProfiles>::import_jira(
+                client,
+                engine.clone(),
+                workspace,
+                profile,
+                source_scope,
+                snapshot_payload,
+                field_policy,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("InterchangeProfiles", "import_confluence") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let profile = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source_scope = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let snapshot_payload = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let default_space = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as InterchangeProfiles>::import_confluence(
+                client,
+                engine.clone(),
+                workspace,
+                profile,
+                source_scope,
+                snapshot_payload,
+                default_space,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("InterchangeProfiles", "import_slack") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let profile = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source_scope = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let snapshot_payload = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as InterchangeProfiles>::import_slack(
+                client,
+                engine.clone(),
+                workspace,
+                profile,
+                source_scope,
+                snapshot_payload,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("InterchangeProfiles", "import_drive") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let profile = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source_scope = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let archive_payload = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as InterchangeProfiles>::import_drive(
+                client,
+                engine.clone(),
+                workspace,
+                profile,
+                source_scope,
+                archive_payload,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("InterchangeProfiles", "import_markdown") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let profile = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source_scope = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let archive_payload = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let space = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as InterchangeProfiles>::import_markdown(
+                client,
+                engine.clone(),
+                workspace,
+                profile,
+                source_scope,
+                archive_payload,
+                space,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("InterchangeProfiles", "import_notion") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let profile = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source_scope = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let snapshot_payload = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let default_space = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as InterchangeProfiles>::import_notion(
+                client,
+                engine.clone(),
+                workspace,
+                profile,
+                source_scope,
+                snapshot_payload,
+                default_space,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }
         ("Car", "car_import") => {
             let src_path = {
@@ -5569,6 +7311,53 @@ pub fn dispatch(
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }
+        ("Vector", "vector_text_upsert") => {
+            let request = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Vector>::vector_text_upsert(
+                client,
+                engine.clone(),
+                request,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("Vector", "vector_workspace_configure_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let request_json = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as Vector>::vector_workspace_configure_json(
+                    client,
+                    engine.clone(),
+                    workspace,
+                    request_json,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
         ("Columnar", "create") => {
             let workspace = {
                 let __v = take(args, 1)?;
@@ -5893,6 +7682,132 @@ pub fn dispatch(
                 name,
                 aggregates,
                 filter,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("Columnar", "columnar_import_arrow") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let name = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let payload = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let target_segment_rows = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<u64, LoomError> = {
+                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let replace = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Columnar>::columnar_import_arrow(
+                client,
+                engine.clone(),
+                workspace,
+                name,
+                payload,
+                target_segment_rows,
+                replace,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("Columnar", "columnar_import_parquet") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let name = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let payload = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let target_segment_rows = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<u64, LoomError> = {
+                    <u64 as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let replace = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Columnar>::columnar_import_parquet(
+                client,
+                engine.clone(),
+                workspace,
+                name,
+                payload,
+                target_segment_rows,
+                replace,
+                dry_run,
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }
@@ -8879,14 +10794,8 @@ pub fn dispatch(
             }?;
             let placement = {
                 let __v = take(args, 4)?;
-                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
-                    match __v {
-                        ::loom_codec::Value::Null => Ok(None),
-                        other => Ok(Some(
-                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
-                                .map_err(arg_err)?,
-                        )),
-                    }
+                let __decoded: ::core::result::Result<Option<LaneTicketPlacement>, LoomError> = {
+                    match __v { ::loom_codec::Value::Null => Ok(None), other => Ok(Some(<LaneTicketPlacement as ::loom_remote_protocol::codec::FromValue>::from_value(other).map_err(arg_err)?)) }
                 };
                 __decoded
             }?;
@@ -11762,6 +13671,40 @@ pub fn dispatch(
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Null))
         }
+        ("Sql", "sql_exec_result") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let db = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let sql = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Sql>::sql_exec_result(
+                client,
+                engine.clone(),
+                workspace,
+                db,
+                sql,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
         ("Sql", "sql_exec") => {
             let session = {
                 let __v = take(args, 0)?;
@@ -12705,6 +14648,294 @@ pub fn dispatch(
             let out = poll_ready(
                 <LocalLoomClient as StudioSurfaces>::studio_surface_catalog_json(
                     client, workspace, set,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("StudioMaintenance", "studio_reindex_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let profile = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as StudioMaintenance>::studio_reindex_json(
+                client,
+                engine.clone(),
+                workspace,
+                profile,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("StudioMaintenance", "studio_revisions_rebuild_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let profile = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as StudioMaintenance>::studio_revisions_rebuild_json(
+                    client,
+                    engine.clone(),
+                    workspace,
+                    profile,
+                    dry_run,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("InferenceInstance", "inference_instance_list_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let kind = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as InferenceInstance>::inference_instance_list_json(
+                    client,
+                    engine.clone(),
+                    workspace,
+                    kind,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("InferenceInstance", "inference_instance_get_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let name = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as InferenceInstance>::inference_instance_get_json(
+                    client,
+                    engine.clone(),
+                    workspace,
+                    name,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("InferenceInstance", "inference_instance_create_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let name = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let model = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let kind = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let runtime = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let preset = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let settings_json = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as InferenceInstance>::inference_instance_create_json(
+                    client,
+                    engine.clone(),
+                    workspace,
+                    name,
+                    model,
+                    kind,
+                    runtime,
+                    preset,
+                    settings_json,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("InferenceInstance", "inference_instance_update_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let name = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let preset = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let settings_json = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as InferenceInstance>::inference_instance_update_json(
+                    client,
+                    engine.clone(),
+                    workspace,
+                    name,
+                    preset,
+                    settings_json,
+                ),
+            )?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("InferenceInstance", "inference_instance_delete_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let name = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as InferenceInstance>::inference_instance_delete_json(
+                    client,
+                    engine.clone(),
+                    workspace,
+                    name,
                 ),
             )?;
             Ok(Dispatched::Unary(
@@ -15715,6 +17946,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_create_channel_json(
                 client,
                 engine.clone(),
@@ -15723,6 +17967,7 @@ pub fn dispatch(
                 channel_id,
                 channel_handle,
                 name,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -15761,6 +18006,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_rename_channel_json(
                 client,
                 engine.clone(),
@@ -15768,6 +18026,7 @@ pub fn dispatch(
                 chat_workspace_id,
                 selector,
                 channel_handle,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -15854,6 +18113,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_post_message_json(
                 client,
                 engine.clone(),
@@ -15863,6 +18135,91 @@ pub fn dispatch(
                 message_id,
                 thread_id,
                 body_text,
+                expected_entity_tag,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Chat", "chat_post_message_bytes_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let chat_workspace_id = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let channel_id = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let message_id = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let thread_id = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let body = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let expected_entity_tag = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Chat>::chat_post_message_bytes_json(
+                client,
+                engine.clone(),
+                workspace,
+                chat_workspace_id,
+                channel_id,
+                message_id,
+                thread_id,
+                body,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -15909,6 +18266,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_edit_message_json(
                 client,
                 engine.clone(),
@@ -15917,6 +18287,77 @@ pub fn dispatch(
                 channel_id,
                 message_id,
                 body_text,
+                expected_entity_tag,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Chat", "chat_edit_message_bytes_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let chat_workspace_id = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let channel_id = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let message_id = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let body = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let expected_entity_tag = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Chat>::chat_edit_message_bytes_json(
+                client,
+                engine.clone(),
+                workspace,
+                chat_workspace_id,
+                channel_id,
+                message_id,
+                body,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -15968,6 +18409,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_redact_message_json(
                 client,
                 engine.clone(),
@@ -15976,6 +18430,7 @@ pub fn dispatch(
                 channel_id,
                 message_id,
                 reason,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16022,6 +18477,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_create_thread_json(
                 client,
                 engine.clone(),
@@ -16030,6 +18498,7 @@ pub fn dispatch(
                 channel_id,
                 thread_id,
                 parent_message_id,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16089,6 +18558,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_create_task_json(
                 client,
                 engine.clone(),
@@ -16098,6 +18580,7 @@ pub fn dispatch(
                 task_id,
                 message_id,
                 title,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16157,6 +18640,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_claim_task_json(
                 client,
                 engine.clone(),
@@ -16166,6 +18662,7 @@ pub fn dispatch(
                 task_id,
                 claim_id,
                 lease_token,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16225,6 +18722,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_complete_task_json(
                 client,
                 engine.clone(),
@@ -16234,6 +18744,7 @@ pub fn dispatch(
                 task_id,
                 claim_id,
                 result_message_id,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16296,6 +18807,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 8)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_invoke_agent_json(
                 client,
                 engine.clone(),
@@ -16306,6 +18830,95 @@ pub fn dispatch(
                 agent_principal,
                 source_message_ids_json,
                 prompt_text,
+                expected_entity_tag,
+            ))?;
+            Ok(Dispatched::Unary(
+                ::loom_remote_protocol::codec::ToValue::to_value(&out),
+            ))
+        }
+        ("Chat", "chat_invoke_agent_bytes_json") => {
+            let workspace = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let chat_workspace_id = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let channel_id = {
+                let __v = take(args, 3)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let invocation_id = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let agent_principal = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let source_message_ids_json = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<String, LoomError> = {
+                    <String as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let prompt = {
+                let __v = take(args, 7)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let expected_entity_tag = {
+                let __v = take(args, 8)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as Chat>::chat_invoke_agent_bytes_json(
+                client,
+                engine.clone(),
+                workspace,
+                chat_workspace_id,
+                channel_id,
+                invocation_id,
+                agent_principal,
+                source_message_ids_json,
+                prompt,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16352,6 +18965,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_agent_reply_json(
                 client,
                 engine.clone(),
@@ -16360,6 +18986,7 @@ pub fn dispatch(
                 channel_id,
                 invocation_id,
                 message_id,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16432,6 +19059,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 8)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_request_handoff_json(
                 client,
                 engine.clone(),
@@ -16442,6 +19082,7 @@ pub fn dispatch(
                 from_agent_principal,
                 to_principal,
                 reason,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16488,6 +19129,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_add_reaction_json(
                 client,
                 engine.clone(),
@@ -16496,6 +19150,7 @@ pub fn dispatch(
                 channel_id,
                 message_id,
                 kind,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16542,6 +19197,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 6)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_remove_reaction_json(
                 client,
                 engine.clone(),
@@ -16550,6 +19218,7 @@ pub fn dispatch(
                 channel_id,
                 message_id,
                 kind,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16607,12 +19276,26 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_emoji_register_json(
                 client,
                 engine.clone(),
                 workspace,
                 chat_workspace_id,
                 kind,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16643,12 +19326,26 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 4)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_emoji_unregister_json(
                 client,
                 engine.clone(),
                 workspace,
                 chat_workspace_id,
                 kind,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -16759,6 +19456,19 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
+            let expected_entity_tag = {
+                let __v = take(args, 5)?;
+                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Null => Ok(None),
+                        other => Ok(Some(
+                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
+                                .map_err(arg_err)?,
+                        )),
+                    }
+                };
+                __decoded
+            }?;
             let out = poll_ready(<LocalLoomClient as Chat>::chat_update_cursor_json(
                 client,
                 engine.clone(),
@@ -16766,6 +19476,7 @@ pub fn dispatch(
                 chat_workspace_id,
                 channel_id,
                 next_sequence,
+                expected_entity_tag,
             ))?;
             Ok(Dispatched::Unary(
                 ::loom_remote_protocol::codec::ToValue::to_value(&out),
@@ -17996,23 +20707,7 @@ pub fn dispatch(
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }
         ("StoreAdmin", "store_policy_set") => {
-            let fips_required = {
-                let __v = take(args, 1)?;
-                let __decoded: ::core::result::Result<bool, LoomError> = {
-                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let out = poll_ready(<LocalLoomClient as StoreAdmin>::store_policy_set(
-                client,
-                engine.clone(),
-                fips_required,
-            ))?;
-            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
-        }
-        ("StoreAdmin", "store_rekey") => {
-            let new_passphrase = {
+            let update = {
                 let __v = take(args, 1)?;
                 let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
                     match __v {
@@ -18022,23 +20717,20 @@ pub fn dispatch(
                 };
                 __decoded
             }?;
-            let reseal = {
-                let __v = take(args, 2)?;
-                let __decoded: ::core::result::Result<bool, LoomError> = {
-                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
-                        .map_err(arg_err)
-                };
-                __decoded
-            }?;
-            let suite = {
-                let __v = take(args, 3)?;
-                let __decoded: ::core::result::Result<Option<String>, LoomError> = {
+            let out = poll_ready(<LocalLoomClient as StoreAdmin>::store_policy_set(
+                client,
+                engine.clone(),
+                update,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("StoreAdmin", "store_rekey") => {
+            let request = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
                     match __v {
-                        ::loom_codec::Value::Null => Ok(None),
-                        other => Ok(Some(
-                            <String as ::loom_remote_protocol::codec::FromValue>::from_value(other)
-                                .map_err(arg_err)?,
-                        )),
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
                     }
                 };
                 __decoded
@@ -18046,9 +20738,90 @@ pub fn dispatch(
             let out = poll_ready(<LocalLoomClient as StoreAdmin>::store_rekey(
                 client,
                 engine.clone(),
-                new_passphrase,
-                reseal,
-                suite,
+                request,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("StoreAdmin", "store_bundle_import") => {
+            let bundle = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let dry_run = {
+                let __v = take(args, 2)?;
+                let __decoded: ::core::result::Result<bool, LoomError> = {
+                    <bool as ::loom_remote_protocol::codec::FromValue>::from_value(__v)
+                        .map_err(arg_err)
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as StoreAdmin>::store_bundle_import(
+                client,
+                engine.clone(),
+                bundle,
+                dry_run,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("StoreAdmin", "store_maintenance_status") => {
+            let request = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as StoreAdmin>::store_maintenance_status(
+                client,
+                engine.clone(),
+                request,
+            ))?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("StoreAdmin", "store_maintenance_policy_set") => {
+            let update = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(
+                <LocalLoomClient as StoreAdmin>::store_maintenance_policy_set(
+                    client,
+                    engine.clone(),
+                    update,
+                ),
+            )?;
+            Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
+        }
+        ("StoreAdmin", "store_maintenance_run") => {
+            let request = {
+                let __v = take(args, 1)?;
+                let __decoded: ::core::result::Result<Vec<u8>, LoomError> = {
+                    match __v {
+                        ::loom_codec::Value::Bytes(bytes) => Ok(bytes.clone()),
+                        _ => Err(shape("bytes")),
+                    }
+                };
+                __decoded
+            }?;
+            let out = poll_ready(<LocalLoomClient as StoreAdmin>::store_maintenance_run(
+                client,
+                engine.clone(),
+                request,
             ))?;
             Ok(Dispatched::Unary(::loom_codec::Value::Bytes(out)))
         }

@@ -23,6 +23,40 @@ extension Loom {
         guard status == 0 else { throw LoomSql.lastError() }
     }
 
+    public func columnarImportArrow(workspace: String, name: String, payload: Data,
+                                    targetSegmentRows: UInt64, replace: Bool,
+                                    dryRun: Bool = false) throws -> Data {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = payload.withUnsafeBytes { raw -> Int32 in
+            let base = raw.bindMemory(to: UInt8.self).baseAddress
+            return loom_columnar_import_arrow(session, workspace, name, base, UInt(raw.count),
+                                              targetSegmentRows, replace ? 1 : 0, dryRun ? 1 : 0,
+                                              &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_bytes_free(ptr, len) }
+        guard let ptr, len > 0 else { return Data() }
+        return Data(UnsafeBufferPointer(start: ptr, count: Int(len)))
+    }
+
+    public func columnarImportParquet(workspace: String, name: String, payload: Data,
+                                      targetSegmentRows: UInt64, replace: Bool,
+                                      dryRun: Bool = false) throws -> Data {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = payload.withUnsafeBytes { raw -> Int32 in
+            let base = raw.bindMemory(to: UInt8.self).baseAddress
+            return loom_columnar_import_parquet(session, workspace, name, base, UInt(raw.count),
+                                                targetSegmentRows, replace ? 1 : 0, dryRun ? 1 : 0,
+                                                &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_bytes_free(ptr, len) }
+        guard let ptr, len > 0 else { return Data() }
+        return Data(UnsafeBufferPointer(start: ptr, count: Int(len)))
+    }
+
     /// All rows of dataset `name` in append order as the Loom Canonical CBOR array of cell arrays.
     public func columnarScan(workspace: String, name: String) throws -> Data {
         var ptr: UnsafeMutablePointer<UInt8>?

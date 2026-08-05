@@ -83,6 +83,26 @@ fn parse_projection_list(
         .collect()
 }
 
+fn parse_acceptance_evidence_key_list(
+    value: &str,
+    what: &str,
+) -> LoomResult<Vec<loom_tickets::TicketAcceptanceEvidenceKey>> {
+    parse_string_list(value, what)?
+        .into_iter()
+        .map(|key| loom_tickets::TicketAcceptanceEvidenceKey::parse(&key))
+        .collect()
+}
+
+fn parse_review_type_list(
+    value: &str,
+    what: &str,
+) -> LoomResult<Vec<loom_tickets::TicketReviewType>> {
+    parse_string_list(value, what)?
+        .into_iter()
+        .map(|review| loom_tickets::TicketReviewType::parse(&review))
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct FfiBoardColumn {
     column_id: String,
@@ -466,6 +486,7 @@ pub unsafe extern "C" fn loom_tickets_project_settings_get_json(
     workspace: *const c_char,
     ticket_workspace_id: *const c_char,
     project_id: *const c_char,
+    include_contracts: bool,
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
@@ -479,11 +500,12 @@ pub unsafe extern "C" fn loom_tickets_project_settings_get_json(
     out_json!(
         out,
         ticket_read_loom(h, workspace, |loom, ns| {
-            json_result(loom_tickets::get_project(
+            json_result(loom_tickets::get_project_with_contract_details(
                 loom,
                 ns,
                 ticket_workspace_id,
                 project_id,
+                include_contracts,
             ))
         })
     )
@@ -502,6 +524,14 @@ pub unsafe extern "C" fn loom_tickets_project_settings_set_json(
     project_owner_principal: *const c_char,
     clear_project_owner_principal: bool,
     acceptance_authorities_json: *const c_char,
+    acceptance_evidence_enforcement: bool,
+    has_acceptance_evidence_enforcement: bool,
+    required_acceptance_evidence_keys_json: *const c_char,
+    required_acceptance_reviews_json: *const c_char,
+    owner_contract_summary: *const c_char,
+    owner_contract_details: *const c_char,
+    worker_contract_summary: *const c_char,
+    worker_contract_details: *const c_char,
     expected_root: *const c_char,
     out: *mut *mut c_char,
 ) -> i32 {
@@ -537,6 +567,60 @@ pub unsafe extern "C" fn loom_tickets_project_settings_set_json(
     let acceptance_authorities_json = match unsafe {
         optional_str_arg(
             acceptance_authorities_json,
+            "loom_tickets_project_settings_set_json",
+        )
+    } {
+        Ok(value) => value,
+        Err(e) => return fail(e),
+    };
+    let required_acceptance_evidence_keys_json = match unsafe {
+        optional_str_arg(
+            required_acceptance_evidence_keys_json,
+            "loom_tickets_project_settings_set_json",
+        )
+    } {
+        Ok(value) => value,
+        Err(e) => return fail(e),
+    };
+    let required_acceptance_reviews_json = match unsafe {
+        optional_str_arg(
+            required_acceptance_reviews_json,
+            "loom_tickets_project_settings_set_json",
+        )
+    } {
+        Ok(value) => value,
+        Err(e) => return fail(e),
+    };
+    let owner_contract_summary = match unsafe {
+        optional_str_arg(
+            owner_contract_summary,
+            "loom_tickets_project_settings_set_json",
+        )
+    } {
+        Ok(value) => value,
+        Err(e) => return fail(e),
+    };
+    let owner_contract_details = match unsafe {
+        optional_str_arg(
+            owner_contract_details,
+            "loom_tickets_project_settings_set_json",
+        )
+    } {
+        Ok(value) => value,
+        Err(e) => return fail(e),
+    };
+    let worker_contract_summary = match unsafe {
+        optional_str_arg(
+            worker_contract_summary,
+            "loom_tickets_project_settings_set_json",
+        )
+    } {
+        Ok(value) => value,
+        Err(e) => return fail(e),
+    };
+    let worker_contract_details = match unsafe {
+        optional_str_arg(
+            worker_contract_details,
             "loom_tickets_project_settings_set_json",
         )
     } {
@@ -590,6 +674,29 @@ pub unsafe extern "C" fn loom_tickets_project_settings_set_json(
         },
         None => None,
     };
+    let required_acceptance_evidence_keys = match required_acceptance_evidence_keys_json {
+        Some(value) => {
+            match parse_acceptance_evidence_key_list(
+                value,
+                "ticket required acceptance evidence keys json",
+            ) {
+                Ok(value) => Some(value),
+                Err(e) => return fail(e),
+            }
+        }
+        None => None,
+    };
+    let required_acceptance_reviews = match required_acceptance_reviews_json {
+        Some(value) => {
+            match parse_review_type_list(value, "ticket required acceptance reviews json") {
+                Ok(value) => Some(value),
+                Err(e) => return fail(e),
+            }
+        }
+        None => None,
+    };
+    let acceptance_evidence_enforcement =
+        has_acceptance_evidence_enforcement.then_some(acceptance_evidence_enforcement);
     out_json!(
         out,
         ticket_write_loom(h, workspace, |loom, ns| {
@@ -606,12 +713,13 @@ pub unsafe extern "C" fn loom_tickets_project_settings_set_json(
                     project_owner_principal,
                     clear_project_owner_principal,
                     acceptance_authorities: acceptance_authorities.as_deref(),
-                    acceptance_evidence_enforcement: None,
-                    required_acceptance_evidence_keys: None,
-                    owner_contract_summary: None,
-                    owner_contract_details: None,
-                    worker_contract_summary: None,
-                    worker_contract_details: None,
+                    acceptance_evidence_enforcement,
+                    required_acceptance_evidence_keys: required_acceptance_evidence_keys.as_deref(),
+                    required_acceptance_reviews: required_acceptance_reviews.as_deref(),
+                    owner_contract_summary,
+                    owner_contract_details,
+                    worker_contract_summary,
+                    worker_contract_details,
                     expected_root,
                 },
             ))
@@ -1836,6 +1944,7 @@ pub unsafe extern "C" fn loom_tickets_list_json(
                     policy_labels: req.policy_labels,
                     ready_only: req.ready,
                     include_completed: req.include_completed,
+                    lane_id: req.lane,
                     lane_member_ids,
                     board_id: req.board,
                     cursor: req.cursor,

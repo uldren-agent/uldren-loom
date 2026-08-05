@@ -8,70 +8,72 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use futures::executor::block_on;
-use gluesql_core::prelude::{Glue, Payload, Value as GValue};
+use gluesql_core::prelude::{Payload, Value as GValue};
+#[cfg(all(test, feature = "integration-tests"))]
+use loom_client::local::LocalLoomClient;
 use loom_codec::Value as WireValue;
+#[cfg(all(test, feature = "integration-tests"))]
+use loom_core::EmbeddingModel;
+#[cfg(test)]
+use loom_core::Props;
 use loom_core::keys::{EncryptionMeta, KeySpec, Suite};
-use loom_core::search::AggregationRequest;
-use loom_core::tabular::{CmpOp, ColumnType, cell_from, cell_value};
-use loom_core::vector::{Hit, MetaFilter, Metric};
+#[cfg(test)]
+use loom_core::tabular::ColumnType;
+use loom_core::vector::{MetaFilter, Metric};
 use loom_core::workspace::{FacetKind, WorkspaceId};
 use loom_core::{
-    AcceleratorPolicy, AclDomain, AclEffect, AclGrant, AclPredicate, AclRight, AclScope,
-    AclScopeKind, AclStore, AclSubject, Algo, AppCredential, Bundle, Code, ColumnarAggregate,
-    ColumnarAggregateOp, ColumnarInspect, Digest, Document, Edge, EmbeddingModel,
-    EphemeralPutOptions, ExternalCredential, ExternalCredentialKind, FieldMapping, FieldType,
-    FieldValue, IdentityRole, IdentityStore, KvMapConfig, KvTier, LiveRootDiagnostics,
-    LockCoordinator, LockOwner, Loom, Mapping, MergeOutcome, Object, ObjectStore, Principal,
-    PrincipalKind, Props, ProtectedRefPolicy, Query, QueryRequest, QueryResponse, VERSION,
-    WsSelector, bundle_export, bundle_import, clone_workspace, inference_instance_state,
-    migrate_workspace_profile, put_inference_instance_state, search_collections,
+    AclDomain, AclEffect, AclGrant, AclPredicate, AclRight, AclScope, AclScopeKind, AclStore,
+    AclSubject, Algo, AppCredential, Code, Digest, EphemeralPutOptions, ExternalCredential,
+    ExternalCredentialKind, FieldValue, FileKind, IdentityRole, IdentityStore, KvMapConfig, KvTier,
+    LiveRootDiagnostics, LockCoordinator, LockOwner, Loom, MergeOutcome, Object, ObjectStore,
+    Principal, PrincipalKind, ProtectedRefPolicy, VERSION, WsSelector, bundle_export,
+    clone_workspace, inference_instance_state, migrate_workspace_profile, search_collections,
 };
 #[cfg(feature = "inference-native-hf")]
 use loom_inference::DownloadEvent;
 use loom_inference::{DownloadJobManager, DownloadJobPlan};
 use loom_interchange::ArchiveKind;
 #[cfg(all(test, feature = "integration-tests"))]
-use loom_interchange::ImportReportInput;
+use loom_interchange_io::TableImportMode;
 use loom_interchange_io::{
-    ArchiveExportOptions, ArchiveExportResult, ArchiveImportOptions, ArchiveImportResult,
-    CarExportOptions, CarExportResult, CarImportOptions, CarImportResult, FsExportOptions,
-    FsImportOptions, ResolvedImportInput, TableCsvExportOptions, TableCsvImportOptions,
-    TableImportMode, export_archive, export_car, export_fs, export_table_csv, import_archive,
-    import_car, import_fs, import_meetings_bytes, import_table_csv,
-    load_meetings_snapshot as load_meetings_snapshot_io, meetings_source_payload_path,
-    parse_meetings_input_profile, persist_import_checkpoint, retain_import_input,
-    validate_meetings_source_payload_leaf,
+    ArchiveExportOptions, ArchiveExportResult, ArchiveImportResult, CarExportOptions,
+    CarExportResult, CarImportResult, FsExportOptions, TableCsvExportOptions, export_archive,
+    export_car, export_fs, export_table_csv, import_report_from_json, input_profile_label,
+    load_meetings_snapshot as load_meetings_snapshot_io, parse_meetings_input_profile,
 };
-use loom_lanes::{Lane, LaneDecodeDiagnostic, LaneKind, LaneStatus, LaneView};
+use loom_lanes::{Lane, LaneDiagnostic, LaneKind, LaneStatus, LaneView};
+use loom_remote_protocol::api_types::Digest as GeneratedDigest;
 use loom_remote_protocol::codec::ToValue;
-use loom_sql::LoomSqlStore;
+#[cfg(all(test, feature = "integration-tests"))]
+use loom_store::GcSegmentBudget;
 use loom_store::{
-    AuditConfig, DerivedArtifactRebuild, DerivedArtifactRecord, DerivedArtifactStatus, FileStore,
-    GcSegmentBudget, LocalOpenAuth, ServedListenerRecord, StoreMaintenanceReport,
-    StoreMaintenanceRunState, StorePolicy, daemon, gc_loom, open_loom_read_unlocked, save_loom,
+    DerivedArtifactRebuild, DerivedArtifactRecord, DerivedArtifactStatus, FileStore, LocalOpenAuth,
+    ServedListenerRecord, StoreMaintenanceReport, StoreMaintenanceRunState, StorePolicy, daemon,
+    gc_loom, open_loom_read_unlocked, save_loom,
 };
+#[cfg(all(test, feature = "integration-tests"))]
 use loom_substrate::OperationEnvelope;
 #[cfg(all(test, feature = "integration-tests"))]
 use loom_substrate::body::BlockKind;
-use loom_substrate::drive::{
-    DriveOperationLog, DrivePolicyRegistry, DrivePolicyTarget, drive_operation_log_key,
-    drive_policy_registry_key,
-};
+#[cfg(all(test, feature = "integration-tests"))]
+use loom_substrate::drive::{DriveOperationLog, drive_operation_log_key};
+use loom_substrate::drive::{DrivePolicyRegistry, drive_policy_registry_key};
+#[cfg(all(test, feature = "integration-tests"))]
 use loom_substrate::lifecycle::{LifecycleOperationLog, lifecycle_operation_log_key};
 #[cfg(all(test, feature = "integration-tests"))]
 use loom_substrate::meetings::PROFILE_CONTROL_PREFIX as MEETINGS_PROFILE_CONTROL_PREFIX;
 use loom_substrate::meetings::{
     AnnotationRecord, AnnotationStatus, MeetingRecord, MeetingStatus, MeetingsProfileSnapshot,
-    ProjectionAction, ProjectionKind, ProjectionOutput, ProjectionOutputSet, meetings_profile_key,
 };
 #[cfg(all(test, feature = "integration-tests"))]
 use loom_substrate::meetings::{
-    Coverage as MeetingsCoverage, InputProfile, MeetingRecordInput, MeetingsProfileSnapshotParts,
-    SourceRecord, SourceRecordInput, SpanKind, SpanRecord,
+    Coverage as MeetingsCoverage, MeetingRecordInput, MeetingsProfileSnapshotParts,
+    ProjectionAction, ProjectionKind, ProjectionOutput, ProjectionOutputSet, SourceRecord,
+    SourceRecordInput, SpanKind, SpanRecord, meetings_profile_key,
 };
 #[cfg(all(test, feature = "integration-tests"))]
 use loom_substrate::pages::{PageOperationLog, page_profile_operation_log_key};
+#[cfg(all(test, feature = "integration-tests"))]
 use loom_substrate::search::{
     EMBEDDING_PROJECTION_JOBS_DIR, EmbeddingProjectionJob, EmbeddingProjectionKey,
     EmbeddingProjectionStamp,
@@ -80,6 +82,7 @@ use loom_substrate::surfaces::{
     SurfaceAppDefinition, core_surface_catalog, meeting_memory_surface_catalog,
     surface_app_catalog, surface_catalog_json,
 };
+#[cfg(all(test, feature = "integration-tests"))]
 use loom_substrate::versioning::{
     BodyRef, RevisionBackfillUpdate, RevisionIndex, load_optional_current_revision_index,
     persist_current_revision_index,
@@ -137,8 +140,8 @@ endpoints fail fast on discovery, TLS trust, auth, network-access, or protocol-v
 queue commands for later replay. `loom mcp` against a local store serves the full tool surface; against \
 a remote locator it serves the KV, CAS, Queue, Ledger, TimeSeries, full-text search, columnar, calendar, \
 contacts, mail, filesystem, and vector tool families (plus document reads, VCS reads + non-timestamped writes, and graph reads + node writes) \
-over the remote Loom while document/graph ref-index (edge) writes, the timestamped VCS writes, and other tools return a clear not-yet/local-only error, and \
-`--stateless` applies only to a local MCP host.",
+over the remote Loom while document/graph ref-index (edge) writes, the timestamped VCS writes, and other tools return a clear not-yet/local-only error. \
+Local MCP uses the daemon-owned generated boundary and rejects `--stateless`; remote MCP statefulness is owned by the remote endpoint.",
     propagate_version = true
 )]
 struct Cli {
@@ -836,14 +839,12 @@ fn parse_vector_metric(value: &str) -> Result<Metric, String> {
     }
 }
 
-fn vector_floats_from_bytes(bytes: &[u8]) -> Result<Vec<f32>, String> {
-    if !bytes.len().is_multiple_of(4) {
-        return Err("vector bytes length must be a multiple of 4".to_string());
+fn vector_metric_wire_tag(metric: Metric) -> i64 {
+    match metric {
+        Metric::Cosine => 1,
+        Metric::L2 => 2,
+        Metric::Dot => 3,
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
 }
 
 fn vector_floats_to_bytes(vector: &[f32]) -> Vec<u8> {
@@ -857,38 +858,6 @@ fn vector_floats_to_bytes(vector: &[f32]) -> Vec<u8> {
 fn wire_cell_from(value: WireValue) -> Result<loom_core::Value, String> {
     let bytes = loom_codec::encode(&value).map_err(|e| e.to_string())?;
     loom_core::key_from_cbor(&bytes).map_err(|e| e.to_string())
-}
-
-fn wire_cell_value(value: &loom_core::Value) -> Result<WireValue, String> {
-    let bytes = loom_core::key_to_cbor(value);
-    loom_codec::decode(&bytes).map_err(|e| e.to_string())
-}
-
-fn vector_metadata_from_cbor(bytes: &[u8]) -> Result<BTreeMap<String, loom_core::Value>, String> {
-    if bytes.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let WireValue::Map(pairs) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("vector metadata must be a CBOR map".to_string());
-    };
-    let mut out = BTreeMap::new();
-    for (key, value) in pairs {
-        let WireValue::Text(key) = key else {
-            return Err("vector metadata keys must be text".to_string());
-        };
-        out.insert(key, wire_cell_from(value)?);
-    }
-    Ok(out)
-}
-
-fn vector_metadata_value(
-    metadata: &BTreeMap<String, loom_core::Value>,
-) -> Result<WireValue, String> {
-    let pairs = metadata
-        .iter()
-        .map(|(key, value)| Ok((WireValue::Text(key.clone()), wire_cell_value(value)?)))
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(WireValue::Map(pairs))
 }
 
 fn render_structural_diff_text(bytes: &[u8]) -> Result<String, String> {
@@ -1172,35 +1141,17 @@ fn vector_filter_from_cbor(bytes: &[u8]) -> Result<MetaFilter, String> {
     vector_filter_from_value(value)
 }
 
-fn vector_get_cbor(
-    vector: Vec<f32>,
-    metadata: BTreeMap<String, loom_core::Value>,
-) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&WireValue::Array(vec![
-        WireValue::Bytes(vector_floats_to_bytes(&vector)),
-        vector_metadata_value(&metadata)?,
-    ]))
-    .map_err(|e| e.to_string())
-}
-
-fn vector_ids_cbor(ids: &[String]) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&WireValue::Array(
-        ids.iter().cloned().map(WireValue::Text).collect(),
-    ))
-    .map_err(|e| e.to_string())
-}
-
-fn vector_hits_cbor(hits: &[Hit]) -> Result<Vec<u8>, String> {
-    let items = hits
-        .iter()
-        .map(|hit| {
-            Ok(WireValue::Array(vec![
-                WireValue::Text(hit.id.clone()),
-                wire_cell_value(&loom_core::Value::F32(hit.score))?,
-            ]))
+fn string_list_from_cbor(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let WireValue::Array(items) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
+        return Err("expected a CBOR text array".to_string());
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            WireValue::Text(text) => Ok(text),
+            other => Err(format!("expected text list item, found {other:?}")),
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    loom_codec::encode(&WireValue::Array(items)).map_err(|e| e.to_string())
+        .collect()
 }
 
 fn bytes_array_cbor(items: &[Vec<u8>]) -> Result<Vec<u8>, String> {
@@ -1213,45 +1164,10 @@ fn bytes_array_cbor(items: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     .map_err(|e| e.to_string())
 }
 
-fn record_array_cbor(items: impl IntoIterator<Item = Vec<u8>>) -> Result<Vec<u8>, String> {
-    let records = items
-        .into_iter()
-        .map(|bytes| loom_codec::decode(&bytes).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    loom_codec::encode(&WireValue::Array(records)).map_err(|e| e.to_string())
-}
-
 fn text_array_cbor(items: &[String]) -> Result<Vec<u8>, String> {
     loom_codec::encode(&WireValue::Array(
         items.iter().cloned().map(WireValue::Text).collect(),
     ))
-    .map_err(|e| e.to_string())
-}
-
-fn metadata_cbor(display_name: &str) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&WireValue::Map(vec![(
-        WireValue::Text("display_name".into()),
-        WireValue::Text(display_name.to_string()),
-    )]))
-    .map_err(|e| e.to_string())
-}
-
-fn calendar_collection_cbor(meta: &loom_core::calendar::CollectionMeta) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&WireValue::Map(vec![
-        (
-            WireValue::Text("display_name".into()),
-            WireValue::Text(meta.display_name.clone()),
-        ),
-        (
-            WireValue::Text("component_set".into()),
-            WireValue::Array(
-                meta.component_set
-                    .iter()
-                    .map(|component| WireValue::Text(component.as_str().into()))
-                    .collect(),
-            ),
-        ),
-    ]))
     .map_err(|e| e.to_string())
 }
 
@@ -1263,59 +1179,6 @@ fn parse_calendar_component(value: &str) -> Result<loom_core::calendar::Componen
             "unknown calendar component {other:?} (expected event or todo)"
         )),
     }
-}
-
-fn parse_calendar_datetime(value: &str) -> Result<loom_core::calendar::DateTime, String> {
-    let value = value.strip_suffix('Z').unwrap_or(value);
-    let (date, time) = match value.split_once('T') {
-        Some((date, time)) => (date, time),
-        None => (value, "000000"),
-    };
-    if date.len() != 8 || time.len() != 6 {
-        return Err(format!(
-            "invalid calendar date-time {value:?} (expected YYYYMMDD or YYYYMMDDTHHMMSS[Z])"
-        ));
-    }
-    let year = date[0..4]
-        .parse::<i32>()
-        .map_err(|_| format!("invalid calendar year in {value:?}"))?;
-    let month = date[4..6]
-        .parse::<u8>()
-        .map_err(|_| format!("invalid calendar month in {value:?}"))?;
-    let day = date[6..8]
-        .parse::<u8>()
-        .map_err(|_| format!("invalid calendar day in {value:?}"))?;
-    let hour = time[0..2]
-        .parse::<u8>()
-        .map_err(|_| format!("invalid calendar hour in {value:?}"))?;
-    let minute = time[2..4]
-        .parse::<u8>()
-        .map_err(|_| format!("invalid calendar minute in {value:?}"))?;
-    let second = time[4..6]
-        .parse::<u8>()
-        .map_err(|_| format!("invalid calendar second in {value:?}"))?;
-    let month = loom_core::calendar::IcalMonth::try_from(month)
-        .map_err(|_| format!("invalid calendar month in {value:?}"))?;
-    let date = loom_core::calendar::IcalDate::from_calendar_date(year, month, day)
-        .map_err(|_| format!("invalid calendar date {value:?}"))?;
-    let time = loom_core::calendar::IcalTime::from_hms(hour, minute, second)
-        .map_err(|_| format!("invalid calendar time {value:?}"))?;
-    Ok(loom_core::calendar::DateTime::new(date, time))
-}
-
-fn calendar_range_cbor(items: &[loom_core::calendar::Occurrence]) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&WireValue::Array(
-        items
-            .iter()
-            .map(|occ| {
-                WireValue::Array(vec![
-                    WireValue::Text(occ.uid.clone()),
-                    WireValue::Text(occ.start.to_string()),
-                ])
-            })
-            .collect(),
-    ))
-    .map_err(|e| e.to_string())
 }
 
 fn ensure_facet_workspace(
@@ -1350,730 +1213,6 @@ fn ensure_vector_workspace(
 fn parse_kv_key_input(path: &str) -> Result<loom_core::Value, String> {
     loom_core::key_from_cbor(&read_input(path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
-}
-
-fn props_from_cbor(bytes: &[u8]) -> Result<Props, String> {
-    if bytes.is_empty() {
-        return Ok(Props::new());
-    }
-    let WireValue::Map(pairs) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("graph props must be a CBOR map".to_string());
-    };
-    let mut props = Props::new();
-    for (key, value) in pairs {
-        let WireValue::Text(key) = key else {
-            return Err("graph prop key must be text".to_string());
-        };
-        props.insert(key, graph_value_from_cbor(value)?);
-    }
-    Ok(props)
-}
-
-fn graph_value_from_cbor(value: WireValue) -> Result<loom_core::GraphValue, String> {
-    match value {
-        WireValue::Null => Ok(loom_core::GraphValue::Null),
-        WireValue::Bool(value) => Ok(loom_core::GraphValue::Bool(value)),
-        WireValue::Uint(value) => i64::try_from(value)
-            .map(loom_core::GraphValue::Int)
-            .map_err(|_| "graph property integer exceeds i64".to_string()),
-        WireValue::Nint(value) => i64::try_from(value)
-            .map(|value| loom_core::GraphValue::Int(-1 - value))
-            .map_err(|_| "graph property integer exceeds i64".to_string()),
-        WireValue::Float(value) if value.is_finite() => Ok(loom_core::GraphValue::Float(value)),
-        WireValue::Float(_) => Err("graph property float must be finite".to_string()),
-        WireValue::Text(value) => Ok(loom_core::GraphValue::Text(value)),
-        WireValue::Bytes(value) => Ok(loom_core::GraphValue::Bytes(value)),
-        WireValue::Array(values) if cbor_array_has_geometry_tag(&values) => {
-            graph_geometry_from_cbor(values).map(loom_core::GraphValue::Geometry)
-        }
-        WireValue::Array(values) => values
-            .into_iter()
-            .map(graph_value_from_cbor)
-            .collect::<Result<Vec<_>, _>>()
-            .map(loom_core::GraphValue::List),
-        WireValue::Map(pairs) => {
-            let mut values = BTreeMap::new();
-            for (key, value) in pairs {
-                let WireValue::Text(key) = key else {
-                    return Err("graph map key must be text".to_string());
-                };
-                values.insert(key, graph_value_from_cbor(value)?);
-            }
-            Ok(loom_core::GraphValue::Map(values))
-        }
-    }
-}
-
-fn graph_value_to_cbor(value: &loom_core::GraphValue) -> WireValue {
-    match value {
-        loom_core::GraphValue::Null => WireValue::Null,
-        loom_core::GraphValue::Bool(value) => WireValue::Bool(*value),
-        loom_core::GraphValue::Int(value) => WireValue::int(*value),
-        loom_core::GraphValue::Float(value) => WireValue::Float(*value),
-        loom_core::GraphValue::Text(value) => WireValue::Text(value.clone()),
-        loom_core::GraphValue::Bytes(value) => WireValue::Bytes(value.clone()),
-        loom_core::GraphValue::List(values) => {
-            WireValue::Array(values.iter().map(graph_value_to_cbor).collect())
-        }
-        loom_core::GraphValue::Map(values) => WireValue::Map(
-            values
-                .iter()
-                .map(|(key, value)| (WireValue::Text(key.clone()), graph_value_to_cbor(value)))
-                .collect(),
-        ),
-        loom_core::GraphValue::Geometry(value) => graph_geometry_to_cbor(value),
-    }
-}
-
-fn graph_geometry_to_cbor(value: &loom_core::GraphGeometry) -> WireValue {
-    match value {
-        loom_core::GraphGeometry::Point(point) => WireValue::Array(vec![
-            WireValue::Text(loom_core::GRAPH_GEOMETRY_TAG.to_string()),
-            WireValue::Text("point".to_string()),
-            WireValue::Text(point.crs.as_str().to_string()),
-            WireValue::Float(point.x),
-            WireValue::Float(point.y),
-            point.z.map(WireValue::Float).unwrap_or(WireValue::Null),
-        ]),
-    }
-}
-
-fn graph_geometry_from_cbor(values: Vec<WireValue>) -> Result<loom_core::GraphGeometry, String> {
-    let [tag, kind, crs, x, y, z]: [WireValue; 6] = values
-        .try_into()
-        .map_err(|_| "malformed graph geometry value".to_string())?;
-    if cbor_text(tag)? != loom_core::GRAPH_GEOMETRY_TAG {
-        return Err("malformed graph geometry tag".to_string());
-    }
-    match cbor_text(kind)?.as_str() {
-        "point" => {
-            let crs =
-                loom_core::GraphCrs::parse(&cbor_text(crs)?).map_err(|err| err.to_string())?;
-            let x = cbor_finite_float(x, "graph geometry x coordinate")?;
-            let y = cbor_finite_float(y, "graph geometry y coordinate")?;
-            let z = match z {
-                WireValue::Null => None,
-                other => Some(cbor_finite_float(other, "graph geometry z coordinate")?),
-            };
-            loom_core::GraphGeometry::point(crs, x, y, z).map_err(|err| err.to_string())
-        }
-        _ => Err("unsupported graph geometry kind".to_string()),
-    }
-}
-
-fn cbor_array_has_geometry_tag(values: &[WireValue]) -> bool {
-    matches!(values.first(), Some(WireValue::Text(tag)) if tag == loom_core::GRAPH_GEOMETRY_TAG)
-}
-
-fn cbor_text(value: WireValue) -> Result<String, String> {
-    match value {
-        WireValue::Text(value) => Ok(value),
-        _ => Err("graph geometry field must be text".to_string()),
-    }
-}
-
-fn cbor_finite_float(value: WireValue, name: &str) -> Result<f64, String> {
-    match value {
-        WireValue::Float(value) if value.is_finite() => Ok(value),
-        WireValue::Uint(value) => Ok(value as f64),
-        WireValue::Nint(value) => Ok(-1.0 - value as f64),
-        _ => Err(format!("{name} must be finite")),
-    }
-}
-
-fn props_to_cbor(props: &Props) -> Result<Vec<u8>, String> {
-    let pairs = props
-        .iter()
-        .map(|(key, value)| (WireValue::Text(key.clone()), graph_value_to_cbor(value)))
-        .collect();
-    loom_codec::encode(&WireValue::Map(pairs)).map_err(|e| e.to_string())
-}
-
-fn edge_value(edge: &Edge) -> WireValue {
-    let props = edge
-        .props
-        .iter()
-        .map(|(key, value)| (WireValue::Text(key.clone()), graph_value_to_cbor(value)))
-        .collect();
-    WireValue::Array(vec![
-        WireValue::Text(edge.src.clone()),
-        WireValue::Text(edge.dst.clone()),
-        WireValue::Text(edge.label.clone()),
-        WireValue::Map(props),
-    ])
-}
-
-fn graph_edge_cbor(edge: &Edge) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&edge_value(edge)).map_err(|e| e.to_string())
-}
-
-fn graph_strings_cbor(ids: Vec<String>) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&WireValue::Array(
-        ids.into_iter().map(WireValue::Text).collect(),
-    ))
-    .map_err(|e| e.to_string())
-}
-
-fn graph_edges_cbor(edges: Vec<(String, Edge)>) -> Result<Vec<u8>, String> {
-    let items = edges
-        .into_iter()
-        .map(|(id, edge)| WireValue::Array(vec![WireValue::Text(id), edge_value(&edge)]))
-        .collect();
-    loom_codec::encode(&WireValue::Array(items)).map_err(|e| e.to_string())
-}
-
-fn columnar_cmp_op(tag: u64) -> Result<CmpOp, String> {
-    match tag {
-        0 => Ok(CmpOp::Eq),
-        1 => Ok(CmpOp::Ne),
-        2 => Ok(CmpOp::Lt),
-        3 => Ok(CmpOp::Le),
-        4 => Ok(CmpOp::Gt),
-        5 => Ok(CmpOp::Ge),
-        other => Err(format!("unknown columnar op tag {other}")),
-    }
-}
-
-fn columnar_aggregate_op(tag: u64) -> Result<ColumnarAggregateOp, String> {
-    match tag {
-        0 => Ok(ColumnarAggregateOp::Count),
-        1 => Ok(ColumnarAggregateOp::CountNonNull),
-        2 => Ok(ColumnarAggregateOp::Min),
-        3 => Ok(ColumnarAggregateOp::Max),
-        4 => Ok(ColumnarAggregateOp::Sum),
-        other => Err(format!("unknown columnar aggregate op tag {other}")),
-    }
-}
-
-fn columnar_columns_from_cbor(bytes: &[u8]) -> Result<Vec<(String, ColumnType)>, String> {
-    let WireValue::Array(items) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("columnar columns must be a CBOR array".to_string());
-    };
-    let mut columns = Vec::with_capacity(items.len());
-    for item in items {
-        let WireValue::Array(pair) = item else {
-            return Err("each columnar column must be a [name, type_tag] array".to_string());
-        };
-        let mut iter = pair.into_iter();
-        let name = match iter.next() {
-            Some(WireValue::Text(name)) => name,
-            _ => return Err("columnar column name must be text".to_string()),
-        };
-        let tag = match iter.next() {
-            Some(WireValue::Uint(tag)) => u8::try_from(tag)
-                .map_err(|_| "columnar column type tag out of range".to_string())?,
-            _ => return Err("columnar column type tag must be a uint".to_string()),
-        };
-        columns.push((name, ColumnType::from_tag(tag).map_err(|e| e.to_string())?));
-    }
-    Ok(columns)
-}
-
-fn columnar_columns_cbor(columns: Vec<(String, ColumnType)>) -> Result<Vec<u8>, String> {
-    let items = columns
-        .into_iter()
-        .map(|(name, ty)| {
-            WireValue::Array(vec![
-                WireValue::Text(name),
-                WireValue::Uint(u64::from(ty.tag())),
-            ])
-        })
-        .collect();
-    loom_codec::encode(&WireValue::Array(items)).map_err(|e| e.to_string())
-}
-
-fn columnar_row_from_cbor(bytes: &[u8]) -> Result<Vec<loom_core::Value>, String> {
-    let WireValue::Array(items) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("columnar row must be a CBOR cell array".to_string());
-    };
-    items
-        .into_iter()
-        .map(|item| cell_from(item).map_err(|e| e.to_string()))
-        .collect()
-}
-
-fn columnar_rows_cbor(rows: Vec<Vec<loom_core::Value>>) -> Result<Vec<u8>, String> {
-    let items = rows
-        .into_iter()
-        .map(|row| WireValue::Array(row.iter().map(cell_value).collect()))
-        .collect();
-    loom_codec::encode(&WireValue::Array(items)).map_err(|e| e.to_string())
-}
-
-fn columnar_values_cbor(values: Vec<loom_core::Value>) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&WireValue::Array(
-        values.iter().map(cell_value).collect::<Vec<_>>(),
-    ))
-    .map_err(|e| e.to_string())
-}
-
-fn columnar_inspect_cbor(inspect: ColumnarInspect) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&WireValue::Array(vec![
-        WireValue::Array(
-            inspect
-                .columns
-                .into_iter()
-                .map(|(name, ty)| {
-                    WireValue::Array(vec![
-                        WireValue::Text(name),
-                        WireValue::Uint(u64::from(ty.tag())),
-                    ])
-                })
-                .collect(),
-        ),
-        WireValue::Uint(inspect.rows as u64),
-        WireValue::Uint(inspect.segment_count as u64),
-        WireValue::Uint(inspect.target_segment_rows as u64),
-        WireValue::Text(inspect.source_digest.to_string()),
-    ]))
-    .map_err(|e| e.to_string())
-}
-
-fn columnar_aggregates_from_cbor(bytes: &[u8]) -> Result<Vec<ColumnarAggregate>, String> {
-    let WireValue::Array(items) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("columnar aggregates must be a CBOR array".to_string());
-    };
-    items
-        .into_iter()
-        .map(|item| {
-            let WireValue::Array(fields) = item else {
-                return Err("columnar aggregate must be [op, column?]".to_string());
-            };
-            let mut iter = fields.into_iter();
-            let op = match iter.next() {
-                Some(WireValue::Uint(tag)) => columnar_aggregate_op(tag)?,
-                _ => return Err("columnar aggregate op must be a uint".to_string()),
-            };
-            let column = match iter.next() {
-                Some(WireValue::Text(column)) => Some(column),
-                Some(WireValue::Null) | None => None,
-                _ => return Err("columnar aggregate column must be text or null".to_string()),
-            };
-            if iter.next().is_some() {
-                return Err("columnar aggregate has extra fields".to_string());
-            }
-            Ok(ColumnarAggregate { op, column })
-        })
-        .collect()
-}
-
-fn dataframe_batch_cbor(batch: loom_core::DataframeBatch) -> Result<Vec<u8>, String> {
-    let columns = batch
-        .columns
-        .iter()
-        .map(|column| {
-            WireValue::Array(vec![
-                WireValue::Text(column.name.clone()),
-                WireValue::Uint(u64::from(column.column_type.tag())),
-                WireValue::Bool(column.nullable),
-            ])
-        })
-        .collect();
-    let rows = batch
-        .rows
-        .iter()
-        .map(|row| WireValue::Array(row.iter().map(cell_value).collect()))
-        .collect();
-    loom_codec::encode(&WireValue::Array(vec![
-        WireValue::Array(columns),
-        WireValue::Array(rows),
-    ]))
-    .map_err(|e| e.to_string())
-}
-
-fn columnar_select_columns_from_cbor(bytes: &[u8]) -> Result<Vec<String>, String> {
-    let WireValue::Array(items) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("columnar select columns must be a CBOR array".to_string());
-    };
-    items
-        .into_iter()
-        .map(|item| match item {
-            WireValue::Text(name) => Ok(name),
-            _ => Err("columnar select column must be text".to_string()),
-        })
-        .collect()
-}
-
-fn columnar_filter_from_cbor(
-    bytes: &[u8],
-) -> Result<Option<(String, CmpOp, loom_core::Value)>, String> {
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    let WireValue::Array(items) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("columnar select filter must be a CBOR array".to_string());
-    };
-    let mut iter = items.into_iter();
-    let column = match iter.next() {
-        Some(WireValue::Text(column)) => column,
-        _ => return Err("columnar filter column must be text".to_string()),
-    };
-    let op = match iter.next() {
-        Some(WireValue::Uint(tag)) => columnar_cmp_op(tag)?,
-        _ => return Err("columnar filter op must be a uint".to_string()),
-    };
-    let value = iter
-        .next()
-        .ok_or_else(|| "columnar filter is missing its value cell".to_string())?;
-    Ok(Some((
-        column,
-        op,
-        cell_from(value).map_err(|e| e.to_string())?,
-    )))
-}
-
-fn ensure_columnar_import_target(
-    loom: &Loom<FileStore>,
-    ns: WorkspaceId,
-    name: &str,
-    replace: bool,
-) -> Result<(), String> {
-    match loom_core::get_columnar(loom, ns, name) {
-        Ok(_) if replace => Ok(()),
-        Ok(_) => Err(format!(
-            "columnar dataset {name:?} already exists; pass --replace to overwrite it"
-        )),
-        Err(err) if err.code == loom_core::error::Code::NotFound => Ok(()),
-        Err(err) => Err(err.to_string()),
-    }
-}
-
-fn search_field_type(tag: u64) -> Result<FieldType, String> {
-    match tag {
-        0 => Ok(FieldType::Text),
-        1 => Ok(FieldType::Keyword),
-        other => Err(format!("unknown search field type tag {other}")),
-    }
-}
-
-fn search_mapping_from_cbor(bytes: &[u8]) -> Result<Mapping, String> {
-    let WireValue::Map(pairs) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("search mapping must be a CBOR map".to_string());
-    };
-    let mut mapping = Mapping::new();
-    for (key, value) in pairs {
-        let WireValue::Text(field) = key else {
-            return Err("search mapping field name must be text".to_string());
-        };
-        let WireValue::Array(parts) = value else {
-            return Err("search field mapping must be an array".to_string());
-        };
-        if parts.len() != 3 && parts.len() != 6 {
-            return Err("search field mapping must have 3 or 6 fields".to_string());
-        }
-        let mut iter = parts.into_iter();
-        let field_type = match iter.next() {
-            Some(WireValue::Uint(tag)) => search_field_type(tag)?,
-            _ => return Err("search field type tag must be a uint".to_string()),
-        };
-        let stored = matches!(iter.next(), Some(WireValue::Bool(true)));
-        let faceted = matches!(iter.next(), Some(WireValue::Bool(true)));
-        let analysis = loom_core::AnalyzerMapping {
-            index_analyzer: search_opt_text(iter.next())?,
-            search_analyzer: search_opt_text(iter.next())?,
-            normalizer: search_opt_text(iter.next())?,
-        };
-        mapping.insert(
-            field,
-            FieldMapping {
-                field_type,
-                stored,
-                faceted,
-                analysis,
-            },
-        );
-    }
-    Ok(mapping)
-}
-
-fn search_opt_text(value: Option<WireValue>) -> Result<Option<String>, String> {
-    match value {
-        Some(WireValue::Null) | None => Ok(None),
-        Some(WireValue::Text(value)) => Ok(Some(value)),
-        _ => Err("search analyzer field must be text or null".to_string()),
-    }
-}
-
-fn search_document_from_cbor(bytes: &[u8]) -> Result<Document, String> {
-    let WireValue::Map(pairs) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("search document must be a CBOR map".to_string());
-    };
-    let mut doc = Document::new();
-    for (key, value) in pairs {
-        let WireValue::Text(field) = key else {
-            return Err("search document field name must be text".to_string());
-        };
-        let value = match value {
-            WireValue::Text(text) => FieldValue::Text(text),
-            WireValue::Bytes(bytes) => FieldValue::Bytes(bytes),
-            _ => return Err("search document value must be text or bytes".to_string()),
-        };
-        doc.insert(field, value);
-    }
-    Ok(doc)
-}
-
-fn search_document_cbor(doc: &Document) -> Result<Vec<u8>, String> {
-    let pairs = doc
-        .iter()
-        .map(|(field, value)| {
-            let value = match value {
-                FieldValue::Text(text) => WireValue::Text(text.clone()),
-                FieldValue::Bytes(bytes) => WireValue::Bytes(bytes.clone()),
-            };
-            (WireValue::Text(field.clone()), value)
-        })
-        .collect();
-    loom_codec::encode(&WireValue::Map(pairs)).map_err(|e| e.to_string())
-}
-
-fn search_opt_bytes(value: Option<WireValue>) -> Result<Option<Vec<u8>>, String> {
-    match value {
-        Some(WireValue::Null) | None => Ok(None),
-        Some(WireValue::Bytes(bytes)) => Ok(Some(bytes)),
-        _ => Err("search range bound must be bytes or null".to_string()),
-    }
-}
-
-fn search_query_from_value(value: WireValue) -> Result<Query, String> {
-    let WireValue::Array(items) = value else {
-        return Err("search query node must be a CBOR array".to_string());
-    };
-    let mut iter = items.into_iter();
-    let tag = match iter.next() {
-        Some(WireValue::Uint(tag)) => tag,
-        _ => return Err("search query tag must be a uint".to_string()),
-    };
-    let text = |value: Option<WireValue>, what: &str| match value {
-        Some(WireValue::Text(text)) => Ok(text),
-        _ => Err(format!("search query {what} must be text")),
-    };
-    match tag {
-        5 => Ok(Query::MatchAll),
-        0 => Ok(Query::Match {
-            field: text(iter.next(), "Match field")?,
-            text: text(iter.next(), "Match text")?,
-        }),
-        1 => {
-            let field = text(iter.next(), "Term field")?;
-            let value = match iter.next() {
-                Some(WireValue::Bytes(bytes)) => bytes,
-                Some(WireValue::Text(text)) => text.into_bytes(),
-                _ => return Err("search Term value must be bytes".to_string()),
-            };
-            Ok(Query::Term { field, value })
-        }
-        2 => {
-            let field = text(iter.next(), "Phrase field")?;
-            let terms = match iter.next() {
-                Some(WireValue::Array(terms)) => terms
-                    .into_iter()
-                    .map(|term| match term {
-                        WireValue::Text(term) => Ok(term),
-                        _ => Err("search Phrase term must be text".to_string()),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-                _ => return Err("search Phrase terms must be an array".to_string()),
-            };
-            let slop = match iter.next() {
-                Some(WireValue::Uint(slop)) => u32::try_from(slop)
-                    .map_err(|_| "search Phrase slop out of range".to_string())?,
-                _ => return Err("search Phrase slop must be a uint".to_string()),
-            };
-            Ok(Query::Phrase { field, terms, slop })
-        }
-        3 => {
-            let field = text(iter.next(), "Range field")?;
-            let lower = search_opt_bytes(iter.next())?;
-            let upper = search_opt_bytes(iter.next())?;
-            let include_lower = matches!(iter.next(), Some(WireValue::Bool(true)));
-            let include_upper = matches!(iter.next(), Some(WireValue::Bool(true)));
-            Ok(Query::Range {
-                field,
-                lower,
-                upper,
-                include_lower,
-                include_upper,
-            })
-        }
-        4 => {
-            let list = |value: Option<WireValue>, what: &str| match value {
-                Some(WireValue::Array(queries)) => queries
-                    .into_iter()
-                    .map(search_query_from_value)
-                    .collect::<Result<Vec<_>, _>>(),
-                _ => Err(format!("search Bool {what} must be an array")),
-            };
-            Ok(Query::Bool {
-                must: list(iter.next(), "must")?,
-                should: list(iter.next(), "should")?,
-                must_not: list(iter.next(), "must_not")?,
-            })
-        }
-        6 => {
-            let field = text(iter.next(), "Prefix field")?;
-            let value = match iter.next() {
-                Some(WireValue::Bytes(bytes)) => bytes,
-                Some(WireValue::Text(text)) => text.into_bytes(),
-                _ => return Err("search Prefix value must be bytes".to_string()),
-            };
-            Ok(Query::Prefix { field, value })
-        }
-        7 => {
-            let field = text(iter.next(), "Wildcard field")?;
-            let pattern = match iter.next() {
-                Some(WireValue::Bytes(bytes)) => bytes,
-                Some(WireValue::Text(text)) => text.into_bytes(),
-                _ => return Err("search Wildcard pattern must be bytes".to_string()),
-            };
-            Ok(Query::Wildcard { field, pattern })
-        }
-        8 => {
-            let field = text(iter.next(), "Fuzzy field")?;
-            let text = text(iter.next(), "Fuzzy text")?;
-            let max_distance = match iter.next() {
-                Some(WireValue::Uint(value)) => u32::try_from(value)
-                    .map_err(|_| "search Fuzzy distance out of range".to_string())?,
-                _ => return Err("search Fuzzy distance must be a uint".to_string()),
-            };
-            Ok(Query::Fuzzy {
-                field,
-                text,
-                max_distance,
-            })
-        }
-        9 => {
-            let field = text(iter.next(), "Similar field")?;
-            let text = text(iter.next(), "Similar text")?;
-            let min_should_match = match iter.next() {
-                Some(WireValue::Uint(value)) => u32::try_from(value)
-                    .map_err(|_| "search Similar min_should_match out of range".to_string())?,
-                _ => return Err("search Similar min_should_match must be a uint".to_string()),
-            };
-            Ok(Query::Similar {
-                field,
-                text,
-                min_should_match,
-            })
-        }
-        other => Err(format!("unknown search query tag {other}")),
-    }
-}
-
-fn search_text_list_from_value(value: WireValue, what: &str) -> Result<Vec<String>, String> {
-    let WireValue::Array(items) = value else {
-        return Err(format!("{what} must be an array"));
-    };
-    items
-        .into_iter()
-        .map(|item| match item {
-            WireValue::Text(text) => Ok(text),
-            _ => Err(format!("{what} entries must be text")),
-        })
-        .collect()
-}
-
-fn search_aggregations_from_value(value: WireValue) -> Result<Vec<AggregationRequest>, String> {
-    let WireValue::Array(items) = value else {
-        return Err("search request aggregations must be an array".to_string());
-    };
-    items
-        .into_iter()
-        .map(|item| {
-            let WireValue::Array(parts) = item else {
-                return Err("search aggregation request must be an array".to_string());
-            };
-            if parts.len() != 3 {
-                return Err("search aggregation request must have tag, name, and field".to_string());
-            }
-            let tag = match &parts[0] {
-                WireValue::Uint(tag) => *tag,
-                _ => return Err("search aggregation tag must be a uint".to_string()),
-            };
-            let WireValue::Text(name) = parts[1].clone() else {
-                return Err("search aggregation name must be text".to_string());
-            };
-            let WireValue::Text(field) = parts[2].clone() else {
-                return Err("search aggregation field must be text".to_string());
-            };
-            match tag {
-                0 => Ok(AggregationRequest::Terms { name, field }),
-                1 => Ok(AggregationRequest::ValueCount { name, field }),
-                other => Err(format!("unknown search aggregation tag {other}")),
-            }
-        })
-        .collect()
-}
-
-fn search_request_from_cbor(bytes: &[u8]) -> Result<QueryRequest, String> {
-    let WireValue::Array(items) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
-        return Err("search request must be a CBOR array".to_string());
-    };
-    let mut iter = items.into_iter();
-    let query = search_query_from_value(
-        iter.next()
-            .ok_or_else(|| "search request is missing its query".to_string())?,
-    )?;
-    let limit = match iter.next() {
-        Some(WireValue::Uint(limit)) => {
-            u32::try_from(limit).map_err(|_| "search limit out of range".to_string())?
-        }
-        _ => return Err("search request limit must be a uint".to_string()),
-    };
-    let offset = match iter.next() {
-        Some(WireValue::Uint(offset)) => {
-            u32::try_from(offset).map_err(|_| "search offset out of range".to_string())?
-        }
-        _ => return Err("search request offset must be a uint".to_string()),
-    };
-    let facets = match iter.next() {
-        Some(value) => search_text_list_from_value(value, "search request facets")?,
-        None => Vec::new(),
-    };
-    let highlight = match iter.next() {
-        Some(value) => search_text_list_from_value(value, "search request highlight")?,
-        None => Vec::new(),
-    };
-    let aggregations = match iter.next() {
-        Some(value) => search_aggregations_from_value(value)?,
-        None => Vec::new(),
-    };
-    if iter.next().is_some() {
-        return Err("search request has extra fields".to_string());
-    }
-    Ok(QueryRequest {
-        query,
-        limit,
-        offset,
-        facets,
-        highlight,
-        aggregations,
-    })
-}
-
-fn search_response_cbor(response: &QueryResponse) -> Result<Vec<u8>, String> {
-    let hits = response
-        .hits
-        .iter()
-        .map(|hit| {
-            Ok(WireValue::Array(vec![
-                WireValue::Bytes(hit.id.clone()),
-                wire_cell_value(&loom_core::Value::F32(hit.score))?,
-            ]))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    loom_codec::encode(&WireValue::Array(vec![
-        WireValue::Bool(response.reduced),
-        WireValue::Array(hits),
-    ]))
-    .map_err(|e| e.to_string())
-}
-
-fn search_ids_cbor(ids: Vec<Vec<u8>>) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&WireValue::Array(
-        ids.into_iter().map(WireValue::Bytes).collect(),
-    ))
-    .map_err(|e| e.to_string())
 }
 
 fn search_bytes_arg(
@@ -2124,14 +1263,21 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
                     .map(|value| parse_calendar_component(value))
                     .collect::<Result<Vec<_>, _>>()?
             };
-            let client = remote::open_store_client(&store)?;
-            client.cal_create_collection(
-                keys,
-                &workspace,
-                &principal,
-                &collection,
+            let meta = loom_core::calendar::CollectionMeta {
                 display_name,
                 component_set,
+            };
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Calendar",
+                "create_collection",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                    WireValue::Bytes(meta.encode()),
+                ],
             )
         }
         CalendarCmd::DeleteCollection {
@@ -2140,9 +1286,17 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
             principal,
             collection,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let present =
-                client.cal_delete_collection(keys, &workspace, &principal, &collection)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Calendar",
+                "delete_collection",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                ],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -2153,9 +1307,18 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
             collection,
             uid,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let present =
-                client.cal_delete_entry(keys, &workspace, &principal, &collection, &uid)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Calendar",
+                "delete_entry",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                    uid.to_value(),
+                ],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -2166,9 +1329,17 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
             collection,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) =
-                client.cal_get_collection(keys, &workspace, &principal, &collection)?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Calendar",
+                "get_collection",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                ],
+            )?
             else {
                 return Err(format!("calendar collection {collection:?} not found"));
             };
@@ -2182,9 +1353,18 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
             uid,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) =
-                client.cal_get_entry(keys, &workspace, &principal, &collection, &uid)?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Calendar",
+                "get_entry",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                    uid.to_value(),
+                ],
+            )?
             else {
                 return Err(format!("calendar entry {uid:?} not found"));
             };
@@ -2196,11 +1376,17 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
             principal,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let collections = client.cal_list_collections(keys, &workspace, &principal)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Calendar",
+                "list_collections",
+                vec![workspace.to_value(), principal.to_value()],
+            )?;
             if let Some(out) = out {
-                write_output(Some(&out), &text_array_cbor(&collections)?).map_err(|e| e.to_string())
+                write_output(Some(&out), &encoded).map_err(|e| e.to_string())
             } else {
+                let collections = string_list_from_cbor(&encoded)?;
                 for collection in collections {
                     println!("{collection}");
                 }
@@ -2214,8 +1400,17 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
             collection,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.cal_list_entries(keys, &workspace, &principal, &collection)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Calendar",
+                "list_entries",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         CalendarCmd::PutEntry {
@@ -2226,8 +1421,18 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let etag = client.cal_put_entry(keys, &workspace, &principal, &collection, bytes)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let etag = execute_generated_digest_string(
+                &client,
+                "Calendar",
+                "put_entry",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                    WireValue::Bytes(bytes),
+                ],
+            )?;
             println!("{etag}");
             Ok(())
         }
@@ -2240,8 +1445,18 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
         } => {
             let ics = String::from_utf8(read_input(&input).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let etag = client.cal_put_ics(keys, &workspace, &principal, &collection, ics)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let etag = execute_generated_digest_string(
+                &client,
+                "Calendar",
+                "put_ics",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                    ics.to_value(),
+                ],
+            )?;
             println!("{etag}");
             Ok(())
         }
@@ -2254,9 +1469,19 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
             to,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded =
-                client.cal_range(keys, &workspace, &principal, &collection, &from, &to)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Calendar",
+                "range",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                    from.to_value(),
+                    to.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         CalendarCmd::Search {
@@ -2272,9 +1497,22 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
                 .as_deref()
                 .map(parse_calendar_component)
                 .transpose()?;
-            let client = remote::open_store_client(&store)?;
-            let encoded =
-                client.cal_search(keys, &workspace, &principal, &collection, component, text)?;
+            let component = component
+                .map(|component| component.as_str().to_string())
+                .unwrap_or_default();
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Calendar",
+                "search",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                    component.to_value(),
+                    text.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         CalendarCmd::ToIcs {
@@ -2285,8 +1523,18 @@ fn run_calendar(action: CalendarCmd, keys: &KeyOpts) -> Result<(), String> {
             uid,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.cal_to_ics(keys, &workspace, &principal, &collection, &uid)?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Calendar",
+                "to_ics",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    collection.to_value(),
+                    uid.to_value(),
+                ],
+            )?
             else {
                 return Err(format!("calendar entry {uid:?} not found"));
             };
@@ -2303,8 +1551,16 @@ fn run_cas(action: CasCmd, keys: &KeyOpts) -> Result<(), String> {
             digest,
         } => {
             let digest = Digest::parse(&digest).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let present = client.cas_delete(keys, &workspace, &digest)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Cas",
+                "delete",
+                vec![
+                    workspace.to_value(),
+                    loom_remote_protocol::api_types::Digest(digest.to_string()).to_value(),
+                ],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -2315,8 +1571,17 @@ fn run_cas(action: CasCmd, keys: &KeyOpts) -> Result<(), String> {
             out,
         } => {
             let digest = Digest::parse(&digest).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.cas_get(keys, &workspace, &digest)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Cas",
+                "get",
+                vec![
+                    workspace.to_value(),
+                    GeneratedDigest(digest.to_string()).to_value(),
+                ],
+            )?
+            else {
                 return Err(format!("cas blob {digest} not found"));
             };
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
@@ -2327,8 +1592,17 @@ fn run_cas(action: CasCmd, keys: &KeyOpts) -> Result<(), String> {
             digest,
         } => {
             let digest = Digest::parse(&digest).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            println!("{}", client.cas_has(keys, &workspace, &digest)?);
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Cas",
+                "has",
+                vec![
+                    workspace.to_value(),
+                    GeneratedDigest(digest.to_string()).to_value(),
+                ],
+            )?;
+            println!("{present}");
             Ok(())
         }
         CasCmd::List {
@@ -2336,8 +1610,9 @@ fn run_cas(action: CasCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let digests = client.cas_list(keys, &workspace)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let digests =
+                execute_generated_digest_list(&client, "Cas", "list", vec![workspace.to_value()])?;
             let items = digests.iter().map(ToString::to_string).collect::<Vec<_>>();
             if let Some(out) = out {
                 write_output(Some(&out), &text_array_cbor(&items)?).map_err(|e| e.to_string())
@@ -2354,8 +1629,13 @@ fn run_cas(action: CasCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let digest = client.cas_put(keys, &workspace, bytes)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let digest = execute_generated_digest_string(
+                &client,
+                "Cas",
+                "put",
+                vec![workspace.to_value(), WireValue::Bytes(bytes)],
+            )?;
             println!("{digest}");
             Ok(())
         }
@@ -2392,7 +1672,7 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let Some(document) = client.doc_get_text(&workspace, &collection, &id)? else {
                 return Err(format!("document id {id:?} not found"));
             };
@@ -2426,7 +1706,7 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let Some(document) = client.doc_get_binary(&workspace, &collection, &id)? else {
                 return Err(format!("document id {id:?} not found"));
             };
@@ -2458,7 +1738,7 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             collection,
             out,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let encoded = client.doc_list_binary(&workspace, &collection)?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
@@ -2469,7 +1749,7 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             index,
             value_json,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let ids = client.doc_find(&workspace, &collection, &index, &value_json)?;
             println!("{}", serde_json::json!({ "ids": ids }));
             Ok(())
@@ -2481,7 +1761,7 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let result = client.doc_query(&workspace, &collection, bytes)?;
             println!("{result}");
             Ok(())
@@ -2523,7 +1803,7 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             collection,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             println!("{}", client.doc_index_list(&workspace, &collection)?);
             Ok(())
         }
@@ -2541,7 +1821,7 @@ fn run_document(action: DocumentCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             collection,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             println!("{}", client.doc_index_statuses(&workspace, &collection)?);
             Ok(())
         }
@@ -2557,8 +1837,19 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
             book,
             display_name,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.con_create_book(keys, &workspace, &principal, &book, display_name)
+            let meta = loom_core::contacts::BookMeta { display_name };
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Contacts",
+                "create_book",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    book.to_value(),
+                    WireValue::Bytes(meta.encode()),
+                ],
+            )
         }
         ContactsCmd::DeleteBook {
             store,
@@ -2566,8 +1857,13 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
             principal,
             book,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let present = client.con_delete_book(keys, &workspace, &principal, &book)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Contacts",
+                "delete_book",
+                vec![workspace.to_value(), principal.to_value(), book.to_value()],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -2578,8 +1874,18 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
             book,
             uid,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let present = client.con_delete_entry(keys, &workspace, &principal, &book, &uid)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Contacts",
+                "delete_entry",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    book.to_value(),
+                    uid.to_value(),
+                ],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -2590,8 +1896,14 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
             book,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.con_get_book(keys, &workspace, &principal, &book)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Contacts",
+                "get_book",
+                vec![workspace.to_value(), principal.to_value(), book.to_value()],
+            )?
+            else {
                 return Err(format!("contacts book {book:?} not found"));
             };
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
@@ -2604,8 +1916,18 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
             uid,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.con_get_entry(keys, &workspace, &principal, &book, &uid)?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Contacts",
+                "get_entry",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    book.to_value(),
+                    uid.to_value(),
+                ],
+            )?
             else {
                 return Err(format!("contacts entry {uid:?} not found"));
             };
@@ -2617,11 +1939,17 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
             principal,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let books = client.con_list_books(keys, &workspace, &principal)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Contacts",
+                "list_books",
+                vec![workspace.to_value(), principal.to_value()],
+            )?;
             if let Some(out) = out {
-                write_output(Some(&out), &text_array_cbor(&books)?).map_err(|e| e.to_string())
+                write_output(Some(&out), &encoded).map_err(|e| e.to_string())
             } else {
+                let books = string_list_from_cbor(&encoded)?;
                 for book in books {
                     println!("{book}");
                 }
@@ -2635,8 +1963,13 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
             book,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.con_list_entries(keys, &workspace, &principal, &book)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Contacts",
+                "list_entries",
+                vec![workspace.to_value(), principal.to_value(), book.to_value()],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         ContactsCmd::PutEntry {
@@ -2647,8 +1980,18 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let etag = client.con_put_entry(keys, &workspace, &principal, &book, bytes)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let etag = execute_generated_digest_string(
+                &client,
+                "Contacts",
+                "put_entry",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    book.to_value(),
+                    WireValue::Bytes(bytes),
+                ],
+            )?;
             println!("{etag}");
             Ok(())
         }
@@ -2661,8 +2004,18 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
         } => {
             let vcard = String::from_utf8(read_input(&input).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let etag = client.con_put_vcard(keys, &workspace, &principal, &book, vcard)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let etag = execute_generated_digest_string(
+                &client,
+                "Contacts",
+                "put_vcard",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    book.to_value(),
+                    vcard.to_value(),
+                ],
+            )?;
             println!("{etag}");
             Ok(())
         }
@@ -2674,8 +2027,18 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
             text,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.con_search(keys, &workspace, &principal, &book, &text)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Contacts",
+                "search",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    book.to_value(),
+                    text.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         ContactsCmd::ToVcard {
@@ -2686,8 +2049,18 @@ fn run_contacts(action: ContactsCmd, keys: &KeyOpts) -> Result<(), String> {
             uid,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.con_to_vcard(keys, &workspace, &principal, &book, &uid)?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Contacts",
+                "to_vcard",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    book.to_value(),
+                    uid.to_value(),
+                ],
+            )?
             else {
                 return Err(format!("contacts entry {uid:?} not found"));
             };
@@ -2705,8 +2078,18 @@ fn run_kv(action: KvCmd, keys: &KeyOpts) -> Result<(), String> {
             key,
         } => {
             let key = parse_kv_key_input(&key)?;
-            let client = remote::open_store_client(&store)?;
-            let present = client.kv_delete(keys, &workspace, &collection, key)?;
+            let key = loom_core::kv::key_to_cbor(&key);
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Kv",
+                "delete",
+                vec![
+                    workspace.to_value(),
+                    collection.to_value(),
+                    WireValue::Bytes(key),
+                ],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -2718,8 +2101,19 @@ fn run_kv(action: KvCmd, keys: &KeyOpts) -> Result<(), String> {
             out,
         } => {
             let key = parse_kv_key_input(&key)?;
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.kv_get(keys, &workspace, &collection, key)? else {
+            let key = loom_core::kv::key_to_cbor(&key);
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Kv",
+                "get",
+                vec![
+                    workspace.to_value(),
+                    collection.to_value(),
+                    WireValue::Bytes(key),
+                ],
+            )?
+            else {
                 return Err("kv key not found".to_string());
             };
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
@@ -2730,8 +2124,13 @@ fn run_kv(action: KvCmd, keys: &KeyOpts) -> Result<(), String> {
             collection,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.kv_list(keys, &workspace, &collection)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Kv",
+                "list",
+                vec![workspace.to_value(), collection.to_value()],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         KvCmd::Put {
@@ -2742,9 +2141,20 @@ fn run_kv(action: KvCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let key = parse_kv_key_input(&key)?;
+            let key = loom_core::kv::key_to_cbor(&key);
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            client.kv_put(keys, &workspace, &collection, key, bytes)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Kv",
+                "put",
+                vec![
+                    workspace.to_value(),
+                    collection.to_value(),
+                    WireValue::Bytes(key),
+                    WireValue::Bytes(bytes),
+                ],
+            )
         }
         KvCmd::Range {
             store,
@@ -2756,8 +2166,20 @@ fn run_kv(action: KvCmd, keys: &KeyOpts) -> Result<(), String> {
         } => {
             let from = parse_kv_key_input(&from)?;
             let to = parse_kv_key_input(&to)?;
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.kv_range(keys, &workspace, &collection, from, to)?;
+            let from = loom_core::kv::key_to_cbor(&from);
+            let to = loom_core::kv::key_to_cbor(&to);
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Kv",
+                "range",
+                vec![
+                    workspace.to_value(),
+                    collection.to_value(),
+                    WireValue::Bytes(from),
+                    WireValue::Bytes(to),
+                ],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
     }
@@ -2772,8 +2194,19 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             mailbox,
             display_name,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.mail_create_mailbox(keys, &workspace, &principal, &mailbox, display_name)
+            let meta = loom_core::mail::MailboxMeta { display_name };
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Mail",
+                "create_mailbox",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                    WireValue::Bytes(meta.encode()),
+                ],
+            )
         }
         MailCmd::DeleteMailbox {
             store,
@@ -2781,8 +2214,17 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             principal,
             mailbox,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let present = client.mail_delete_mailbox(keys, &workspace, &principal, &mailbox)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Mail",
+                "delete_mailbox",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                ],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -2793,9 +2235,18 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             mailbox,
             uid,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let present =
-                client.mail_delete_message(keys, &workspace, &principal, &mailbox, &uid)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Mail",
+                "delete_message",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                    uid.to_value(),
+                ],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -2807,11 +2258,22 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             uid,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let flags = client.mail_get_flags(keys, &workspace, &principal, &mailbox, &uid)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Mail",
+                "get_flags",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                    uid.to_value(),
+                ],
+            )?;
             if let Some(out) = out {
-                write_output(Some(&out), &text_array_cbor(&flags)?).map_err(|e| e.to_string())
+                write_output(Some(&out), &encoded).map_err(|e| e.to_string())
             } else {
+                let flags = string_list_from_cbor(&encoded)?;
                 for flag in flags {
                     println!("{flag}");
                 }
@@ -2825,8 +2287,17 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             mailbox,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.mail_get_mailbox(keys, &workspace, &principal, &mailbox)?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Mail",
+                "get_mailbox",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                ],
+            )?
             else {
                 return Err(format!("mailbox {mailbox:?} not found"));
             };
@@ -2840,9 +2311,18 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             uid,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) =
-                client.mail_get_message(keys, &workspace, &principal, &mailbox, &uid)?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Mail",
+                "get_message",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                    uid.to_value(),
+                ],
+            )?
             else {
                 return Err(format!("mail message {uid:?} not found"));
             };
@@ -2857,9 +2337,19 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let digest =
-                client.mail_ingest_message(keys, &workspace, &principal, &mailbox, &uid, bytes)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let digest = execute_generated_digest_string(
+                &client,
+                "Mail",
+                "ingest_message",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                    uid.to_value(),
+                    WireValue::Bytes(bytes),
+                ],
+            )?;
             println!("{digest}");
             Ok(())
         }
@@ -2869,11 +2359,17 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             principal,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let mailboxes = client.mail_list_mailboxes(keys, &workspace, &principal)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Mail",
+                "list_mailboxes",
+                vec![workspace.to_value(), principal.to_value()],
+            )?;
             if let Some(out) = out {
-                write_output(Some(&out), &text_array_cbor(&mailboxes)?).map_err(|e| e.to_string())
+                write_output(Some(&out), &encoded).map_err(|e| e.to_string())
             } else {
+                let mailboxes = string_list_from_cbor(&encoded)?;
                 for mailbox in mailboxes {
                     println!("{mailbox}");
                 }
@@ -2887,8 +2383,17 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             mailbox,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.mail_list_messages(keys, &workspace, &principal, &mailbox)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Mail",
+                "list_messages",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         MailCmd::Search {
@@ -2899,8 +2404,18 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             text,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.mail_search(keys, &workspace, &principal, &mailbox, &text)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Mail",
+                "search",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                    text.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         MailCmd::SetFlags {
@@ -2911,8 +2426,20 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             uid,
             flags,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.mail_set_flags(keys, &workspace, &principal, &mailbox, &uid, flags)
+            let encoded = text_array_cbor(&flags)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Mail",
+                "set_flags",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                    uid.to_value(),
+                    WireValue::Bytes(encoded),
+                ],
+            )
         }
         MailCmd::ToEml {
             store,
@@ -2922,8 +2449,18 @@ fn run_mail(action: MailCmd, keys: &KeyOpts) -> Result<(), String> {
             uid,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.mail_to_eml(keys, &workspace, &principal, &mailbox, &uid)?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Mail",
+                "to_eml",
+                vec![
+                    workspace.to_value(),
+                    principal.to_value(),
+                    mailbox.to_value(),
+                    uid.to_value(),
+                ],
+            )?
             else {
                 return Err(format!("mail message {uid:?} not found"));
             };
@@ -3016,14 +2553,13 @@ fn run_meetings(action: MeetingsCmd, keys: &KeyOpts) -> Result<(), String> {
             leaf,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            validate_meetings_source_payload_leaf(&leaf).map_err(|e| e.to_string())?;
-            let path = meetings_source_payload_path(&profile_id, &source_id, &leaf);
-            let bytes = loom
-                .read_file_reserved(workspace_id, &path)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Meetings",
+                "meetings_source_read",
+                vec![workspace.to_value(), source_id.to_value(), leaf.to_value()],
+            )?;
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         MeetingsCmd::Import {
@@ -3037,12 +2573,20 @@ fn run_meetings(action: MeetingsCmd, keys: &KeyOpts) -> Result<(), String> {
             let input_profile =
                 parse_meetings_input_profile(&input_profile).map_err(|e| e.to_string())?;
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Vcs)?;
-            let result =
-                import_meetings_bytes(&mut loom, workspace_id, input_profile, &bytes, dry_run)
-                    .map_err(|e| e.to_string())?;
-            print_import_report(&result.report, &report_format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let report_json = execute_generated_string(
+                &client,
+                "Meetings",
+                "meetings_import_snapshot",
+                vec![
+                    workspace.to_value(),
+                    input_profile_label(input_profile).to_value(),
+                    WireValue::Bytes(bytes),
+                    dry_run.to_value(),
+                ],
+            )?;
+            let report = import_report_from_json(&report_json).map_err(|e| e.to_string())?;
+            print_import_report(&report, &report_format)
         }
     }
 }
@@ -3112,7 +2656,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             include_contracts,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Tickets",
@@ -3139,6 +2683,8 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             acceptance_evidence_enforcement,
             required_acceptance_evidence_keys,
             replace_required_acceptance_evidence_keys,
+            required_acceptance_reviews,
+            replace_required_acceptance_reviews,
             owner_contract_summary,
             owner_contract_details,
             worker_contract_summary,
@@ -3171,6 +2717,16 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             } else {
                 None
             };
+            let required_acceptance_reviews = required_acceptance_reviews
+                .iter()
+                .map(|review| loom_tickets::TicketReviewType::parse(review))
+                .collect::<loom_core::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?;
+            let required_acceptance_reviews = if replace_required_acceptance_reviews {
+                Some(required_acceptance_reviews.as_slice())
+            } else {
+                None
+            };
             // Contract summaries/details accept `@path` to load the value from a file (markdown/text
             // can be large); `@@` escapes a literal leading `@`.
             let owner_contract_summary = expand_at_file_opt(owner_contract_summary)?;
@@ -3187,6 +2743,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
                 acceptance_authorities,
                 acceptance_evidence_enforcement,
                 required_acceptance_evidence_keys,
+                required_acceptance_reviews,
                 owner_contract_summary: owner_contract_summary.as_deref(),
                 owner_contract_details: owner_contract_details.as_deref(),
                 worker_contract_summary: worker_contract_summary.as_deref(),
@@ -3212,7 +2769,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Tickets",
@@ -3227,7 +2784,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             ticket_id,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Tickets",
@@ -3248,7 +2805,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             operation,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Tickets",
@@ -3601,7 +3158,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             ticket_id,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Tickets",
@@ -3766,7 +3323,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             board_id,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Tickets",
@@ -3785,7 +3342,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             include_deleted,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Tickets",
@@ -4005,7 +3562,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             cursor,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let request = serde_json::json!({
                 "projection": projection,
@@ -4044,7 +3601,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
         } => {
             loom_tickets::parse_ticket_projection(projection.as_deref())
                 .map_err(|e| e.to_string())?;
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let ticket_raw = client.generated_json(
                 "Tickets",
@@ -4093,7 +3650,7 @@ fn run_tickets(action: TicketsCmd, keys: &KeyOpts) -> Result<(), String> {
             detailed,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Tickets",
@@ -4166,7 +3723,7 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             detailed,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             if detailed {
                 let ticket_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
                 let raw =
@@ -4188,7 +3745,7 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             detailed,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let ticket_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.lanes_list_views_json(&workspace, &ticket_workspace_id, true)?;
             let views: Vec<LaneView> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
@@ -4419,7 +3976,11 @@ fn run_lanes(action: LanesCmd, keys: &KeyOpts) -> Result<(), String> {
             updated_by,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = if apply {
+                remote::open_cli_generated_client(&store, keys)?
+            } else {
+                remote::open_cli_read_only_generated_client(&store, keys)?
+            };
             let actor = resolve_generated_lane_actor(updated_by.as_deref())?;
             let raw = client.generated_json(
                 "Lanes",
@@ -4614,7 +4175,7 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Pages",
@@ -4629,7 +4190,7 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             space_id,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Pages",
@@ -4720,7 +4281,7 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             page_id,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Pages",
@@ -4739,7 +4300,7 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             page_id,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Pages",
@@ -4785,7 +4346,7 @@ fn run_pages(action: PagesCmd, keys: &KeyOpts) -> Result<(), String> {
             structure_id,
             format,
         } => {
-            let client = remote::open_cli_generated_client(&store, keys)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let profile_id = client.resolve_workspace_id(&workspace)?.to_string();
             let raw = client.generated_json(
                 "Pages",
@@ -5000,15 +4561,6 @@ fn parse_page_structure_decompose_items(
     Ok(items)
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct LifecycleGateEvaluationJson {
-    gate_id: String,
-    passed: bool,
-    principal_id: Option<String>,
-    evidence_digest: Option<String>,
-    evaluated_at_ms: Option<u64>,
-}
-
 fn run_lifecycle(action: LifecycleCmd, keys: &KeyOpts) -> Result<(), String> {
     match action {
         LifecycleCmd::DefineStandard {
@@ -5019,22 +4571,18 @@ fn run_lifecycle(action: LifecycleCmd, keys: &KeyOpts) -> Result<(), String> {
             completion_predicate_digest,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Vcs)?;
-            let profile_id = workspace_id.to_string();
-            let definition = loom_lifecycle::define_standard_lifecycle(
-                &mut loom,
-                workspace_id,
-                loom_lifecycle::StandardLifecycleRequest {
-                    workspace_id: &profile_id,
-                    kind: &kind,
-                    version: &version,
-                    completion_predicate_digest: &completion_predicate_digest,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_lifecycle(&definition, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let raw = client.generated_json(
+                "Lifecycle",
+                "lifecycle_define_standard_json",
+                vec![
+                    workspace.to_value(),
+                    kind.to_value(),
+                    version.to_value(),
+                    completion_predicate_digest.to_value(),
+                ],
+            )?;
+            print_lifecycle_json(&raw, &format)
         }
         LifecycleCmd::Define {
             store,
@@ -5043,14 +4591,13 @@ fn run_lifecycle(action: LifecycleCmd, keys: &KeyOpts) -> Result<(), String> {
             format,
         } => {
             let bytes = read_input(&definition).map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Vcs)?;
-            let profile_id = workspace_id.to_string();
-            let definition =
-                loom_lifecycle::define_lifecycle(&mut loom, workspace_id, &profile_id, &bytes)
-                    .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_lifecycle(&definition, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let raw = client.generated_json(
+                "Lifecycle",
+                "lifecycle_define_json",
+                vec![workspace.to_value(), WireValue::Bytes(bytes)],
+            )?;
+            print_lifecycle_json(&raw, &format)
         }
         LifecycleCmd::Definitions {
             store,
@@ -5087,20 +4634,18 @@ fn run_lifecycle(action: LifecycleCmd, keys: &KeyOpts) -> Result<(), String> {
             subject_refs,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let instance = loom_lifecycle::instantiate(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &instance_id,
-                &definition_id,
-                subject_refs,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_lifecycle(&instance, &format)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let raw = client.generated_json(
+                "Lifecycle",
+                "lifecycle_instantiate_json",
+                vec![
+                    workspace.to_value(),
+                    instance_id.to_value(),
+                    definition_id.to_value(),
+                    subject_refs.to_value(),
+                ],
+            )?;
+            print_lifecycle_json(&raw, &format)
         }
         LifecycleCmd::Instances {
             store,
@@ -5140,29 +4685,22 @@ fn run_lifecycle(action: LifecycleCmd, keys: &KeyOpts) -> Result<(), String> {
             snapshot_digest,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let now = current_time_ms()?;
-            let gate_evaluations = parse_lifecycle_gate_evaluations(&gate_evaluations, now)?;
-            let actor_principal_id = actor_principal_id.unwrap_or_else(|| workspace_id.to_string());
-            let result = loom_lifecycle::transition(
-                &mut loom,
-                workspace_id,
-                loom_lifecycle::LifecycleTransitionRequest {
-                    workspace_id: &profile_id,
-                    instance_id: &instance_id,
-                    transition_id: &transition_id,
-                    to_stage_id: &to_stage_id,
-                    actor_principal_id: &actor_principal_id,
-                    gate_evaluations,
-                    snapshot_digest: snapshot_digest.as_deref(),
-                    recorded_at_ms: now,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            print_lifecycle(&result, &format)
+            let gate_evaluations = read_lifecycle_gate_evaluations_json(&gate_evaluations)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let raw = client.generated_json(
+                "Lifecycle",
+                "lifecycle_transition_json",
+                vec![
+                    workspace.to_value(),
+                    instance_id.to_value(),
+                    transition_id.to_value(),
+                    to_stage_id.to_value(),
+                    actor_principal_id.to_value(),
+                    gate_evaluations.to_value(),
+                    snapshot_digest.to_value(),
+                ],
+            )?;
+            print_lifecycle_json(&raw, &format)
         }
         LifecycleCmd::SnapshotPlan {
             store,
@@ -5255,27 +4793,18 @@ fn run_lifecycle(action: LifecycleCmd, keys: &KeyOpts) -> Result<(), String> {
     }
 }
 
-fn parse_lifecycle_gate_evaluations(
-    input: &str,
-    now_ms: u64,
-) -> Result<Vec<loom_lifecycle::LifecycleGateEvaluationInput>, String> {
-    let bytes = if let Some(path) = input.strip_prefix('@') {
-        read_input(path).map_err(|e| e.to_string())?
+fn read_lifecycle_gate_evaluations_json(input: &str) -> Result<String, String> {
+    if let Some(path) = input.strip_prefix('@') {
+        let bytes = read_input(path).map_err(|e| e.to_string())?;
+        String::from_utf8(bytes).map_err(|_| "lifecycle gate evaluations must be UTF-8".to_string())
     } else {
-        input.as_bytes().to_vec()
-    };
-    let values: Vec<LifecycleGateEvaluationJson> =
-        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    Ok(values
-        .into_iter()
-        .map(|value| loom_lifecycle::LifecycleGateEvaluationInput {
-            gate_id: value.gate_id,
-            passed: value.passed,
-            principal_id: value.principal_id,
-            evidence_digest: value.evidence_digest,
-            evaluated_at_ms: value.evaluated_at_ms.unwrap_or(now_ms),
-        })
-        .collect())
+        Ok(input.to_string())
+    }
+}
+
+fn print_lifecycle_json(raw: &str, format: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    print_lifecycle(&value, format)
 }
 
 fn print_lifecycle<T: serde::Serialize>(value: &T, format: &str) -> Result<(), String> {
@@ -5701,7 +5230,7 @@ fn print_generated_ticket_summary_value(ticket: &serde_json::Value) -> Result<()
         json_string_field(ticket, "ticket_id")?,
         json_string_field(ticket, "project_id")?,
         json_string_field(ticket, "ticket_type")?,
-        json_string_field(ticket, "projection_profile")?,
+        json_string_field(ticket, "projection")?,
         json_string_field(ticket, "profile_root")?
     );
     Ok(())
@@ -5918,6 +5447,7 @@ struct TicketProjectSettingsPatchArgs<'a> {
     acceptance_authorities: Option<&'a [String]>,
     acceptance_evidence_enforcement: Option<bool>,
     required_acceptance_evidence_keys: Option<&'a [loom_tickets::TicketAcceptanceEvidenceKey]>,
+    required_acceptance_reviews: Option<&'a [loom_tickets::TicketReviewType]>,
     owner_contract_summary: Option<&'a str>,
     owner_contract_details: Option<&'a str>,
     worker_contract_summary: Option<&'a str>,
@@ -5965,6 +5495,18 @@ fn ticket_project_settings_patch_to_cbor(
             })
             .unwrap_or(WireValue::Null)
     };
+    let optional_reviews = |values: Option<&[loom_tickets::TicketReviewType]>| {
+        values
+            .map(|values| {
+                WireValue::Array(
+                    values
+                        .iter()
+                        .map(|value| WireValue::Text(value.as_str().to_string()))
+                        .collect(),
+                )
+            })
+            .unwrap_or(WireValue::Null)
+    };
     let optional_bool = |value: Option<bool>| value.map(WireValue::Bool).unwrap_or(WireValue::Null);
     let value = WireValue::Array(vec![
         opt_text(args.default_projection.map(|profile| profile.profile_id())),
@@ -5976,6 +5518,7 @@ fn ticket_project_settings_patch_to_cbor(
         optional_strings(args.acceptance_authorities),
         optional_bool(args.acceptance_evidence_enforcement),
         optional_keys(args.required_acceptance_evidence_keys),
+        optional_reviews(args.required_acceptance_reviews),
         opt_text(args.owner_contract_summary),
         opt_text(args.owner_contract_details),
         opt_text(args.worker_contract_summary),
@@ -6571,23 +6114,19 @@ fn print_lane_view(view: &LaneView, format: &str, detailed: bool) -> Result<(), 
     Ok(())
 }
 
-/// The `lanes list` JSON payload: healthy lane views plus one diagnostic per record that failed to
-/// decode, so malformed coordination records surface instead of being dropped.
-fn lane_list_json_payload(
-    views: &[LaneView],
-    diagnostics: &[LaneDecodeDiagnostic],
-) -> serde_json::Value {
+/// The `lanes list` JSON payload with canonical Lane views and consistency warnings.
+fn lane_list_json_payload(views: &[LaneView], diagnostics: &[LaneDiagnostic]) -> serde_json::Value {
     serde_json::json!({ "lanes": views, "diagnostics": diagnostics })
 }
 
-/// One fail-soft decode diagnostic rendered as a tab-separated text line for `lanes list`.
-fn lane_diagnostic_text_line(diagnostic: &LaneDecodeDiagnostic) -> String {
+/// One Lane consistency warning rendered as a tab-separated text line for `lanes list`.
+fn lane_diagnostic_text_line(diagnostic: &LaneDiagnostic) -> String {
     format!("diagnostic\t{}\t{}", diagnostic.lane_id, diagnostic.error)
 }
 
 fn print_lane_views(
     views: &[LaneView],
-    diagnostics: &[LaneDecodeDiagnostic],
+    diagnostics: &[LaneDiagnostic],
     format: &str,
     detailed: bool,
 ) -> Result<(), String> {
@@ -7117,8 +6656,17 @@ fn run_queue(action: QueueCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let seq = client.queue_append(keys, &workspace, &stream, bytes)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let seq = execute_generated_u64(
+                &client,
+                "Queue",
+                "append",
+                vec![
+                    workspace.to_value(),
+                    stream.to_value(),
+                    WireValue::Bytes(bytes),
+                ],
+            )?;
             println!("{seq}");
             Ok(())
         }
@@ -7129,8 +6677,18 @@ fn run_queue(action: QueueCmd, keys: &KeyOpts) -> Result<(), String> {
             consumer,
             next,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.queue_consumer_advance(keys, &workspace, &stream, &consumer, next)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "QueueConsumers",
+                "consumer_advance",
+                vec![
+                    workspace.to_value(),
+                    stream.to_value(),
+                    consumer.to_value(),
+                    next.to_value(),
+                ],
+            )
         }
         QueueCmd::Get {
             store,
@@ -7139,8 +6697,18 @@ fn run_queue(action: QueueCmd, keys: &KeyOpts) -> Result<(), String> {
             seq,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.queue_get(keys, &workspace, &stream, seq)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Queue",
+                "get",
+                vec![
+                    workspace.to_value(),
+                    stream.to_value(),
+                    (seq as u64).to_value(),
+                ],
+            )?
+            else {
                 return Err(format!("queue sequence {seq} not found"));
             };
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
@@ -7150,8 +6718,14 @@ fn run_queue(action: QueueCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             stream,
         } => {
-            let client = remote::open_store_client(&store)?;
-            println!("{}", client.queue_len(keys, &workspace, &stream)?);
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let len = execute_generated_u64(
+                &client,
+                "Queue",
+                "len",
+                vec![workspace.to_value(), stream.to_value()],
+            )?;
+            println!("{len}");
             Ok(())
         }
         QueueCmd::Position {
@@ -7160,11 +6734,14 @@ fn run_queue(action: QueueCmd, keys: &KeyOpts) -> Result<(), String> {
             stream,
             consumer,
         } => {
-            let client = remote::open_store_client(&store)?;
-            println!(
-                "{}",
-                client.queue_consumer_position(keys, &workspace, &stream, &consumer)?
-            );
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let position = execute_generated_u64(
+                &client,
+                "QueueConsumers",
+                "consumer_position",
+                vec![workspace.to_value(), stream.to_value(), consumer.to_value()],
+            )?;
+            println!("{position}");
             Ok(())
         }
         QueueCmd::Range {
@@ -7175,8 +6752,18 @@ fn run_queue(action: QueueCmd, keys: &KeyOpts) -> Result<(), String> {
             to,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let entries = client.queue_range(keys, &workspace, &stream, from as u64, to as u64)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let entries = execute_generated_bytes_list(
+                &client,
+                "Queue",
+                "range",
+                vec![
+                    workspace.to_value(),
+                    stream.to_value(),
+                    (from as u64).to_value(),
+                    (to as u64).to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &bytes_array_cbor(&entries)?).map_err(|e| e.to_string())
         }
         QueueCmd::Read {
@@ -7187,8 +6774,18 @@ fn run_queue(action: QueueCmd, keys: &KeyOpts) -> Result<(), String> {
             max,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let entries = client.queue_consumer_read(keys, &workspace, &stream, &consumer, max)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let entries = execute_generated_bytes_list(
+                &client,
+                "QueueConsumers",
+                "consumer_read",
+                vec![
+                    workspace.to_value(),
+                    stream.to_value(),
+                    consumer.to_value(),
+                    (max as u32).to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &bytes_array_cbor(&entries)?).map_err(|e| e.to_string())
         }
         QueueCmd::Reset {
@@ -7198,8 +6795,18 @@ fn run_queue(action: QueueCmd, keys: &KeyOpts) -> Result<(), String> {
             consumer,
             next,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.queue_consumer_reset(keys, &workspace, &stream, &consumer, next)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "QueueConsumers",
+                "consumer_reset",
+                vec![
+                    workspace.to_value(),
+                    stream.to_value(),
+                    consumer.to_value(),
+                    next.to_value(),
+                ],
+            )
         }
     }
 }
@@ -7213,8 +6820,18 @@ fn run_time_series(action: TimeSeriesCmd, keys: &KeyOpts) -> Result<(), String> 
             timestamp,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.ts_get(keys, &workspace, &series, timestamp)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "TimeSeries",
+                "get",
+                vec![
+                    workspace.to_value(),
+                    series.to_value(),
+                    timestamp.to_value(),
+                ],
+            )?
+            else {
                 return Err(format!("time-series point {timestamp} not found"));
             };
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
@@ -7225,13 +6842,17 @@ fn run_time_series(action: TimeSeriesCmd, keys: &KeyOpts) -> Result<(), String> 
             series,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
             let mut result = loom_core::Series::new();
-            if let Some((timestamp, bytes)) =
-                loom_core::ts_latest(&loom, ns, &series).map_err(|e| e.to_string())?
-            {
-                result.put(timestamp, bytes);
+            if let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "TimeSeries",
+                "latest",
+                vec![workspace.to_value(), series.to_value()],
+            )? {
+                let (timestamp, value) = loom_core::timeseries::latest_point_from_cbor(&bytes)
+                    .map_err(|e| e.to_string())?;
+                result.put(timestamp, value);
             }
             write_output(out.as_deref(), &result.encode()).map_err(|e| e.to_string())
         }
@@ -7243,8 +6864,18 @@ fn run_time_series(action: TimeSeriesCmd, keys: &KeyOpts) -> Result<(), String> 
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            client.ts_put(keys, &workspace, &series, timestamp, bytes)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "TimeSeries",
+                "put",
+                vec![
+                    workspace.to_value(),
+                    series.to_value(),
+                    timestamp.to_value(),
+                    WireValue::Bytes(bytes),
+                ],
+            )
         }
         TimeSeriesCmd::Range {
             store,
@@ -7254,8 +6885,18 @@ fn run_time_series(action: TimeSeriesCmd, keys: &KeyOpts) -> Result<(), String> 
             to,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.ts_range(keys, &workspace, &series, from, to)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "TimeSeries",
+                "range",
+                vec![
+                    workspace.to_value(),
+                    series.to_value(),
+                    from.to_value(),
+                    to.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
     }
@@ -7599,133 +7240,115 @@ fn load_inference_instance_state(
     inference_instance_state(loom, workspace).map_err(|error| error.to_string())
 }
 
-fn save_inference_instance_state(
-    loom: &mut Loom<FileStore>,
-    workspace: WorkspaceId,
-    state: &loom_inference::InferenceInstanceState,
-) -> Result<(), String> {
-    put_inference_instance_state(loom, workspace, state).map_err(|error| error.to_string())?;
-    save_loom(loom).map_err(|error| error.to_string())
-}
-
 fn run_inference_instance(action: InferenceInstanceCmd, keys: &KeyOpts) -> Result<(), String> {
-    let (store_path, workspace) = match &action {
-        InferenceInstanceCmd::List {
-            store, workspace, ..
-        }
-        | InferenceInstanceCmd::Show {
-            store, workspace, ..
-        }
-        | InferenceInstanceCmd::Create {
-            store, workspace, ..
-        }
-        | InferenceInstanceCmd::Update {
-            store, workspace, ..
-        }
-        | InferenceInstanceCmd::Delete {
-            store, workspace, ..
-        } => (store.as_str(), workspace.as_str()),
-    };
-    let mut opened = cli_open_loom(store_path, keys)?;
-    let workspace_id = resolve_ns(&opened, workspace)?;
-    let mut state = load_inference_instance_state(&opened, workspace_id)?;
     match action {
-        InferenceInstanceCmd::List { kind, format, .. } => {
-            let kind = parse_inference_kind_filter(kind)?;
-            let instances = state
-                .instances
+        InferenceInstanceCmd::List {
+            store,
+            workspace,
+            kind,
+            format,
+        } => {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let result_json = execute_generated_string(
+                &client,
+                "InferenceInstance",
+                "inference_instance_list_json",
+                vec![workspace.to_value(), kind.to_value()],
+            )?;
+            let owned = parse_inference_instance_list(&result_json)?;
+            let instances = owned
                 .iter()
-                .filter(|instance| kind.is_none_or(|kind| instance.kind == kind))
-                .map(|instance| InferenceInstanceView {
-                    instance,
-                    refs: state.instance_ref_count(&instance.name),
-                })
+                .map(OwnedInferenceInstanceView::as_view)
                 .collect::<Vec<_>>();
             print_inference_instance_list(&instances, &format)
         }
         InferenceInstanceCmd::Show {
+            store,
+            workspace,
             name,
             resolved,
             format,
-            ..
         } => {
-            let instance = state
-                .find_instance(&name)
-                .ok_or_else(|| format!("inference instance {name:?} not found"))?;
-            let view = InferenceInstanceView {
-                instance,
-                refs: state.instance_ref_count(&instance.name),
-            };
-            print_inference_instance(&view, resolved, &format)
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let result_json = execute_generated_string(
+                &client,
+                "InferenceInstance",
+                "inference_instance_get_json",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
+            let view = parse_inference_instance_view(&result_json)?;
+            print_inference_instance(&view.as_view(), resolved, &format)
         }
         InferenceInstanceCmd::Create {
+            store,
+            workspace,
             name,
             model,
             kind,
             runtime,
             preset,
             settings,
-            ..
         } => {
-            if state.find_instance(&name).is_some() {
-                return Err(format!("inference instance {name:?} already exists"));
-            }
-            let model = inference_model_ref(kind, model, None)?;
-            let runtime = RuntimeKind::parse(&runtime).map_err(|e| e.to_string())?;
-            let instance = loom_inference::build_instance_descriptor(
-                name,
-                model.kind,
-                model,
-                runtime,
-                preset,
-                parse_instance_settings(settings)?,
-            )
-            .map_err(|e| e.to_string())?;
-            state.upsert_instance(instance.clone());
-            save_inference_instance_state(&mut opened, workspace_id, &state)?;
-            let view = InferenceInstanceView {
-                instance: &instance,
-                refs: state.instance_ref_count(&instance.name),
-            };
-            print_inference_instance(&view, true, "text")?;
-            Ok(())
+            let settings_json = inference_instance_settings_json(settings)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let result_json = execute_generated_string(
+                &client,
+                "InferenceInstance",
+                "inference_instance_create_json",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    model.to_value(),
+                    kind.to_value(),
+                    runtime.to_value(),
+                    preset.to_value(),
+                    settings_json.to_value(),
+                ],
+            )?;
+            let view = parse_inference_instance_view(&result_json)?;
+            print_inference_instance(&view.as_view(), true, "text")
         }
         InferenceInstanceCmd::Update {
+            store,
+            workspace,
             name,
             preset,
             settings,
-            ..
         } => {
-            let instance = state
-                .find_instance(&name)
-                .cloned()
-                .ok_or_else(|| format!("inference instance {name:?} not found"))?;
-            let instance = loom_inference::update_instance_descriptor(
-                instance,
-                preset,
-                parse_instance_settings(settings)?,
-            )
-            .map_err(|e| e.to_string())?;
-            state.upsert_instance(instance.clone());
-            save_inference_instance_state(&mut opened, workspace_id, &state)?;
-            let view = InferenceInstanceView {
-                instance: &instance,
-                refs: state.instance_ref_count(&instance.name),
-            };
-            print_inference_instance(&view, true, "text")
+            let settings_json = inference_instance_settings_json(settings)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let result_json = execute_generated_string(
+                &client,
+                "InferenceInstance",
+                "inference_instance_update_json",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    preset.to_value(),
+                    settings_json.to_value(),
+                ],
+            )?;
+            let view = parse_inference_instance_view(&result_json)?;
+            print_inference_instance(&view.as_view(), true, "text")
         }
-        InferenceInstanceCmd::Delete { name, .. } => {
-            let refs = state.instance_ref_count(&name);
-            if refs != 0 {
-                return Err(format!(
-                    "inference instance {name:?} is still referenced by {refs} binding(s)"
-                ));
+        InferenceInstanceCmd::Delete {
+            store,
+            workspace,
+            name,
+        } => {
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let result_json = execute_generated_string(
+                &client,
+                "InferenceInstance",
+                "inference_instance_delete_json",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
+            let result: InferenceInstanceDeleteView =
+                serde_json::from_str(&result_json).map_err(|error| error.to_string())?;
+            if !result.deleted {
+                return Err("inference instance delete returned deleted=false".to_string());
             }
-            state
-                .remove_instance(&name)
-                .ok_or_else(|| format!("inference instance {name:?} not found"))?;
-            save_inference_instance_state(&mut opened, workspace_id, &state)?;
-            println!("deleted\t{name}");
+            println!("deleted\t{}", result.name);
             Ok(())
         }
     }
@@ -7739,7 +7362,7 @@ fn run_inference_instance_doctor(
     keys: &KeyOpts,
 ) -> Result<(), String> {
     let cache_dir = inference_cache_dir(None)?;
-    let opened = cli_open_loom(store, keys)?;
+    let opened = cli_open_loom_read(store, keys)?;
     let workspace_id = resolve_ns(&opened, workspace)?;
     let state = load_inference_instance_state(&opened, workspace_id)?;
     let instance = state
@@ -7754,6 +7377,29 @@ fn run_inference_instance_doctor(
 struct InferenceInstanceView<'a> {
     instance: &'a loom_types::InferenceInstanceDescriptor,
     refs: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct OwnedInferenceInstanceView {
+    instance: loom_types::InferenceInstanceDescriptor,
+    refs: usize,
+}
+
+impl OwnedInferenceInstanceView {
+    fn as_view(&self) -> InferenceInstanceView<'_> {
+        InferenceInstanceView {
+            instance: &self.instance,
+            refs: self.refs,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct InferenceInstanceDeleteView {
+    name: String,
+    deleted: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -7776,6 +7422,18 @@ fn parse_instance_settings(settings: Vec<String>) -> Result<BTreeMap<String, Str
         }
     }
     Ok(parsed)
+}
+
+fn inference_instance_settings_json(settings: Vec<String>) -> Result<String, String> {
+    serde_json::to_string(&parse_instance_settings(settings)?).map_err(|error| error.to_string())
+}
+
+fn parse_inference_instance_view(raw: &str) -> Result<OwnedInferenceInstanceView, String> {
+    serde_json::from_str(raw).map_err(|error| error.to_string())
+}
+
+fn parse_inference_instance_list(raw: &str) -> Result<Vec<OwnedInferenceInstanceView>, String> {
+    serde_json::from_str(raw).map_err(|error| error.to_string())
 }
 
 fn print_inference_instance_list(
@@ -8413,6 +8071,9 @@ fn store_doctor_json_value(store: &str, keys: &KeyOpts) -> Result<serde_json::Va
                         maintenance["live_root_diagnostics"] =
                             cli_live_root_diagnostics_json(&diagnostics);
                     }
+                    if let Ok(diagnostics) = fs.root_codec_diagnostics() {
+                        maintenance["root_codecs"] = root_codec_diagnostics_json(&diagnostics);
+                    }
                     maintenance
                 }
                 Err(error) => {
@@ -8531,6 +8192,94 @@ fn cli_live_root_diagnostics_json(diagnostics: &LiveRootDiagnostics) -> serde_js
             })
         }).collect::<Vec<_>>(),
     })
+}
+
+fn root_codec_diagnostics_json(
+    diagnostics: &loom_store::StoreRootCodecDiagnostics,
+) -> serde_json::Value {
+    serde_json::json!({
+        "state": if diagnostics.failures.is_empty() { "ok" } else { "error" },
+        "checked": diagnostics.checked_roots,
+        "failures": diagnostics.failures.len(),
+        "roots": diagnostics.details.iter().map(|diagnostic| {
+            serde_json::json!({
+                "root": diagnostic.root_name,
+                "family_id": diagnostic.family_id,
+                "root_page": diagnostic.root_page,
+                "byte_offset": diagnostic.byte_offset,
+                "expected_codec": diagnostic.expected_codec,
+                "expected_discriminator": diagnostic.expected_discriminator,
+                "raw_magic": diagnostic.raw_magic,
+                "raw_flags": diagnostic.raw_flags,
+                "actual_discriminator": diagnostic.actual_discriminator,
+                "in_range": diagnostic.in_range,
+                "checksum_ok": diagnostic.checksum_ok,
+                "magic_ok": diagnostic.magic_ok,
+                "codec_ok": diagnostic.codec_ok,
+                "reachable": diagnostic.reachable,
+                "failure": diagnostic.failure,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(test)]
+mod mu15b_smoke_b_tests {
+    use super::*;
+
+    #[test]
+    fn mu15b_smoke_b_root_codec_json_output_includes_detailed_rows() {
+        let diagnostics = loom_store::StoreRootCodecDiagnostics {
+            checked_roots: 1,
+            failures: vec![loom_store::StoreRootCodecDiagnostic {
+                root_name: "owner_tokens",
+                family_id: Some(0x0110),
+                root_page: 9,
+                byte_offset: 8192,
+                expected_codec: "PackedRecordRefCodec",
+                expected_discriminator: 0x10,
+                raw_magic: Some(0xb7),
+                raw_flags: Some(0x00),
+                actual_discriminator: Some(0x00),
+                in_range: true,
+                checksum_ok: true,
+                magic_ok: true,
+                codec_ok: false,
+                reachable: true,
+                failure: Some("btree_node_codec_discriminator_mismatch"),
+            }],
+            details: vec![loom_store::StoreRootCodecDiagnostic {
+                root_name: "owner_tokens",
+                family_id: Some(0x0110),
+                root_page: 9,
+                byte_offset: 8192,
+                expected_codec: "PackedRecordRefCodec",
+                expected_discriminator: 0x10,
+                raw_magic: Some(0xb7),
+                raw_flags: Some(0x00),
+                actual_discriminator: Some(0x00),
+                in_range: true,
+                checksum_ok: true,
+                magic_ok: true,
+                codec_ok: false,
+                reachable: true,
+                failure: Some("btree_node_codec_discriminator_mismatch"),
+            }],
+        };
+
+        let json = root_codec_diagnostics_json(&diagnostics);
+        assert_eq!(json["state"], "error");
+        assert_eq!(json["checked"], 1);
+        assert_eq!(json["failures"], 1);
+        assert_eq!(json["roots"][0]["root"], "owner_tokens");
+        assert_eq!(json["roots"][0]["family_id"], 0x0110);
+        assert_eq!(json["roots"][0]["expected_discriminator"], 0x10);
+        assert_eq!(json["roots"][0]["actual_discriminator"], 0x00);
+        assert_eq!(
+            json["roots"][0]["failure"],
+            "btree_node_codec_discriminator_mismatch"
+        );
+    }
 }
 
 fn daemon_doctor_json_value(store: &str) -> Result<serde_json::Value, String> {
@@ -8921,8 +8670,19 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
             dim,
             metric,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.v_create(keys, &workspace, &name, dim as u64, &metric)?;
+            let metric = vector_metric_wire_tag(parse_vector_metric(&metric)?);
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Vector",
+                "create",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Uint(dim as u64),
+                    WireValue::int(metric),
+                ],
+            )?;
             println!("created {name}");
             Ok(())
         }
@@ -8939,8 +8699,19 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
                 Some(path) => read_input(&path).map_err(|e| e.to_string())?,
                 None => Vec::new(),
             };
-            let client = remote::open_store_client(&store)?;
-            client.v_upsert(keys, &workspace, &name, &id, vector, metadata)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Vector",
+                "upsert",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    id.to_value(),
+                    WireValue::Bytes(vector),
+                    WireValue::Bytes(metadata),
+                ],
+            )
         }
         VectorCmd::UpsertSource {
             store,
@@ -8959,17 +8730,21 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
                 Some(path) => read_input(&path).map_err(|e| e.to_string())?,
                 None => Vec::new(),
             };
-            let client = remote::open_store_client(&store)?;
-            client.v_upsert_source(
-                keys,
-                &workspace,
-                &name,
-                &id,
-                vector,
-                metadata,
-                source_text,
-                model_id,
-                weights_digest,
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Vector",
+                "upsert_source",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    id.to_value(),
+                    WireValue::Bytes(vector),
+                    WireValue::Bytes(metadata),
+                    WireValue::Bytes(source_text),
+                    model_id.to_value(),
+                    weights_digest.to_value(),
+                ],
             )
         }
         VectorCmd::Get {
@@ -8979,8 +8754,14 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.v_get(keys, &workspace, &name, &id)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Vector",
+                "get",
+                vec![workspace.to_value(), name.to_value(), id.to_value()],
+            )?
+            else {
                 return Err(format!("vector id {id:?} not found"));
             };
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
@@ -8992,8 +8773,14 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.v_source_text(keys, &workspace, &name, &id)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Vector",
+                "source_text",
+                vec![workspace.to_value(), name.to_value(), id.to_value()],
+            )?
+            else {
                 return Err(format!("vector id {id:?} has no source text"));
             };
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
@@ -9005,11 +8792,17 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
             prefix,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let ids = client.v_ids(keys, &workspace, &name, prefix.as_deref())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let ids_bytes = execute_generated_bytes(
+                &client,
+                "Vector",
+                "ids",
+                vec![workspace.to_value(), name.to_value(), prefix.to_value()],
+            )?;
             if let Some(out) = out {
-                write_output(Some(&out), &vector_ids_cbor(&ids)?).map_err(|e| e.to_string())
+                write_output(Some(&out), &ids_bytes).map_err(|e| e.to_string())
             } else {
+                let ids = string_list_from_cbor(&ids_bytes)?;
                 for id in ids {
                     println!("{id}");
                 }
@@ -9022,11 +8815,17 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let index_keys = client.v_index_keys(keys, &workspace, &name)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let index_keys_bytes = execute_generated_bytes(
+                &client,
+                "Vector",
+                "metadata_index_keys",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
             if let Some(out) = out {
-                write_output(Some(&out), &vector_ids_cbor(&index_keys)?).map_err(|e| e.to_string())
+                write_output(Some(&out), &index_keys_bytes).map_err(|e| e.to_string())
             } else {
+                let index_keys = string_list_from_cbor(&index_keys_bytes)?;
                 for key in index_keys {
                     println!("{key}");
                 }
@@ -9039,8 +8838,13 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             key,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let changed = client.v_create_index(keys, &workspace, &name, &key)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let changed = execute_generated_bool(
+                &client,
+                "Vector",
+                "create_metadata_index",
+                vec![workspace.to_value(), name.to_value(), key.to_value()],
+            )?;
             println!("{changed}");
             Ok(())
         }
@@ -9050,8 +8854,13 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             key,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let changed = client.v_drop_index(keys, &workspace, &name, &key)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let changed = execute_generated_bool(
+                &client,
+                "Vector",
+                "drop_metadata_index",
+                vec![workspace.to_value(), name.to_value(), key.to_value()],
+            )?;
             println!("{changed}");
             Ok(())
         }
@@ -9061,8 +8870,13 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             id,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let present = client.v_delete(keys, &workspace, &name, &id)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Vector",
+                "delete",
+                vec![workspace.to_value(), name.to_value(), id.to_value()],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -9086,20 +8900,33 @@ fn run_vector(action: VectorCmd, keys: &KeyOpts) -> Result<(), String> {
                 Some(path) => read_input(&path).map_err(|e| e.to_string())?,
                 None => Vec::new(),
             };
-            let client = remote::open_store_client(&store)?;
-            let hits_bytes = client.v_search(
-                keys,
-                &workspace,
-                &name,
-                query,
-                k as u64,
-                filter,
-                &policy,
-                threshold as u64,
-                ef as u64,
-                pq_m as u64,
-                pq_k as u64,
-                pq_iters as u64,
+            let policy_int = match policy.as_str() {
+                "exact" => 0_i32,
+                "approximate-pq" => 1_i32,
+                other => {
+                    return Err(format!(
+                        "unknown vector accelerator policy {other}; expected exact or approximate-pq"
+                    ));
+                }
+            };
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let hits_bytes = execute_generated_bytes(
+                &client,
+                "Vector",
+                "search_policy",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(query),
+                    (k as u64).to_value(),
+                    WireValue::Bytes(filter),
+                    policy_int.to_value(),
+                    (threshold as u64).to_value(),
+                    (ef as u64).to_value(),
+                    (pq_m as u64).to_value(),
+                    (pq_k as u64).to_value(),
+                    (pq_iters as u64).to_value(),
+                ],
             )?;
             if let Some(out) = out {
                 write_output(Some(&out), &hits_bytes).map_err(|e| e.to_string())
@@ -9151,6 +8978,7 @@ struct VectorTextUpsertView {
     id: String,
     embedding_instance: String,
     model: VectorTextModelView,
+    current_token: String,
 }
 
 #[derive(serde::Serialize)]
@@ -9193,21 +9021,23 @@ fn run_vector_text(action: VectorTextCmd, keys: &KeyOpts) -> Result<(), String> 
             embedding_instance,
             metadata,
             create,
+            expected_token,
+            expect_absent,
             metric,
             format,
         } => {
             let source_text = text_input(text, text_file, "text")?;
-            // Keep raw metadata CBOR bytes: forwarded as-is to the remote Vector surface, decoded
-            // to a map for the local path (empty bytes decode to an empty map).
+            let expected_token = expected_token
+                .map(|token| hex::decode(token).map_err(|e| format!("expected token: {e}")))
+                .transpose()?;
+            // Keep raw metadata CBOR bytes: forwarded as-is to the generated Vector surface.
             let metadata_bytes = match metadata {
                 Some(path) => read_input(&path).map_err(|e| e.to_string())?,
                 None => Vec::new(),
             };
-            // task 650 client-embed: for a remote store the client embeds text locally (owning model
-            // selection) and routes the computed vector + explicit model metadata through the
-            // already-remote Vector.upsert_source. The server never infers. No local path is sent.
+            // Remote text upsert embeds locally and sends the computed vector plus source text through
+            // the generated Vector mutation surface. The server never receives a local model path.
             if remote::target_is_remote(&store)? {
-                vector_metadata_from_cbor(&metadata_bytes)?; // validate before the network round-trip
                 let handle = resolve_local_text_embedding(embedding_instance.as_deref())?;
                 let model = handle
                     .model()
@@ -9216,21 +9046,32 @@ fn run_vector_text(action: VectorTextCmd, keys: &KeyOpts) -> Result<(), String> 
                     .embed(std::slice::from_ref(&source_text))
                     .map_err(|e| e.to_string())?;
                 let vector_bytes = vector_floats_to_bytes(&vectors[0]);
-                let client = remote::open_store_client(&store)?;
-                if create {
-                    client.v_create(keys, &workspace, &name, model.dimension as u64, &metric)?;
-                }
-                client.v_upsert_source(
-                    keys,
-                    &workspace,
-                    &name,
-                    &id,
-                    vector_bytes,
-                    metadata_bytes,
-                    source_text.clone().into_bytes(),
-                    Some(model.model_id.clone()),
-                    model.weights_digest.clone(),
+                let metric_tag = vector_metric_wire_tag(parse_vector_metric(&metric)?);
+                let request = loom_wire::vector::TextUpsertRequest {
+                    workspace: workspace.clone(),
+                    name: name.clone(),
+                    id: id.clone(),
+                    vector: vector_bytes,
+                    metadata: metadata_bytes,
+                    source_text: source_text.clone().into_bytes(),
+                    model_id: Some(model.model_id.clone()),
+                    weights_digest: model.weights_digest.clone(),
+                    create,
+                    metric: metric_tag as i32,
+                    expected_token: expected_token.clone(),
+                    expect_absent,
+                };
+                let client = remote::open_cli_generated_client(&store, keys)?;
+                let report_bytes = execute_generated_bytes(
+                    &client,
+                    "Vector",
+                    "vector_text_upsert",
+                    vec![WireValue::Bytes(
+                        loom_wire::vector::text_upsert_request_to_cbor(&request),
+                    )],
                 )?;
+                let report = loom_wire::vector::text_upsert_report_from_cbor(&report_bytes)
+                    .map_err(|e| e.to_string())?;
                 let view = VectorTextUpsertView {
                     store,
                     workspace,
@@ -9238,10 +9079,10 @@ fn run_vector_text(action: VectorTextCmd, keys: &KeyOpts) -> Result<(), String> 
                     id,
                     embedding_instance: model.model_id.clone(),
                     model: vector_text_model_view(model),
+                    current_token: hex::encode(report.current_token),
                 };
                 return print_vector_text_upsert(&view, &format);
             }
-            let metadata = vector_metadata_from_cbor(&metadata_bytes)?;
             let mut loom = cli_open_loom(&store, keys)?;
             let ns = if create {
                 ensure_vector_workspace(&mut loom, &workspace)?
@@ -9254,25 +9095,38 @@ fn run_vector_text(action: VectorTextCmd, keys: &KeyOpts) -> Result<(), String> 
                 .handle
                 .model()
                 .ok_or_else(|| "text embedding provider did not expose a model".to_string())?;
-            if create {
-                let metric = parse_vector_metric(&metric)?;
-                match loom_core::vector_create(&mut loom, ns, &name, model.dimension, metric) {
-                    Ok(()) => {}
-                    Err(err) if err.code == Code::Conflict => {}
-                    Err(err) => return Err(err.to_string()),
-                }
-            }
-            loom_core::vector_upsert_text(
-                &mut loom,
-                ns,
-                &name,
-                &id,
-                &source_text,
-                metadata,
-                &resolved.handle,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let vectors = resolved
+                .handle
+                .embed(std::slice::from_ref(&source_text))
+                .map_err(|e| e.to_string())?;
+            let vector_bytes = vector_floats_to_bytes(&vectors[0]);
+            drop(loom);
+            let metric_tag = vector_metric_wire_tag(parse_vector_metric(&metric)?);
+            let request = loom_wire::vector::TextUpsertRequest {
+                workspace: workspace.clone(),
+                name: name.clone(),
+                id: id.clone(),
+                vector: vector_bytes,
+                metadata: metadata_bytes,
+                source_text: source_text.clone().into_bytes(),
+                model_id: Some(model.model_id.clone()),
+                weights_digest: model.weights_digest.clone(),
+                create,
+                metric: metric_tag as i32,
+                expected_token,
+                expect_absent,
+            };
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let report_bytes = execute_generated_bytes(
+                &client,
+                "Vector",
+                "vector_text_upsert",
+                vec![WireValue::Bytes(
+                    loom_wire::vector::text_upsert_request_to_cbor(&request),
+                )],
+            )?;
+            let report = loom_wire::vector::text_upsert_report_from_cbor(&report_bytes)
+                .map_err(|e| e.to_string())?;
             let view = VectorTextUpsertView {
                 store,
                 workspace,
@@ -9280,6 +9134,7 @@ fn run_vector_text(action: VectorTextCmd, keys: &KeyOpts) -> Result<(), String> 
                 id,
                 embedding_instance: resolved.instance.name,
                 model: vector_text_model_view(model),
+                current_token: hex::encode(report.current_token),
             };
             print_vector_text_upsert(&view, &format)
         }
@@ -9310,20 +9165,18 @@ fn run_vector_text(action: VectorTextCmd, keys: &KeyOpts) -> Result<(), String> 
                     .embed(std::slice::from_ref(&query))
                     .map_err(|e| e.to_string())?;
                 let query_bytes = vector_floats_to_bytes(&query_vectors[0]);
-                let client = remote::open_store_client(&store)?;
-                let hits_bytes = client.v_search(
-                    keys,
-                    &workspace,
-                    &name,
-                    query_bytes,
-                    top_k as u64,
-                    filter_bytes,
-                    "exact",
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
+                let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+                let hits_bytes = execute_generated_bytes(
+                    &client,
+                    "Vector",
+                    "search",
+                    vec![
+                        workspace.to_value(),
+                        name.to_value(),
+                        WireValue::Bytes(query_bytes),
+                        (top_k as u64).to_value(),
+                        WireValue::Bytes(filter_bytes),
+                    ],
                 )?;
                 let WireValue::Array(items) =
                     loom_codec::decode(&hits_bytes).map_err(|e| e.to_string())?
@@ -9347,9 +9200,13 @@ fn run_vector_text(action: VectorTextCmd, keys: &KeyOpts) -> Result<(), String> 
                         },
                         None => return Err("vector hit is missing its score".to_string()),
                     };
-                    let source_text = client
-                        .v_source_text(keys, &workspace, &name, &hit_id)?
-                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+                    let source_text = execute_generated_optional_bytes(
+                        &client,
+                        "Vector",
+                        "source_text",
+                        vec![workspace.to_value(), name.to_value(), hit_id.to_value()],
+                    )?
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
                     hits.push(VectorTextHitView {
                         id: hit_id,
                         score,
@@ -9413,12 +9270,13 @@ fn print_vector_text_upsert(view: &VectorTextUpsertView, format: &str) -> Result
     match format {
         "text" => {
             println!(
-                "vector_text_upsert\t{}\t{}\t{}\tembedding_instance={}\tmodel={}",
+                "vector_text_upsert\t{}\t{}\t{}\tembedding_instance={}\tmodel={}\tcurrent_token={}",
                 view.workspace,
                 view.collection,
                 view.id,
                 view.embedding_instance,
-                view.model.model_id
+                view.model.model_id,
+                view.current_token
             );
             Ok(())
         }
@@ -9493,15 +9351,16 @@ fn print_surface_catalog(
     }
 }
 
+#[derive(serde::Deserialize)]
 struct StudioReindexEnqueueResult {
-    workspace_id: WorkspaceId,
+    workspace: String,
     profile: String,
     job_path: String,
     state: String,
-    source_digest: Digest,
+    source_digest: String,
     model_id: String,
-    vector_records_indexed: usize,
-    vector_records_deleted: usize,
+    vector_records_indexed: u64,
+    vector_records_deleted: u64,
 }
 
 fn run_studio(action: StudioCmd, keys: &KeyOpts) -> Result<(), String> {
@@ -9513,7 +9372,15 @@ fn run_studio(action: StudioCmd, keys: &KeyOpts) -> Result<(), String> {
             profile,
             format,
         } => {
-            let result = enqueue_studio_reindex(&store, &workspace, &profile, None, keys)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let result_json = execute_generated_string(
+                &client,
+                "StudioMaintenance",
+                "studio_reindex_json",
+                vec![workspace.to_value(), profile.to_value()],
+            )?;
+            let result: StudioReindexEnqueueResult =
+                serde_json::from_str(&result_json).map_err(|error| error.to_string())?;
             print_studio_reindex_enqueue(&result, &format)
         }
         StudioCmd::Revisions { action } => run_studio_revisions(action, keys),
@@ -9553,18 +9420,21 @@ fn run_studio_revisions(action: StudioRevisionsCmd, keys: &KeyOpts) -> Result<()
             dry_run,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let report = rebuild_studio_revision_index(&mut loom, workspace_id, &profile, dry_run)?;
-            if !dry_run && report.inserted > 0 {
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-            }
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let report_json = execute_generated_string(
+                &client,
+                "StudioMaintenance",
+                "studio_revisions_rebuild_json",
+                vec![workspace.to_value(), profile.to_value(), dry_run.to_value()],
+            )?;
+            let report: RevisionRebuildReport =
+                serde_json::from_str(&report_json).map_err(|error| error.to_string())?;
             print_revision_rebuild_report(&report, &format)
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct RevisionRebuildReport {
     workspace: String,
     scope_id: String,
@@ -9576,6 +9446,7 @@ struct RevisionRebuildReport {
     dry_run: bool,
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn rebuild_studio_revision_index(
     loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
@@ -9594,6 +9465,7 @@ fn rebuild_studio_revision_index(
     }
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn rebuild_meetings_revision_index(
     loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
@@ -9632,6 +9504,7 @@ fn rebuild_meetings_revision_index(
     apply_revision_backfill(loom, workspace, scope_id, "meetings", dry_run, updates)
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn rebuild_drive_revision_index(
     loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
@@ -9679,6 +9552,7 @@ fn rebuild_drive_revision_index(
     )
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn rebuild_pages_revision_index(
     loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
@@ -9725,6 +9599,7 @@ fn rebuild_pages_revision_index(
     )
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn rebuild_lifecycle_revision_index(
     loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
@@ -9803,6 +9678,7 @@ fn rebuild_lifecycle_revision_index(
     apply_revision_backfill(loom, workspace, scope_id, "lifecycle", dry_run, updates)
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn apply_revision_backfill(
     loom: &mut Loom<FileStore>,
     workspace: WorkspaceId,
@@ -9838,6 +9714,7 @@ fn apply_revision_backfill(
     })
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn revision_backfill_update(
     loom: &Loom<FileStore>,
     entity_id: String,
@@ -9864,6 +9741,7 @@ fn revision_backfill_update(
     .map_err(|e| e.to_string())
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn page_operation_revision_entity_id(operation_kind: &str, target_entity_id: &str) -> String {
     match operation_kind {
         "space.created" => format!("space:{target_entity_id}"),
@@ -9889,30 +9767,25 @@ fn run_vector_workspace(action: VectorWorkspaceCmd, keys: &KeyOpts) -> Result<()
             let embedding_instance = embedding_instance.ok_or_else(|| {
                 "vector workspace configure requires --embedding-instance".to_string()
             })?;
-            let mut opened = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&opened, &workspace)?;
-            let mut state = load_inference_instance_state(&opened, workspace_id)?;
-            let instance = state
-                .find_instance(&embedding_instance)
-                .cloned()
-                .ok_or_else(|| format!("inference instance {embedding_instance:?} not found"))?;
-            if instance.kind != InferenceModelKind::TextEmbedding {
-                return Err(format!(
-                    "inference instance {embedding_instance:?} is not a text-embedding instance"
-                ));
-            }
-            let binding = loom_inference::VectorWorkspaceBinding {
-                store: store.clone(),
-                workspace: workspace_id.to_string(),
-                embedding_instance: embedding_instance.clone(),
-            };
-            state.upsert_vector_binding(binding.clone());
-            save_inference_instance_state(&mut opened, workspace_id, &state)?;
+            let request_json = serde_json::json!({
+                "embedding-instance": embedding_instance.clone(),
+            })
+            .to_string();
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let binding_json = execute_generated_string(
+                &client,
+                "Vector",
+                "vector_workspace_configure_json",
+                vec![workspace.to_value(), request_json.to_value()],
+            )?;
+            let binding: loom_inference::VectorWorkspaceBinding =
+                serde_json::from_str(&binding_json).map_err(|error| error.to_string())?;
             print_vector_workspace_binding(&binding, &format)
         }
     }
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn enqueue_studio_reindex(
     store: &str,
     workspace: &str,
@@ -9947,17 +9820,18 @@ fn enqueue_studio_reindex(
     }
     save_loom(&mut opened).map_err(|e| e.to_string())?;
     Ok(StudioReindexEnqueueResult {
-        workspace_id: ns,
+        workspace: ns.to_string(),
         profile: profile.to_string(),
         job_path,
         state: job.state.as_str().to_string(),
-        source_digest,
+        source_digest: source_digest.to_string(),
         model_id: job.stamp.model_id,
-        vector_records_indexed,
-        vector_records_deleted,
+        vector_records_indexed: vector_records_indexed as u64,
+        vector_records_deleted: vector_records_deleted as u64,
     })
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 struct StudioVectorDrainSummary {
     indexed: usize,
     deleted: usize,
@@ -9993,6 +9867,7 @@ fn resolve_optional_vector_binding(
     .map(Some)
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn drain_meetings_vector_outputs(
     loom: &mut Loom<FileStore>,
     ns: WorkspaceId,
@@ -10072,6 +9947,7 @@ fn drain_meetings_vector_outputs(
     Ok(summary)
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn studio_meetings_profile_ids(ns: WorkspaceId, profile: &str) -> Vec<String> {
     match profile {
         "all" | "meetings" => vec![ns.to_string()],
@@ -10079,10 +9955,12 @@ fn studio_meetings_profile_ids(ns: WorkspaceId, profile: &str) -> Vec<String> {
     }
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn meetings_vector_collection(profile_id: &str) -> String {
     format!("meetings/{profile_id}")
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn meetings_vector_id(output: &ProjectionOutput) -> String {
     output
         .output_ref
@@ -10091,6 +9969,7 @@ fn meetings_vector_id(output: &ProjectionOutput) -> String {
         .to_string()
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn meetings_vector_metadata(output: &ProjectionOutput) -> BTreeMap<String, loom_core::Value> {
     let mut metadata = BTreeMap::new();
     metadata.insert(
@@ -10123,6 +10002,7 @@ fn meetings_vector_metadata(output: &ProjectionOutput) -> BTreeMap<String, loom_
     metadata
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn meetings_vector_projection_job(
     ns: WorkspaceId,
     profile_id: &str,
@@ -10137,6 +10017,7 @@ fn meetings_vector_projection_job(
     Ok(EmbeddingProjectionJob::queued(key, stamp))
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn studio_reindex_source_digest(
     loom: &Loom<FileStore>,
     ns: WorkspaceId,
@@ -10155,6 +10036,7 @@ fn studio_reindex_source_digest(
     }
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn studio_reindex_job(
     ns: WorkspaceId,
     profile: &str,
@@ -10182,6 +10064,7 @@ fn studio_reindex_job(
     }
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn studio_reindex_stamp_for_instance(
     source_digest: Digest,
     instance: &loom_types::InferenceInstanceDescriptor,
@@ -10213,7 +10096,7 @@ fn print_studio_reindex_enqueue(
         "text" => {
             println!(
                 "studio_reindex\t{}\tprofile={}\tstate={}\tindexed={}\tdeleted={}\tjob={}",
-                result.workspace_id,
+                result.workspace,
                 result.profile,
                 result.state,
                 result.vector_records_indexed,
@@ -10226,7 +10109,7 @@ fn print_studio_reindex_enqueue(
             let mut out = String::new();
             out.push('{');
             out.push_str("\"workspace\":");
-            out.push_str(&json_string(&result.workspace_id.to_string()));
+            out.push_str(&json_string(&result.workspace));
             out.push_str(",\"profile\":");
             out.push_str(&json_string(&result.profile));
             out.push_str(",\"state\":");
@@ -10234,7 +10117,7 @@ fn print_studio_reindex_enqueue(
             out.push_str(",\"job_path\":");
             out.push_str(&json_string(&result.job_path));
             out.push_str(",\"source_digest\":");
-            out.push_str(&json_string(&result.source_digest.to_string()));
+            out.push_str(&json_string(&result.source_digest));
             out.push_str(",\"model_id\":");
             out.push_str(&json_string(&result.model_id));
             out.push_str(",\"vector_records_indexed\":");
@@ -10298,8 +10181,8 @@ fn print_vector_workspace_binding(
     match format {
         "text" => {
             println!(
-                "vector_workspace\t{}\t{}\tembedding_instance={}",
-                binding.store, binding.workspace, binding.embedding_instance
+                "vector_workspace\t{}\tembedding_instance={}",
+                binding.workspace, binding.embedding_instance
             );
             Ok(())
         }
@@ -10329,8 +10212,18 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
                 Some(path) => read_input(&path).map_err(|e| e.to_string())?,
                 None => Vec::new(),
             };
-            let client = remote::open_store_client(&store)?;
-            client.g_upsert_node(keys, &workspace, &name, &id, props)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Graph",
+                "upsert_node",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    id.to_value(),
+                    WireValue::Bytes(props),
+                ],
+            )
         }
         GraphCmd::GetNode {
             store,
@@ -10339,8 +10232,14 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.g_get_node(keys, &workspace, &name, &id)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Graph",
+                "get_node",
+                vec![workspace.to_value(), name.to_value(), id.to_value()],
+            )?
+            else {
                 return Err(format!("graph node {id:?} not found"));
             };
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
@@ -10352,8 +10251,18 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             cascade,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.g_remove_node(keys, &workspace, &name, &id, cascade)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Graph",
+                "remove_node",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    id.to_value(),
+                    cascade.to_value(),
+                ],
+            )
         }
         GraphCmd::UpsertEdge {
             store,
@@ -10369,8 +10278,21 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
                 Some(path) => read_input(&path).map_err(|e| e.to_string())?,
                 None => Vec::new(),
             };
-            let client = remote::open_store_client(&store)?;
-            client.g_upsert_edge(keys, &workspace, &name, &id, &src, &dst, &label, props)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Graph",
+                "upsert_edge",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    id.to_value(),
+                    src.to_value(),
+                    dst.to_value(),
+                    label.to_value(),
+                    WireValue::Bytes(props),
+                ],
+            )
         }
         GraphCmd::GetEdge {
             store,
@@ -10379,8 +10301,14 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(bytes) = client.g_get_edge(keys, &workspace, &name, &id)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Graph",
+                "get_edge",
+                vec![workspace.to_value(), name.to_value(), id.to_value()],
+            )?
+            else {
                 return Err(format!("graph edge {id:?} not found"));
             };
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
@@ -10391,8 +10319,13 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             id,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let present = client.g_remove_edge(keys, &workspace, &name, &id)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Graph",
+                "remove_edge",
+                vec![workspace.to_value(), name.to_value(), id.to_value()],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -10403,8 +10336,13 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.g_neighbors(keys, &workspace, &name, &id)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Graph",
+                "neighbors",
+                vec![workspace.to_value(), name.to_value(), id.to_value()],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         GraphCmd::OutEdges {
@@ -10414,8 +10352,13 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.g_out_edges(keys, &workspace, &name, &id)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Graph",
+                "out_edges",
+                vec![workspace.to_value(), name.to_value(), id.to_value()],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         GraphCmd::InEdges {
@@ -10425,8 +10368,13 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             id,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.g_in_edges(keys, &workspace, &name, &id)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Graph",
+                "in_edges",
+                vec![workspace.to_value(), name.to_value(), id.to_value()],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         GraphCmd::Reachable {
@@ -10438,14 +10386,18 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             via_label,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.g_reachable(
-                keys,
-                &workspace,
-                &name,
-                &start,
-                max_depth,
-                via_label.as_deref(),
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Graph",
+                "reachable",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    start.to_value(),
+                    max_depth.to_value(),
+                    via_label.unwrap_or_default().to_value(),
+                ],
             )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
@@ -10458,14 +10410,18 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             via_label,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(path) = client.g_shortest_path(
-                keys,
-                &workspace,
-                &name,
-                &from,
-                &to,
-                via_label.as_deref(),
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(path) = execute_generated_optional_bytes(
+                &client,
+                "Graph",
+                "shortest_path",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    from.to_value(),
+                    to.to_value(),
+                    via_label.unwrap_or_default().to_value(),
+                ],
             )?
             else {
                 return Err(format!("no graph path from {from:?} to {to:?}"));
@@ -10479,8 +10435,13 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             query,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.g_query(keys, &workspace, &name, &query)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Graph",
+                "query",
+                vec![workspace.to_value(), name.to_value(), query.to_value()],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         GraphCmd::ExplainQuery {
@@ -10490,8 +10451,13 @@ fn run_graph(action: GraphCmd, keys: &KeyOpts) -> Result<(), String> {
             query,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.g_explain_query(keys, &workspace, &name, &query)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Graph",
+                "explain_query",
+                vec![workspace.to_value(), name.to_value(), query.to_value()],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
     }
@@ -10506,8 +10472,17 @@ fn run_ledger(action: LedgerCmd, keys: &KeyOpts) -> Result<(), String> {
             payload,
         } => {
             let payload = read_input(&payload).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let seq = client.ledger_append(keys, &workspace, &collection, payload)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let seq = execute_generated_u64(
+                &client,
+                "Ledger",
+                "append",
+                vec![
+                    workspace.to_value(),
+                    collection.to_value(),
+                    WireValue::Bytes(payload),
+                ],
+            )?;
             println!("{seq}");
             Ok(())
         }
@@ -10518,8 +10493,14 @@ fn run_ledger(action: LedgerCmd, keys: &KeyOpts) -> Result<(), String> {
             seq,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(payload) = client.ledger_get(keys, &workspace, &collection, seq)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(payload) = execute_generated_optional_bytes(
+                &client,
+                "Ledger",
+                "get",
+                vec![workspace.to_value(), collection.to_value(), seq.to_value()],
+            )?
+            else {
                 return Err(format!("ledger entry {seq} not found"));
             };
             write_output(out.as_deref(), &payload).map_err(|e| e.to_string())
@@ -10530,8 +10511,14 @@ fn run_ledger(action: LedgerCmd, keys: &KeyOpts) -> Result<(), String> {
             collection,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let Some(head) = client.ledger_head(keys, &workspace, &collection)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(head) = execute_generated_optional_digest(
+                &client,
+                "Ledger",
+                "head",
+                vec![workspace.to_value(), collection.to_value()],
+            )?
+            else {
                 return Err("ledger is empty".to_string());
             };
             if let Some(out) = out {
@@ -10546,8 +10533,13 @@ fn run_ledger(action: LedgerCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             collection,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let len = client.ledger_len(keys, &workspace, &collection)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let len = execute_generated_u64(
+                &client,
+                "Ledger",
+                "len",
+                vec![workspace.to_value(), collection.to_value()],
+            )?;
             println!("{len}");
             Ok(())
         }
@@ -10556,12 +10548,409 @@ fn run_ledger(action: LedgerCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             collection,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.ledger_verify(keys, &workspace, &collection)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Ledger",
+                "verify",
+                vec![workspace.to_value(), collection.to_value()],
+            )?;
             println!("ok");
             Ok(())
         }
     }
+}
+
+fn execute_generated_value(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<WireValue, String> {
+    client.execute_unary(&remote::CliGeneratedOperation::new(
+        interface, method, args,
+    )?)
+}
+
+fn execute_generated_void(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<(), String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Null => Ok(()),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn execute_generated_bytes(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<Vec<u8>, String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Bytes(bytes) => Ok(bytes),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn execute_generated_key_add_wrap(
+    client: &remote::CliGeneratedClient,
+    new_spec: KeySpec,
+    allow_no_recovery: bool,
+) -> Result<(), String> {
+    let (method, credential) = generated_key_add_wrap_method_and_credential(new_spec);
+    execute_generated_void(
+        client,
+        "KeySource",
+        method,
+        vec![WireValue::Bytes(credential), allow_no_recovery.to_value()],
+    )
+}
+
+fn generated_key_add_wrap_method_and_credential(new_spec: KeySpec) -> (&'static str, Vec<u8>) {
+    match new_spec {
+        KeySpec::Passphrase(passphrase) => ("key_add_wrap_keyed", passphrase.as_bytes().to_vec()),
+        KeySpec::RawKek(kek) => ("key_add_wrap_with_kek", kek.to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod mu6i_d4_generated_cli_source_tests {
+    use super::*;
+
+    #[test]
+    fn keysource_generated_wrap_method_selection_is_type_directed() {
+        let (method, credential) =
+            generated_key_add_wrap_method_and_credential(KeySpec::passphrase("secret"));
+        assert_eq!(method, "key_add_wrap_keyed");
+        assert_eq!(credential, b"secret");
+
+        let (method, credential) =
+            generated_key_add_wrap_method_and_credential(KeySpec::raw_kek([0x5a; 32]));
+        assert_eq!(method, "key_add_wrap_with_kek");
+        assert_eq!(credential, vec![0x5a; 32]);
+    }
+
+    #[test]
+    fn generated_cli_administration_source_uses_required_methods() {
+        let rows = [
+            (
+                "store key",
+                include_str!("main.rs"),
+                "StoreCmd::Key { action } => match action",
+                &[
+                    "open_cli_generated_client",
+                    "\"KeySource\"",
+                    "execute_generated_key_add_wrap",
+                    "\"key_remove_wrap\"",
+                ][..],
+                &[
+                    "admin_key_add_wrap",
+                    "admin_key_remove_wrap",
+                    "FileStore::open(",
+                ][..],
+            ),
+            (
+                "audit compact",
+                include_str!("audit_cmd.rs"),
+                "fn run_audit_compact",
+                &[
+                    "open_cli_generated_client",
+                    "\"Audit\"",
+                    "\"audit_compact\"",
+                    "audit_compact_result_from_cbor",
+                ][..],
+                &[
+                    "cli_open_loom(",
+                    "require_global_admin_actor",
+                    "audit_prune_through",
+                ][..],
+            ),
+            (
+                "maintenance",
+                include_str!("daemon_cmd.rs"),
+                "fn run_daemon_maintenance",
+                &[
+                    "open_cli_generated_client",
+                    "\"StoreAdmin\"",
+                    "\"store_maintenance_status\"",
+                    "\"store_maintenance_policy_set\"",
+                    "\"store_maintenance_run\"",
+                ][..],
+                &[
+                    "cli_open_loom(",
+                    "cli_open_loom_read(",
+                    "set_store_maintenance_policy",
+                    "run_store_maintenance_once(",
+                ][..],
+            ),
+        ];
+
+        for (name, source, marker, required, rejected) in rows {
+            let body = braced_body_after(source, marker);
+            for needle in required {
+                assert!(body.contains(needle), "{name} missing {needle}");
+            }
+            for needle in rejected {
+                assert!(!body.contains(needle), "{name} retains {needle}");
+            }
+        }
+    }
+
+    fn braced_body_after<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source.rfind(marker).expect("marker present");
+        let search_start = start + marker.len();
+        let brace = source[search_start..].find('{').expect("body starts") + search_start;
+        let mut depth = 0usize;
+        for (offset, ch) in source[brace..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[brace..=brace + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("body closes");
+    }
+}
+
+fn execute_generated_optional_bytes(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<Option<Vec<u8>>, String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Null => Ok(None),
+        WireValue::Bytes(bytes) => Ok(Some(bytes)),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn execute_generated_bytes_list(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<Vec<Vec<u8>>, String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                WireValue::Bytes(bytes) => Ok(bytes),
+                value => Err(format!(
+                    "{interface}.{method} returned unexpected list item {value:?}"
+                )),
+            })
+            .collect(),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn execute_generated_optional_digest(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<Option<Digest>, String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Null => Ok(None),
+        WireValue::Text(text) => Digest::parse(&text).map(Some).map_err(|e| e.to_string()),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn execute_generated_digest_list(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<Vec<Digest>, String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                WireValue::Text(text) => Digest::parse(&text).map_err(|e| e.to_string()),
+                value => Err(format!(
+                    "{interface}.{method} returned unexpected list item {value:?}"
+                )),
+            })
+            .collect(),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn execute_generated_string(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<String, String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Text(text) => Ok(text),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn execute_generated_optional_string(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<Option<String>, String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Null => Ok(None),
+        WireValue::Text(text) => Ok(Some(text)),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn execute_generated_bool(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<bool, String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Bool(value) => Ok(value),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn execute_generated_u64(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<u64, String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Uint(value) => Ok(value),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn execute_generated_digest_string(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<String, String> {
+    match execute_generated_value(client, interface, method, args)? {
+        WireValue::Text(text) => Ok(text),
+        value => Err(format!(
+            "{interface}.{method} returned unexpected value {value:?}"
+        )),
+    }
+}
+
+fn generated_import_report_from_cbor(
+    bytes: &[u8],
+) -> Result<loom_interchange::ImportReport, String> {
+    loom_interchange::ImportReport::decode(bytes).map_err(|e| e.to_string())
+}
+
+fn generated_import_report_from_value(
+    value: WireValue,
+) -> Result<loom_interchange::ImportReport, String> {
+    let bytes = loom_codec::encode(&value).map_err(|e| e.to_string())?;
+    generated_import_report_from_cbor(&bytes)
+}
+
+fn generated_car_import_result_from_cbor(bytes: &[u8]) -> Result<CarImportResult, String> {
+    let WireValue::Array(fields) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
+        return Err("generated CAR import result must be a CBOR array".to_string());
+    };
+    let [workspace, root_cid, blocks_read, report] = fields.as_slice() else {
+        return Err("generated CAR import result has an invalid field shape".to_string());
+    };
+    let workspace = match workspace {
+        WireValue::Null => None,
+        WireValue::Text(id) => Some(WorkspaceId::parse(id).map_err(|e| e.to_string())?),
+        _ => return Err("generated CAR import workspace must be null or text".to_string()),
+    };
+    let WireValue::Text(root_cid_hex) = root_cid else {
+        return Err("generated CAR import root cid must be text".to_string());
+    };
+    let WireValue::Uint(blocks_read) = blocks_read else {
+        return Err("generated CAR import block count must be uint".to_string());
+    };
+    Ok(CarImportResult {
+        workspace,
+        root_cid_hex: root_cid_hex.clone(),
+        blocks_read: *blocks_read,
+        report: generated_import_report_from_value(report.clone())?,
+    })
+}
+
+fn generated_archive_import_result_from_cbor(bytes: &[u8]) -> Result<ArchiveImportResult, String> {
+    let WireValue::Array(fields) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
+        return Err("generated archive import result must be a CBOR array".to_string());
+    };
+    let [manifest, report] = fields.as_slice() else {
+        return Err("generated archive import result has an invalid field shape".to_string());
+    };
+    let manifest = generated_archive_manifest(manifest)?;
+    let report = generated_import_report_from_value(report.clone())?;
+    Ok(ArchiveImportResult { manifest, report })
+}
+
+fn generated_archive_manifest(
+    value: &WireValue,
+) -> Result<loom_interchange::ArchiveManifest, String> {
+    let WireValue::Array(fields) = value else {
+        return Err("generated archive manifest must be a CBOR array".to_string());
+    };
+    let [
+        WireValue::Text(archive_id),
+        WireValue::Text(kind),
+        WireValue::Text(root_digest),
+        entries,
+    ] = fields.as_slice()
+    else {
+        return Err("generated archive manifest has an invalid field shape".to_string());
+    };
+    let kind = parse_archive_kind(kind)?;
+    let root_digest = Digest::parse(root_digest).map_err(|e| e.to_string())?;
+    let mut manifest =
+        loom_interchange::ArchiveManifest::new(archive_id.clone(), kind, root_digest)
+            .map_err(|e| e.to_string())?;
+    let WireValue::Array(entries) = entries else {
+        return Err("generated archive manifest entries must be an array".to_string());
+    };
+    manifest.entries = entries
+        .iter()
+        .cloned()
+        .map(loom_interchange::ArchiveEntry::from_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(manifest)
 }
 
 fn run_metrics(action: MetricsCmd, keys: &KeyOpts) -> Result<(), String> {
@@ -10572,13 +10961,13 @@ fn run_metrics(action: MetricsCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let descriptor =
-                loom_core::MetricDescriptor::decode(&bytes).map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Metrics)?;
-            loom_core::metrics_put_descriptor(&mut loom, ns, &descriptor)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Metrics",
+                "put_descriptor",
+                vec![workspace.to_value(), WireValue::Bytes(bytes)],
+            )
         }
         MetricsCmd::GetDescriptor {
             store,
@@ -10586,14 +10975,16 @@ fn run_metrics(action: MetricsCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let Some(descriptor) =
-                loom_core::metrics_get_descriptor(&loom, ns, &name).map_err(|e| e.to_string())?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Metrics",
+                "get_descriptor",
+                vec![workspace.to_value(), name.to_value()],
+            )?
             else {
                 return Err(format!("metric descriptor {name:?} not found"));
             };
-            let bytes = descriptor.encode().map_err(|e| e.to_string())?;
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         MetricsCmd::PutObservation {
@@ -10603,13 +10994,17 @@ fn run_metrics(action: MetricsCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let observation =
-                loom_core::MetricObservation::decode(&bytes).map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Metrics)?;
-            loom_core::metrics_put_observation(&mut loom, ns, &descriptor, &observation)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Metrics",
+                "put_observation",
+                vec![
+                    workspace.to_value(),
+                    descriptor.to_value(),
+                    WireValue::Bytes(bytes),
+                ],
+            )
         }
         MetricsCmd::Query {
             store,
@@ -10624,46 +11019,26 @@ fn run_metrics(action: MetricsCmd, keys: &KeyOpts) -> Result<(), String> {
             now,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let result = loom_core::metrics_query_observations(
-                &loom,
-                ns,
-                &descriptor,
-                &loom_core::MetricQuery {
-                    from_timestamp_ms: from,
-                    to_timestamp_ms: to,
-                    max_series,
-                    max_groups,
-                    max_samples,
-                    max_output_bytes,
-                    now_timestamp_ms: now,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            let bytes = metrics_query_result_cbor(result)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Metrics",
+                "query",
+                vec![
+                    workspace.to_value(),
+                    descriptor.to_value(),
+                    from.to_value(),
+                    to.to_value(),
+                    max_series.to_value(),
+                    max_groups.to_value(),
+                    max_samples.to_value(),
+                    max_output_bytes.to_value(),
+                    now.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
     }
-}
-
-fn metrics_query_result_cbor(result: loom_core::MetricQueryResult) -> Result<Vec<u8>, String> {
-    let observations = result
-        .observations
-        .iter()
-        .map(|observation| {
-            observation
-                .encode()
-                .map(WireValue::Bytes)
-                .map_err(|e| e.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    loom_codec::encode(&WireValue::Array(vec![
-        WireValue::Array(observations),
-        WireValue::Bool(result.partial),
-        WireValue::Bool(result.stale),
-    ]))
-    .map_err(|e| e.to_string())
 }
 
 fn run_logs(action: LogsCmd, keys: &KeyOpts) -> Result<(), String> {
@@ -10674,12 +11049,13 @@ fn run_logs(action: LogsCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let record = loom_core::LogRecord::decode(&bytes).map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Logs)?;
-            let record_id =
-                loom_core::logs_put_record(&mut loom, ns, &record).map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let record_id = execute_generated_string(
+                &client,
+                "Logs",
+                "put_record",
+                vec![workspace.to_value(), WireValue::Bytes(bytes)],
+            )?;
             println!("{record_id}");
             Ok(())
         }
@@ -10689,14 +11065,16 @@ fn run_logs(action: LogsCmd, keys: &KeyOpts) -> Result<(), String> {
             record_id,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let Some(record) =
-                loom_core::logs_get_record(&loom, ns, &record_id).map_err(|e| e.to_string())?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Logs",
+                "get_record",
+                vec![workspace.to_value(), record_id.to_value()],
+            )?
             else {
                 return Err(format!("log record {record_id:?} not found"));
             };
-            let bytes = record.encode().map_err(|e| e.to_string())?;
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         LogsCmd::Query {
@@ -10708,41 +11086,22 @@ fn run_logs(action: LogsCmd, keys: &KeyOpts) -> Result<(), String> {
             max_output_bytes,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let result = loom_core::logs_query(
-                &loom,
-                ns,
-                &loom_core::LogQuery {
-                    from_time_unix_nano: from,
-                    to_time_unix_nano: to,
-                    max_records,
-                    max_output_bytes,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            let bytes = log_query_result_cbor(result)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Logs",
+                "query",
+                vec![
+                    workspace.to_value(),
+                    from.to_value(),
+                    to.to_value(),
+                    max_records.to_value(),
+                    max_output_bytes.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
     }
-}
-
-fn log_query_result_cbor(result: loom_core::LogQueryResult) -> Result<Vec<u8>, String> {
-    let records = result
-        .records
-        .iter()
-        .map(|record| {
-            record
-                .encode()
-                .map(WireValue::Bytes)
-                .map_err(|e| e.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    loom_codec::encode(&WireValue::Array(vec![
-        WireValue::Array(records),
-        WireValue::Bool(result.partial),
-    ]))
-    .map_err(|e| e.to_string())
 }
 
 fn run_traces(action: TracesCmd, keys: &KeyOpts) -> Result<(), String> {
@@ -10753,11 +11112,13 @@ fn run_traces(action: TracesCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let span = loom_core::SpanRecord::decode(&bytes).map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Traces)?;
-            loom_core::traces_put_span(&mut loom, ns, &span).map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Traces",
+                "put_span",
+                vec![workspace.to_value(), WireValue::Bytes(bytes)],
+            )
         }
         TracesCmd::GetSpan {
             store,
@@ -10766,14 +11127,20 @@ fn run_traces(action: TracesCmd, keys: &KeyOpts) -> Result<(), String> {
             span_id,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let Some(span) = loom_core::traces_get_span(&loom, ns, &trace_id, &span_id)
-                .map_err(|e| e.to_string())?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Traces",
+                "get_span",
+                vec![
+                    workspace.to_value(),
+                    trace_id.to_value(),
+                    span_id.to_value(),
+                ],
+            )?
             else {
                 return Err(format!("span {trace_id}/{span_id} not found"));
             };
-            let bytes = span.encode().map_err(|e| e.to_string())?;
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         TracesCmd::TraceSpans {
@@ -10784,12 +11151,18 @@ fn run_traces(action: TracesCmd, keys: &KeyOpts) -> Result<(), String> {
             max_output_bytes,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let result =
-                loom_core::traces_trace_spans(&loom, ns, &trace_id, max_spans, max_output_bytes)
-                    .map_err(|e| e.to_string())?;
-            let bytes = trace_query_result_cbor(result)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Traces",
+                "trace_spans",
+                vec![
+                    workspace.to_value(),
+                    trace_id.to_value(),
+                    max_spans.to_value(),
+                    max_output_bytes.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         TracesCmd::Query {
@@ -10801,40 +11174,22 @@ fn run_traces(action: TracesCmd, keys: &KeyOpts) -> Result<(), String> {
             max_output_bytes,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let result = loom_core::traces_query(
-                &loom,
-                ns,
-                &loom_core::TraceQuery {
-                    from_start_time_ns: from,
-                    to_start_time_ns: to,
-                    max_spans,
-                    max_output_bytes,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            let bytes = trace_query_result_cbor(result)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Traces",
+                "query",
+                vec![
+                    workspace.to_value(),
+                    from.to_value(),
+                    to.to_value(),
+                    max_spans.to_value(),
+                    max_output_bytes.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
     }
-}
-
-fn trace_query_result_cbor(result: loom_core::TraceQueryResult) -> Result<Vec<u8>, String> {
-    let spans = result
-        .spans
-        .iter()
-        .map(|span| {
-            span.encode()
-                .map(WireValue::Bytes)
-                .map_err(|e| e.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    loom_codec::encode(&WireValue::Array(vec![
-        WireValue::Array(spans),
-        WireValue::Bool(result.partial),
-    ]))
-    .map_err(|e| e.to_string())
 }
 
 fn run_program(action: ProgramCmd, keys: &KeyOpts) -> Result<(), String> {
@@ -10852,12 +11207,19 @@ fn run_program(action: ProgramCmd, keys: &KeyOpts) -> Result<(), String> {
                 &body,
                 loom_compute::GrantSet::all_facets(),
             );
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Program)?;
-            let record = loom_compute::program_put_wasm(&mut loom, ns, &name, manifest, &body)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            write_output(out.as_deref(), &program_record_cbor(&record)?).map_err(|e| e.to_string())
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Program",
+                "program_put",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(manifest.encode()),
+                    WireValue::Bytes(body),
+                ],
+            )?;
+            write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         ProgramCmd::PutTemplate {
             store,
@@ -10874,13 +11236,19 @@ fn run_program(action: ProgramCmd, keys: &KeyOpts) -> Result<(), String> {
                 &source,
                 loom_compute::GrantSet::all_facets(),
             );
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Program)?;
-            let record =
-                loom_compute::program_put_template(&mut loom, ns, &name, manifest, &source)
-                    .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            write_output(out.as_deref(), &program_record_cbor(&record)?).map_err(|e| e.to_string())
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Program",
+                "program_put",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(manifest.encode()),
+                    WireValue::Bytes(source.into_bytes()),
+                ],
+            )?;
+            write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         ProgramCmd::PutCel {
             store,
@@ -10897,12 +11265,19 @@ fn run_program(action: ProgramCmd, keys: &KeyOpts) -> Result<(), String> {
                 &source,
                 loom_compute::GrantSet::all_facets(),
             );
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Program)?;
-            let record = loom_compute::program_put_cel(&mut loom, ns, &name, manifest, &source)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            write_output(out.as_deref(), &program_record_cbor(&record)?).map_err(|e| e.to_string())
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Program",
+                "program_put",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(manifest.encode()),
+                    WireValue::Bytes(source.into_bytes()),
+                ],
+            )?;
+            write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         ProgramCmd::Inspect {
             store,
@@ -10910,14 +11285,17 @@ fn run_program(action: ProgramCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let Some(record) =
-                loom_compute::program_inspect(&loom, ns, &name).map_err(|e| e.to_string())?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Program",
+                "program_inspect",
+                vec![workspace.to_value(), name.to_value()],
+            )?
             else {
                 return Err(format!("program {name:?} not found"));
             };
-            write_output(out.as_deref(), &program_record_cbor(&record)?).map_err(|e| e.to_string())
+            write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         ProgramCmd::Get {
             store,
@@ -10925,81 +11303,62 @@ fn run_program(action: ProgramCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let Some(program) =
-                loom_compute::program_get(&loom, ns, &name).map_err(|e| e.to_string())?
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(bytes) = execute_generated_optional_bytes(
+                &client,
+                "Program",
+                "program_get",
+                vec![workspace.to_value(), name.to_value()],
+            )?
             else {
                 return Err(format!("program {name:?} not found"));
             };
-            write_output(out.as_deref(), &program.body).map_err(|e| e.to_string())
+            let body = program_get_body_from_cbor(&bytes)?;
+            write_output(out.as_deref(), &body).map_err(|e| e.to_string())
         }
         ProgramCmd::List {
             store,
             workspace,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let records = loom_compute::program_list(&loom, ns).map_err(|e| e.to_string())?;
-            write_output(out.as_deref(), &program_list_cbor(&records)?).map_err(|e| e.to_string())
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Program",
+                "program_list",
+                vec![workspace.to_value()],
+            )?;
+            write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         ProgramCmd::Remove {
             store,
             workspace,
             name,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let removed =
-                loom_compute::program_remove(&mut loom, ns, &name).map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let removed = execute_generated_bool(
+                &client,
+                "Program",
+                "program_remove",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
             println!("{}", if removed { "removed" } else { "missing" });
             Ok(())
         }
     }
 }
 
-fn program_list_cbor(records: &[loom_compute::StoredProgram]) -> Result<Vec<u8>, String> {
-    let records = records
-        .iter()
-        .map(program_record_value)
-        .collect::<Result<Vec<_>, _>>()?;
-    loom_codec::encode(&WireValue::Array(records)).map_err(|e| e.to_string())
-}
-
-fn program_record_cbor(record: &loom_compute::StoredProgram) -> Result<Vec<u8>, String> {
-    loom_codec::encode(&program_record_value(record)?).map_err(|e| e.to_string())
-}
-
-fn program_record_value(record: &loom_compute::StoredProgram) -> Result<WireValue, String> {
-    Ok(WireValue::Map(vec![
-        text_value(
-            "schema",
-            WireValue::Text("loom.program.record.summary.v1".to_string()),
-        ),
-        text_value("name", WireValue::Text(record.name.clone())),
-        text_value("engine", WireValue::Text(record.manifest.engine.clone())),
-        text_value(
-            "abi_version",
-            WireValue::Uint(record.manifest.abi_version.into()),
-        ),
-        text_value("entry", WireValue::Text(record.manifest.entry.clone())),
-        text_value(
-            "manifest_digest",
-            WireValue::Bytes(record.manifest_digest.bytes().to_vec()),
-        ),
-        text_value(
-            "body_digest",
-            WireValue::Bytes(record.body_digest.bytes().to_vec()),
-        ),
-        text_value("body_len", WireValue::Uint(record.body_len)),
-        text_value("manifest", WireValue::Bytes(record.manifest.encode())),
-    ]))
-}
-
-fn text_value(key: &str, value: WireValue) -> (WireValue, WireValue) {
-    (WireValue::Text(key.to_string()), value)
+fn program_get_body_from_cbor(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let WireValue::Array(mut fields) = loom_codec::decode(bytes).map_err(|e| e.to_string())? else {
+        return Err("program_get result must be a CBOR array".to_string());
+    };
+    if fields.len() != 2 {
+        return Err("program_get result must contain record and body".to_string());
+    }
+    match fields.remove(1) {
+        WireValue::Bytes(body) => Ok(body),
+        _ => Err("program_get body must be bytes".to_string()),
+    }
 }
 
 fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
@@ -11012,8 +11371,18 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
             target_segment_rows,
         } => {
             let columns = read_input(&columns).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            client.col_create(keys, &workspace, &name, columns, target_segment_rows as u64)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Columnar",
+                "create",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(columns),
+                    (target_segment_rows as u64).to_value(),
+                ],
+            )?;
             println!("created {name}");
             Ok(())
         }
@@ -11024,8 +11393,13 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
             row,
         } => {
             let row = read_input(&row).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            client.col_append(keys, &workspace, &name, row)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Columnar",
+                "append",
+                vec![workspace.to_value(), name.to_value(), WireValue::Bytes(row)],
+            )
         }
         ColumnarCmd::Scan {
             store,
@@ -11033,8 +11407,13 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.col_scan(keys, &workspace, &name)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Columnar",
+                "scan",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         ColumnarCmd::Columns {
@@ -11043,8 +11422,13 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.col_columns(keys, &workspace, &name)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Columnar",
+                "columns",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         ColumnarCmd::Rows {
@@ -11052,8 +11436,13 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             name,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let rows = client.col_rows(keys, &workspace, &name)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let rows = execute_generated_u64(
+                &client,
+                "Columnar",
+                "rows",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
             println!("{rows}");
             Ok(())
         }
@@ -11062,8 +11451,13 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             name,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.col_compact(keys, &workspace, &name)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Columnar",
+                "compact",
+                vec![workspace.to_value(), name.to_value()],
+            )
         }
         ColumnarCmd::Inspect {
             store,
@@ -11071,8 +11465,13 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.col_inspect(keys, &workspace, &name)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Columnar",
+                "inspect",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         ColumnarCmd::SourceDigest {
@@ -11080,8 +11479,17 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             name,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let digest = client.col_source_digest(keys, &workspace, &name)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let digest_bytes = execute_generated_bytes(
+                &client,
+                "Columnar",
+                "source_digest",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
+            let digest = match loom_codec::decode(&digest_bytes).map_err(|e| e.to_string())? {
+                WireValue::Text(text) => text,
+                _ => return Err("columnar source digest must be CBOR text".to_string()),
+            };
             println!("{digest}");
             Ok(())
         }
@@ -11098,8 +11506,18 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
                 Some(path) => read_input(&path).map_err(|e| e.to_string())?,
                 None => Vec::new(),
             };
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.col_select(keys, &workspace, &name, columns, filter)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Columnar",
+                "select",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(columns),
+                    WireValue::Bytes(filter),
+                ],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         ColumnarCmd::Aggregate {
@@ -11115,8 +11533,18 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
                 Some(path) => read_input(&path).map_err(|e| e.to_string())?,
                 None => Vec::new(),
             };
-            let client = remote::open_store_client(&store)?;
-            let encoded = client.col_aggregate(keys, &workspace, &name, aggregates, filter)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Columnar",
+                "aggregate",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(aggregates),
+                    WireValue::Bytes(filter),
+                ],
+            )?;
             write_output(out.as_deref(), &encoded).map_err(|e| e.to_string())
         }
         ColumnarCmd::ImportArrow {
@@ -11128,13 +11556,21 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
             replace,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let dataset = loom_core::columnar_from_arrow_ipc(&bytes, target_segment_rows)
-                .map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Columnar)?;
-            ensure_columnar_import_target(&loom, ns, &name, replace)?;
-            loom_core::put_columnar(&mut loom, ns, &name, &dataset).map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_bytes(
+                &client,
+                "Columnar",
+                "columnar_import_arrow",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(bytes),
+                    (target_segment_rows as u64).to_value(),
+                    replace.to_value(),
+                    false.to_value(),
+                ],
+            )?;
+            Ok(())
         }
         ColumnarCmd::ExportArrow {
             store,
@@ -11157,13 +11593,21 @@ fn run_columnar(action: ColumnarCmd, keys: &KeyOpts) -> Result<(), String> {
             replace,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let dataset = loom_core::columnar_from_parquet(&bytes, target_segment_rows)
-                .map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Columnar)?;
-            ensure_columnar_import_target(&loom, ns, &name, replace)?;
-            loom_core::put_columnar(&mut loom, ns, &name, &dataset).map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_bytes(
+                &client,
+                "Columnar",
+                "columnar_import_parquet",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(bytes),
+                    (target_segment_rows as u64).to_value(),
+                    replace.to_value(),
+                    false.to_value(),
+                ],
+            )?;
+            Ok(())
         }
         ColumnarCmd::ExportParquet {
             store,
@@ -11188,13 +11632,18 @@ fn run_dataframe(action: DataframeCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             plan,
         } => {
-            let plan =
-                loom_core::DataframePlan::decode(&read_input(&plan).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = ensure_facet_workspace(&mut loom, &workspace, FacetKind::Dataframe)?;
-            loom_core::dataframe_create(&mut loom, ns, &name, &plan).map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let plan = read_input(&plan).map_err(|e| e.to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Dataframe",
+                "create",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(plan),
+                ],
+            )?;
             println!("created {name}");
             Ok(())
         }
@@ -11204,22 +11653,27 @@ fn run_dataframe(action: DataframeCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let batch =
-                loom_core::dataframe_collect(&loom, ns, &name).map_err(|e| e.to_string())?;
-            write_output(out.as_deref(), &dataframe_batch_cbor(batch)?).map_err(|e| e.to_string())
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Dataframe",
+                "collect",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
+            write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         DataframeCmd::Materialize {
             store,
             workspace,
             name,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let digest = loom_core::dataframe_materialize(&mut loom, ns, &name)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let digest = execute_generated_optional_string(
+                &client,
+                "Dataframe",
+                "materialize",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
             if let Some(digest) = digest {
                 println!("{digest}");
             } else {
@@ -11232,10 +11686,13 @@ fn run_dataframe(action: DataframeCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             name,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let digest =
-                loom_core::dataframe_plan_digest(&loom, ns, &name).map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let digest = execute_generated_string(
+                &client,
+                "Dataframe",
+                "plan_digest",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
             println!("{digest}");
             Ok(())
         }
@@ -11246,11 +11703,14 @@ fn run_dataframe(action: DataframeCmd, keys: &KeyOpts) -> Result<(), String> {
             rows,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let batch =
-                loom_core::dataframe_preview(&loom, ns, &name, rows).map_err(|e| e.to_string())?;
-            write_output(out.as_deref(), &dataframe_batch_cbor(batch)?).map_err(|e| e.to_string())
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Dataframe",
+                "preview",
+                vec![workspace.to_value(), name.to_value(), rows.to_value()],
+            )?;
+            write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         DataframeCmd::SourceDigests {
             store,
@@ -11258,14 +11718,14 @@ fn run_dataframe(action: DataframeCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             out,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let digests = loom_core::dataframe_source_digests(&loom, ns, &name)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|digest| digest.to_string())
-                .collect::<Vec<_>>();
-            write_output(out.as_deref(), &text_array_cbor(&digests)?).map_err(|e| e.to_string())
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "Dataframe",
+                "source_digests",
+                vec![workspace.to_value(), name.to_value()],
+            )?;
+            write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
     }
 }
@@ -11279,8 +11739,17 @@ fn run_search(action: SearchCmd, keys: &KeyOpts) -> Result<(), String> {
             mapping,
         } => {
             let mapping = read_input(&mapping).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            client.search_create(keys, &workspace, &name, mapping)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Search",
+                "create",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(mapping),
+                ],
+            )?;
             println!("created {name}");
             Ok(())
         }
@@ -11299,8 +11768,18 @@ fn run_search(action: SearchCmd, keys: &KeyOpts) -> Result<(), String> {
             let doc = doc.ok_or_else(|| "missing doc input".to_string())?;
             let id = search_bytes_arg(id, id_file, "id")?;
             let doc = read_input(&doc).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            client.search_index(keys, &workspace, &name, id, doc)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Search",
+                "index",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(id),
+                    WireValue::Bytes(doc),
+                ],
+            )
         }
         SearchCmd::Get {
             store,
@@ -11311,8 +11790,14 @@ fn run_search(action: SearchCmd, keys: &KeyOpts) -> Result<(), String> {
             out,
         } => {
             let id = search_bytes_arg(id, id_file, "id")?;
-            let client = remote::open_store_client(&store)?;
-            let Some(doc) = client.search_get(keys, &workspace, &name, id)? else {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let Some(doc) = execute_generated_optional_bytes(
+                &client,
+                "Search",
+                "get",
+                vec![workspace.to_value(), name.to_value(), WireValue::Bytes(id)],
+            )?
+            else {
                 return Err("search document not found".to_string());
             };
             write_output(out.as_deref(), &doc).map_err(|e| e.to_string())
@@ -11325,8 +11810,13 @@ fn run_search(action: SearchCmd, keys: &KeyOpts) -> Result<(), String> {
             id_file,
         } => {
             let id = search_bytes_arg(id, id_file, "id")?;
-            let client = remote::open_store_client(&store)?;
-            let present = client.search_delete(keys, &workspace, &name, id)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let present = execute_generated_bool(
+                &client,
+                "Search",
+                "delete",
+                vec![workspace.to_value(), name.to_value(), WireValue::Bytes(id)],
+            )?;
             println!("{present}");
             Ok(())
         }
@@ -11339,8 +11829,19 @@ fn run_search(action: SearchCmd, keys: &KeyOpts) -> Result<(), String> {
             out,
         } => {
             let prefix = search_optional_bytes_arg(prefix, prefix_file, "prefix")?;
-            let client = remote::open_store_client(&store)?;
-            let ids = client.search_ids(keys, &workspace, &name, prefix)?;
+            let has_prefix = prefix.is_some();
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let ids = execute_generated_bytes(
+                &client,
+                "Search",
+                "ids",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(prefix.unwrap_or_default()),
+                    has_prefix.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &ids).map_err(|e| e.to_string())
         }
         SearchCmd::Remap {
@@ -11350,8 +11851,17 @@ fn run_search(action: SearchCmd, keys: &KeyOpts) -> Result<(), String> {
             mapping,
         } => {
             let mapping = read_input(&mapping).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            client.search_remap(keys, &workspace, &name, mapping)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "Search",
+                "remap",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(mapping),
+                ],
+            )
         }
         SearchCmd::Query {
             store,
@@ -11361,8 +11871,17 @@ fn run_search(action: SearchCmd, keys: &KeyOpts) -> Result<(), String> {
             out,
         } => {
             let request = read_input(&request).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            let response = client.search_query(keys, &workspace, &name, request)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let response = execute_generated_bytes(
+                &client,
+                "Search",
+                "query",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    WireValue::Bytes(request),
+                ],
+            )?;
             write_output(out.as_deref(), &response).map_err(|e| e.to_string())
         }
         SearchCmd::Rebuild {
@@ -11379,12 +11898,22 @@ fn run_search(action: SearchCmd, keys: &KeyOpts) -> Result<(), String> {
             engine_version,
             format,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let (ws_display, source_digest, status) =
-                client.search_status(keys, &workspace, &name, &engine_version)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let status_bytes = execute_generated_bytes(
+                &client,
+                "Search",
+                "status",
+                vec![
+                    workspace.to_value(),
+                    name.to_value(),
+                    engine_version.to_value(),
+                ],
+            )?;
+            let (source_digest, status) = loom_store::decode_search_status_result(&status_bytes)
+                .map_err(|e| e.to_string())?;
             print_search_status(
                 &format,
-                &ws_display,
+                &workspace,
                 &name,
                 source_digest,
                 &engine_version,
@@ -11970,6 +12499,10 @@ fn run(command: Command, keys: &KeyOpts) -> Result<(), String> {
             stateless,
             keys,
         ),
+        #[cfg(feature = "mcp-daemon-cli-tests")]
+        Command::McpDaemonCliTestHoldSession { store, millis } => {
+            run_mcp_daemon_cli_test_hold_session(&store, millis, keys)
+        }
         #[cfg(any(feature = "fuse", feature = "nfs"))]
         Command::Mount { action } => run_mount(action, keys),
         Command::Queue { action } => run_queue(action, keys),
@@ -12012,6 +12545,16 @@ fn run(command: Command, keys: &KeyOpts) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+#[cfg(feature = "mcp-daemon-cli-tests")]
+fn run_mcp_daemon_cli_test_hold_session(
+    store: &str,
+    millis: u64,
+    keys: &KeyOpts,
+) -> Result<(), String> {
+    let _ = keys;
+    hold_daemon_session_for_test(store, std::time::Duration::from_millis(millis))
 }
 
 #[cfg(any(feature = "fuse", feature = "nfs"))]
@@ -12090,19 +12633,20 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
         }
         StoreCmd::BundleImport { store, input } => {
             let bytes = std::fs::read(&input).map_err(|e| e.to_string())?;
-            let bundle = Bundle::decode(&bytes).map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let (_, report) = bundle_import(&mut loom, &bundle).map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
-            let facets = bundle
-                .facets
-                .iter()
-                .map(|facet| facet.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let report_bytes = execute_generated_bytes(
+                &client,
+                "StoreAdmin",
+                "store_bundle_import",
+                vec![WireValue::Bytes(bytes), false.to_value()],
+            )?;
+            let report =
+                loom_wire::store_admin::store_bundle_import_result_from_cbor(&report_bytes)
+                    .map_err(|e| e.to_string())?;
+            let facets = report.facets.join(",");
             println!(
                 "imported {} [{}] ({} new, {} skipped)",
-                bundle.ns_name, facets, report.objects_transferred, report.objects_skipped
+                report.workspace_name, facets, report.objects_transferred, report.objects_skipped
             );
             Ok(())
         }
@@ -12377,30 +12921,14 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
                 allow_no_recovery,
                 new_key_source,
             } => {
-                let client = remote::open_store_client(&store)?;
-                if client.is_remote() {
-                    let new_source = resolve_new_key_source(new_key_source.as_deref(), keys)?;
-                    let new_passphrase = acquire(&new_source, "New passphrase", true)?.into_bytes();
-                    client.admin_key_add_wrap(new_passphrase, allow_no_recovery)?;
+                let client = remote::open_cli_generated_client(&store, keys)?;
+                let new_source = resolve_new_key_source(new_key_source.as_deref(), keys)?;
+                let new_spec = acquire_key_spec(&new_source, "New passphrase", true)?;
+                execute_generated_key_add_wrap(&client, new_spec, allow_no_recovery)?;
+                if client.target() == remote::CliExecutionTarget::Remote {
                     println!("added unlock wrap to remote store {store}");
                     return Ok(());
                 }
-                let fs = FileStore::open(&store).map_err(|e| e.to_string())?;
-                fs.unlock(&acquire_key_spec(
-                    &keys.source,
-                    "Current passphrase",
-                    false,
-                )?)
-                .map_err(|e| e.to_string())?;
-                let new_source = resolve_new_key_source(new_key_source.as_deref(), keys)?;
-                let new_spec = acquire_key_spec(&new_source, "New passphrase", true)?;
-                fs.add_wrap(
-                    &new_spec,
-                    rand_bytes(16)?,
-                    rand_bytes(24)?,
-                    allow_no_recovery,
-                )
-                .map_err(|e| e.to_string())?;
                 println!("added unlock wrap to {store}");
                 Ok(())
             }
@@ -12409,21 +12937,17 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
                 index,
                 allow_no_recovery,
             } => {
-                let client = remote::open_store_client(&store)?;
-                if client.is_remote() {
-                    client.admin_key_remove_wrap(index as u64, allow_no_recovery)?;
+                let client = remote::open_cli_generated_client(&store, keys)?;
+                execute_generated_void(
+                    &client,
+                    "KeySource",
+                    "key_remove_wrap",
+                    vec![(index as u64).to_value(), allow_no_recovery.to_value()],
+                )?;
+                if client.target() == remote::CliExecutionTarget::Remote {
                     println!("removed unlock wrap {index} from remote store {store}");
                     return Ok(());
                 }
-                let fs = FileStore::open(&store).map_err(|e| e.to_string())?;
-                fs.unlock(&acquire_key_spec(
-                    &keys.source,
-                    "Current passphrase",
-                    false,
-                )?)
-                .map_err(|e| e.to_string())?;
-                fs.remove_wrap(index, allow_no_recovery)
-                    .map_err(|e| e.to_string())?;
                 println!("removed unlock wrap {index} from {store}");
                 Ok(())
             }
@@ -12435,48 +12959,36 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
             facet_durability,
             clear_facet_durability,
         } => {
-            let durability_update_requested = default_durability.is_some()
+            let update_requested = fips_required.is_some()
+                || default_durability.is_some()
                 || !facet_durability.is_empty()
                 || !clear_facet_durability.is_empty();
-            let client = remote::open_store_client(&store)?;
-            if client.is_remote() {
-                if durability_update_requested {
-                    return Err(
-                        "remote `store policy` durability updates are not available through the current StoreAdmin wire method"
-                            .to_string(),
-                    );
-                }
-                let json = match fips_required {
-                    Some(f) => client.admin_policy_set_json(f)?,
-                    None => client.admin_policy_get_json()?,
-                };
-                println!("{json}");
-                return Ok(());
-            }
-            if fips_required.is_some() || durability_update_requested {
-                let fs = cli_open_store_for_write(&store)?;
-                unlock_if_encrypted(&fs, keys)?;
-                let mut policy = fs.store_policy().map_err(|e| e.to_string())?;
-                apply_store_policy_cli_updates(
-                    &mut policy,
+            let client = if update_requested {
+                remote::open_cli_generated_client(&store, keys)?
+            } else {
+                remote::open_cli_read_only_generated_client(&store, keys)?
+            };
+            let bytes = if update_requested {
+                let update = store_policy_update_from_cli(
                     fips_required,
                     default_durability.as_deref(),
                     facet_durability,
                     clear_facet_durability,
                 )?;
-                let target = store_policy_audit_target(&policy);
-                let seq = fs
-                    .save_store_policy_audited(policy, None, "store.policy.set", Some(&target))
-                    .map_err(|e| e.to_string())?;
-                println!("{}", store_policy_json(policy, Some(seq)));
-                return Ok(());
-            }
-            let fs = FileStore::open_read(&store).map_err(|e| e.to_string())?;
-            unlock_if_encrypted(&fs, keys)?;
-            println!(
-                "{}",
-                store_policy_json(fs.store_policy().map_err(|e| e.to_string())?, None)
-            );
+                execute_generated_bytes(
+                    &client,
+                    "StoreAdmin",
+                    "store_policy_set",
+                    vec![WireValue::Bytes(
+                        loom_wire::store_admin::store_policy_update_to_cbor(&update),
+                    )],
+                )?
+            } else {
+                execute_generated_bytes(&client, "StoreAdmin", "store_policy_get", Vec::new())?
+            };
+            let result = loom_wire::store_admin::store_policy_result_from_cbor(&bytes)
+                .map_err(|e| e.to_string())?;
+            println!("{}", store_policy_result_json(result));
             Ok(())
         }
         StoreCmd::Put { store, path } => {
@@ -12498,116 +13010,37 @@ fn run_store(action: StoreCmd, keys: &KeyOpts) -> Result<(), String> {
             reseal,
             new_key_source,
         } => {
-            let client = remote::open_store_client(&store)?;
-            if client.is_remote() {
-                // Remote rekey is server-side and passphrase-based: the client sends only the new
-                // passphrase; the server mints the salt/nonce/DEK and never returns key material.
-                let new_source = resolve_new_key_source(new_key_source.as_deref(), keys)?;
-                let new_passphrase = acquire(&new_source, "New passphrase", true)?.into_bytes();
-                println!(
-                    "{}",
-                    client.admin_rekey_summary(new_passphrase, reseal, suite)?
-                );
-                return Ok(());
-            }
-            let mut fs = FileStore::open(&store).map_err(|e| e.to_string())?;
-            let meta = fs
-                .encryption_meta()
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("{store} is not encrypted"))?;
-            // Current credential from --key-source; the new one from --new-key-source (confirmed). Each
-            // may be a passphrase or a raw KEK.
-            fs.unlock(&acquire_key_spec(
-                &keys.source,
-                "Current passphrase",
-                false,
-            )?)
-            .map_err(|e| e.to_string())?;
             let new_source = resolve_new_key_source(new_key_source.as_deref(), keys)?;
-            let new_spec = acquire_key_spec(&new_source, "New passphrase", true)?;
-            let salt = rand_bytes(16)?;
-            // 24 random bytes cover either wrap nonce length (XChaCha 24 / AES-GCM 12); `create`/`rewrap`
-            // use the leading bytes for the profile's wrap AEAD.
-            let wrap_nonce = rand_bytes(24)?;
-            if reseal {
-                // Full data pass: a fresh DEK, optionally a new suite, re-sealing every object.
-                let target_suite = match &suite {
-                    Some(s) => Suite::parse(s).map_err(|e| e.to_string())?,
-                    None => meta.active_suite,
-                };
-                let new_dek: [u8; 32] = rand_bytes(32)?
-                    .try_into()
-                    .map_err(|_| "DEK must be 32 bytes".to_string())?;
-                let (new_meta, new_session) =
-                    EncryptionMeta::create(&new_spec, target_suite, salt, new_dek, wrap_nonce)
-                        .map_err(|e| e.to_string())?;
-                let stats = fs
-                    .rekey_reseal(new_meta.encode(), new_session)
-                    .map_err(|e| e.to_string())?;
-                println!(
-                    "rekeyed {store} (re-sealed every object under a fresh DEK, suite {}; {} -> {} bytes)",
-                    target_suite.as_str(),
-                    stats.before,
-                    stats.after
-                );
-            } else {
-                // Cheap path: DEK re-wrap only; changing the AEAD suite needs --reseal.
-                if let Some(s) = &suite {
-                    let want = Suite::parse(s).map_err(|e| e.to_string())?;
-                    if want != meta.active_suite {
-                        return Err(format!(
-                            "changing the AEAD suite ({} -> {}) requires re-sealing every object; \
-                             re-run with --reseal",
-                            meta.active_suite.as_str(),
-                            want.as_str()
-                        ));
-                    }
-                }
-                fs.rekey(&new_spec, salt, wrap_nonce)
-                    .map_err(|e| e.to_string())?;
-                println!("rekeyed {store} (DEK re-wrapped under the new credential)");
-            }
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let credential = store_rekey_credential_from_key_spec(acquire_key_spec(
+                &new_source,
+                "New passphrase",
+                true,
+            )?);
+            let request = loom_wire::store_admin::StoreRekeyRequest {
+                credential,
+                reseal,
+                suite,
+            };
+            let bytes = execute_generated_bytes(
+                &client,
+                "StoreAdmin",
+                "store_rekey",
+                vec![WireValue::Bytes(
+                    loom_wire::store_admin::store_rekey_request_to_cbor(&request),
+                )],
+            )?;
+            let result = loom_wire::store_admin::store_rekey_result_from_cbor(&bytes)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                store_rekey_result_summary(client.target(), &store, result)
+            );
             Ok(())
         }
         StoreCmd::Stat { store } => {
-            let client = remote::open_store_client(&store)?;
-            if client.is_remote() {
-                println!("{}", client.admin_stat_json()?);
-                return Ok(());
-            }
-            let fs = FileStore::open_read(&store).map_err(|e| e.to_string())?;
-            println!("{}: {} object(s)", store, fs.len());
-            let status = fs.maintenance_status().map_err(|e| e.to_string())?;
-            println!(
-                "maintenance: generation={} object_count={} physical_pages={} physical_bytes={} reusable_free_pages={} candidate_dead_pages={} tail_free_pages={} tail_free_bytes={} last_validated_mark_epoch={} touched_segments={} candidate_segments={} segment_overflow={}",
-                status.generation,
-                status.object_count,
-                status.physical_page_count,
-                status.physical_bytes,
-                status.reusable_free_pages,
-                status.candidate_dead_pages,
-                status.tail_free_pages,
-                status.tail_free_bytes,
-                status.last_validated_mark_epoch,
-                status.touched_segments.len(),
-                status.candidate_segments.len(),
-                status.segment_overflow
-            );
-            let gc = &status.group_commit;
-            println!(
-                "group_commit: batches_total={} transactions_total={} records_total={} fsync_total_micros={} fsync_count={} write_lock_wait_total_micros={} write_lock_wait_count={} pending_durable_window_transactions={} pending_durable_window_records={} pinned_reader_blockers={}",
-                gc.group_commit_batches_total,
-                gc.group_commit_transactions_total,
-                gc.group_commit_records_total,
-                gc.fsync_total_micros,
-                gc.fsync_count,
-                gc.write_lock_wait_total_micros,
-                gc.write_lock_wait_count,
-                gc.pending_durable_window_transactions,
-                gc.pending_durable_window_records,
-                gc.pinned_reader_blockers
-                    .map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
-            );
+            let context = remote::open_cli_execution_context(&store)?;
+            println!("{}", remote::generated_store_stat_json(context, keys)?);
             Ok(())
         }
         StoreCmd::Attribution {
@@ -13045,23 +13478,12 @@ fn build_store_replacement_preflight_report(
                     true,
                     format!("workspace_id={workspace_id}"),
                 ));
-                match loom_lanes::list_lanes_with_diagnostics(loom, workspace_id) {
-                    Ok((lanes, diagnostics)) if diagnostics.is_empty() => {
+                match loom_lanes::list_lanes(loom, workspace_id) {
+                    Ok(lanes) => {
                         checks.push(store_preflight_check(
                             "lanes_list",
                             true,
                             format!("lanes={}", lanes.len()),
-                        ));
-                    }
-                    Ok((lanes, diagnostics)) => {
-                        checks.push(store_preflight_check(
-                            "lanes_list",
-                            false,
-                            format!(
-                                "lanes={} decode_diagnostics={}",
-                                lanes.len(),
-                                diagnostics.len()
-                            ),
                         ));
                     }
                     Err(error) => {
@@ -13082,6 +13504,7 @@ fn build_store_replacement_preflight_report(
                     policy_labels: Vec::new(),
                     ready_only: false,
                     include_completed: true,
+                    lane_id: None,
                     lane_member_ids: None,
                     board_id: None,
                     cursor: None,
@@ -13152,6 +13575,14 @@ fn build_store_replacement_preflight_report(
                 "doctor_store",
                 false,
                 format!("maintenance report is not readable by this binary: {error}"),
+            )),
+        }
+        match fs.root_codec_diagnostics() {
+            Ok(diagnostics) => checks.push(store_replacement_root_codec_check(&diagnostics)),
+            Err(error) => checks.push(store_preflight_check(
+                "root_codecs",
+                false,
+                format!("root codec diagnostics are not readable by this binary: {error}"),
             )),
         }
     }
@@ -13712,6 +14143,48 @@ fn store_preflight_check(name: &str, ok: bool, message: impl Into<String>) -> se
     })
 }
 
+fn store_replacement_root_codec_check(
+    diagnostics: &loom_store::StoreRootCodecDiagnostics,
+) -> serde_json::Value {
+    if diagnostics.failures.is_empty() {
+        store_preflight_check(
+            "root_codecs",
+            true,
+            format!("checked={} failures=0", diagnostics.checked_roots),
+        )
+    } else {
+        store_preflight_check(
+            "root_codecs",
+            false,
+            format!(
+                "root codec diagnostics failed: checked={} failures={} {}",
+                diagnostics.checked_roots,
+                diagnostics.failures.len(),
+                root_codec_failure_summary(&diagnostics.failures)
+            ),
+        )
+    }
+}
+
+fn root_codec_failure_summary(failures: &[loom_store::StoreRootCodecDiagnostic]) -> String {
+    failures
+        .iter()
+        .take(4)
+        .map(|failure| {
+            format!(
+                "{}:page={} expected={} actual={}",
+                failure.root_name,
+                failure.root_page,
+                failure.expected_codec,
+                failure
+                    .actual_discriminator
+                    .map_or_else(|| "none".to_string(), |value| format!("0x{value:02x}"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn store_replacement_preflight_report(
     store: &str,
     workspace: &str,
@@ -13902,11 +14375,14 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let channels = loom_chat::list_channels(&loom, workspace_id, &profile_id)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let chat_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let channels = execute_generated_json::<Vec<loom_chat::HostedChatChannelSummary>>(
+                &client,
+                "Chat",
+                "chat_list_channels_json",
+                vec![workspace.to_value(), chat_workspace_id.to_value()],
+            )?;
             print_chat_channels(&channels, &format)
         }
         ChatCmd::CreateChannel {
@@ -13917,23 +14393,25 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             channel_id,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
             let channel_id = match channel_id {
                 Some(value) => parse_chat_workspace_id(&value)?,
                 None => random_workspace_id()?,
             };
-            let channel = loom_chat::ensure_channel(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                channel_id,
-                &handle,
-                &name,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let channel = execute_generated_json::<loom_chat::HostedChatChannelSummary>(
+                &client,
+                "Chat",
+                "chat_create_channel_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel_id.to_string().to_value(),
+                    handle.to_value(),
+                    name.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
             print_chat_channel_summary(&channel, &format)
         }
         ChatCmd::RenameChannel {
@@ -13943,13 +14421,20 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             handle,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let channel =
-                loom_chat::rename_channel(&mut loom, workspace_id, &profile_id, &channel, &handle)
-                    .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let channel = execute_generated_json::<loom_chat::HostedChatChannelSummary>(
+                &client,
+                "Chat",
+                "chat_rename_channel_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    handle.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
             print_chat_channel_summary(&channel, &format)
         }
         ChatCmd::Messages {
@@ -13958,12 +14443,18 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             channel,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let projection =
-                loom_chat::channel_projection(&loom, workspace_id, &profile_id, &channel)
-                    .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let chat_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let projection = execute_generated_json::<loom_chat::HostedChatChannel>(
+                &client,
+                "Chat",
+                "chat_messages_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                ],
+            )?;
             print_chat_channel(&projection, &format)
         }
         ChatCmd::Events {
@@ -13974,18 +14465,24 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             max,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let events = loom_chat::operation_changes(
-                &loom,
-                workspace_id,
-                &profile_id,
-                &channel,
-                from_sequence,
-                max,
-            )
-            .map_err(|e| e.to_string())?;
+            let max = u64::try_from(max)
+                .map_err(|_| "chat event max exceeds protocol u64 range".to_string())?;
+            let from_sequence = from_sequence.max(1);
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let chat_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let events =
+                execute_generated_json::<loom_substrate::changes::HostedOperationChangesBatch>(
+                    &client,
+                    "Chat",
+                    "chat_fetch_events_json",
+                    vec![
+                        workspace.to_value(),
+                        chat_workspace_id.to_value(),
+                        channel.to_value(),
+                        from_sequence.to_value(),
+                        max.to_value(),
+                    ],
+                )?;
             print_chat_events(&events, &format)
         }
         ChatCmd::Cursor {
@@ -13994,11 +14491,18 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             channel,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let cursor = loom_chat::read_cursor(&loom, workspace_id, &profile_id, &channel)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let chat_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let cursor = execute_generated_json::<loom_chat::HostedChatCursor>(
+                &client,
+                "Chat",
+                "chat_cursor_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                ],
+            )?;
             print_chat_cursor(&cursor, &format)
         }
         ChatCmd::UpdateCursor {
@@ -14008,18 +14512,20 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             next_sequence,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let cursor = loom_chat::update_cursor(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &channel,
-                next_sequence,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let cursor = execute_generated_json::<loom_chat::HostedChatCursor>(
+                &client,
+                "Chat",
+                "chat_update_cursor_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    next_sequence.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
             print_chat_cursor(&cursor, &format)
         }
         ChatCmd::Post {
@@ -14032,20 +14538,22 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             format,
         } => {
             let body = read_input(&input).map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let write = loom_chat::post_message(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &channel,
-                &message_id,
-                thread.as_deref(),
-                body,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_post_message_bytes_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    message_id.to_value(),
+                    thread.to_value(),
+                    WireValue::Bytes(body),
+                    WireValue::Null,
+                ],
+            )?;
             print_chat_write(&write, &format)
         }
         ChatCmd::Edit {
@@ -14054,22 +14562,25 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             channel,
             message_id,
             input,
+            expected_entity_tag,
             format,
         } => {
             let body = read_input(&input).map_err(|e| e.to_string())?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let write = loom_chat::edit_message(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &channel,
-                &message_id,
-                body,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_edit_message_bytes_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    message_id.to_value(),
+                    WireValue::Bytes(body),
+                    expected_entity_tag.to_value(),
+                ],
+            )?;
             print_chat_write(&write, &format)
         }
         ChatCmd::Redact {
@@ -14079,22 +14590,24 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             message_id,
             reason,
             format,
-        } => chat_write(
-            keys,
-            &store,
-            &workspace,
-            &format,
-            |loom, workspace_id, profile_id| {
-                loom_chat::redact_message(
-                    loom,
-                    workspace_id,
-                    profile_id,
-                    &channel,
-                    &message_id,
-                    reason.as_deref(),
-                )
-            },
-        ),
+        } => {
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_redact_message_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    message_id.to_value(),
+                    reason.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
+            print_chat_write(&write, &format)
+        }
         ChatCmd::CreateThread {
             store,
             workspace,
@@ -14102,22 +14615,24 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             thread_id,
             parent_message_id,
             format,
-        } => chat_write(
-            keys,
-            &store,
-            &workspace,
-            &format,
-            |loom, workspace_id, profile_id| {
-                loom_chat::create_thread(
-                    loom,
-                    workspace_id,
-                    profile_id,
-                    &channel,
-                    &thread_id,
-                    &parent_message_id,
-                )
-            },
-        ),
+        } => {
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_create_thread_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    thread_id.to_value(),
+                    parent_message_id.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
+            print_chat_write(&write, &format)
+        }
         ChatCmd::CreateTask {
             store,
             workspace,
@@ -14126,23 +14641,25 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             title,
             message_id,
             format,
-        } => chat_write(
-            keys,
-            &store,
-            &workspace,
-            &format,
-            |loom, workspace_id, profile_id| {
-                loom_chat::create_task(
-                    loom,
-                    workspace_id,
-                    profile_id,
-                    &channel,
-                    &task_id,
-                    message_id.as_deref(),
-                    &title,
-                )
-            },
-        ),
+        } => {
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_create_task_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    task_id.to_value(),
+                    message_id.to_value(),
+                    title.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
+            print_chat_write(&write, &format)
+        }
         ChatCmd::ClaimTask {
             store,
             workspace,
@@ -14151,23 +14668,25 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             claim_id,
             lease_token,
             format,
-        } => chat_write(
-            keys,
-            &store,
-            &workspace,
-            &format,
-            |loom, workspace_id, profile_id| {
-                loom_chat::claim_task(
-                    loom,
-                    workspace_id,
-                    profile_id,
-                    &channel,
-                    &task_id,
-                    &claim_id,
-                    lease_token.as_deref(),
-                )
-            },
-        ),
+        } => {
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_claim_task_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    task_id.to_value(),
+                    claim_id.to_value(),
+                    lease_token.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
+            print_chat_write(&write, &format)
+        }
         ChatCmd::CompleteTask {
             store,
             workspace,
@@ -14176,23 +14695,25 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             claim_id,
             result_message_id,
             format,
-        } => chat_write(
-            keys,
-            &store,
-            &workspace,
-            &format,
-            |loom, workspace_id, profile_id| {
-                loom_chat::complete_task(
-                    loom,
-                    workspace_id,
-                    profile_id,
-                    &channel,
-                    &task_id,
-                    &claim_id,
-                    result_message_id.as_deref(),
-                )
-            },
-        ),
+        } => {
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_complete_task_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    task_id.to_value(),
+                    claim_id.to_value(),
+                    result_message_id.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
+            print_chat_write(&write, &format)
+        }
         ChatCmd::InvokeAgent {
             store,
             workspace,
@@ -14204,25 +14725,27 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             format,
         } => {
             let prompt = read_input(&input).map_err(|e| e.to_string())?;
-            let agent_principal = parse_chat_workspace_id(&agent_principal)?;
-            chat_write(
-                keys,
-                &store,
-                &workspace,
-                &format,
-                |loom, workspace_id, profile_id| {
-                    loom_chat::invoke_agent(
-                        loom,
-                        workspace_id,
-                        profile_id,
-                        &channel,
-                        &invocation_id,
-                        agent_principal,
-                        source_message_ids,
-                        prompt,
-                    )
-                },
-            )
+            let agent_principal = parse_chat_workspace_id(&agent_principal)?.to_string();
+            let source_message_ids_json =
+                serde_json::to_string(&source_message_ids).map_err(|e| e.to_string())?;
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_invoke_agent_bytes_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    invocation_id.to_value(),
+                    agent_principal.to_value(),
+                    source_message_ids_json.to_value(),
+                    WireValue::Bytes(prompt),
+                    WireValue::Null,
+                ],
+            )?;
+            print_chat_write(&write, &format)
         }
         ChatCmd::AgentReply {
             store,
@@ -14231,22 +14754,24 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             invocation_id,
             message_id,
             format,
-        } => chat_write(
-            keys,
-            &store,
-            &workspace,
-            &format,
-            |loom, workspace_id, profile_id| {
-                loom_chat::agent_reply(
-                    loom,
-                    workspace_id,
-                    profile_id,
-                    &channel,
-                    &invocation_id,
-                    &message_id,
-                )
-            },
-        ),
+        } => {
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_agent_reply_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    invocation_id.to_value(),
+                    message_id.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
+            print_chat_write(&write, &format)
+        }
         ChatCmd::RequestHandoff {
             store,
             workspace,
@@ -14257,29 +14782,30 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             reason,
             format,
         } => {
-            let from_agent_principal = parse_chat_workspace_id(&from_agent_principal)?;
+            let from_agent_principal = parse_chat_workspace_id(&from_agent_principal)?.to_string();
             let to_principal = to_principal
                 .as_deref()
                 .map(parse_chat_workspace_id)
-                .transpose()?;
-            chat_write(
-                keys,
-                &store,
-                &workspace,
-                &format,
-                |loom, workspace_id, profile_id| {
-                    loom_chat::request_handoff(
-                        loom,
-                        workspace_id,
-                        profile_id,
-                        &channel,
-                        &handoff_id,
-                        from_agent_principal,
-                        to_principal,
-                        reason.as_deref(),
-                    )
-                },
-            )
+                .transpose()?
+                .map(|id| id.to_string());
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_request_handoff_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    handoff_id.to_value(),
+                    from_agent_principal.to_value(),
+                    to_principal.to_value(),
+                    reason.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
+            print_chat_write(&write, &format)
         }
         ChatCmd::AddReaction {
             store,
@@ -14288,22 +14814,24 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             message_id,
             kind,
             format,
-        } => chat_write(
-            keys,
-            &store,
-            &workspace,
-            &format,
-            |loom, workspace_id, profile_id| {
-                loom_chat::add_reaction(
-                    loom,
-                    workspace_id,
-                    profile_id,
-                    &channel,
-                    &message_id,
-                    &kind,
-                )
-            },
-        ),
+        } => {
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_add_reaction_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    message_id.to_value(),
+                    kind.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
+            print_chat_write(&write, &format)
+        }
         ChatCmd::RemoveReaction {
             store,
             workspace,
@@ -14311,32 +14839,37 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             message_id,
             kind,
             format,
-        } => chat_write(
-            keys,
-            &store,
-            &workspace,
-            &format,
-            |loom, workspace_id, profile_id| {
-                loom_chat::remove_reaction(
-                    loom,
-                    workspace_id,
-                    profile_id,
-                    &channel,
-                    &message_id,
-                    &kind,
-                )
-            },
-        ),
+        } => {
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_chat::HostedChatWrite>(
+                &client,
+                "Chat",
+                "chat_remove_reaction_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    channel.to_value(),
+                    message_id.to_value(),
+                    kind.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
+            print_chat_write(&write, &format)
+        }
         ChatCmd::EmojiList {
             store,
             workspace,
             format,
         } => {
-            let loom = cli_open_loom_read(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let registry = loom_chat::emoji_registry(&loom, workspace_id, &profile_id)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let chat_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let registry = execute_generated_json::<loom_chat::HostedChatEmojiRegistry>(
+                &client,
+                "Chat",
+                "chat_emoji_list_json",
+                vec![workspace.to_value(), chat_workspace_id.to_value()],
+            )?;
             print_chat_emoji_registry(&registry, &format)
         }
         ChatCmd::EmojiRegister {
@@ -14345,12 +14878,19 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             kind,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let registry = loom_chat::register_emoji(&mut loom, workspace_id, &profile_id, &kind)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let registry = execute_generated_json::<loom_chat::HostedChatEmojiRegistry>(
+                &client,
+                "Chat",
+                "chat_emoji_register_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    kind.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
             print_chat_emoji_registry(&registry, &format)
         }
         ChatCmd::EmojiUnregister {
@@ -14359,37 +14899,45 @@ fn run_chat(action: ChatCmd, keys: &KeyOpts) -> Result<(), String> {
             kind,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let workspace_id = resolve_ns(&loom, &workspace)?;
-            let profile_id = workspace_id.to_string();
-            let registry = loom_chat::unregister_emoji(&mut loom, workspace_id, &profile_id, &kind)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, chat_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let registry = execute_generated_json::<loom_chat::HostedChatEmojiRegistry>(
+                &client,
+                "Chat",
+                "chat_emoji_unregister_json",
+                vec![
+                    workspace.to_value(),
+                    chat_workspace_id.to_value(),
+                    kind.to_value(),
+                    WireValue::Null,
+                ],
+            )?;
             print_chat_emoji_registry(&registry, &format)
         }
     }
 }
 
-fn chat_write<F>(
-    keys: &KeyOpts,
+fn generated_workspace_context(
     store: &str,
     workspace: &str,
-    format: &str,
-    f: F,
-) -> Result<(), String>
+    keys: &KeyOpts,
+) -> Result<(remote::CliGeneratedClient, String), String> {
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let workspace_id = client.resolve_workspace_id(workspace)?.to_string();
+    Ok((client, workspace_id))
+}
+
+fn execute_generated_json<T>(
+    client: &remote::CliGeneratedClient,
+    interface: &str,
+    method: &str,
+    args: Vec<WireValue>,
+) -> Result<T, String>
 where
-    F: FnOnce(
-        &mut Loom<FileStore>,
-        WorkspaceId,
-        &str,
-    ) -> loom_core::Result<loom_chat::HostedChatWrite>,
+    T: serde::de::DeserializeOwned,
 {
-    let mut loom = cli_open_loom(store, keys)?;
-    let workspace_id = resolve_ns(&loom, workspace)?;
-    let profile_id = workspace_id.to_string();
-    let write = f(&mut loom, workspace_id, &profile_id).map_err(|e| e.to_string())?;
-    save_loom(&mut loom).map_err(|e| e.to_string())?;
-    print_chat_write(&write, format)
+    let json = execute_generated_string(client, interface, method, args)?;
+    serde_json::from_str(&json).map_err(|e| e.to_string())
 }
 
 fn parse_chat_workspace_id(value: &str) -> Result<WorkspaceId, String> {
@@ -14475,7 +15023,7 @@ fn print_chat_channel(channel: &loom_chat::HostedChatChannel, format: &str) -> R
 }
 
 fn print_chat_events(
-    batch: &loom_substrate::changes::OperationChangeBatch,
+    batch: &loom_substrate::changes::HostedOperationChangesBatch,
     format: &str,
 ) -> Result<(), String> {
     match format {
@@ -14484,24 +15032,37 @@ fn print_chat_events(
                 .events
                 .iter()
                 .map(|event| {
+                    let loom_substrate::changes::HostedOperationChangeEvent::Operation {
+                        workspace_id,
+                        app_id,
+                        scope_id,
+                        operation_id,
+                        operation_kind,
+                        sequence,
+                        actor_principal,
+                        timestamp_ms,
+                        root_after,
+                        payload_digest,
+                        policy_labels,
+                    } = event;
                     serde_json::json!({
-                        "workspace_id": event.workspace_id,
-                        "app_id": event.app_id,
-                        "scope_id": event.scope_id,
-                        "operation_id": event.operation_id,
-                        "operation_kind": event.operation_kind,
-                        "sequence": event.sequence,
-                        "actor_principal": event.actor_principal,
-                        "timestamp_ms": event.timestamp_ms,
-                        "root_after": event.root_after.to_string(),
-                        "payload_digest": event.payload_digest.to_string(),
-                        "policy_labels": event.policy_labels
+                        "workspace_id": workspace_id,
+                        "app_id": app_id,
+                        "scope_id": scope_id,
+                        "operation_id": operation_id,
+                        "operation_kind": operation_kind,
+                        "sequence": sequence,
+                        "actor_principal": actor_principal,
+                        "timestamp_ms": timestamp_ms,
+                        "root_after": root_after,
+                        "payload_digest": payload_digest,
+                        "policy_labels": policy_labels
                     })
                 })
                 .collect::<Vec<_>>();
             let body = serde_json::json!({
                 "events": events,
-                "next": batch.next.encode()
+                "next": batch.next
             });
             println!(
                 "{}",
@@ -14511,12 +15072,19 @@ fn print_chat_events(
         }
         "text" => {
             for event in &batch.events {
+                let loom_substrate::changes::HostedOperationChangeEvent::Operation {
+                    operation_id,
+                    operation_kind,
+                    sequence,
+                    root_after,
+                    ..
+                } = event;
                 println!(
                     "{}\t{}\t{}\t{}",
-                    event.sequence, event.operation_id, event.operation_kind, event.root_after
+                    sequence, operation_id, operation_kind, root_after
                 );
             }
-            println!("next\t{}", batch.next.encode());
+            println!("next\t{}", batch.next);
             Ok(())
         }
         other => Err(format!(
@@ -14593,28 +15161,6 @@ fn print_chat_write(write: &loom_chat::HostedChatWrite, format: &str) -> Result<
     }
 }
 
-fn open_drive_read(
-    store: &str,
-    workspace: &str,
-    keys: &KeyOpts,
-) -> Result<(Loom<FileStore>, WorkspaceId, String), String> {
-    let loom = cli_open_loom_read(store, keys)?;
-    let workspace_id = resolve_ns(&loom, workspace)?;
-    let profile_id = workspace_id.to_string();
-    Ok((loom, workspace_id, profile_id))
-}
-
-fn open_drive_write(
-    store: &str,
-    workspace: &str,
-    keys: &KeyOpts,
-) -> Result<(CliLoom, WorkspaceId, String), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let workspace_id = resolve_ns(&loom, workspace)?;
-    let profile_id = workspace_id.to_string();
-    Ok((loom, workspace_id, profile_id))
-}
-
 fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
     match action {
         DriveCmd::List {
@@ -14623,9 +15169,18 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             folder_id,
             format,
         } => {
-            let (loom, workspace_id, profile_id) = open_drive_read(&store, &workspace, keys)?;
-            let folder = loom_drive::list_folder(&loom, workspace_id, &profile_id, &folder_id)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let drive_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let folder = execute_generated_json::<loom_drive::HostedDriveFolder>(
+                &client,
+                "Drive",
+                "drive_list_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    folder_id.to_value(),
+                ],
+            )?;
             print_drive_folder(&folder, &format)
         }
         DriveCmd::Stat {
@@ -14635,9 +15190,19 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             name,
             format,
         } => {
-            let (loom, workspace_id, profile_id) = open_drive_read(&store, &workspace, keys)?;
-            let stat = loom_drive::stat_node(&loom, workspace_id, &profile_id, &folder_id, &name)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let drive_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let stat = execute_generated_json::<loom_drive::HostedDriveStat>(
+                &client,
+                "Drive",
+                "drive_stat_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    folder_id.to_value(),
+                    name.to_value(),
+                ],
+            )?;
             print_drive_stat(&stat, &format)
         }
         DriveCmd::Read {
@@ -14646,9 +15211,18 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             file_id,
             out,
         } => {
-            let (loom, workspace_id, profile_id) = open_drive_read(&store, &workspace, keys)?;
-            let bytes = loom_drive::read_file(&loom, workspace_id, &profile_id, &file_id)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let drive_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let bytes = execute_generated_bytes(
+                &client,
+                "Drive",
+                "drive_read_file",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    file_id.to_value(),
+                ],
+            )?;
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         DriveCmd::ListVersions {
@@ -14657,9 +15231,18 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             file_id,
             format,
         } => {
-            let (loom, workspace_id, profile_id) = open_drive_read(&store, &workspace, keys)?;
-            let versions = loom_drive::list_versions(&loom, workspace_id, &profile_id, &file_id)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let drive_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let versions = execute_generated_json::<Vec<loom_drive::HostedDriveVersion>>(
+                &client,
+                "Drive",
+                "drive_list_versions_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    file_id.to_value(),
+                ],
+            )?;
             print_drive_versions(&versions, &format)
         }
         DriveCmd::ListConflicts {
@@ -14667,9 +15250,14 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             format,
         } => {
-            let (loom, workspace_id, profile_id) = open_drive_read(&store, &workspace, keys)?;
-            let conflicts = loom_drive::list_conflicts(&loom, workspace_id, &profile_id)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let drive_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let conflicts = execute_generated_json::<Vec<loom_drive::HostedDriveConflict>>(
+                &client,
+                "Drive",
+                "drive_list_conflicts_json",
+                vec![workspace.to_value(), drive_workspace_id.to_value()],
+            )?;
             print_drive_conflicts(&conflicts, &format)
         }
         DriveCmd::ListShares {
@@ -14677,9 +15265,14 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             format,
         } => {
-            let (loom, workspace_id, profile_id) = open_drive_read(&store, &workspace, keys)?;
-            let shares = loom_drive::list_shares(&loom, workspace_id, &profile_id)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let drive_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let shares = execute_generated_json::<Vec<loom_drive::HostedDriveShareGrant>>(
+                &client,
+                "Drive",
+                "drive_list_shares_json",
+                vec![workspace.to_value(), drive_workspace_id.to_value()],
+            )?;
             print_drive_shares(&shares, &format)
         }
         DriveCmd::GrantShare {
@@ -14694,23 +15287,24 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             expires_at_ms,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let write = loom_drive::grant_share(
-                &mut loom,
-                workspace_id,
-                loom_drive::HostedDriveGrantShare {
-                    workspace_id: &profile_id,
-                    grant_id: &grant_id,
-                    target_kind: &target_kind,
-                    target_id: &target_id,
-                    principal: &principal,
-                    role: &role,
-                    granted_at_ms,
-                    expires_at_ms,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_drive::HostedDriveWrite>(
+                &client,
+                "Drive",
+                "drive_grant_share_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    grant_id.to_value(),
+                    target_kind.to_value(),
+                    target_id.to_value(),
+                    principal.to_value(),
+                    role.to_value(),
+                    granted_at_ms.to_value(),
+                    expires_at_ms.to_value(),
+                ],
+            )?;
             print_drive_write(&write, &format)
         }
         DriveCmd::RevokeShare {
@@ -14719,10 +15313,18 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             grant_id,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let write = loom_drive::revoke_share(&mut loom, workspace_id, &profile_id, &grant_id)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_drive::HostedDriveWrite>(
+                &client,
+                "Drive",
+                "drive_revoke_share_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    grant_id.to_value(),
+                ],
+            )?;
             print_drive_write(&write, &format)
         }
         DriveCmd::ApplyShareExpiry {
@@ -14731,11 +15333,18 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             now_ms,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let applied =
-                loom_drive::apply_share_expiry(&mut loom, workspace_id, &profile_id, now_ms)
-                    .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let applied = execute_generated_json::<loom_drive::HostedDriveShareExpiryApply>(
+                &client,
+                "Drive",
+                "drive_apply_share_expiry_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    now_ms.to_value(),
+                ],
+            )?;
             print_drive_share_expiry_apply(&applied, &format)
         }
         DriveCmd::ListRetention {
@@ -14743,9 +15352,14 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             format,
         } => {
-            let (loom, workspace_id, profile_id) = open_drive_read(&store, &workspace, keys)?;
-            let pins = loom_drive::list_retention(&loom, workspace_id, &profile_id)
-                .map_err(|e| e.to_string())?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let drive_workspace_id = client.resolve_workspace_id(&workspace)?.to_string();
+            let pins = execute_generated_json::<Vec<loom_drive::HostedDriveRetentionPin>>(
+                &client,
+                "Drive",
+                "drive_list_retention_json",
+                vec![workspace.to_value(), drive_workspace_id.to_value()],
+            )?;
             print_drive_retention(&pins, &format)
         }
         DriveCmd::PinRetention {
@@ -14759,22 +15373,23 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             expires_at_ms,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let write = loom_drive::pin_retention(
-                &mut loom,
-                workspace_id,
-                loom_drive::HostedDrivePinRetention {
-                    workspace_id: &profile_id,
-                    pin_id: &pin_id,
-                    kind: &kind,
-                    root: &root,
-                    target_entity_id: target_entity_id.as_deref(),
-                    added_at_ms,
-                    expires_at_ms,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_drive::HostedDriveWrite>(
+                &client,
+                "Drive",
+                "drive_pin_retention_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    pin_id.to_value(),
+                    kind.to_value(),
+                    root.to_value(),
+                    target_entity_id.to_value(),
+                    added_at_ms.to_value(),
+                    expires_at_ms.to_value(),
+                ],
+            )?;
             print_drive_write(&write, &format)
         }
         DriveCmd::UnpinRetention {
@@ -14783,10 +15398,18 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             pin_id,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let write = loom_drive::unpin_retention(&mut loom, workspace_id, &profile_id, &pin_id)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_drive::HostedDriveWrite>(
+                &client,
+                "Drive",
+                "drive_unpin_retention_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    pin_id.to_value(),
+                ],
+            )?;
             print_drive_write(&write, &format)
         }
         DriveCmd::ApplyRetention {
@@ -14795,10 +15418,18 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             now_ms,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let applied = loom_drive::apply_retention(&mut loom, workspace_id, &profile_id, now_ms)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let applied = execute_generated_json::<loom_drive::HostedDriveRetentionApply>(
+                &client,
+                "Drive",
+                "drive_apply_retention_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    now_ms.to_value(),
+                ],
+            )?;
             print_drive_retention_apply(&applied, &format)
         }
         DriveCmd::CreateFolder {
@@ -14810,18 +15441,21 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let write = loom_drive::create_folder(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &parent_folder_id,
-                &folder_id,
-                &name,
-                &expected_root,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_drive::HostedDriveWrite>(
+                &client,
+                "Drive",
+                "drive_create_folder_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    parent_folder_id.to_value(),
+                    folder_id.to_value(),
+                    name.to_value(),
+                    expected_root.to_value(),
+                ],
+            )?;
             print_drive_write(&write, &format)
         }
         DriveCmd::CreateUpload {
@@ -14836,23 +15470,24 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             replace_file,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let upload = loom_drive::create_upload(
-                &mut loom,
-                workspace_id,
-                loom_drive::HostedDriveCreateUpload {
-                    workspace_id: &profile_id,
-                    upload_id: &upload_id,
-                    parent_folder_id: &parent_folder_id,
-                    name: &name,
-                    file_id: &file_id,
-                    expected_root: &expected_root,
-                    created_at_ms,
-                    replace_file,
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let upload = execute_generated_json::<loom_drive::HostedDriveUploadSession>(
+                &client,
+                "Drive",
+                "drive_create_upload_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    upload_id.to_value(),
+                    parent_folder_id.to_value(),
+                    name.to_value(),
+                    file_id.to_value(),
+                    expected_root.to_value(),
+                    created_at_ms.to_value(),
+                    replace_file.to_value(),
+                ],
+            )?;
             print_drive_upload(&upload, &format)
         }
         DriveCmd::UploadChunk {
@@ -14863,11 +15498,19 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             format,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let upload =
-                loom_drive::upload_chunk(&mut loom, workspace_id, &profile_id, &upload_id, &bytes)
-                    .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let upload = execute_generated_json::<loom_drive::HostedDriveUploadSession>(
+                &client,
+                "Drive",
+                "drive_upload_chunk_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    upload_id.to_value(),
+                    WireValue::Bytes(bytes),
+                ],
+            )?;
             print_drive_upload(&upload, &format)
         }
         DriveCmd::CommitUpload {
@@ -14876,10 +15519,18 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             upload_id,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let write = loom_drive::commit_upload(&mut loom, workspace_id, &profile_id, &upload_id)
-                .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_drive::HostedDriveWrite>(
+                &client,
+                "Drive",
+                "drive_commit_upload_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    upload_id.to_value(),
+                ],
+            )?;
             print_drive_write(&write, &format)
         }
         DriveCmd::Rename {
@@ -14891,18 +15542,21 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let write = loom_drive::rename_node(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &folder_id,
-                &node_id,
-                &new_name,
-                &expected_root,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_drive::HostedDriveWrite>(
+                &client,
+                "Drive",
+                "drive_rename_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    folder_id.to_value(),
+                    node_id.to_value(),
+                    new_name.to_value(),
+                    expected_root.to_value(),
+                ],
+            )?;
             print_drive_write(&write, &format)
         }
         DriveCmd::Move {
@@ -14914,18 +15568,21 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let write = loom_drive::move_node(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &source_folder_id,
-                &target_folder_id,
-                &node_id,
-                &expected_root,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_drive::HostedDriveWrite>(
+                &client,
+                "Drive",
+                "drive_move_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    source_folder_id.to_value(),
+                    target_folder_id.to_value(),
+                    node_id.to_value(),
+                    expected_root.to_value(),
+                ],
+            )?;
             print_drive_write(&write, &format)
         }
         DriveCmd::Delete {
@@ -14936,17 +15593,20 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             expected_root,
             format,
         } => {
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let write = loom_drive::delete_node(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &folder_id,
-                &node_id,
-                &expected_root,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_drive::HostedDriveWrite>(
+                &client,
+                "Drive",
+                "drive_delete_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    folder_id.to_value(),
+                    node_id.to_value(),
+                    expected_root.to_value(),
+                ],
+            )?;
             print_drive_write(&write, &format)
         }
         DriveCmd::ResolveConflict {
@@ -14956,17 +15616,20 @@ fn run_drive(action: DriveCmd, keys: &KeyOpts) -> Result<(), String> {
             resolution,
             format,
         } => {
-            let resolution = parse_drive_conflict_resolution(&resolution)?;
-            let (mut loom, workspace_id, profile_id) = open_drive_write(&store, &workspace, keys)?;
-            let write = loom_drive::resolve_conflict(
-                &mut loom,
-                workspace_id,
-                &profile_id,
-                &conflict_id,
-                resolution,
-            )
-            .map_err(|e| e.to_string())?;
-            save_loom(&mut loom).map_err(|e| e.to_string())?;
+            let _resolution = parse_drive_conflict_resolution(&resolution)?;
+            let (client, drive_workspace_id) =
+                generated_workspace_context(&store, &workspace, keys)?;
+            let write = execute_generated_json::<loom_drive::HostedDriveWrite>(
+                &client,
+                "Drive",
+                "drive_resolve_conflict_json",
+                vec![
+                    workspace.to_value(),
+                    drive_workspace_id.to_value(),
+                    conflict_id.to_value(),
+                    resolution.to_value(),
+                ],
+            )?;
             print_drive_write(&write, &format)
         }
     }
@@ -15284,12 +15947,32 @@ fn run_files(action: FilesCmd, keys: &KeyOpts) -> Result<(), String> {
             path,
             recursive,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.fs_delete(keys, &workspace, &path, recursive)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let stat_bytes = execute_generated_bytes(
+                &client,
+                "FileSystem",
+                "stat",
+                vec![workspace.to_value(), path.to_value()],
+            )?;
+            let stat = loom_wire::fs::fs_stat_from_cbor(&stat_bytes).map_err(|e| e.to_string())?;
+            match stat.kind {
+                FileKind::Directory => execute_generated_void(
+                    &client,
+                    "FileSystem",
+                    "remove_directory",
+                    vec![workspace.to_value(), path.to_value(), recursive.to_value()],
+                ),
+                FileKind::File | FileKind::Symlink => execute_generated_void(
+                    &client,
+                    "FileSystem",
+                    "remove_file",
+                    vec![workspace.to_value(), path.to_value()],
+                ),
+            }
         }
         FilesCmd::Ls { store, workspace } => {
-            let client = remote::open_store_client(&store)?;
-            for p in client.fs_ls(keys, &workspace)? {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            for p in generated_files_list(&client, &workspace)? {
                 println!("{p}");
             }
             Ok(())
@@ -15300,8 +15983,13 @@ fn run_files(action: FilesCmd, keys: &KeyOpts) -> Result<(), String> {
             path,
             parents,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.fs_mkdir(keys, &workspace, &path, parents)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "FileSystem",
+                "create_directory",
+                vec![workspace.to_value(), path.to_value(), parents.to_value()],
+            )
         }
         FilesCmd::Read {
             store,
@@ -15309,8 +15997,13 @@ fn run_files(action: FilesCmd, keys: &KeyOpts) -> Result<(), String> {
             path,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let bytes = client.fs_read_file(keys, &workspace, &path)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "FileSystem",
+                "read_file",
+                vec![workspace.to_value(), path.to_value()],
+            )?;
             write_output(out.as_deref(), &bytes).map_err(|e| e.to_string())
         }
         FilesCmd::Write {
@@ -15320,10 +16013,65 @@ fn run_files(action: FilesCmd, keys: &KeyOpts) -> Result<(), String> {
             input,
         } => {
             let bytes = read_input(&input).map_err(|e| e.to_string())?;
-            let client = remote::open_store_client(&store)?;
-            client.fs_write_file(keys, &workspace, &path, bytes)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                execute_generated_void(
+                    &client,
+                    "FileSystem",
+                    "create_directory",
+                    vec![workspace.to_value(), parent.to_value(), true.to_value()],
+                )?;
+            }
+            execute_generated_void(
+                &client,
+                "FileSystem",
+                "write_file",
+                vec![
+                    workspace.to_value(),
+                    path.to_value(),
+                    WireValue::Bytes(bytes),
+                    0o100644u64.to_value(),
+                ],
+            )
         }
     }
+}
+
+fn generated_files_list(
+    client: &remote::CliGeneratedClient,
+    workspace: &str,
+) -> Result<Vec<String>, String> {
+    fn walk(
+        client: &remote::CliGeneratedClient,
+        workspace: &str,
+        dir: &str,
+        out: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let bytes = execute_generated_bytes(
+            client,
+            "FileSystem",
+            "list_directory",
+            vec![workspace.to_value(), dir.to_value()],
+        )?;
+        let entries = loom_wire::fs::dir_listing_from_cbor(&bytes).map_err(|e| e.to_string())?;
+        for entry in entries {
+            let child = if dir.is_empty() {
+                entry.name
+            } else {
+                format!("{dir}/{}", entry.name)
+            };
+            match entry.kind {
+                FileKind::Directory => walk(client, workspace, &child, out)?,
+                FileKind::File | FileKind::Symlink => out.push(child),
+            }
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    walk(client, workspace, "", &mut out)?;
+    out.sort();
+    Ok(out)
 }
 
 fn run_redmine_import(
@@ -15336,24 +16084,23 @@ fn run_redmine_import(
     format: &str,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    let (mut loom, ns, input) = open_profile_import_input(store, workspace, snapshot, keys)?;
-    let bytes = file_import_bytes(&input, "Redmine")?;
-    let field_policy = loom_interchange_io::TicketImportFieldPolicy::parse(field_policy)
-        .map_err(|e| e.to_string())?;
-    let report = loom_interchange_io::import_redmine_bytes_with_field_policy(
-        &mut loom,
-        ns,
-        profile,
-        &input.source_scope,
-        bytes,
-        dry_run,
-        field_policy,
-    )
-    .map_err(|e| e.to_string())?;
-    let persisted = persist_profile_import_artifacts(&mut loom, ns, profile, &input, &report)?;
-    if report.operations_applied > 0 || persisted {
-        save_loom(&mut loom).map_err(|e| e.to_string())?;
-    }
+    let payload =
+        std::fs::read(snapshot).map_err(|e| format!("read Redmine import {snapshot}: {e}"))?;
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let encoded = execute_generated_bytes(
+        &client,
+        "InterchangeProfiles",
+        "import_redmine",
+        vec![
+            workspace.to_value(),
+            profile.to_value(),
+            snapshot.to_value(),
+            WireValue::Bytes(payload),
+            field_policy.to_value(),
+            dry_run.to_value(),
+        ],
+    )?;
+    let report = generated_import_report_from_cbor(&encoded)?;
     print_import_report(&report, format)
 }
 
@@ -15367,24 +16114,23 @@ fn run_asana_import(
     format: &str,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    let (mut loom, ns, input) = open_profile_import_input(store, workspace, snapshot, keys)?;
-    let bytes = file_import_bytes(&input, "Asana")?;
-    let field_policy = loom_interchange_io::TicketImportFieldPolicy::parse(field_policy)
-        .map_err(|e| e.to_string())?;
-    let report = loom_interchange_io::import_asana_bytes_with_field_policy(
-        &mut loom,
-        ns,
-        profile,
-        &input.source_scope,
-        bytes,
-        dry_run,
-        field_policy,
-    )
-    .map_err(|e| e.to_string())?;
-    let persisted = persist_profile_import_artifacts(&mut loom, ns, profile, &input, &report)?;
-    if report.operations_applied > 0 || persisted {
-        save_loom(&mut loom).map_err(|e| e.to_string())?;
-    }
+    let payload =
+        std::fs::read(snapshot).map_err(|e| format!("read Asana import {snapshot}: {e}"))?;
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let encoded = execute_generated_bytes(
+        &client,
+        "InterchangeProfiles",
+        "import_asana",
+        vec![
+            workspace.to_value(),
+            profile.to_value(),
+            snapshot.to_value(),
+            WireValue::Bytes(payload),
+            field_policy.to_value(),
+            dry_run.to_value(),
+        ],
+    )?;
+    let report = generated_import_report_from_cbor(&encoded)?;
     print_import_report(&report, format)
 }
 
@@ -15398,22 +16144,23 @@ fn run_confluence_import(
     format: &str,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    let (mut loom, ns, input) = open_profile_import_input(store, workspace, snapshot, keys)?;
-    let bytes = file_import_bytes(&input, "Confluence")?;
-    let report = loom_interchange_io::import_confluence_bytes(
-        &mut loom,
-        ns,
-        profile,
-        &input.source_scope,
-        default_space,
-        bytes,
-        dry_run,
-    )
-    .map_err(|e| e.to_string())?;
-    let persisted = persist_profile_import_artifacts(&mut loom, ns, profile, &input, &report)?;
-    if report.operations_applied > 0 || persisted {
-        save_loom(&mut loom).map_err(|e| e.to_string())?;
-    }
+    let payload =
+        std::fs::read(snapshot).map_err(|e| format!("read Confluence import {snapshot}: {e}"))?;
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let encoded = execute_generated_bytes(
+        &client,
+        "InterchangeProfiles",
+        "import_confluence",
+        vec![
+            workspace.to_value(),
+            profile.to_value(),
+            snapshot.to_value(),
+            WireValue::Bytes(payload),
+            default_space.to_value(),
+            dry_run.to_value(),
+        ],
+    )?;
+    let report = generated_import_report_from_cbor(&encoded)?;
     print_import_report(&report, format)
 }
 
@@ -15426,21 +16173,22 @@ fn run_slack_import(
     format: &str,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    let (mut loom, ns, input) = open_profile_import_input(store, workspace, snapshot, keys)?;
-    let bytes = file_import_bytes(&input, "Slack")?;
-    let report = loom_interchange_io::import_slack_bytes(
-        &mut loom,
-        ns,
-        profile,
-        &input.source_scope,
-        bytes,
-        dry_run,
-    )
-    .map_err(|e| e.to_string())?;
-    let persisted = persist_profile_import_artifacts(&mut loom, ns, profile, &input, &report)?;
-    if report.operations_applied > 0 || persisted {
-        save_loom(&mut loom).map_err(|e| e.to_string())?;
-    }
+    let payload =
+        std::fs::read(snapshot).map_err(|e| format!("read Slack import {snapshot}: {e}"))?;
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let encoded = execute_generated_bytes(
+        &client,
+        "InterchangeProfiles",
+        "import_slack",
+        vec![
+            workspace.to_value(),
+            profile.to_value(),
+            snapshot.to_value(),
+            WireValue::Bytes(payload),
+            dry_run.to_value(),
+        ],
+    )?;
+    let report = generated_import_report_from_cbor(&encoded)?;
     print_import_report(&report, format)
 }
 
@@ -15453,26 +16201,22 @@ fn run_drive_import(
     format: &str,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    let (mut loom, ns, input) = open_profile_import_input(store, workspace, snapshot, keys)?;
-    let bytes = file_import_bytes(&input, "Drive")?;
-    let snapshot_dir = input
-        .path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let report = loom_interchange_io::import_drive_bytes(
-        &mut loom,
-        ns,
-        profile,
-        &input.source_scope,
-        bytes,
-        snapshot_dir,
-        dry_run,
-    )
-    .map_err(|e| e.to_string())?;
-    let persisted = persist_profile_import_artifacts(&mut loom, ns, profile, &input, &report)?;
-    if report.operations_applied > 0 || persisted {
-        save_loom(&mut loom).map_err(|e| e.to_string())?;
-    }
+    let payload =
+        std::fs::read(snapshot).map_err(|e| format!("read Drive import {snapshot}: {e}"))?;
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let encoded = execute_generated_bytes(
+        &client,
+        "InterchangeProfiles",
+        "import_drive",
+        vec![
+            workspace.to_value(),
+            profile.to_value(),
+            snapshot.to_value(),
+            WireValue::Bytes(payload),
+            dry_run.to_value(),
+        ],
+    )?;
+    let report = generated_import_report_from_cbor(&encoded)?;
     print_import_report(&report, format)
 }
 
@@ -15486,24 +16230,23 @@ fn run_jira_import(
     format: &str,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    let (mut loom, ns, input) = open_profile_import_input(store, workspace, snapshot, keys)?;
-    let bytes = file_import_bytes(&input, "Jira")?;
-    let field_policy = loom_interchange_io::TicketImportFieldPolicy::parse(field_policy)
-        .map_err(|e| e.to_string())?;
-    let report = loom_interchange_io::import_jira_bytes_with_field_policy(
-        &mut loom,
-        ns,
-        profile,
-        &input.source_scope,
-        bytes,
-        dry_run,
-        field_policy,
-    )
-    .map_err(|e| e.to_string())?;
-    let persisted = persist_profile_import_artifacts(&mut loom, ns, profile, &input, &report)?;
-    if report.operations_applied > 0 || persisted {
-        save_loom(&mut loom).map_err(|e| e.to_string())?;
-    }
+    let payload =
+        std::fs::read(snapshot).map_err(|e| format!("read Jira import {snapshot}: {e}"))?;
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let encoded = execute_generated_bytes(
+        &client,
+        "InterchangeProfiles",
+        "import_jira",
+        vec![
+            workspace.to_value(),
+            profile.to_value(),
+            snapshot.to_value(),
+            WireValue::Bytes(payload),
+            field_policy.to_value(),
+            dry_run.to_value(),
+        ],
+    )?;
+    let report = generated_import_report_from_cbor(&encoded)?;
     print_import_report(&report, format)
 }
 
@@ -15517,22 +16260,78 @@ fn run_markdown_import(
     format: &str,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    let (mut loom, ns, input) = open_profile_import_input(store, workspace, src, keys)?;
-    let report = loom_interchange_io::import_markdown_path(
-        &mut loom,
-        ns,
-        profile,
-        &input.source_scope,
-        &input.path,
-        space,
-        dry_run,
-    )
-    .map_err(|e| e.to_string())?;
-    let persisted = persist_profile_import_artifacts(&mut loom, ns, profile, &input, &report)?;
-    if report.operations_applied > 0 || persisted {
-        save_loom(&mut loom).map_err(|e| e.to_string())?;
-    }
+    let payload = markdown_import_archive(src)?;
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let encoded = execute_generated_bytes(
+        &client,
+        "InterchangeProfiles",
+        "import_markdown",
+        vec![
+            workspace.to_value(),
+            profile.to_value(),
+            src.to_value(),
+            WireValue::Bytes(payload),
+            space.to_value(),
+            dry_run.to_value(),
+        ],
+    )?;
+    let report = generated_import_report_from_cbor(&encoded)?;
     print_import_report(&report, format)
+}
+
+fn markdown_import_archive(src: &str) -> Result<Vec<u8>, String> {
+    let root = PathBuf::from(src);
+    if !root.is_dir() {
+        return Err(format!("Markdown import source {src} must be a directory"));
+    }
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    write_markdown_archive_dir(&root, &root, &mut archive, options)?;
+    archive
+        .finish()
+        .map_err(|e| format!("finish Markdown import archive: {e}"))
+        .map(std::io::Cursor::into_inner)
+}
+
+fn write_markdown_archive_dir(
+    root: &std::path::Path,
+    current: &std::path::Path,
+    archive: &mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>,
+    options: zip::write::SimpleFileOptions,
+) -> Result<(), String> {
+    let mut entries = std::fs::read_dir(current)
+        .map_err(|e| format!("read Markdown import directory {}: {e}", current.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .map_err(|e| format!("stat Markdown import path {}: {e}", path.display()))?;
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if metadata.is_dir() {
+            archive
+                .add_directory(format!("{relative}/"), options)
+                .map_err(|e| format!("add Markdown archive directory {relative}: {e}"))?;
+            write_markdown_archive_dir(root, &path, archive, options)?;
+        } else if metadata.is_file() {
+            archive
+                .start_file(&relative, options)
+                .map_err(|e| format!("add Markdown archive file {relative}: {e}"))?;
+            let bytes = std::fs::read(&path)
+                .map_err(|e| format!("read Markdown import file {}: {e}", path.display()))?;
+            archive
+                .write_all(&bytes)
+                .map_err(|e| format!("write Markdown archive file {relative}: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn run_notion_import(
@@ -15545,70 +16344,24 @@ fn run_notion_import(
     format: &str,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    let (mut loom, ns, input) = open_profile_import_input(store, workspace, snapshot, keys)?;
-    let bytes = file_import_bytes(&input, "Notion")?;
-    let report = loom_interchange_io::import_notion_bytes(
-        &mut loom,
-        ns,
-        profile,
-        &input.source_scope,
-        default_space,
-        bytes,
-        dry_run,
-    )
-    .map_err(|e| e.to_string())?;
-    let persisted = persist_profile_import_artifacts(&mut loom, ns, profile, &input, &report)?;
-    if report.operations_applied > 0 || persisted {
-        save_loom(&mut loom).map_err(|e| e.to_string())?;
-    }
+    let payload =
+        std::fs::read(snapshot).map_err(|e| format!("read Notion import {snapshot}: {e}"))?;
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let encoded = execute_generated_bytes(
+        &client,
+        "InterchangeProfiles",
+        "import_notion",
+        vec![
+            workspace.to_value(),
+            profile.to_value(),
+            snapshot.to_value(),
+            WireValue::Bytes(payload),
+            default_space.to_value(),
+            dry_run.to_value(),
+        ],
+    )?;
+    let report = generated_import_report_from_cbor(&encoded)?;
     print_import_report(&report, format)
-}
-
-fn open_profile_import_input(
-    store: &str,
-    workspace: &str,
-    source: &str,
-    keys: &KeyOpts,
-) -> Result<(CliLoom, WorkspaceId, ResolvedImportInput), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let ns = resolve_ns(&loom, workspace)?;
-    let input = loom_interchange_io::resolve_import_input(
-        std::path::Path::new(source),
-        loom.store().digest_algo(),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok((loom, ns, input))
-}
-
-fn file_import_bytes<'a>(
-    input: &'a ResolvedImportInput,
-    profile: &str,
-) -> Result<&'a [u8], String> {
-    input
-        .bytes
-        .as_deref()
-        .ok_or_else(|| format!("{profile} import requires a file input"))
-}
-
-fn persist_profile_import_artifacts(
-    loom: &mut CliLoom,
-    ns: WorkspaceId,
-    profile: &str,
-    input: &ResolvedImportInput,
-    report: &loom_interchange::ImportReport,
-) -> Result<bool, String> {
-    if report.dry_run {
-        return Ok(false);
-    }
-    let retained =
-        retain_import_input(loom, ns, profile, input, None).map_err(|e| e.to_string())?;
-    let checkpoint_id = format!("{}:{}", profile, input.source_digest);
-    let mut checkpoint = input
-        .checkpoint(profile, &checkpoint_id)
-        .map_err(|e| e.to_string())?;
-    checkpoint.profile_state_digest = Some(retained.manifest_digest);
-    persist_import_checkpoint(loom, ns, &checkpoint, None).map_err(|e| e.to_string())?;
-    Ok(true)
 }
 
 fn run_interchange(action: InterchangeCmd, keys: &KeyOpts) -> Result<(), String> {
@@ -15624,21 +16377,23 @@ fn run_interchange(action: InterchangeCmd, keys: &KeyOpts) -> Result<(), String>
             format,
         } => {
             if remote::target_is_remote(&store)? {
-                return Err("`import fs` to/from a remote store is not supported yet (fs-tree byte transfer is deferred, specs/0067 §17.2); use `import archive` with a tar/zip payload, or run against a local store".to_string());
+                return Err("`import fs` to/from a remote store is local-only because it sends a host filesystem path; remote filesystem-tree import requires a byte-transfer contract".to_string());
             }
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let src_path = PathBuf::from(&src);
-            let mut options = FsImportOptions::new(&src);
-            options.commit = commit;
-            options.dry_run = dry_run;
-            options.author = author;
-            options.message = message;
-            let report =
-                import_fs(&mut loom, ns, &src_path, &options).map_err(|e| e.to_string())?;
-            if !dry_run {
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-            }
+            let client = remote::open_cli_generated_client_for_dry_run(&store, keys, dry_run)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "FileSystem",
+                "import_fs",
+                vec![
+                    workspace.to_value(),
+                    src.to_value(),
+                    Some(author).to_value(),
+                    Some(message).to_value(),
+                    commit.to_value(),
+                    dry_run.to_value(),
+                ],
+            )?;
+            let report = generated_import_report_from_cbor(&encoded)?;
             print_import_report(&report, &format)
         }
         InterchangeCmd::ImportArchive {
@@ -15653,36 +16408,26 @@ fn run_interchange(action: InterchangeCmd, keys: &KeyOpts) -> Result<(), String>
             message,
             format,
         } => {
-            let client = remote::open_store_client(&store)?;
-            if client.is_remote() {
-                // Remote: read the archive locally and drive the byte-transfer contract (§17). v1 does
-                // not thread `gzip_output_path`/`author`/`message` over the transfer contract.
-                let summary = client.transfer_import(
-                    keys,
-                    &workspace,
-                    archive_transfer_kind_name(&kind)?,
-                    &archive,
-                    commit,
-                    dry_run,
-                )?;
-                println!("{summary}");
-                return Ok(());
+            if remote::target_is_remote(&store)? {
+                return Err("`import archive` to/from a remote store is local-only because it sends a host archive path; remote archive import requires a byte-transfer contract".to_string());
             }
-            let kind = parse_archive_kind(&kind)?;
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let archive_path = PathBuf::from(&archive);
-            let mut options = ArchiveImportOptions::new(&archive);
-            options.gzip_output_path = gzip_output_path;
-            options.commit = commit;
-            options.dry_run = dry_run;
-            options.author = author;
-            options.message = message;
-            let result = import_archive(&mut loom, ns, &archive_path, kind, &options)
-                .map_err(|e| e.to_string())?;
-            if !dry_run {
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-            }
+            let client = remote::open_cli_generated_client_for_dry_run(&store, keys, dry_run)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Archive",
+                "archive_import",
+                vec![
+                    workspace.to_value(),
+                    archive.to_value(),
+                    kind.to_value(),
+                    gzip_output_path.to_value(),
+                    commit.to_value(),
+                    Some(author).to_value(),
+                    Some(message).to_value(),
+                    dry_run.to_value(),
+                ],
+            )?;
+            let result = generated_archive_import_result_from_cbor(&encoded)?;
             print_archive_import_result(&result, &format)
         }
         InterchangeCmd::ImportTableCsv {
@@ -15700,26 +16445,29 @@ fn run_interchange(action: InterchangeCmd, keys: &KeyOpts) -> Result<(), String>
             message,
             format,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            let csv_path = PathBuf::from(&csv);
-            let mut options = TableCsvImportOptions::new(
-                &csv,
-                database,
-                table,
-                parse_table_csv_schema(&schema)?,
-                parse_table_csv_primary_key(&primary_key)?,
-            );
-            options.mode = parse_table_csv_import_mode(&mode)?;
-            options.commit = commit;
-            options.dry_run = dry_run;
-            options.author = author;
-            options.message = message;
-            let report =
-                import_table_csv(&mut loom, ns, &csv_path, &options).map_err(|e| e.to_string())?;
-            if !dry_run {
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-            }
+            let payload =
+                std::fs::read(&csv).map_err(|e| format!("read table CSV import {csv}: {e}"))?;
+            let client = remote::open_cli_generated_client_for_dry_run(&store, keys, dry_run)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "InterchangeProfiles",
+                "import_table_csv",
+                vec![
+                    workspace.to_value(),
+                    csv.to_value(),
+                    WireValue::Bytes(payload),
+                    database.to_value(),
+                    table.to_value(),
+                    schema.to_value(),
+                    primary_key.to_value(),
+                    mode.to_value(),
+                    commit.to_value(),
+                    Some(author).to_value(),
+                    Some(message).to_value(),
+                    dry_run.to_value(),
+                ],
+            )?;
+            let report = generated_import_report_from_cbor(&encoded)?;
             print_import_report(&report, &format)
         }
         InterchangeCmd::ImportRedmine {
@@ -15932,21 +16680,14 @@ fn run_interchange(action: InterchangeCmd, keys: &KeyOpts) -> Result<(), String>
             dry_run,
             format,
         } => {
-            let client = remote::open_store_client(&store)?;
-            if client.is_remote() {
-                // A CAR import derives its own workspace from the manifest; workspace is unused here.
-                let summary = client.transfer_import(keys, "", "car", &src, false, dry_run)?;
-                println!("{summary}");
-                return Ok(());
-            }
-            let mut loom = cli_open_loom(&store, keys)?;
-            let src_path = PathBuf::from(&src);
-            let mut options = CarImportOptions::new(&src);
-            options.dry_run = dry_run;
-            let result = import_car(&mut loom, &src_path, &options).map_err(|e| e.to_string())?;
-            if !dry_run {
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-            }
+            let client = remote::open_cli_generated_client_for_dry_run(&store, keys, dry_run)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Car",
+                "car_import",
+                vec![src.to_value(), dry_run.to_value()],
+            )?;
+            let result = generated_car_import_result_from_cbor(&encoded)?;
             print_car_import_result(&result, &format)
         }
     }
@@ -15980,6 +16721,7 @@ fn archive_transfer_kind_name(kind: &str) -> Result<&'static str, String> {
     }
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn parse_table_csv_import_mode(mode: &str) -> Result<TableImportMode, String> {
     match mode {
         "snapshot" => Ok(TableImportMode::Snapshot),
@@ -15990,6 +16732,7 @@ fn parse_table_csv_import_mode(mode: &str) -> Result<TableImportMode, String> {
     }
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn parse_table_csv_primary_key(value: &str) -> Result<Vec<String>, String> {
     let columns: Vec<String> = value
         .split(',')
@@ -16003,6 +16746,7 @@ fn parse_table_csv_primary_key(value: &str) -> Result<Vec<String>, String> {
     Ok(columns)
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn parse_table_csv_schema(value: &str) -> Result<Vec<(String, ColumnType)>, String> {
     let mut columns = Vec::new();
     for item in value.split(',') {
@@ -16025,6 +16769,7 @@ fn parse_table_csv_schema(value: &str) -> Result<Vec<(String, ColumnType)>, Stri
     Ok(columns)
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn parse_table_csv_column_type(value: &str) -> Result<ColumnType, String> {
     match value {
         "int" | "integer" => Ok(ColumnType::Int),
@@ -16718,58 +17463,85 @@ fn store_policy_json(policy: StorePolicy, audit_seq: Option<u64>) -> String {
     out
 }
 
-fn apply_store_policy_cli_updates(
-    policy: &mut StorePolicy,
+fn store_policy_result_json(result: loom_wire::store_admin::StorePolicyResult) -> String {
+    let mut policy = StorePolicy {
+        fips_required: result.fips_required,
+        default_durability: result.default_durability,
+        ..StorePolicy::default()
+    };
+    for assignment in result.facet_durability_overrides {
+        policy.facet_durability_overrides[assignment.facet.stable_tag() as usize] =
+            Some(assignment.durability);
+    }
+    store_policy_json(policy, result.audit_seq)
+}
+
+fn store_policy_update_from_cli(
     fips_required: Option<bool>,
     default_durability: Option<&str>,
     facet_durability: Vec<String>,
     clear_facet_durability: Vec<String>,
-) -> Result<(), String> {
-    if let Some(value) = fips_required {
-        policy.fips_required = value;
-    }
-    if let Some(value) = default_durability {
-        policy
-            .set_default_durability(
-                loom_store::parse_store_durability_policy(value).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-    }
+) -> Result<loom_wire::store_admin::StorePolicyUpdate, String> {
+    let default_durability = default_durability
+        .map(loom_store::parse_store_durability_policy)
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let mut facet_durability_assignments = Vec::new();
     for assignment in facet_durability {
         let (facet, durability) = assignment.split_once('=').ok_or_else(|| {
             format!("facet durability override {assignment:?} must use <facet>=<policy>")
         })?;
-        let facet = FacetKind::parse(facet).map_err(|e| e.to_string())?;
-        let durability =
-            loom_store::parse_store_durability_policy(durability).map_err(|e| e.to_string())?;
-        policy
-            .set_facet_durability(facet, Some(durability))
-            .map_err(|e| e.to_string())?;
+        facet_durability_assignments.push(loom_wire::store_admin::StoreFacetDurabilityAssignment {
+            facet: FacetKind::parse(facet).map_err(|e| e.to_string())?,
+            durability: loom_store::parse_store_durability_policy(durability)
+                .map_err(|e| e.to_string())?,
+        });
     }
-    for facet in clear_facet_durability {
-        let facet = FacetKind::parse(&facet).map_err(|e| e.to_string())?;
-        policy
-            .set_facet_durability(facet, None)
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    let clear_facet_durability = clear_facet_durability
+        .into_iter()
+        .map(|facet| FacetKind::parse(&facet).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(loom_wire::store_admin::StorePolicyUpdate {
+        fips_required,
+        default_durability,
+        facet_durability_assignments,
+        clear_facet_durability,
+    })
 }
 
-fn store_policy_audit_target(policy: &StorePolicy) -> String {
-    let mut target = format!(
-        "fips_required={},default_durability={}",
-        policy.fips_required,
-        policy.default_durability.as_str()
-    );
-    for facet in FacetKind::ALL {
-        if let Some(durability) = policy.facet_durability_overrides[facet.stable_tag() as usize] {
-            target.push(',');
-            target.push_str(facet.as_str());
-            target.push('=');
-            target.push_str(durability.as_str());
+fn store_rekey_credential_from_key_spec(
+    spec: KeySpec,
+) -> loom_wire::store_admin::StoreRekeyCredential {
+    match spec {
+        KeySpec::Passphrase(passphrase) => {
+            loom_wire::store_admin::StoreRekeyCredential::Passphrase(passphrase.as_bytes().to_vec())
         }
+        KeySpec::RawKek(kek) => loom_wire::store_admin::StoreRekeyCredential::RawKek(*kek),
     }
-    target
+}
+
+fn store_rekey_result_summary(
+    target: remote::CliExecutionTarget,
+    store: &str,
+    result: loom_wire::store_admin::StoreRekeyResult,
+) -> String {
+    if target == remote::CliExecutionTarget::Remote {
+        let bytes = match (result.bytes_before, result.bytes_after) {
+            (Some(before), Some(after)) => format!(" ({before} -> {after} bytes)"),
+            _ => String::new(),
+        };
+        return format!(
+            "rekeyed remote store (resealed={}, suite={}, audit_seq={}){}",
+            result.resealed, result.suite, result.audit_seq, bytes
+        );
+    }
+    match (result.resealed, result.bytes_before, result.bytes_after) {
+        (true, Some(before), Some(after)) => format!(
+            "rekeyed {store} (re-sealed every object under a fresh DEK, suite {}; {before} -> {after} bytes)",
+            result.suite
+        ),
+        _ => format!("rekeyed {store} (DEK re-wrapped under the new credential)"),
+    }
 }
 
 fn ensure_store_copy_clean(loom: &Loom<FileStore>) -> Result<(), String> {
@@ -16845,8 +17617,13 @@ fn run_vcs(action: VcsCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             branch,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.vcs_branch(keys, &workspace, &branch)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "VersionControl",
+                "branch",
+                vec![workspace.to_value(), branch.to_value()],
+            )
         }
         VcsCmd::Commit {
             store,
@@ -16854,8 +17631,18 @@ fn run_vcs(action: VcsCmd, keys: &KeyOpts) -> Result<(), String> {
             message,
             author,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let commit = client.vcs_commit(keys, &workspace, &author, &message)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let commit = execute_generated_digest_string(
+                &client,
+                "VersionControl",
+                "commit",
+                vec![
+                    workspace.to_value(),
+                    author.to_value(),
+                    message.to_value(),
+                    current_time_ms()?.to_value(),
+                ],
+            )?;
             println!("{commit}");
             Ok(())
         }
@@ -16864,8 +17651,13 @@ fn run_vcs(action: VcsCmd, keys: &KeyOpts) -> Result<(), String> {
             workspace,
             branch,
         } => {
-            let client = remote::open_store_client(&store)?;
-            client.vcs_checkout(keys, &workspace, &branch)
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            execute_generated_void(
+                &client,
+                "VersionControl",
+                "checkout",
+                vec![workspace.to_value(), branch.to_value()],
+            )
         }
         VcsCmd::Diff {
             store,
@@ -16875,8 +17667,13 @@ fn run_vcs(action: VcsCmd, keys: &KeyOpts) -> Result<(), String> {
             format,
             out,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let bytes = client.vcs_diff(keys, &workspace, &from, &to)?;
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let bytes = execute_generated_bytes(
+                &client,
+                "VersionControl",
+                "diff",
+                vec![workspace.to_value(), from.to_value(), to.to_value()],
+            )?;
             match format.as_str() {
                 "cbor" => write_output(out.as_deref(), &bytes).map_err(|e| e.to_string()),
                 "text" => {
@@ -16889,8 +17686,19 @@ fn run_vcs(action: VcsCmd, keys: &KeyOpts) -> Result<(), String> {
             }
         }
         VcsCmd::Log { store, workspace } => {
-            let client = remote::open_store_client(&store)?;
-            for commit in client.vcs_log(keys, &workspace)? {
+            let client = remote::open_cli_read_only_generated_client(&store, keys)?;
+            let branch = execute_generated_string(
+                &client,
+                "VersionControl",
+                "head_branch",
+                vec![workspace.to_value()],
+            )?;
+            for commit in execute_generated_digest_list(
+                &client,
+                "VersionControl",
+                "log",
+                vec![workspace.to_value(), branch.to_value()],
+            )? {
                 println!("{commit}");
             }
             Ok(())
@@ -16902,8 +17710,21 @@ fn run_vcs(action: VcsCmd, keys: &KeyOpts) -> Result<(), String> {
             cells,
             author,
         } => {
-            let client = remote::open_store_client(&store)?;
-            let outcome = client.vcs_merge(keys, &workspace, &from, &author, cells)?;
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "VersionControl",
+                "merge",
+                vec![
+                    workspace.to_value(),
+                    from.to_value(),
+                    author.to_value(),
+                    cells.to_value(),
+                    current_time_ms()?.to_value(),
+                ],
+            )?;
+            let outcome =
+                loom_wire::vcs::merge_result_from_cbor(&encoded).map_err(|e| e.to_string())?;
             // A conflicting merge changed nothing; report it as a failure with the unresolved paths.
             if let MergeOutcome::Conflicts(paths) = &outcome {
                 return Err(format!("merge conflicts: {}", paths.join(", ")));
@@ -16919,6 +17740,111 @@ fn run_vcs(action: VcsCmd, keys: &KeyOpts) -> Result<(), String> {
     }
 }
 
+fn print_sql_exec_result_cbor(bytes: &[u8]) -> Result<(), String> {
+    let payload = loom_result::result_view::decode(bytes).map_err(|e| e.to_string())?;
+    match payload {
+        loom_result::result_view::ResultPayload::Statements(statements) => {
+            for payload in &statements {
+                print_sql_payload_value(payload)?;
+            }
+        }
+        loom_result::result_view::ResultPayload::Reader(_) => {
+            return Err("Sql.sql_exec_result returned corrupt reader payload".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn print_sql_payload_value(payload: &loom_result::result_view::Statement) -> Result<(), String> {
+    let payload = sql_payload_from_result_statement(payload)?;
+    print_payload(&payload);
+    Ok(())
+}
+
+fn sql_payload_from_result_statement(
+    statement: &loom_result::result_view::Statement,
+) -> Result<Payload, String> {
+    use loom_result::result_view::Statement;
+    Ok(match statement {
+        Statement::Select { labels, rows } => {
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(sql_gluesql_value_from_tabular)
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Payload::Select {
+                labels: labels.clone(),
+                rows,
+            }
+        }
+        Statement::SelectMap(rows) => {
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|(label, value)| {
+                            Ok((label.clone(), sql_gluesql_value_from_tabular(value)?))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, String>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Payload::SelectMap(rows)
+        }
+        Statement::ShowColumns(columns) => {
+            let columns = columns
+                .iter()
+                .map(|column| {
+                    Ok((
+                        column.name.clone(),
+                        loom_sql::data_type_from_result_label(&column.type_name)
+                            .map_err(|e| e.to_string())?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Payload::ShowColumns(columns)
+        }
+        Statement::Insert(n) => Payload::Insert(sql_result_count(*n)?),
+        Statement::Delete(n) => Payload::Delete(sql_result_count(*n)?),
+        Statement::Update(n) => Payload::Update(sql_result_count(*n)?),
+        Statement::DropTable(n) => Payload::DropTable(sql_result_count(*n)?),
+        Statement::Create => Payload::Create,
+        Statement::DropFunction => Payload::DropFunction,
+        Statement::AlterTable => Payload::AlterTable,
+        Statement::CreateIndex => Payload::CreateIndex,
+        Statement::DropIndex => Payload::DropIndex,
+        Statement::StartTransaction => Payload::StartTransaction,
+        Statement::Commit => Payload::Commit,
+        Statement::Rollback => Payload::Rollback,
+        Statement::ShowVariable(variable) => Payload::ShowVariable(match variable {
+            loom_result::result_view::ShowVariable::Tables(values) => {
+                gluesql_core::prelude::PayloadVariable::Tables(values.clone())
+            }
+            loom_result::result_view::ShowVariable::Functions(values) => {
+                gluesql_core::prelude::PayloadVariable::Functions(values.clone())
+            }
+            loom_result::result_view::ShowVariable::Version(value) => {
+                gluesql_core::prelude::PayloadVariable::Version(value.clone())
+            }
+        }),
+    })
+}
+
+fn sql_result_count(count: u64) -> Result<usize, String> {
+    usize::try_from(count).map_err(|_| format!("SQL result count {count} exceeds usize"))
+}
+
+fn sql_gluesql_value_from_tabular(value: &loom_core::tabular::Value) -> Result<GValue, String> {
+    loom_sql::value_from_tabular(value).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+fn generated_sql_cell_text(value: &loom_core::tabular::Value) -> Result<String, String> {
+    Ok(format_value(&sql_gluesql_value_from_tabular(value)?))
+}
+
 fn run_sql_cmd(action: SqlCmd, keys: &KeyOpts) -> Result<(), String> {
     match action {
         SqlCmd::Exec {
@@ -16927,28 +17853,14 @@ fn run_sql_cmd(action: SqlCmd, keys: &KeyOpts) -> Result<(), String> {
             sql,
             db,
         } => {
-            let mut loom = cli_open_loom(&store, keys)?;
-            let ns = resolve_ns(&loom, &workspace)?;
-            loom.registry_mut()
-                .add_facet(ns, FacetKind::Sql)
-                .map_err(|e| e.to_string())?;
-            // Build the SQL store over a lock-free read snapshot - the lazy base, which
-            // streams durable rows on demand; the write loom is used only to persist any mutations. An
-            // absent catalog yields an empty store (first use).
-            let read = cli_open_loom_read(&store, keys)?;
-            let state = LoomSqlStore::open_write(read, ns, &db).map_err(|e| e.to_string())?;
-            let mut glue = Glue::new(state);
-            let payloads = block_on(glue.execute(&sql)).map_err(|e| e.to_string())?;
-            if glue.storage.is_dirty() {
-                glue.storage
-                    .persist(&mut loom, ns, &db)
-                    .map_err(|e| e.to_string())?;
-                save_loom(&mut loom).map_err(|e| e.to_string())?;
-            }
-            for payload in &payloads {
-                print_payload(payload);
-            }
-            Ok(())
+            let client = remote::open_cli_generated_client(&store, keys)?;
+            let encoded = execute_generated_bytes(
+                &client,
+                "Sql",
+                "sql_exec_result",
+                vec![workspace.to_value(), db.to_value(), sql.to_value()],
+            )?;
+            print_sql_exec_result_cbor(&encoded)
         }
         SqlCmd::Table { action } => run_table(action, keys),
     }
@@ -16957,6 +17869,159 @@ fn run_sql_cmd(action: SqlCmd, keys: &KeyOpts) -> Result<(), String> {
 #[cfg(test)]
 mod root_help_tests {
     use super::*;
+
+    #[test]
+    fn generated_sql_value_formatting_matches_legacy_gluesql_formatter() {
+        let samples = vec![
+            loom_core::tabular::Value::Null,
+            loom_core::tabular::Value::Bool(true),
+            loom_core::tabular::Value::I8(-8),
+            loom_core::tabular::Value::I16(-16),
+            loom_core::tabular::Value::I32(-32),
+            loom_core::tabular::Value::Int(-64),
+            loom_core::tabular::Value::I128(-128),
+            loom_core::tabular::Value::U8(8),
+            loom_core::tabular::Value::U16(16),
+            loom_core::tabular::Value::U32(32),
+            loom_core::tabular::Value::U64(64),
+            loom_core::tabular::Value::U128(128),
+            loom_core::tabular::Value::F32(-1.5),
+            loom_core::tabular::Value::Float(2.5),
+            loom_core::tabular::Value::Decimal {
+                mantissa: 1234500,
+                scale: 4,
+            },
+            loom_core::tabular::Value::Text("hello".into()),
+            loom_core::tabular::Value::Bytes(vec![0, 1, 2, 255]),
+            loom_core::tabular::Value::Inet(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                10, 0, 0, 1,
+            ))),
+            loom_core::tabular::Value::Date(20_260),
+            loom_core::tabular::Value::Time(49_530_123_456_789),
+            loom_core::tabular::Value::Timestamp(-876_544),
+            loom_core::tabular::Value::Interval {
+                months: 15,
+                micros: 0,
+            },
+            loom_core::tabular::Value::Interval {
+                months: 0,
+                micros: -987_654,
+            },
+            loom_core::tabular::Value::Uuid(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+            loom_core::tabular::Value::Point { x: 1.25, y: -2.5 },
+            loom_core::tabular::Value::List(vec![
+                loom_core::tabular::Value::Int(1),
+                loom_core::tabular::Value::Text("x".into()),
+            ]),
+            loom_core::tabular::Value::Map(BTreeMap::from([(
+                "k".to_string(),
+                loom_core::tabular::Value::Int(9),
+            )])),
+        ];
+        for value in samples {
+            let legacy = format_value(&loom_sql::value_from_tabular(&value).unwrap());
+            let generated = generated_sql_cell_text(&value).unwrap();
+            assert_eq!(generated, legacy, "generated formatting for {value:?}");
+        }
+    }
+
+    #[test]
+    fn generated_sql_statements_convert_exhaustively_to_gluesql_payloads() {
+        use gluesql_core::ast::DataType;
+        use gluesql_core::prelude::PayloadVariable;
+        use loom_result::result_view::{Column, ShowVariable, Statement};
+
+        let select_row = vec![
+            loom_core::tabular::Value::Int(7),
+            loom_core::tabular::Value::Text("seven".to_string()),
+        ];
+        let select_map_row =
+            BTreeMap::from([("flag".to_string(), loom_core::tabular::Value::Bool(true))]);
+        let cases = vec![
+            (
+                Statement::Select {
+                    labels: vec!["id".to_string(), "name".to_string()],
+                    rows: vec![select_row.clone()],
+                },
+                Payload::Select {
+                    labels: vec!["id".to_string(), "name".to_string()],
+                    rows: vec![vec![GValue::I64(7), GValue::Str("seven".to_string())]],
+                },
+            ),
+            (
+                Statement::SelectMap(vec![select_map_row]),
+                Payload::SelectMap(vec![BTreeMap::from([(
+                    "flag".to_string(),
+                    GValue::Bool(true),
+                )])]),
+            ),
+            (
+                Statement::ShowColumns(vec![
+                    Column {
+                        name: "id".to_string(),
+                        type_name: "Int".to_string(),
+                    },
+                    Column {
+                        name: "body".to_string(),
+                        type_name: "Text".to_string(),
+                    },
+                ]),
+                Payload::ShowColumns(vec![
+                    ("id".to_string(), DataType::Int),
+                    ("body".to_string(), DataType::Text),
+                ]),
+            ),
+            (Statement::Insert(1), Payload::Insert(1)),
+            (Statement::Delete(2), Payload::Delete(2)),
+            (Statement::Update(3), Payload::Update(3)),
+            (Statement::DropTable(4), Payload::DropTable(4)),
+            (Statement::Create, Payload::Create),
+            (Statement::DropFunction, Payload::DropFunction),
+            (Statement::AlterTable, Payload::AlterTable),
+            (Statement::CreateIndex, Payload::CreateIndex),
+            (Statement::DropIndex, Payload::DropIndex),
+            (Statement::StartTransaction, Payload::StartTransaction),
+            (Statement::Commit, Payload::Commit),
+            (Statement::Rollback, Payload::Rollback),
+            (
+                Statement::ShowVariable(ShowVariable::Tables(vec!["t".to_string()])),
+                Payload::ShowVariable(PayloadVariable::Tables(vec!["t".to_string()])),
+            ),
+            (
+                Statement::ShowVariable(ShowVariable::Functions(vec!["f".to_string()])),
+                Payload::ShowVariable(PayloadVariable::Functions(vec!["f".to_string()])),
+            ),
+            (
+                Statement::ShowVariable(ShowVariable::Version("0.19".to_string())),
+                Payload::ShowVariable(PayloadVariable::Version("0.19".to_string())),
+            ),
+        ];
+
+        for (statement, expected) in cases {
+            assert_eq!(
+                sql_payload_from_result_statement(&statement).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn sql_exec_result_rejects_reader_payloads() {
+        let reader = WireValue::Map(vec![
+            (
+                WireValue::Text("kind".into()),
+                WireValue::Text("Rows".into()),
+            ),
+            (
+                WireValue::Text("columns".into()),
+                WireValue::Array(Vec::new()),
+            ),
+            (WireValue::Text("rows".into()), WireValue::Array(Vec::new())),
+        ]);
+        let bytes = loom_codec::encode(&reader).unwrap();
+        let error = print_sql_exec_result_cbor(&bytes).unwrap_err();
+        assert!(error.contains("corrupt reader payload"));
+    }
 
     #[test]
     fn every_visible_root_command_has_a_section() {
@@ -16983,6 +18048,66 @@ mod root_help_tests {
         let names = visible_subcommand_names(&cli_command_for_test());
 
         assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn root_help_documents_locator_semantics() {
+        let long = cli_command_for_test()
+            .get_long_about()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            long.contains("STORE forms"),
+            "help must explain STORE forms"
+        );
+        assert!(long.contains("context"), "help must explain contexts");
+        assert!(long.contains("--project"), "help must mention --project");
+        assert!(
+            long.contains("fail fast"),
+            "help must mention remote fail-fast"
+        );
+        assert!(
+            long.contains("rejects `--stateless`"),
+            "help must note local MCP rejects --stateless"
+        );
+        assert!(
+            long.contains("remote MCP statefulness is owned by the remote endpoint"),
+            "help must explain remote MCP statefulness"
+        );
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_help_documents_stateless_boundaries() {
+        let command = cli_command_for_test();
+        let mcp = command
+            .find_subcommand("mcp")
+            .expect("mcp command should be present");
+        let about = mcp.get_about().map(|s| s.to_string()).unwrap_or_default();
+        assert!(
+            about.contains("daemon-owned generated boundary"),
+            "mcp help must explain local daemon boundary"
+        );
+        assert!(
+            about.contains("Local MCP rejects `--stateless`"),
+            "mcp help must say local MCP rejects --stateless"
+        );
+        assert!(
+            about.contains("remote endpoint statefulness is owned by that endpoint"),
+            "mcp help must explain remote endpoint statefulness"
+        );
+        let stateless = mcp
+            .get_arguments()
+            .find(|arg| arg.get_id() == "stateless")
+            .expect("mcp --stateless arg should be present");
+        let help = stateless
+            .get_help()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            help.contains("Local MCP rejects this"),
+            "--stateless arg help must not claim local stateless support"
+        );
     }
 
     #[test]
@@ -17016,43 +18141,58 @@ mod root_help_tests {
 
     #[test]
     fn store_policy_cli_updates_durability_settings() {
-        let mut policy = StorePolicy::default();
-        apply_store_policy_cli_updates(
-            &mut policy,
+        let update = store_policy_update_from_cli(
             Some(true),
             Some("relaxed"),
             vec!["document=normal".to_string(), "ledger=strict".to_string()],
-            Vec::new(),
+            vec!["search".to_string()],
         )
         .unwrap();
 
-        assert!(policy.fips_required);
         assert_eq!(
-            policy.default_durability,
-            loom_store::StoreDurabilityPolicy::Relaxed
+            update.default_durability,
+            Some(loom_store::StoreDurabilityPolicy::Relaxed)
         );
         assert_eq!(
-            policy.effective_durability(FacetKind::Ledger),
+            update.facet_durability_assignments[1].durability,
             loom_store::StoreDurabilityPolicy::Strict
         );
+        assert_eq!(update.clear_facet_durability, vec![FacetKind::Search]);
 
-        let json: serde_json::Value =
-            serde_json::from_str(&store_policy_json(policy, Some(7))).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&store_policy_result_json(
+            loom_wire::store_admin::StorePolicyResult {
+                fips_required: true,
+                default_durability: loom_store::StoreDurabilityPolicy::Relaxed,
+                facet_durability_overrides: update.facet_durability_assignments,
+                audit_seq: Some(7),
+            },
+        ))
+        .unwrap();
+        assert_eq!(json["fips_required"], true);
         assert_eq!(json["default_durability"], "relaxed");
         assert_eq!(json["facet_durability_overrides"]["document"], "normal");
+        assert_eq!(json["audit_seq"], 7);
+    }
 
-        apply_store_policy_cli_updates(
-            &mut policy,
-            None,
-            None,
-            Vec::new(),
-            vec!["document".to_string()],
+    #[test]
+    fn store_rekey_cli_preserves_raw_kek_request_kind() {
+        let raw = [0x42; loom_core::keys::KEY_LEN];
+        let credential = store_rekey_credential_from_key_spec(KeySpec::raw_kek(raw));
+        let request = loom_wire::store_admin::StoreRekeyRequest {
+            credential,
+            reseal: true,
+            suite: Some("aes-256-gcm".to_string()),
+        };
+        let decoded = loom_wire::store_admin::store_rekey_request_from_cbor(
+            &loom_wire::store_admin::store_rekey_request_to_cbor(&request),
         )
         .unwrap();
-        assert_eq!(
-            policy.effective_durability(FacetKind::Document),
-            loom_store::StoreDurabilityPolicy::Relaxed
-        );
+        assert!(matches!(
+            decoded.credential,
+            loom_wire::store_admin::StoreRekeyCredential::RawKek(kek) if kek == raw
+        ));
+        assert!(decoded.reseal);
+        assert_eq!(decoded.suite.as_deref(), Some("aes-256-gcm"));
     }
 
     #[test]
@@ -17115,6 +18255,103 @@ mod root_help_tests {
 
         let _ = std::fs::remove_file(&report_path);
         let _ = std::fs::remove_file(&backup_path);
+    }
+
+    #[test]
+    fn store_replacement_preflight_rejects_root_codec_mismatch() {
+        let diagnostics = loom_store::StoreRootCodecDiagnostics {
+            checked_roots: 2,
+            failures: vec![loom_store::StoreRootCodecDiagnostic {
+                root_name: "owner_tokens",
+                family_id: Some(0x0110),
+                root_page: 9,
+                byte_offset: 36_864,
+                expected_codec: "PackedRecordRefCodec",
+                expected_discriminator: 0x10,
+                raw_magic: Some(0xb7),
+                raw_flags: Some(0x00),
+                actual_discriminator: Some(0x00),
+                in_range: true,
+                checksum_ok: true,
+                magic_ok: true,
+                codec_ok: false,
+                reachable: true,
+                failure: Some("btree_node_codec_discriminator_mismatch"),
+            }],
+            details: Vec::new(),
+        };
+        let root_codec_check = store_replacement_root_codec_check(&diagnostics);
+        let body = store_replacement_preflight_report(
+            "candidate.loom",
+            "matrix2",
+            false,
+            &[
+                store_preflight_check("store_stat", true, "objects=1"),
+                root_codec_check,
+            ],
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(body["ok"], serde_json::json!(false));
+        assert_eq!(body["safe_to_replace"], serde_json::json!(false));
+        assert_eq!(body["checks"][1]["name"], serde_json::json!("root_codecs"));
+        assert_eq!(body["checks"][1]["ok"], serde_json::json!(false));
+        assert!(
+            body["checks"][1]["message"]
+                .as_str()
+                .unwrap()
+                .contains("owner_tokens:page=9 expected=PackedRecordRefCodec actual=0x00")
+        );
+    }
+
+    #[test]
+    fn store_replacement_preflight_reports_descendant_root_codec_failure_page() {
+        let diagnostics = loom_store::StoreRootCodecDiagnostics {
+            checked_roots: 1,
+            failures: vec![loom_store::StoreRootCodecDiagnostic {
+                root_name: "retained_history",
+                family_id: Some(0x0100),
+                root_page: 72,
+                byte_offset: 294_912,
+                expected_codec: "PackedRecordRefCodec",
+                expected_discriminator: 0x10,
+                raw_magic: Some(0xb7),
+                raw_flags: Some(0x01),
+                actual_discriminator: Some(0x00),
+                in_range: true,
+                checksum_ok: true,
+                magic_ok: true,
+                codec_ok: false,
+                reachable: true,
+                failure: Some("btree_node_codec_discriminator_mismatch"),
+            }],
+            details: Vec::new(),
+        };
+        let body = store_replacement_preflight_report(
+            "candidate.loom",
+            "matrix2",
+            false,
+            &[
+                store_preflight_check("store_stat", true, "objects=1"),
+                store_replacement_root_codec_check(&diagnostics),
+            ],
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(body["ok"], serde_json::json!(false));
+        assert_eq!(body["safe_to_replace"], serde_json::json!(false));
+        assert!(
+            body["checks"][1]["message"]
+                .as_str()
+                .unwrap()
+                .contains("retained_history:page=72 expected=PackedRecordRefCodec actual=0x00")
+        );
     }
 
     #[test]
@@ -17181,6 +18418,261 @@ mod root_help_tests {
             cli_try_parse_for_test(["loom", "inference", "instance", "doctor", "store.loom"])
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod interchange_cli_tests {
+    use super::*;
+
+    fn temp_store(tag: &str) -> String {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "loom-cli-{tag}-{}-{}.loom",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn import_table_csv_routes_generated_contract() {
+        let store = temp_store("table-csv-import-generated");
+        let mut csv = std::env::temp_dir();
+        csv.push(format!(
+            "loom-cli-table-csv-{}-{}.csv",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&csv, "id,name,note\n1,alpha,\"from cli\"\n2,beta,\"\"\n").unwrap();
+
+        run(
+            Command::Store {
+                action: StoreCmd::Init {
+                    store: store.clone(),
+                    encrypt: false,
+                    suite: None,
+                    identity_profile: None,
+                    fips: false,
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        run(
+            Command::Workspace {
+                action: WorkspaceCmd::Create {
+                    store: store.clone(),
+                    name: "main".to_string(),
+                    facet: None,
+                },
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        run_interchange(
+            InterchangeCmd::ImportTableCsv {
+                store: store.clone(),
+                workspace: "main".to_string(),
+                database: "app".to_string(),
+                table: "items".to_string(),
+                csv: csv.to_string_lossy().into_owned(),
+                schema: "id:int,name:text,note:text".to_string(),
+                primary_key: "id".to_string(),
+                mode: "snapshot".to_string(),
+                commit: true,
+                dry_run: false,
+                author: "tester".to_string(),
+                message: "table import".to_string(),
+                format: "json".to_string(),
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+
+        let loom = cli_open_loom_read(&store, &KeyOpts::default()).unwrap();
+        let ns = resolve_ns(&loom, "main").unwrap();
+        let table = loom_core::get_table(
+            &loom,
+            ns,
+            &loom_core::workspace::facet_path(FacetKind::Sql, "app/tables/items"),
+        )
+        .unwrap();
+        let mut rows = table.scan(&loom_core::Predicate::All);
+        rows.sort_by_key(|row| match &row[0] {
+            loom_core::Value::Int(id) => *id,
+            other => panic!("unexpected id cell {other:?}"),
+        });
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], loom_core::Value::Int(1));
+        assert_eq!(rows[0][1], loom_core::Value::Text("alpha".to_string()));
+        assert_eq!(rows[0][2], loom_core::Value::Text("from cli".to_string()));
+        assert_eq!(rows[1][2], loom_core::Value::Text(String::new()));
+
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(csv);
+    }
+
+    #[test]
+    fn ticket_profile_imports_route_generated_contracts() {
+        let cases = [
+            (
+                "redmine",
+                InterchangeCmd::ImportRedmine {
+                    store: String::new(),
+                    workspace: "main".to_string(),
+                    profile: "studio".to_string(),
+                    snapshot: String::new(),
+                    dry_run: false,
+                    field_policy: "infer".to_string(),
+                    format: "json".to_string(),
+                },
+                "redmine",
+                "issue:42",
+                r#"{"source_scope":"redmine://example","projects":[{"id":1,"identifier":"core","key_prefix":"CORE","name":"Core"}],"issues":[{"id":42,"project_identifier":"core","tracker":"Bug","subject":"Login fails","custom_fields":{"severity":"critical"}}]}"#,
+            ),
+            (
+                "asana",
+                InterchangeCmd::ImportAsana {
+                    store: String::new(),
+                    workspace: "main".to_string(),
+                    profile: "studio".to_string(),
+                    snapshot: String::new(),
+                    dry_run: false,
+                    field_policy: "infer".to_string(),
+                    format: "json".to_string(),
+                },
+                "asana",
+                "task:t1",
+                r#"{"source_scope":"asana://workspace","projects":[{"gid":"p1","key_prefix":"AS","name":"Asana Project"}],"tasks":[{"gid":"t1","project_gid":"p1","name":"Ship importer","custom_fields":{"size":"M"}}]}"#,
+            ),
+            (
+                "jira",
+                InterchangeCmd::ImportJira {
+                    store: String::new(),
+                    workspace: "main".to_string(),
+                    profile: "studio".to_string(),
+                    snapshot: String::new(),
+                    dry_run: false,
+                    field_policy: "infer".to_string(),
+                    format: "json".to_string(),
+                },
+                "jira",
+                "issue:10042",
+                r#"{"source_scope":"jira://site","projects":[{"id":10001,"key":"CORE","name":"Core"}],"issues":[{"id":10042,"key":"CORE-42","project_key":"CORE","issue_type":"Bug","summary":"Login fails","custom_fields":{"severity":"critical"}}]}"#,
+            ),
+        ];
+
+        for (tag, template, source, external_id, payload) in cases {
+            let store = temp_store(&format!("{tag}-profile-generated"));
+            let snapshot = std::env::temp_dir().join(format!(
+                "loom-cli-{tag}-{}-{}.json",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::write(&snapshot, payload).unwrap();
+            run(
+                Command::Store {
+                    action: StoreCmd::Init {
+                        store: store.clone(),
+                        encrypt: false,
+                        suite: None,
+                        identity_profile: None,
+                        fips: false,
+                    },
+                },
+                &KeyOpts::default(),
+            )
+            .unwrap();
+            run(
+                Command::Workspace {
+                    action: WorkspaceCmd::Create {
+                        store: store.clone(),
+                        name: "main".to_string(),
+                        facet: None,
+                    },
+                },
+                &KeyOpts::default(),
+            )
+            .unwrap();
+            let snapshot = snapshot.to_string_lossy().into_owned();
+            let action = match template {
+                InterchangeCmd::ImportRedmine {
+                    workspace,
+                    profile,
+                    dry_run,
+                    field_policy,
+                    format,
+                    ..
+                } => InterchangeCmd::ImportRedmine {
+                    store: store.clone(),
+                    workspace,
+                    profile,
+                    snapshot: snapshot.clone(),
+                    dry_run,
+                    field_policy,
+                    format,
+                },
+                InterchangeCmd::ImportAsana {
+                    workspace,
+                    profile,
+                    dry_run,
+                    field_policy,
+                    format,
+                    ..
+                } => InterchangeCmd::ImportAsana {
+                    store: store.clone(),
+                    workspace,
+                    profile,
+                    snapshot: snapshot.clone(),
+                    dry_run,
+                    field_policy,
+                    format,
+                },
+                InterchangeCmd::ImportJira {
+                    workspace,
+                    profile,
+                    dry_run,
+                    field_policy,
+                    format,
+                    ..
+                } => InterchangeCmd::ImportJira {
+                    store: store.clone(),
+                    workspace,
+                    profile,
+                    snapshot: snapshot.clone(),
+                    dry_run,
+                    field_policy,
+                    format,
+                },
+                _ => unreachable!("profile import case"),
+            };
+            run_interchange(action, &KeyOpts::default()).unwrap();
+            let loom = cli_open_loom_read(&store, &KeyOpts::default()).unwrap();
+            let ns = resolve_ns(&loom, "main").unwrap();
+            let reader = loom_tickets::TicketProfileReader::open(&loom, ns, "studio")
+                .unwrap()
+                .unwrap();
+            let identity = loom_tickets::ExternalTicketIdentity::new(source, external_id).unwrap();
+            assert!(
+                reader
+                    .ticket_by_external_identity(&identity)
+                    .unwrap()
+                    .is_some()
+            );
+            let _ = std::fs::remove_file(&store);
+            let _ = std::fs::remove_file(snapshot);
+        }
     }
 }
 
@@ -17774,28 +19266,6 @@ mod cli_parse_tests {
             _ => panic!("expected doctor command"),
         }
         assert!(cli_try_parse_for_test(["loom", "doctor", "store.loom"]).is_err());
-    }
-
-    #[test]
-    fn root_help_documents_locator_semantics() {
-        let long = cli_command_for_test()
-            .get_long_about()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        assert!(
-            long.contains("STORE forms"),
-            "help must explain STORE forms"
-        );
-        assert!(long.contains("context"), "help must explain contexts");
-        assert!(long.contains("--project"), "help must mention --project");
-        assert!(
-            long.contains("fail fast"),
-            "help must mention remote fail-fast"
-        );
-        assert!(
-            long.contains("--stateless"),
-            "help must note local-only --stateless"
-        );
     }
 
     #[test]
@@ -18620,12 +20090,9 @@ mod cli_parse_tests {
         .unwrap();
 
         let loom = loom_store::open_loom_read(&store).unwrap();
-        let history = loom_substrate::versioning::load_current_revision_index(
-            &loom,
-            workspace_id,
-            &profile_id,
-        )
-        .unwrap();
+        let history =
+            loom_substrate::versioning::load_current_revision_index(&loom, ns, &profile_id)
+                .unwrap();
         let revisions = history.history("meeting:meet-1");
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].revision, 1);
@@ -18651,12 +20118,9 @@ mod cli_parse_tests {
         .unwrap();
 
         let loom = loom_store::open_loom_read(&store).unwrap();
-        let history = loom_substrate::versioning::load_current_revision_index(
-            &loom,
-            workspace_id,
-            &profile_id,
-        )
-        .unwrap();
+        let history =
+            loom_substrate::versioning::load_current_revision_index(&loom, ns, &profile_id)
+                .unwrap();
         assert_eq!(history.history("meeting:meet-1").len(), 1);
         assert_eq!(history.checkpoints().len(), 1);
     }
@@ -18711,7 +20175,7 @@ mod cli_parse_tests {
         assert_eq!(report.candidates, 1);
         assert_eq!(report.inserted, 1);
         let history =
-            loom_substrate::versioning::load_current_revision_index(&loom, workspace, &profile_id)
+            loom_substrate::versioning::load_current_revision_index(&loom, ns, &profile_id)
                 .unwrap();
         let revisions = history.history("drive:metadata:file-1");
         assert_eq!(revisions.len(), 1);
@@ -18772,7 +20236,7 @@ mod cli_parse_tests {
         assert_eq!(report.candidates, 1);
         assert_eq!(report.inserted, 1);
         let history =
-            loom_substrate::versioning::load_current_revision_index(&loom, workspace, &profile_id)
+            loom_substrate::versioning::load_current_revision_index(&loom, ns, &profile_id)
                 .unwrap();
         let revisions = history.history("structure-node:node-1");
         assert_eq!(revisions.len(), 1);
@@ -18834,7 +20298,7 @@ mod cli_parse_tests {
         assert_eq!(report.candidates, 1);
         assert_eq!(report.inserted, 1);
         let history =
-            loom_substrate::versioning::load_current_revision_index(&loom, workspace, &profile_id)
+            loom_substrate::versioning::load_current_revision_index(&loom, ns, &profile_id)
                 .unwrap();
         let revisions = history.history("lifecycle:instance:inst-1");
         assert_eq!(revisions.len(), 1);
@@ -18864,7 +20328,7 @@ mod cli_parse_tests {
 
         let result =
             enqueue_studio_reindex(&store, "main", "meetings", None, &KeyOpts::default()).unwrap();
-        assert_eq!(result.workspace_id, ns);
+        assert_eq!(result.workspace, ns.to_string());
         assert_eq!(result.state, "no_engine");
 
         let loom = cli_open_loom_read(&store, &KeyOpts::default()).unwrap();
@@ -19081,7 +20545,6 @@ mod cli_parse_tests {
             .unwrap(),
         );
         state.upsert_vector_binding(loom_inference::VectorWorkspaceBinding {
-            store: store.clone(),
             workspace: WorkspaceId::from_bytes([7; 16]).to_string(),
             embedding_instance: "fast-embed".to_string(),
         });
@@ -19089,15 +20552,46 @@ mod cli_parse_tests {
         init_control_state(&fs).unwrap();
         let mut loom = open_loom_from(fs, &KeyOpts::default(), false).unwrap();
         let workspace = WorkspaceId::from_bytes([7; 16]);
-        put_inference_instance_state(&mut loom, workspace, &state).unwrap();
+        loom.registry_mut()
+            .create(FacetKind::Vector, Some("main"), workspace)
+            .unwrap();
+        save_loom(&mut loom).unwrap();
+        drop(loom);
+        let client = LocalLoomClient::new(&store);
+        let session = client.open().unwrap();
+        let instance = state.find_instance("fast-embed").unwrap();
+        client
+            .inference_instance_create_json(
+                &session,
+                "main",
+                instance.name.clone(),
+                instance.model.repo_id.clone(),
+                instance.kind.as_str().to_string(),
+                instance.runtime.as_str().to_string(),
+                instance.preset.clone(),
+                "{}",
+            )
+            .unwrap();
+        client
+            .vector_workspace_configure_json(
+                &session,
+                "main",
+                r#"{"embedding-instance":"fast-embed"}"#,
+            )
+            .unwrap();
+        client.close(&session);
+        let loom = loom_store::open_loom_read(&store).unwrap();
         let hardware = smoke_hardware_report(&hf_cache);
         let resolved = resolve_vector_text_embedding_instance_from_cache(
             &hf_cache, hardware, &loom, workspace, None,
         )
         .unwrap();
+        drop(loom);
+        let fs = FileStore::open(&store).unwrap();
+        let mut loom = open_loom_from(fs, &KeyOpts::default(), false).unwrap();
         let ns = loom
-            .registry_mut()
-            .create(FacetKind::Vector, Some("main"), workspace)
+            .registry()
+            .open(&WsSelector::Name("main".to_string()))
             .unwrap();
         let model = resolved.handle.model().unwrap();
         loom_core::vector_create(&mut loom, ns, "notes", model.dimension, Metric::Cosine).unwrap();
@@ -20271,6 +21765,8 @@ mod cli_parse_tests {
                     acceptance_evidence_enforcement: None,
                     required_acceptance_evidence_keys: Vec::new(),
                     replace_required_acceptance_evidence_keys: false,
+                    required_acceptance_reviews: Vec::new(),
+                    replace_required_acceptance_reviews: false,
                     owner_contract_summary: None,
                     owner_contract_details: None,
                     worker_contract_summary: None,
@@ -20300,8 +21796,12 @@ mod cli_parse_tests {
                 action: TicketsCmd::Create {
                     store: store.clone(),
                     workspace: "main".to_string(),
-                    project_id: "core".to_string(),
                     ticket_type: "task".to_string(),
+                    project_id: Some("core".to_string()),
+                    title: None,
+                    description: None,
+                    priority: None,
+                    assignee: None,
                     fields: r#"{"title":"Build CLI tickets","status":"planned"}"#.to_string(),
                     projection: None,
                     external_source: None,
@@ -20715,8 +22215,8 @@ mod cli_parse_tests {
     }
 
     #[test]
-    fn lane_list_output_surfaces_decode_diagnostics_in_json_and_text() {
-        let diagnostics = vec![LaneDecodeDiagnostic {
+    fn lane_list_output_surfaces_consistency_warnings_in_json_and_text() {
+        let diagnostics = vec![LaneDiagnostic {
             lane_id: "agent-broken".to_string(),
             error: "lane document is invalid: expected value".to_string(),
         }];
@@ -20773,6 +22273,8 @@ mod cli_parse_tests {
                     lane_key: "agent-3".to_string(),
                     kind: "assignment".to_string(),
                     owner_principal: Some("agent:3".to_string()),
+                    title: String::new(),
+                    description: String::new(),
                     lane_status: "closed".to_string(),
                     active_ticket_id: Some("MX-102".to_string()),
                     status_report: "ready".to_string(),
@@ -22045,7 +23547,7 @@ mod cli_parse_tests {
 
     #[test]
     fn structured_imports_report_unsupported_source_fields() {
-        let mut report = loom_interchange::ImportReport::new(ImportReportInput {
+        let mut report = loom_interchange::ImportReport::new(loom_interchange::ImportReportInput {
             profile: "test",
             source_scope: "source",
             commit: None,
@@ -22675,8 +24177,8 @@ mod cli_parse_tests {
             _ => panic!("expected meetings source-read command"),
         }
 
-        let store =
-            FileStore::create_with_profile(temp_store("meetings-import"), Algo::Blake3).unwrap();
+        let store_path = temp_store("meetings-import");
+        let store = FileStore::create_with_profile(&store_path, Algo::Blake3).unwrap();
         let mut loom = Loom::new(store);
         let workspace_id = WorkspaceId::parse("1b1b1b1b-1b1b-4b1b-9b1b-1b1b1b1b1b1b").unwrap();
         loom.registry_mut()
@@ -22722,20 +24224,28 @@ mod cli_parse_tests {
                 }]
             }]
         });
-        let result = import_meetings_bytes(
-            &mut loom,
-            workspace_id,
-            InputProfile::GranolaApi,
-            serde_json::to_string(&input).unwrap().as_bytes(),
-            false,
-        )
-        .unwrap();
+        save_loom(&mut loom).unwrap();
+        drop(loom);
+        let client = LocalLoomClient::new(&store_path);
+        let session = client.open().unwrap();
+        let result_json = client
+            .meetings_import_snapshot(
+                &session,
+                "studio",
+                "granola-api",
+                serde_json::to_string(&input).unwrap().as_bytes(),
+                false,
+            )
+            .unwrap();
+        client.close(&session);
+        let result = import_report_from_json(&result_json).unwrap();
+        let loom = loom_store::open_loom_read(&store_path).unwrap();
         let snapshot = load_meetings_snapshot_io(&loom, &workspace_id.to_string())
             .unwrap()
             .unwrap();
 
-        assert_eq!(result.report.rows_imported, 1);
-        assert_eq!(result.report.operations_planned, 7);
+        assert_eq!(result.rows_imported, 1);
+        assert_eq!(result.operations_planned, 7);
         assert_eq!(snapshot.sources[0].source_id, "not_1");
         assert_eq!(snapshot.meetings[0].meeting_id, "meeting/not_1");
         assert_eq!(snapshot.meetings[0].source_refs, vec!["not_1"]);
@@ -22845,7 +24355,11 @@ mod cli_parse_tests {
         assert_eq!(
             loom.read_file_reserved(
                 workspace_id,
-                &meetings_source_payload_path(&profile_id, "source-a", "source.json")
+                &loom_interchange_io::meetings_source_payload_path(
+                    &profile_id,
+                    "source-a",
+                    "source.json",
+                )
             )
             .unwrap(),
             br#"{"raw":"source"}"#
@@ -22853,7 +24367,11 @@ mod cli_parse_tests {
         assert_eq!(
             loom.read_file_reserved(
                 workspace_id,
-                &meetings_source_payload_path(&profile_id, "source-a", "summary.txt")
+                &loom_interchange_io::meetings_source_payload_path(
+                    &profile_id,
+                    "source-a",
+                    "summary.txt",
+                )
             )
             .unwrap(),
             b"Planning summary"
@@ -22861,7 +24379,11 @@ mod cli_parse_tests {
         assert_eq!(
             loom.read_file_reserved(
                 workspace_id,
-                &meetings_source_payload_path(&profile_id, "source-a", "transcript.jsonl")
+                &loom_interchange_io::meetings_source_payload_path(
+                    &profile_id,
+                    "source-a",
+                    "transcript.jsonl",
+                )
             )
             .unwrap(),
             br#"{"language":null,"locator":"transcript/0","span_id":"span/source-a/0","speaker":null,"text":"Ship the import command."}
@@ -23101,14 +24623,13 @@ mod cli_parse_tests {
     #[test]
     fn vector_workspace_binding_json_renderer_is_stable() {
         let binding = loom_inference::VectorWorkspaceBinding {
-            store: "store.loom".to_string(),
             workspace: "main".to_string(),
             embedding_instance: "fast-embed".to_string(),
         };
         let rendered = serde_json::to_string_pretty(&binding).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
-        assert_eq!(value["store"], "store.loom");
+        assert!(value.get("store").is_none());
         assert_eq!(value["workspace"], "main");
         assert_eq!(value["embedding-instance"], "fast-embed");
     }

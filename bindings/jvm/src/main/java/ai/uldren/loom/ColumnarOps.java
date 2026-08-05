@@ -184,4 +184,34 @@ public final class ColumnarOps {
                             outLen.get(ValueLayout.JAVA_LONG, 0));
                 });
     }
+
+    public byte[] importArrow(String workspace, String name, byte[] payload,
+                              long targetSegmentRows, boolean replace, boolean dryRun) {
+        return importBytes("loom_columnar_import_arrow", Loom.LOOM_COLUMNAR_IMPORT_ARROW,
+                workspace, name, payload, targetSegmentRows, replace, dryRun);
+    }
+
+    public byte[] importParquet(String workspace, String name, byte[] payload,
+                                long targetSegmentRows, boolean replace, boolean dryRun) {
+        return importBytes("loom_columnar_import_parquet", Loom.LOOM_COLUMNAR_IMPORT_PARQUET,
+                workspace, name, payload, targetSegmentRows, replace, dryRun);
+    }
+
+    private byte[] importBytes(String symbol, java.lang.invoke.MethodHandle method,
+                               String workspace, String name, byte[] payload,
+                               long targetSegmentRows, boolean replace, boolean dryRun) {
+        return session.onHandle(symbol, (arena, handle) -> {
+            MemorySegment outPtr = arena.allocate(ValueLayout.ADDRESS);
+            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+            int status = (int) method.invokeExact(
+                    handle, arena.allocateFrom(workspace), arena.allocateFrom(name),
+                    Loom.bytesOrNull(arena, payload), (long) (payload != null ? payload.length : 0),
+                    targetSegmentRows, replace ? 1 : 0, dryRun ? 1 : 0, outPtr, outLen);
+            if (status != 0) {
+                throw Loom.lastError(symbol);
+            }
+            return Loom.takeOwnedBytes(outPtr.get(ValueLayout.ADDRESS, 0),
+                    outLen.get(ValueLayout.JAVA_LONG, 0));
+        });
+    }
 }

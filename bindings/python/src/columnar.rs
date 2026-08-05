@@ -1,6 +1,8 @@
 //! Licensed under BUSL-1.1 (see the workspace `LICENSE`). (c) Uldren Technologies LLC.
 
 use super::*;
+use futures::executor::block_on;
+use loom_client::generated_api::Columnar as GeneratedColumnar;
 
 use loom_core::tabular::{CmpOp, ColumnType, cell_from, cell_value};
 use loom_core::{ColumnarAggregate, ColumnarAggregateOp, ColumnarInspect};
@@ -409,5 +411,83 @@ pub(crate) fn columnar_aggregate<'py>(
     let bytes = values_to_cbor(
         loom_core::columnar_aggregate(&loom, ns, name, &aggregates, filter_ref).map_err(py_err)?,
     );
+    Ok(PyBytes::new(py, &bytes))
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, workspace, name, payload, target_segment_rows, replace, dry_run, store_passphrase=None, auth_principal=None, auth_passphrase=None))]
+pub(crate) fn columnar_import_arrow<'py>(
+    py: Python<'py>,
+    path: &str,
+    workspace: &str,
+    name: &str,
+    payload: &[u8],
+    target_segment_rows: u64,
+    replace: bool,
+    dry_run: bool,
+    store_passphrase: Option<&str>,
+    auth_principal: Option<&str>,
+    auth_passphrase: Option<&str>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
+        let generated = generated_session::open_generated_session(
+            path,
+            store_passphrase,
+            auth_principal,
+            auth_passphrase,
+        )?;
+        block_on(
+            <loom_client::LocalLoomClient as GeneratedColumnar>::columnar_import_arrow(
+                &generated.client,
+                generated.session.clone(),
+                workspace.to_string(),
+                name.to_string(),
+                payload.to_vec(),
+                target_segment_rows,
+                replace,
+                dry_run,
+            ),
+        )
+        .map_err(py_err)
+    })?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, workspace, name, payload, target_segment_rows, replace, dry_run, store_passphrase=None, auth_principal=None, auth_passphrase=None))]
+pub(crate) fn columnar_import_parquet<'py>(
+    py: Python<'py>,
+    path: &str,
+    workspace: &str,
+    name: &str,
+    payload: &[u8],
+    target_segment_rows: u64,
+    replace: bool,
+    dry_run: bool,
+    store_passphrase: Option<&str>,
+    auth_principal: Option<&str>,
+    auth_passphrase: Option<&str>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
+        let generated = generated_session::open_generated_session(
+            path,
+            store_passphrase,
+            auth_principal,
+            auth_passphrase,
+        )?;
+        block_on(
+            <loom_client::LocalLoomClient as GeneratedColumnar>::columnar_import_parquet(
+                &generated.client,
+                generated.session.clone(),
+                workspace.to_string(),
+                name.to_string(),
+                payload.to_vec(),
+                target_segment_rows,
+                replace,
+                dry_run,
+            ),
+        )
+        .map_err(py_err)
+    })?;
     Ok(PyBytes::new(py, &bytes))
 }

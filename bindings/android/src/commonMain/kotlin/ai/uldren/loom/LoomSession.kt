@@ -103,6 +103,9 @@ class LoomSession(
         else -> LoomSql(path, workspace, db)
     }
 
+    fun sqlExecResult(workspace: String, db: String, sql: String): ByteArray =
+        Loom.sqlExecResult(path, workspace, db, sql, passphrase, kek, authPrincipal, authPassphrase)
+
     companion object {
         /** Open a session over an unencrypted `.loom` at [path]. */
         fun open(path: String): LoomSession = LoomSession(path)
@@ -1006,6 +1009,15 @@ class VectorOps(private val s: LoomSession) {
             s.path, workspace, name, query, k, filter, policy, threshold, ef, pqM, pqK, pqIters,
             s.passphrase, s.kek, s.authPrincipal, s.authPassphrase,
         )
+
+    fun textUpsert(request: ByteArray): ByteArray =
+        Loom.vectorTextUpsert(s.path, request, s.passphrase, s.kek, s.authPrincipal, s.authPassphrase)
+
+    fun workspaceConfigureJson(workspace: String, requestJson: String): String =
+        Loom.vectorWorkspaceConfigureJson(
+            s.path, workspace, requestJson, s.passphrase, s.kek,
+            s.authPrincipal, s.authPassphrase,
+        )
 }
 
 /** Columnar-dataset facet operations for a [LoomSession] (per dataset; returns raw Loom Canonical CBOR). */
@@ -1068,6 +1080,32 @@ class ColumnarOps(private val s: LoomSession) {
             s.kek,
             s.authPrincipal,
             s.authPassphrase,
+        )
+
+    fun importArrow(
+        workspace: String,
+        name: String,
+        payload: ByteArray,
+        targetSegmentRows: ULong,
+        replace: Boolean,
+        dryRun: Boolean = false,
+    ): ByteArray =
+        Loom.columnarImportArrow(
+            s.path, workspace, name, payload, targetSegmentRows, replace, dryRun,
+            s.passphrase, s.kek, s.authPrincipal, s.authPassphrase,
+        )
+
+    fun importParquet(
+        workspace: String,
+        name: String,
+        payload: ByteArray,
+        targetSegmentRows: ULong,
+        replace: Boolean,
+        dryRun: Boolean = false,
+    ): ByteArray =
+        Loom.columnarImportParquet(
+            s.path, workspace, name, payload, targetSegmentRows, replace, dryRun,
+            s.passphrase, s.kek, s.authPrincipal, s.authPassphrase,
         )
 }
 

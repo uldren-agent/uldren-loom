@@ -6,7 +6,7 @@
 //! `[key text, principal text, session text, mode_tag uint, permits uint, capacity uint,
 //! fence_authority uint, fence_epoch uint, fence_sequence uint, lease_deadline_ms uint]`.
 
-use loom_codec::{Value as CborValue, encode};
+use loom_codec::{Value as CborValue, decode, encode};
 use loom_core::{LockMode, LockOwner, LockToken};
 use loom_types::{Code, Fence, LoomError};
 
@@ -96,6 +96,49 @@ pub fn lock_token_to_cbor(token: &LockToken) -> Result<Vec<u8>, LoomError> {
         CborValue::Uint(token.lease_deadline_ms),
     ]))
     .map_err(|err| LoomError::new(Code::CorruptObject, format!("cbor: {err}")))
+}
+
+/// Decode the canonical IDL `LockToken` representation.
+pub fn lock_token_from_cbor(bytes: &[u8]) -> Result<LockToken, LoomError> {
+    let CborValue::Array(items) = decode(bytes)
+        .map_err(|err| LoomError::new(Code::InvalidArgument, format!("lock token cbor: {err}")))?
+    else {
+        return Err(LoomError::invalid("lock token must be an array"));
+    };
+    let [
+        CborValue::Text(key),
+        CborValue::Text(principal),
+        CborValue::Text(session),
+        CborValue::Uint(mode),
+        CborValue::Uint(permits),
+        CborValue::Uint(capacity),
+        CborValue::Uint(fence_authority),
+        CborValue::Uint(fence_epoch),
+        CborValue::Uint(fence_sequence),
+        CborValue::Uint(lease_deadline_ms),
+    ] = items.as_slice()
+    else {
+        return Err(LoomError::invalid("lock token has an invalid shape"));
+    };
+    let mode = u8::try_from(*mode).map_err(|_| LoomError::invalid("lock mode overflows"))?;
+    let permits =
+        u32::try_from(*permits).map_err(|_| LoomError::invalid("lock permits overflow"))?;
+    let capacity =
+        u32::try_from(*capacity).map_err(|_| LoomError::invalid("lock capacity overflows"))?;
+    let fence_authority = u32::try_from(*fence_authority)
+        .map_err(|_| LoomError::invalid("lock fence authority overflows"))?;
+    let fence_epoch = u32::try_from(*fence_epoch)
+        .map_err(|_| LoomError::invalid("lock fence epoch overflows"))?;
+    Ok(LockToken {
+        key: key.as_bytes().to_vec(),
+        owner: LockOwner {
+            principal: principal.clone(),
+            session: session.clone(),
+        },
+        mode: lock_mode_from_wire(&[mode], permits, capacity)?,
+        fence: Fence::new(fence_authority, fence_epoch, *fence_sequence),
+        lease_deadline_ms: *lease_deadline_ms,
+    })
 }
 
 #[cfg(test)]
@@ -203,5 +246,26 @@ mod tests {
         assert_eq!(items[3], CborValue::Uint(u64::from(MODE_SEMAPHORE)));
         assert_eq!(items[4], CborValue::Uint(2));
         assert_eq!(items[5], CborValue::Uint(4));
+    }
+
+    #[test]
+    fn token_round_trips_through_canonical_cbor() {
+        let token = LockToken {
+            key: b"resource/a".to_vec(),
+            owner: LockOwner {
+                principal: "p".to_string(),
+                session: "s".to_string(),
+            },
+            mode: LockMode::Semaphore {
+                permits: 2,
+                capacity: 4,
+            },
+            fence: Fence::new(3, 7, 11),
+            lease_deadline_ms: 1234,
+        };
+        assert_eq!(
+            lock_token_from_cbor(&lock_token_to_cbor(&token).unwrap()).unwrap(),
+            token
+        );
     }
 }

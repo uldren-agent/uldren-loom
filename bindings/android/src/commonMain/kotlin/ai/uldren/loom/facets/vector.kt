@@ -182,3 +182,22 @@ expect fun Loom.vectorSearchPolicyCbor(
         authPrincipal: String? = null,
         authPassphrase: String? = null,
     ): ByteArray
+
+expect fun Loom.vectorTextUpsert(
+        path: String,
+        request: ByteArray,
+        passphrase: String? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: String? = null,
+    ): ByteArray
+
+expect fun Loom.vectorWorkspaceConfigureJson(
+        path: String,
+        workspace: String,
+        requestJson: String,
+        passphrase: String? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: String? = null,
+    ): String

@@ -4,13 +4,16 @@
 
 pub mod memory;
 
+use crate::acl::AclStore;
 use crate::digest::{Algo, Digest};
 use crate::error::Result;
 use crate::mutable_overlay::{
-    MutableOverlayEntrySnapshot, OverlayKey, OverlayOwnerToken, OverlayReadSnapshot,
-    OverlaySnapshot,
+    MutableOverlayEntrySnapshot, OverlayEntryKind, OverlayGeneration, OverlayKey, OverlayKeyPrefix,
+    OverlayOwnerToken, OverlayReadSnapshot, OverlaySnapshot,
 };
-use crate::workflow_transaction::{CommitReceipt, WorkflowTransaction};
+use crate::workflow_transaction::{
+    CommitReceipt, FacetWriteOp, WorkflowControlWrite, WorkflowTransaction, WriteOutcome,
+};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -90,6 +93,16 @@ pub trait ObjectStore {
         Ok(Vec::new())
     }
 
+    fn mutable_overlay_current_entries_with_prefix(
+        &self,
+        key_prefix: &OverlayKeyPrefix,
+    ) -> Result<Vec<MutableOverlayEntrySnapshot>> {
+        let _ = key_prefix;
+        Err(crate::LoomError::unsupported(
+            "mutable overlay prefix enumeration is not supported by this store",
+        ))
+    }
+
     fn mutable_overlay_current_entry(
         &self,
         key: &crate::OverlayKey,
@@ -158,12 +171,39 @@ pub trait ObjectStore {
             "workflow transactions are not supported by this store",
         ))
     }
+
+    fn control_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _ = key;
+        Err(crate::LoomError::unsupported(
+            "control records are not supported by this store",
+        ))
+    }
+
+    fn control_set(&self, key: &[u8], value: Vec<u8>) -> Result<()> {
+        let _ = key;
+        let _ = value;
+        Err(crate::LoomError::unsupported(
+            "control records are not supported by this store",
+        ))
+    }
+
+    fn acl_store_control_write(&self, acl: &AclStore) -> WorkflowControlWrite {
+        let _ = acl;
+        WorkflowControlWrite::Put {
+            key: b"acl".to_vec(),
+            payload: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct PlanningObjectStore<'a, S: ObjectStore> {
     base: &'a S,
     objects: Mutex<BTreeMap<[u8; 32], Vec<u8>>>,
+    controls: Mutex<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    direct_controls: Mutex<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    current: Mutex<BTreeMap<Vec<u8>, MutableOverlayEntrySnapshot>>,
+    workflow_transactions: Mutex<Vec<WorkflowTransaction>>,
 }
 
 impl<'a, S: ObjectStore> PlanningObjectStore<'a, S> {
@@ -171,6 +211,10 @@ impl<'a, S: ObjectStore> PlanningObjectStore<'a, S> {
         Self {
             base,
             objects: Mutex::new(BTreeMap::new()),
+            controls: Mutex::new(BTreeMap::new()),
+            direct_controls: Mutex::new(BTreeMap::new()),
+            current: Mutex::new(BTreeMap::new()),
+            workflow_transactions: Mutex::new(Vec::new()),
         }
     }
 
@@ -183,6 +227,30 @@ impl<'a, S: ObjectStore> PlanningObjectStore<'a, S> {
             .cloned()
             .map(|bytes| (Digest::hash(self.digest_algo(), &bytes), bytes))
             .collect())
+    }
+
+    pub fn workflow_transactions(&self) -> Result<Vec<WorkflowTransaction>> {
+        self.workflow_transactions
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(
+                    crate::Code::Internal,
+                    "planning workflow transaction lock poisoned",
+                )
+            })
+            .map(|transactions| transactions.clone())
+    }
+
+    pub fn direct_control_writes(&self) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
+        self.direct_controls
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(
+                    crate::Code::Internal,
+                    "planning direct control lock poisoned",
+                )
+            })
+            .map(|controls| controls.clone())
     }
 }
 
@@ -240,6 +308,251 @@ impl<S: ObjectStore> ObjectStore for PlanningObjectStore<'_, S> {
     fn digest_algo(&self) -> Algo {
         self.base.digest_algo()
     }
+
+    fn uses_mutable_overlay_current_records(&self) -> bool {
+        self.base.uses_mutable_overlay_current_records()
+    }
+
+    fn mutable_overlay_current_entry(
+        &self,
+        key: &crate::OverlayKey,
+    ) -> Result<Option<MutableOverlayEntrySnapshot>> {
+        if let Some(entry) = self
+            .current
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(crate::Code::Internal, "planning current lock poisoned")
+            })?
+            .get(key.as_bytes())
+            .cloned()
+        {
+            return Ok(Some(entry));
+        }
+        self.base.mutable_overlay_current_entry(key)
+    }
+
+    fn mutable_overlay_generation(&self) -> Result<OverlayGeneration> {
+        let base = self.base.mutable_overlay_generation()?.as_u64();
+        let planned = self
+            .workflow_transactions
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(
+                    crate::Code::Internal,
+                    "planning workflow transaction lock poisoned",
+                )
+            })?
+            .len() as u64;
+        Ok(OverlayGeneration::new(base.saturating_add(planned)))
+    }
+
+    fn retained_history_head(&self, key: &[u8]) -> Result<u64> {
+        self.base.retained_history_head(key)
+    }
+
+    fn retained_history_records(
+        &self,
+        key: &[u8],
+        first_sequence: u64,
+        max: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.base.retained_history_records(key, first_sequence, max)
+    }
+
+    fn open_workflow_planning_snapshot(&self, owner: Option<&str>) -> Result<OverlayReadSnapshot> {
+        self.base.open_workflow_planning_snapshot(owner)
+    }
+
+    fn commit_workflow_transaction(&self, mut txn: WorkflowTransaction) -> Result<CommitReceipt> {
+        txn.validate()?;
+        if let Some(expected) = txn.expected_generation {
+            let current = self.mutable_overlay_generation()?;
+            if current != expected {
+                return Err(crate::LoomError::new(
+                    crate::Code::Conflict,
+                    "workflow transaction overlay generation is stale",
+                ));
+            }
+        }
+        let mut direct_controls = self.direct_controls.lock().map_err(|_| {
+            crate::LoomError::new(
+                crate::Code::Internal,
+                "planning direct control lock poisoned",
+            )
+        })?;
+        if !direct_controls.is_empty() {
+            let mut controls = direct_controls
+                .iter()
+                .map(|(key, value)| match value {
+                    Some(payload) => WorkflowControlWrite::Put {
+                        key: key.clone(),
+                        payload: payload.clone(),
+                    },
+                    None => WorkflowControlWrite::Delete { key: key.clone() },
+                })
+                .collect::<Vec<_>>();
+            controls.extend(txn.owner_state.controls);
+            txn.owner_state.controls = controls;
+            direct_controls.clear();
+        }
+        let generation = OverlayGeneration::new(self.mutable_overlay_generation()?.as_u64() + 1);
+        for control in &txn.owner_state.controls {
+            match control {
+                WorkflowControlWrite::Put { key, payload } => {
+                    self.controls
+                        .lock()
+                        .map_err(|_| {
+                            crate::LoomError::new(
+                                crate::Code::Internal,
+                                "planning control lock poisoned",
+                            )
+                        })?
+                        .insert(key.clone(), Some(payload.clone()));
+                }
+                WorkflowControlWrite::Delete { key } => {
+                    self.controls
+                        .lock()
+                        .map_err(|_| {
+                            crate::LoomError::new(
+                                crate::Code::Internal,
+                                "planning control lock poisoned",
+                            )
+                        })?
+                        .insert(key.clone(), None);
+                }
+                WorkflowControlWrite::AppendRetained { .. } => {}
+            }
+        }
+        let mut outcomes = Vec::new();
+        let mut current = self.current.lock().map_err(|_| {
+            crate::LoomError::new(crate::Code::Internal, "planning current lock poisoned")
+        })?;
+        for write in &txn.writes {
+            let kind = match write.op {
+                FacetWriteOp::Put { .. } => OverlayEntryKind::Value,
+                FacetWriteOp::Delete => OverlayEntryKind::Tombstone,
+            };
+            let payload = match &write.op {
+                FacetWriteOp::Put { payload } => payload.clone(),
+                FacetWriteOp::Delete => Vec::new(),
+            };
+            let owner_token = OverlayOwnerToken::from_bytes([0u8; 32]);
+            let entry = MutableOverlayEntrySnapshot {
+                generation,
+                key: write.target.clone(),
+                owner_token: owner_token.clone(),
+                kind,
+                payload,
+            };
+            current.insert(write.target.as_bytes().to_vec(), entry);
+            outcomes.push(WriteOutcome {
+                facet: write.facet,
+                target: write.target.clone(),
+                owner_token,
+                change: kind,
+            });
+        }
+        self.workflow_transactions
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(
+                    crate::Code::Internal,
+                    "planning workflow transaction lock poisoned",
+                )
+            })?
+            .push(txn.clone());
+        Ok(CommitReceipt {
+            generation,
+            root_after: Digest::hash(self.digest_algo(), b"planning workflow transaction"),
+            writes: outcomes,
+            operation_identities: txn
+                .prepared_operations
+                .iter()
+                .map(|operation| operation.operation_id.clone())
+                .collect(),
+            revision_identities: txn
+                .revision_metadata
+                .iter()
+                .map(|revision| crate::RevisionReceipt {
+                    entity_id: revision.entity_id.clone(),
+                    revision_id: revision.revision_id.clone(),
+                })
+                .collect(),
+            audit_sequences: Vec::new(),
+            retained_sequences: txn
+                .owner_state
+                .controls
+                .iter()
+                .filter_map(|write| match write {
+                    crate::WorkflowControlWrite::AppendRetained {
+                        key,
+                        expected_next_sequence,
+                        records,
+                    } => Some(crate::RetainedSequenceReceipt {
+                        key: key.clone(),
+                        first_sequence: *expected_next_sequence,
+                        last_sequence: expected_next_sequence
+                            .saturating_add(records.len() as u64)
+                            .saturating_sub(1),
+                    }),
+                    _ => None,
+                })
+                .collect(),
+            delivery_receipts: txn
+                .delivery_intents
+                .iter()
+                .map(|delivery| crate::DeliveryReceipt {
+                    stream_id: delivery.stream_id.clone(),
+                    sequence: delivery.sequence,
+                    envelope_id: delivery.envelope_id.clone(),
+                    payload_digest: delivery.payload_digest,
+                })
+                .collect(),
+            post_commit_delta: txn
+                .post_commit_delta
+                .as_ref()
+                .map(crate::PostCommitDeltaReceipt::from),
+            replayed: false,
+        })
+    }
+
+    fn control_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(value) = self
+            .controls
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(crate::Code::Internal, "planning control lock poisoned")
+            })?
+            .get(key)
+            .cloned()
+        {
+            return Ok(value);
+        }
+        self.base.control_get(key)
+    }
+
+    fn control_set(&self, key: &[u8], value: Vec<u8>) -> Result<()> {
+        self.controls
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(crate::Code::Internal, "planning control lock poisoned")
+            })?
+            .insert(key.to_vec(), Some(value.clone()));
+        self.direct_controls
+            .lock()
+            .map_err(|_| {
+                crate::LoomError::new(
+                    crate::Code::Internal,
+                    "planning direct control lock poisoned",
+                )
+            })?
+            .insert(key.to_vec(), Some(value));
+        Ok(())
+    }
+
+    fn acl_store_control_write(&self, acl: &AclStore) -> WorkflowControlWrite {
+        self.base.acl_store_control_write(acl)
+    }
 }
 
 /// A shared, type-erased object store. Lets a component own a readable store without being generic
@@ -285,6 +598,14 @@ impl ObjectStore for std::sync::Arc<dyn ObjectStore + Send + Sync> {
     fn mutable_overlay_current_entries(&self) -> Result<Vec<MutableOverlayEntrySnapshot>> {
         (**self).mutable_overlay_current_entries()
     }
+
+    fn mutable_overlay_current_entries_with_prefix(
+        &self,
+        key_prefix: &OverlayKeyPrefix,
+    ) -> Result<Vec<MutableOverlayEntrySnapshot>> {
+        (**self).mutable_overlay_current_entries_with_prefix(key_prefix)
+    }
+
     fn mutable_overlay_current_entry(
         &self,
         key: &crate::OverlayKey,
@@ -323,5 +644,14 @@ impl ObjectStore for std::sync::Arc<dyn ObjectStore + Send + Sync> {
     }
     fn commit_workflow_transaction(&self, txn: WorkflowTransaction) -> Result<CommitReceipt> {
         (**self).commit_workflow_transaction(txn)
+    }
+    fn control_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        (**self).control_get(key)
+    }
+    fn control_set(&self, key: &[u8], value: Vec<u8>) -> Result<()> {
+        (**self).control_set(key, value)
+    }
+    fn acl_store_control_write(&self, acl: &AclStore) -> WorkflowControlWrite {
+        (**self).acl_store_control_write(acl)
     }
 }

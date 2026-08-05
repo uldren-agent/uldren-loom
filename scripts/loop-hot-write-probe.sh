@@ -8,8 +8,7 @@ if ! [[ "$minutes" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
-loom_bin="${LOOM_BIN:-$repo_root/target/debug/loom}"
+loom_bin="${LOOM_BIN:-$script_dir/loop/loom}"
 store="${LOOP_STORE:-loop.loom}"
 daemon_transport="${LOOP_DAEMON_TRANSPORT:-native}"
 workspace="${LOOP_WORKSPACE:-loop}"
@@ -23,7 +22,7 @@ lane_id="loop-lane"
 
 if [[ ! -x "$loom_bin" ]]; then
   echo "loom binary is not executable: $loom_bin" >&2
-  echo "set LOOM_BIN=/path/to/loom or build ./target/debug/loom" >&2
+  echo "copy the Loom binary to $script_dir/loop/loom or set LOOM_BIN=/path/to/loom" >&2
   exit 1
 fi
 
@@ -52,21 +51,51 @@ write_text_file() {
   printf '%s\n' "$body" > "$path"
 }
 
+run_iteration_operation() {
+  local iteration="$1"
+  local operation="$2"
+  shift 2
+  if ! "$@" >/dev/null; then
+    echo "operation failed: $operation (iteration $iteration)" >&2
+    return 1
+  fi
+}
+
 if [[ ! -f "$store" ]]; then
   echo "initializing $store"
   "$loom_bin" store init "$store"
   "$loom_bin" workspace create "$store" "$workspace" --facet document
+else
+  echo "using existing $store"
+fi
+
+project_json="$("$loom_bin" tickets project-settings-get "$store" "$workspace" "$project_id" --format json 2>/dev/null || true)"
+if [[ -z "$project_json" || "$project_json" == "null" ]]; then
   "$loom_bin" tickets project-create "$store" "$workspace" "$project_id" LOOP "Loop Probe" --format text
+fi
+ticket_json="$("$loom_bin" tickets get "$store" "$workspace" "$ticket_id" --format json 2>/dev/null || true)"
+if [[ -z "$ticket_json" || "$ticket_json" == "null" ]]; then
   "$loom_bin" tickets create "$store" "$workspace" task \
     --project-id "$project_id" \
     --title "Loop probe ticket" \
     --description "Initial loop probe ticket." \
     --priority P1 \
     --format text
+fi
+space_json="$("$loom_bin" pages space-get "$store" "$workspace" "$space_id" --format json 2>/dev/null || true)"
+if [[ -z "$space_json" || "$space_json" == "null" ]]; then
   "$loom_bin" pages space-create "$store" "$workspace" "$space_id" "Loop Probe Space" --format text
+fi
+page_json="$("$loom_bin" pages get "$store" "$workspace" "$page_id" --format json 2>/dev/null || true)"
+if [[ -z "$page_json" || "$page_json" == "null" ]]; then
   "$loom_bin" pages create "$store" "$workspace" "$page_id" "$space_id" "Loop Probe Page" --format text
+fi
+if ! "$loom_bin" document get-text "$store" "$workspace" "$document_collection" "$document_id" >/dev/null 2>&1; then
   write_text_file "$tmpdir/document.txt" "initial loop document"
   "$loom_bin" document put-text "$store" "$workspace" "$document_collection" "$document_id" "$tmpdir/document.txt"
+fi
+lane_json="$("$loom_bin" lanes get "$store" "$workspace" "$lane_id" --format json 2>/dev/null || true)"
+if [[ -z "$lane_json" || "$lane_json" == "null" ]]; then
   "$loom_bin" lanes create "$store" "$workspace" "$lane_id" "$lane_id" \
     --kind assignment \
     --owner-principal "loop:agent" \
@@ -78,8 +107,6 @@ if [[ ! -f "$store" ]]; then
     --ticket "$ticket_id" \
     --updated-by "loop:agent" \
     --format text
-else
-  echo "using existing $store"
 fi
 
 daemon_status="$("$loom_bin" daemon status "$store" --json 2>/dev/null || true)"
@@ -104,24 +131,29 @@ while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
 
 $body"
 
-  "$loom_bin" tickets update "$store" "$workspace" "$ticket_id" \
+  run_iteration_operation "$iteration" ticket_update \
+    "$loom_bin" tickets update "$store" "$workspace" "$ticket_id" \
     --title "Loop probe ticket $iteration" \
     --description "$body" \
     --status in_progress \
     --priority P1 \
-    --format text >/dev/null
+    --format text
 
-  "$loom_bin" pages update "$store" "$workspace" "$page_id" "$tmpdir/page.txt" --format text >/dev/null
-  "$loom_bin" pages publish "$store" "$workspace" "$page_id" --format text >/dev/null
+  run_iteration_operation "$iteration" page_update \
+    "$loom_bin" pages update "$store" "$workspace" "$page_id" "$tmpdir/page.txt" --format text
+  run_iteration_operation "$iteration" page_publish \
+    "$loom_bin" pages publish "$store" "$workspace" "$page_id" --format text
 
-  "$loom_bin" document put-text "$store" "$workspace" "$document_collection" "$document_id" "$tmpdir/document.txt" >/dev/null
+  run_iteration_operation "$iteration" document_put \
+    "$loom_bin" document put-text "$store" "$workspace" "$document_collection" "$document_id" "$tmpdir/document.txt"
 
-  "$loom_bin" lanes update "$store" "$workspace" "$lane_id" \
+  run_iteration_operation "$iteration" lane_update \
+    "$loom_bin" lanes update "$store" "$workspace" "$lane_id" \
     --lane-status working \
     --status-report "$body" \
     --reviewer-feedback "loop feedback $iteration" \
     --updated-by "loop:agent" \
-    --format text >/dev/null
+    --format text
 
   if (( iteration % 25 == 0 )); then
     echo "iterations=$iteration elapsed=$(( $(date +%s) - start_epoch ))s"
@@ -130,6 +162,10 @@ done
 
 echo "completed iterations=$iteration duration=${duration_seconds}s store=$store"
 echo "workload_semantics=current_overwrite:document,lane retained_history:ticket,page"
+if [[ "$daemon_started" -eq 1 ]]; then
+  "$loom_bin" daemon stop "$store"
+  daemon_started=0
+fi
 "$loom_bin" store stat "$store"
 "$loom_bin" store attribution "$store" "$workspace" \
   --max-objects 0 \

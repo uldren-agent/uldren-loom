@@ -875,10 +875,10 @@ use direct::{
     json_string, log_ns, merge_abort_ns, merge_conflicts_ns, merge_continue_ns,
     merge_in_progress_ns, merge_ns, merge_resolve_ns, open_h_read, open_h_write, passphrase_arg,
     random_workspace_id, read_at_ns, read_file_ns, read_link_ns, read_table_ns, rebase_ns,
-    remove_file_ns, resolve_workspace_arg, restore_file_ns, restore_path_ns, revert_ns, squash_ns,
-    stage_all_ns, stage_ns, status_json_ns, symlink_ns, tag_create_ns, tag_delete_ns, tag_list_ns,
-    tag_rename_ns, tag_target_ns, task_handle, truncate_ns, unstage_ns, vcs_blame_ns, vcs_diff_ns,
-    watch_poll_ns, write_at_ns, write_file_ns,
+    remove_file_ns, require_global_admin_actor, resolve_workspace_arg, restore_file_ns,
+    restore_path_ns, revert_ns, squash_ns, stage_all_ns, stage_ns, status_json_ns, symlink_ns,
+    tag_create_ns, tag_delete_ns, tag_list_ns, tag_rename_ns, tag_target_ns, task_handle,
+    truncate_ns, unstage_ns, vcs_blame_ns, vcs_diff_ns, watch_poll_ns, write_at_ns, write_file_ns,
 };
 // ---------------------------------------------------------------------------------------------------
 // Per-facet C ABI surface, split into modules. Each module does `use super::*` to pull the
@@ -895,6 +895,7 @@ mod document;
 mod drive;
 mod files;
 mod fsdir;
+mod generated_local;
 mod graph;
 mod kv;
 mod lanes;
@@ -909,6 +910,7 @@ mod queue;
 mod replay;
 mod restore;
 mod search;
+mod security_admin;
 mod tags;
 mod tickets;
 mod timeseries;

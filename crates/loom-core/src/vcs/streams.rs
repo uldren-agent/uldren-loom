@@ -465,6 +465,25 @@ impl<S: ObjectStore> Loom<S> {
         have: &BTreeSet<Digest>,
         deadline: Option<std::time::Instant>,
     ) -> Result<BTreeSet<Digest>> {
+        self.stream_reachable_from_low_water_until(root, have, 0, deadline)
+    }
+
+    pub(crate) fn stream_reachable_from_low_water(
+        &self,
+        root: Digest,
+        have: &BTreeSet<Digest>,
+        retained_low_water: u64,
+    ) -> Result<BTreeSet<Digest>> {
+        self.stream_reachable_from_low_water_until(root, have, retained_low_water, None)
+    }
+
+    fn stream_reachable_from_low_water_until(
+        &self,
+        root: Digest,
+        have: &BTreeSet<Digest>,
+        retained_low_water: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<BTreeSet<Digest>> {
         let mut out = BTreeSet::new();
         if have.contains(&root) {
             return Ok(out);
@@ -489,8 +508,12 @@ impl<S: ObjectStore> Loom<S> {
                         check_stream_deadline(deadline)?;
                         out.insert(node);
                     }
-                    for value in reach.leaf_values {
+                    for (key, value) in reach.leaf_entries {
                         check_stream_deadline(deadline)?;
+                        let seq = stream_sequence_from_key(&key)?;
+                        if seq < retained_low_water {
+                            continue;
+                        }
                         let mut f = crate::cbor::Fields::new(crate::cbor::decode_array(&value)?);
                         if f.uint()? != STREAM_ENTRY_VERSION {
                             return Err(LoomError::corrupt(
@@ -501,6 +524,15 @@ impl<S: ObjectStore> Loom<S> {
                         let _len = f.uint()?;
                         f.end()?;
                         self.collect_content_objects_until(payload_addr, have, &mut out, deadline)?;
+                        let payload = self.load_content(payload_addr)?;
+                        if let Ok(envelope) = loom_delivery::decode_envelope(&payload) {
+                            self.collect_content_objects_until(
+                                envelope.payload_digest,
+                                have,
+                                &mut out,
+                                deadline,
+                            )?;
+                        }
                     }
                 }
                 "consumers" => {
@@ -560,4 +592,11 @@ fn check_stream_deadline(deadline: Option<std::time::Instant>) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn stream_sequence_from_key(key: &[u8]) -> Result<u64> {
+    let bytes: [u8; 8] = key
+        .try_into()
+        .map_err(|_| LoomError::corrupt("stream entry key has invalid length"))?;
+    Ok(u64::from_be_bytes(bytes))
 }

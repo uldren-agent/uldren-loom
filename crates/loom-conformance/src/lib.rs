@@ -3482,6 +3482,29 @@ pub fn run_interchange_vectors() -> Result<()> {
         encoded_archive,
         "interchange archive manifest canonical round-trip mismatch"
     );
+    let archive_import = loom_interchange_io::ArchiveImportResult {
+        manifest: archive.clone(),
+        report: report.clone(),
+    };
+    let encoded_archive_import = archive_import.encode()?;
+    let loom_codec::Value::Array(import_fields) =
+        loom_codec::decode(&encoded_archive_import).map_err(codec_contract_error)?
+    else {
+        panic!("archive import result must encode as an array");
+    };
+    assert_eq!(import_fields.len(), 2, "archive import result field count");
+    let loom_codec::Value::Array(manifest_fields) = &import_fields[0] else {
+        panic!("archive import manifest must encode as an array");
+    };
+    let loom_codec::Value::Array(entry_fields) = &manifest_fields[3] else {
+        panic!("archive import manifest entries must encode as an array");
+    };
+    assert_eq!(
+        entry_fields.len(),
+        3,
+        "archive import keeps detailed entries"
+    );
+    ImportReport::from_value(import_fields[1].clone())?;
     assert!(
         ArchiveEntry::new("/tmp/file", ArchiveEntryKind::File, 1).is_err(),
         "interchange archive entry must reject absolute paths"
@@ -10174,10 +10197,269 @@ impl ConformanceReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loom_client::LocalLoomClient;
     use loom_core::MemoryStore;
+    use loom_core::acl::{AclRight, AclStore, AclSubject};
+    use loom_core::identity::IdentityStore;
+    use loom_store::FileStore;
+    use std::path::PathBuf;
 
     fn report_memory_store_manifest() -> ConformanceReport {
         report_memory_store_from_summary(memory_store_certification_manifest())
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("loom-conformance-{}-{tag}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn principal(byte: u8) -> WorkspaceId {
+        let mut bytes = [0u8; 16];
+        bytes[0] = byte;
+        WorkspaceId::v4_from_bytes(bytes)
+    }
+
+    fn authenticated_admin_session(
+        client: &LocalLoomClient,
+    ) -> (loom_client::types::LoomSession, WorkspaceId) {
+        let session = client.open().expect("open");
+        let root = principal(7);
+        client
+            .with_session(&session, |loom| {
+                let mut identity = IdentityStore::new(root);
+                identity.set_passphrase(root, "rootpw", b"root-salt-bytes")?;
+                loom.store().save_identity_store(&identity)?;
+                let mut acl = AclStore::default();
+                acl.allow(AclSubject::Principal(root), None, None, [AclRight::Admin])?;
+                loom.store().save_acl_store(&acl)?;
+                loom.set_identity_store(identity);
+                loom.set_acl_store(acl);
+                Ok(())
+            })
+            .expect("seed admin");
+        client
+            .authenticate_passphrase(&session, root, b"rootpw")
+            .expect("authenticate admin");
+        (session, root)
+    }
+
+    #[test]
+    fn security_admin_authorization_conformance_fails_before_untrusted_parsing() {
+        let dir = temp_dir("security-auth-first");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create");
+        let session = client.open().expect("open");
+        let root = principal(8);
+        client
+            .with_session(&session, |loom| {
+                let mut identity = IdentityStore::new(root);
+                identity.set_passphrase(root, "rootpw", b"root-salt-bytes")?;
+                loom.store().save_identity_store(&identity)?;
+                loom.set_identity_store(identity);
+                Ok(())
+            })
+            .expect("seed identity");
+        client
+            .authenticate_passphrase(&session, root, b"rootpw")
+            .expect("authenticate root");
+
+        assert!(matches!(
+            client.certificate_import_json(
+                &session,
+                "bad",
+                b"not a certificate".to_vec(),
+                b"not a private key".to_vec(),
+                None,
+                false,
+            ),
+            Err(err) if err.code == Code::PermissionDenied
+        ));
+        assert!(matches!(
+            client.certificate_generate_self_signed_json(
+                &session,
+                "bad",
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                "bad-algorithm",
+                false,
+            ),
+            Err(err) if err.code == Code::PermissionDenied
+        ));
+        assert!(matches!(
+            client.network_access_set_json(&session, "bad", None, "bad-action", "not-json"),
+            Err(err) if err.code == Code::PermissionDenied
+        ));
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn security_admin_certificate_network_and_audit_conformance() {
+        let dir = temp_dir("security-contracts");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create");
+        let (session, root) = authenticated_admin_session(&client);
+
+        let allow_local = r#"[{"id":"local","action":"allow","source_cidr":"127.0.0.1/32"}]"#;
+        let network: serde_json::Value = serde_json::from_str(
+            &client
+                .network_access_set_json(&session, "internal", None, "deny", allow_local)
+                .expect("set network access"),
+        )
+        .expect("network json");
+        assert_eq!(network["name"], "internal");
+        assert_eq!(network["default_action"], "deny");
+
+        let cert_a: serde_json::Value = serde_json::from_str(
+            &client
+                .certificate_generate_self_signed_json(
+                    &session,
+                    "alpha",
+                    vec!["alpha.test".to_string()],
+                    Vec::new(),
+                    None,
+                    1,
+                    "p256",
+                    true,
+                )
+                .expect("generate alpha"),
+        )
+        .expect("alpha json");
+        let cert_b: serde_json::Value = serde_json::from_str(
+            &client
+                .certificate_generate_self_signed_json(
+                    &session,
+                    "beta",
+                    vec!["beta.test".to_string()],
+                    Vec::new(),
+                    None,
+                    1,
+                    "p256",
+                    true,
+                )
+                .expect("generate beta"),
+        )
+        .expect("beta json");
+        assert_eq!(cert_a["name"], "alpha");
+        assert_eq!(cert_b["name"], "beta");
+
+        let exported_alpha = client
+            .certificate_export(&session, "alpha", true, true, false, true)
+            .expect("export alpha");
+        let exported_beta = client
+            .certificate_export(&session, "beta", false, true, false, true)
+            .expect("export beta key");
+        let alpha_fields = match loom_codec::decode(&exported_alpha).expect("alpha export") {
+            loom_codec::Value::Array(fields) => fields,
+            other => panic!("alpha export is not an array: {other:?}"),
+        };
+        let beta_fields = match loom_codec::decode(&exported_beta).expect("beta export") {
+            loom_codec::Value::Array(fields) => fields,
+            other => panic!("beta export is not an array: {other:?}"),
+        };
+        let alpha_cert = match &alpha_fields[2] {
+            loom_codec::Value::Bytes(bytes) => bytes.clone(),
+            other => panic!("alpha cert is not bytes: {other:?}"),
+        };
+        let alpha_key = match &alpha_fields[3] {
+            loom_codec::Value::Bytes(bytes) => bytes.clone(),
+            other => panic!("alpha key is not bytes: {other:?}"),
+        };
+        let beta_key = match &beta_fields[3] {
+            loom_codec::Value::Bytes(bytes) => bytes.clone(),
+            other => panic!("beta key is not bytes: {other:?}"),
+        };
+
+        let imported: serde_json::Value = serde_json::from_str(
+            &client
+                .certificate_import_json(
+                    &session,
+                    "alpha-copy",
+                    alpha_cert.clone(),
+                    alpha_key,
+                    None,
+                    true,
+                )
+                .expect("import copied certificate"),
+        )
+        .expect("import json");
+        assert_eq!(imported["name"], "alpha-copy");
+        assert!(matches!(
+            client.certificate_import_json(
+                &session,
+                "invalid",
+                b"not a certificate".to_vec(),
+                b"not a key".to_vec(),
+                None,
+                true,
+            ),
+            Err(err) if err.code == Code::InvalidArgument
+        ));
+        assert!(matches!(
+            client.certificate_import_json(&session, "mismatch", alpha_cert, beta_key, None, true),
+            Err(err) if err.code == Code::InvalidArgument
+        ));
+
+        client
+            .with_session(&session, |loom| {
+                let mut listener = FileStore::served_listener_record(
+                    "http",
+                    vec!["workspace".to_string()],
+                    "tcp",
+                    "127.0.0.1:17777",
+                    false,
+                )?;
+                listener.tls.certificate_bundle_ref = Some("alpha".to_string());
+                listener.tls.mode = "direct".to_string();
+                listener.network_access_policy_ref = Some("internal".to_string());
+                loom.store().save_served_listener_audited(
+                    &listener,
+                    Some(root),
+                    "serve.listener.configure",
+                    Some("listener=security"),
+                )?;
+                Ok(())
+            })
+            .expect("save referenced listener");
+
+        assert!(matches!(
+            client.certificate_remove_json(&session, "alpha"),
+            Err(err) if err.code == Code::PermissionDenied
+        ));
+        assert!(matches!(
+            client.network_access_remove_json(&session, "internal"),
+            Err(err) if err.code == Code::PermissionDenied
+        ));
+
+        let audit_list: serde_json::Value =
+            serde_json::from_str(&client.audit_list_json(&session).expect("audit list"))
+                .expect("audit json");
+        let records = audit_list["records"].as_array().expect("audit records");
+        let actions = records
+            .iter()
+            .filter_map(|record| record["action"].as_str())
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&"network-access.policy.set"));
+        assert!(actions.contains(&"certificate.bundle.generate_self_signed.force"));
+        assert!(actions.contains(&"certificate.bundle.import.force"));
+        assert!(actions.contains(&"certificate.bundle.remove.denied"));
+        assert!(actions.contains(&"network-access.policy.remove.denied"));
+        let mut seqs = records
+            .iter()
+            .map(|record| record["seq"].as_u64().expect("audit seq"))
+            .collect::<Vec<_>>();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), records.len());
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

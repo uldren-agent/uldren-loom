@@ -44,6 +44,28 @@ extension Loom {
         guard status == 0 else { throw LoomSql.lastError() }
     }
 
+    public func vectorTextUpsert(_ request: Data) throws -> Data {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = request.withUnsafeBytes { raw -> Int32 in
+            let base = raw.bindMemory(to: UInt8.self).baseAddress
+            return loom_vector_text_upsert(session, base, UInt(raw.count), &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_bytes_free(ptr, len) }
+        guard let ptr, len > 0 else { return Data() }
+        return Data(UnsafeBufferPointer(start: ptr, count: Int(len)))
+    }
+
+    public func vectorWorkspaceConfigureJson(workspace: String, requestJson: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_vector_workspace_configure_json(session, workspace, requestJson, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
     /// Fetch the vector + metadata at `id` in set `name` as the Loom Canonical CBOR array
     /// `[vector_bytes, metadata]`, or nil if the id is absent.
     public func vectorGet(workspace: String, name: String, id: String) throws -> Data? {

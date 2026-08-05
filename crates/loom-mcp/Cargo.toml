@@ -29,6 +29,7 @@ loom-lanes.workspace = true
 loom-lifecycle.workspace = true
 loom-reference.workspace = true
 loom-pages.workspace = true
+loom-remote-protocol.workspace = true
 loom-tickets.workspace = true
 loom-templates = { workspace = true }
 loom-types.workspace = true
@@ -57,6 +58,7 @@ schemars = { version = "1", optional = true }
 default = []
 server = ["dep:rmcp", "dep:tokio", "dep:schemars"]
 integration-tests = ["server"]
+test-hooks = ["loom-store/test-hooks"]
 # Streamable HTTP transport (owner mode) on top of the stdio host.
 http = ["server", "dep:axum", "dep:tokio-util", "rmcp/transport-streamable-http-server", "tokio/net", "tokio/rt-multi-thread"]
 

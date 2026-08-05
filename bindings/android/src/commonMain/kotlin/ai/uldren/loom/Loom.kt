@@ -28,6 +28,13 @@ expect object Loom {
 
     fun studioSurfaceCatalogJson(workspace: String, set: String = "all"): String
 
+    fun create(
+        path: String,
+        profile: String,
+        suite: String? = null,
+        passphrase: String? = null,
+    )
+
     fun execCbor(
         path: String,
         request: ByteArray,
@@ -36,6 +43,155 @@ expect object Loom {
         authPrincipal: String? = null,
         authPassphrase: ByteArray? = null,
     ): ByteArray
+
+    fun applyCbor(
+        path: String,
+        request: ByteArray,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): ByteArray
+
+    fun auditConfigShowJson(
+        path: String,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun auditConfigSetJson(
+        path: String,
+        retentionDays: Int? = null,
+        legalHold: Boolean? = null,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun auditListJson(
+        path: String,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun auditViewJson(
+        path: String,
+        record: String,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun certificateListJson(
+        path: String,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun certificateImportJson(
+        path: String,
+        name: String,
+        certChainPem: ByteArray,
+        privateKeyPem: ByteArray,
+        trustBundlePem: ByteArray? = null,
+        force: Boolean = false,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun certificateExport(
+        path: String,
+        name: String,
+        includeCertChain: Boolean,
+        includePrivateKey: Boolean,
+        includeTrustBundle: Boolean,
+        force: Boolean = false,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): ByteArray
+
+    fun certificateGenerateSelfSignedJson(
+        path: String,
+        name: String,
+        dnsNamesJson: String,
+        ipAddressesJson: String,
+        cn: String? = null,
+        days: Int,
+        algorithm: String,
+        force: Boolean = false,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun certificateRemoveJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun certificateAuditJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun networkAccessListJson(
+        path: String,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun networkAccessSetJson(
+        path: String,
+        name: String,
+        description: String? = null,
+        defaultAction: String,
+        rulesJson: String,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun networkAccessRemoveJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
+
+    fun networkAccessAuditJson(
+        path: String,
+        name: String,
+        passphrase: ByteArray? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: ByteArray? = null,
+    ): String
 
 }
 

@@ -232,9 +232,9 @@ pub use metrics::{
 };
 pub use mutable_overlay::{
     MutableOverlay, MutableOverlayEntrySnapshot, MutableOverlayHealth, OverlayCheckpoint,
-    OverlayDurabilityPolicy, OverlayEntryKind, OverlayGeneration, OverlayKey, OverlayOwnerScope,
-    OverlayOwnerToken, OverlayPromotionEntry, OverlayPromotionSelection, OverlayReadSnapshot,
-    OverlayReadSnapshotIdentity, OverlaySnapshot, OverlaySnapshotPin,
+    OverlayDurabilityPolicy, OverlayEntryKind, OverlayGeneration, OverlayKey, OverlayKeyPrefix,
+    OverlayOwnerScope, OverlayOwnerToken, OverlayPromotionEntry, OverlayPromotionSelection,
+    OverlayReadSnapshot, OverlayReadSnapshotIdentity, OverlaySnapshot, OverlaySnapshotPin,
 };
 pub use object::{
     ChunkRef, Commit, EntryKind, Object, ObjectType, Tag, TreeEntry, content_address,
@@ -284,16 +284,17 @@ pub use vcs::{
     BoundedEnginePlanner, Change, ChangeKind, ConflictResolution, EnginePathSelector,
     EnginePlanningScope, EngineStateDelta, EngineStateIoCounts, FileStat, LiveRootClassDiagnostics,
     LiveRootDiagnostics, LiveRootExample, Loom, MergeOutcome, OpenMode, ProtectedRefPolicy,
-    ReachabilityMarkState, ReachabilityMarkStep, ReachabilityProllyCursor, ReplayOutcome, Status,
-    VcsNamespaceCollision, VcsNamespacePreflight,
+    ReachabilityMarkState, ReachabilityMarkStep, ReachabilityProllyCursor, ReachabilityStreamRoot,
+    ReplayOutcome, Status, VcsNamespaceCollision, VcsNamespacePreflight,
 };
 pub use vector::{
-    Hit, MetaFilter, Metric, VectorEntry, VectorSet, get_vector_set, put_vector_set,
-    vector_build_pq_index, vector_create, vector_create_metadata_index, vector_delete,
-    vector_drop_metadata_index, vector_embedding_model, vector_get, vector_ids,
-    vector_metadata_index_keys, vector_search, vector_search_auto, vector_search_with_policy,
-    vector_search_with_pq_policy, vector_source_digest, vector_source_text, vector_upsert,
-    vector_upsert_text, vector_upsert_with_source,
+    Hit, MetaFilter, Metric, VectorCondition, VectorEntry, VectorExactToken, VectorSet,
+    get_vector_set, put_vector_set, vector_build_pq_index, vector_create,
+    vector_create_metadata_index, vector_delete, vector_drop_metadata_index,
+    vector_embedding_model, vector_exact_token, vector_get, vector_ids, vector_metadata_index_keys,
+    vector_search, vector_search_auto, vector_search_with_policy, vector_search_with_pq_policy,
+    vector_source_digest, vector_source_text, vector_upsert, vector_upsert_text,
+    vector_upsert_with_source, vector_upsert_with_source_conditioned,
 };
 pub use vindex::{
     AcceleratorPolicy, Csr, DEFAULT_EXACT_THRESHOLD, PqIndex, VectorAccelerator, prune_csr,
@@ -306,10 +307,20 @@ pub use watch::{
 };
 pub use workflow_transaction::{
     AtomicityBoundary, AuditIntent, BoundedMutationPlan, CommitReceipt, CompareToken,
-    FacetSideEffect, FacetSideEffects, FacetWrite, FacetWriteBuilder, FacetWriteOp,
-    SecondaryIndexWrite, SecondaryIndexWriteOp, WorkflowAuditWrite, WorkflowCommitter,
-    WorkflowControlWrite, WorkflowOwnerState, WorkflowPlanningSnapshot, WorkflowReferenceUpdate,
-    WorkflowTransaction, WorkflowTransactionErrorKind, WriteOutcome, strictest_durability,
+    DeliveryReceipt, FacetSideEffect, FacetSideEffects, FacetWrite, FacetWriteBuilder,
+    FacetWriteOp, PostCommitDeltaReceipt, PreparedDeliveryIntent, PreparedOperation,
+    PreparedRevisionMetadata, RetainedSequenceReceipt, RevisionReceipt, SecondaryIndexWrite,
+    SecondaryIndexWriteOp, WORKFLOW_RECEIPT_MAX_AUDIT_SEQUENCES,
+    WORKFLOW_RECEIPT_MAX_CHANGED_CONTENT_COUNT, WORKFLOW_RECEIPT_MAX_CHANGED_PATHS,
+    WORKFLOW_RECEIPT_MAX_DELIVERY_RECEIPTS, WORKFLOW_RECEIPT_MAX_KEY_BYTES,
+    WORKFLOW_RECEIPT_MAX_OPERATIONS, WORKFLOW_RECEIPT_MAX_PAYLOAD_BYTES,
+    WORKFLOW_RECEIPT_MAX_RETAINED_SEQUENCES, WORKFLOW_RECEIPT_MAX_REVISIONS,
+    WORKFLOW_RECEIPT_MAX_STRING_BYTES, WORKFLOW_RECEIPT_MAX_WRITES,
+    WORKFLOW_TRANSACTION_MAX_AGGREGATE_ENCODED_BYTES, WORKFLOW_TRANSACTION_MAX_AUDIT_ACTION_BYTES,
+    WORKFLOW_TRANSACTION_MAX_AUDIT_TARGET_BYTES, WorkflowAggregateByteBudget, WorkflowAuditWrite,
+    WorkflowCommitter, WorkflowControlWrite, WorkflowOwnerState, WorkflowPlanningSnapshot,
+    WorkflowReferenceUpdate, WorkflowTransaction, WorkflowTransactionErrorKind, WriteOutcome,
+    strictest_durability, workflow_varint_encoded_len,
 };
 pub use workspace::{AclDomain, FacetKind, Registry, WorkspaceId, WorkspaceInfo, WsSelector};
 

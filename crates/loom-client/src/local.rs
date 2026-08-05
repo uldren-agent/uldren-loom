@@ -7,12 +7,17 @@
 //!
 //! Licensed under BUSL-1.1.
 
+use crate::identity_authority_policy::IdentityAuthorityPolicyService;
+use crate::locks::{InProcessLocksAuthority, LocksAuthority};
+use crate::security_admin::SecurityAdminService;
 use crate::types::{HandleId, LoomSession, RowIter, SqlBatch, SqlSession, Task};
 use loom_compute::{
-    Manifest, ProgramBody, StoredProgram, execute_cbor, program_get, program_inspect, program_list,
-    program_put, program_remove,
+    ExecError, Manifest, ProgramBody, StoredProgram, apply, execute_cbor, program_get,
+    program_inspect, program_list, program_put, program_remove,
 };
-use loom_core::acl::{AclGrant, AclRight, AclStore, AclSubject};
+use loom_core::acl::{
+    AclGrant, AclResource, AclResourceScope, AclRight, AclScopeKind, AclStore, AclSubject,
+};
 use loom_core::digest::{Algo, Digest};
 use loom_core::document::Collection;
 use loom_core::identity::{
@@ -20,28 +25,32 @@ use loom_core::identity::{
     PrincipalKind, RoleId,
 };
 use loom_core::keys::{EncryptionMeta, KEY_LEN, KeySpec, Suite};
-use loom_core::lock::{LockCoordinator, LockMode, LockOwner, LockToken};
+use loom_core::lock::{LockMode, LockOwner, LockToken};
 use loom_core::tabular::{CmpOp, ColumnType, Value};
 use loom_core::{
-    AcceleratorPolicy, ColumnarAggregate, ColumnarInspect, DataframePlan, DocumentBinary,
-    DocumentText, Edge, EmbeddingModel, FacetKind, FileKind, FileStat, GraphQuery,
-    GraphQueryExplain, GraphQueryResult, Hit, KvMapConfig, Loom, MetaFilter, Metric, Object,
-    OpenMode, Props, ProtectedRefPolicy, RuntimeProfile, Series, TriggerId, VectorEntry,
-    WatchBatch, WatchCursor, WatchSelector, WorkspaceId, WorkspaceInfo, WsSelector, cas_delete,
-    cas_get, cas_has, cas_list, cas_put, columnar_aggregate, columnar_append, columnar_columns,
-    columnar_compact, columnar_create, columnar_inspect, columnar_rows, columnar_scan,
-    columnar_select, columnar_source_digest, dataframe_collect, dataframe_create,
-    dataframe_materialize, dataframe_plan_digest, dataframe_preview, dataframe_source_digests,
-    doc_delete, doc_delete_collection, doc_list_collections, document_get_binary,
-    document_get_text, document_list_binary, fire_record_to_cbor, graph_explain_query,
-    graph_get_edge, graph_get_node, graph_in_edges, graph_neighbors, graph_out_edges, graph_query,
-    graph_reachable, graph_remove_edge, graph_remove_node, graph_shortest_path, graph_upsert_edge,
-    graph_upsert_node, ledger_append, ledger_get, ledger_head, ledger_len, ledger_list_collections,
-    ledger_verify, trigger_binding_from_cbor, trigger_binding_to_cbor, ts_get, ts_latest,
-    ts_list_collections, ts_put, ts_range, vector_create, vector_create_metadata_index,
-    vector_delete, vector_drop_metadata_index, vector_embedding_model, vector_get, vector_ids,
+    AcceleratorPolicy, AclDomain, AtomicityBoundary, Bundle, ColumnarAggregate, ColumnarInspect,
+    CommitReceipt, DataframePlan, DocumentBinary, DocumentText, Edge, EmbeddingModel, FacetKind,
+    FileKind, FileStat, GraphQuery, GraphQueryExplain, GraphQueryResult, Hit, KvMapConfig, Loom,
+    MetaFilter, Metric, Object, ObjectStore, OpenMode, OverlayDurabilityPolicy, Props,
+    ProtectedRefPolicy, RuntimeProfile, Series, TriggerId, VectorCondition, VectorEntry,
+    WatchBatch, WatchCursor, WatchSelector, WorkflowAuditWrite, WorkflowControlWrite,
+    WorkflowReferenceUpdate, WorkflowTransaction, WorkspaceId, WorkspaceInfo, WsSelector,
+    bundle_import, cas_delete, cas_get, cas_has, cas_list, cas_put, columnar_aggregate,
+    columnar_append, columnar_columns, columnar_compact, columnar_create, columnar_from_arrow_ipc,
+    columnar_from_parquet, columnar_inspect, columnar_rows, columnar_scan, columnar_select,
+    columnar_source_digest, dataframe_collect, dataframe_create, dataframe_materialize,
+    dataframe_plan_digest, dataframe_preview, dataframe_source_digests, doc_delete,
+    doc_delete_collection, doc_list_collections, document_get_binary, document_get_text,
+    document_list_binary, fire_record_to_cbor, get_columnar, graph_explain_query, graph_get_edge,
+    graph_get_node, graph_in_edges, graph_neighbors, graph_out_edges, graph_query, graph_reachable,
+    graph_remove_edge, graph_remove_node, graph_shortest_path, graph_upsert_edge,
+    graph_upsert_node, inference_instance_state, ledger_append, ledger_get, ledger_head,
+    ledger_len, ledger_list_collections, ledger_verify, put_columnar, put_inference_instance_state,
+    trigger_binding_from_cbor, trigger_binding_to_cbor, ts_get, ts_latest, ts_list_collections,
+    ts_put, ts_range, vector_create, vector_create_metadata_index, vector_delete,
+    vector_drop_metadata_index, vector_embedding_model, vector_exact_token, vector_get, vector_ids,
     vector_metadata_index_keys, vector_search, vector_search_with_pq_policy, vector_source_text,
-    vector_upsert, vector_upsert_with_source,
+    vector_upsert, vector_upsert_with_source, vector_upsert_with_source_conditioned,
 };
 use loom_core::{
     ConflictResolution, MergeOutcome, ReplayOutcome, Status, calendar, contacts, kv, log, mail,
@@ -56,13 +65,35 @@ use loom_core::{
 use loom_lanes::{Lane, LaneStatusTextWarning, LaneTicketView, LaneView};
 use loom_sql::LoomSqlStore;
 use loom_store::{
-    FileStore, LocalOpenAuth, attach_local_auth, open_loom, open_loom_read,
+    FileStore, LocalOpenAuth, StoreMaintenanceClock, StorePolicy, SystemStoreMaintenanceClock,
+    attach_local_auth, open_loom, open_loom_daemon_authorized_unlocked, open_loom_read,
     open_loom_read_unlocked, open_loom_registry_read_unlocked, open_loom_unlocked,
-    open_store_metadata_checked, save_loom,
+    open_store_metadata_checked, run_store_maintenance_once_with_clock, save_loom,
 };
-use loom_types::{Code, LoomError};
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
+use loom_substrate::OperationEnvelope;
+use loom_substrate::drive::{
+    DriveOperationLog, DrivePolicyRegistry, DrivePolicyTarget, drive_operation_log_key,
+    drive_policy_registry_key,
+};
+use loom_substrate::lifecycle::{LifecycleOperationLog, lifecycle_operation_log_key};
+use loom_substrate::meetings::{
+    MeetingsProfileSnapshot, ProjectionAction, ProjectionKind, ProjectionOutput,
+    ProjectionOutputSet, meetings_profile_key,
+};
+use loom_substrate::refs::{EntityRef, UnresolvedReference};
+use loom_substrate::search::{
+    EMBEDDING_PROJECTION_JOBS_DIR, EmbeddingProjectionJob, EmbeddingProjectionKey,
+    EmbeddingProjectionStamp,
+};
+use loom_substrate::versioning::{
+    BodyRef, RevisionBackfillUpdate, RevisionIndex, load_optional_current_revision_index,
+    persist_current_revision_index,
+};
+use loom_types::{Code, InferenceModelKind, LoomError};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -71,6 +102,286 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+static NEXT_LOCK_SESSION_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Deserialize)]
+struct LifecycleGateEvaluationJson {
+    gate_id: String,
+    passed: bool,
+    principal_id: Option<String>,
+    evidence_digest: Option<String>,
+    evaluated_at_ms: Option<u64>,
+}
+
+fn json_string<T: Serialize>(value: &T) -> Result<String, LoomError> {
+    serde_json::to_string(value)
+        .map_err(|err| LoomError::new(Code::InvalidArgument, err.to_string()))
+}
+
+fn parse_lifecycle_gate_evaluations(
+    input: &str,
+    now_ms: u64,
+) -> Result<Vec<loom_lifecycle::LifecycleGateEvaluationInput>, LoomError> {
+    let values: Vec<LifecycleGateEvaluationJson> = serde_json::from_str(input)
+        .map_err(|err| LoomError::new(Code::InvalidArgument, err.to_string()))?;
+    Ok(values
+        .into_iter()
+        .map(|value| loom_lifecycle::LifecycleGateEvaluationInput {
+            gate_id: value.gate_id,
+            passed: value.passed,
+            principal_id: value.principal_id,
+            evidence_digest: value.evidence_digest,
+            evaluated_at_ms: value.evaluated_at_ms.unwrap_or(now_ms),
+        })
+        .collect())
+}
+
+fn reconcile_ticket_references(
+    loom: &mut Loom<FileStore>,
+    ns: WorkspaceId,
+    workspace_id: &str,
+    now_ms: u64,
+    max: usize,
+) -> Result<loom_reference::ReconciliationSummary, LoomError> {
+    let principal = loom.effective_principal()?.unwrap_or(ns).to_string();
+    let mut summary = loom_reference::status(loom, ns)?;
+    let mut index = loom_reference::load_or_rebuild_index(loom, ns)?;
+    let records = loom_tickets::reconcile_reference_candidates(
+        loom,
+        ns,
+        workspace_id,
+        now_ms,
+        max,
+        &principal,
+    )?;
+    loom_reference::apply_resolved_edges(&mut index, &records)?;
+    loom_reference::save_index(loom, ns, &index)?;
+    summary.processed = records.len() as u64;
+    let current = loom_reference::status(loom, ns)?;
+    summary.pending = current.pending;
+    summary.resolved = current.resolved;
+    summary.failed = current.failed;
+    Ok(summary)
+}
+
+fn reconcile_chat_references(
+    loom: &mut Loom<FileStore>,
+    ns: WorkspaceId,
+    workspace_id: &str,
+    now_ms: u64,
+    max: usize,
+) -> Result<loom_reference::ReconciliationSummary, LoomError> {
+    let principal = loom.effective_principal()?.unwrap_or(ns).to_string();
+    let mut index = loom_reference::load_or_rebuild_index(loom, ns)?;
+    let mut processed = 0u64;
+    for target in loom_reference::targets(loom, ns)? {
+        if target.source_profile != "chat"
+            || !target.source_scope.starts_with(&format!("{workspace_id}:"))
+        {
+            continue;
+        }
+        let remaining = max.saturating_sub(processed as usize);
+        if remaining == 0 {
+            break;
+        }
+        let records = loom_reference::reconcile(
+            loom,
+            ns,
+            &target,
+            now_ms,
+            remaining,
+            &principal,
+            |loom, candidate| resolve_chat_candidate(loom, ns, &target.source_scope, candidate),
+        )?;
+        processed = processed.saturating_add(records.len() as u64);
+        loom_reference::apply_resolved_edges(&mut index, &records)?;
+    }
+    loom_reference::save_index(loom, ns, &index)?;
+    let mut summary = loom_reference::status(loom, ns)?;
+    summary.processed = processed;
+    Ok(summary)
+}
+
+fn resolve_chat_candidate(
+    loom: &Loom<FileStore>,
+    ns: WorkspaceId,
+    source_scope: &str,
+    candidate: &UnresolvedReference,
+) -> Result<Option<EntityRef>, LoomError> {
+    let (workspace_id, _) = source_scope
+        .rsplit_once(':')
+        .ok_or_else(|| LoomError::corrupt("chat reference scope is invalid"))?;
+    if let Some(handle) = candidate.alias_text.strip_prefix('@') {
+        return loom
+            .identity_store()
+            .map(|identity| identity.resolve_handle(handle))
+            .transpose()?
+            .flatten()
+            .map(|principal| EntityRef::parse(&format!("principal:{principal}")))
+            .transpose();
+    }
+    if let Some(handle) = candidate.alias_text.strip_prefix('#') {
+        return loom_chat::resolve_channel_id(loom, ns, workspace_id, handle)
+            .ok()
+            .map(|channel| EntityRef::parse(&format!("channel:{channel}")))
+            .transpose();
+    }
+    if let Some(key) = candidate.alias_text.strip_prefix("!ticket:") {
+        return resolve_ticket_candidate(loom, ns, workspace_id, key);
+    }
+    if let Some(target) = candidate.alias_text.strip_prefix('!') {
+        return EntityRef::parse(target).map(Some);
+    }
+    Ok(None)
+}
+
+fn resolve_ticket_candidate(
+    loom: &Loom<FileStore>,
+    ns: WorkspaceId,
+    workspace_id: &str,
+    key: &str,
+) -> Result<Option<EntityRef>, LoomError> {
+    let Some(profile) = loom_tickets::TicketProfileReader::open(loom, ns, workspace_id)? else {
+        return Ok(None);
+    };
+    profile
+        .resolve_ticket_key(key)?
+        .map(|resolution| EntityRef::parse(&format!("ticket:{}", resolution.ticket_id)))
+        .transpose()
+}
+
+fn parse_table_csv_import_mode(
+    mode: &str,
+) -> Result<loom_interchange_io::TableImportMode, LoomError> {
+    match mode {
+        "snapshot" => Ok(loom_interchange_io::TableImportMode::Snapshot),
+        "append-only" => Ok(loom_interchange_io::TableImportMode::AppendOnly),
+        other => Err(LoomError::new(
+            Code::InvalidArgument,
+            format!(
+                "unsupported table CSV import mode {other:?}; expected snapshot or append-only"
+            ),
+        )),
+    }
+}
+
+fn parse_table_csv_primary_key(value: &str) -> Result<Vec<String>, LoomError> {
+    let columns = value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        return Err(LoomError::new(
+            Code::InvalidArgument,
+            "table CSV primary key is empty",
+        ));
+    }
+    Ok(columns)
+}
+
+fn parse_table_csv_schema(value: &str) -> Result<Vec<(String, ColumnType)>, LoomError> {
+    let mut columns = Vec::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (name, ty) = item.split_once(':').ok_or_else(|| {
+            LoomError::new(
+                Code::InvalidArgument,
+                format!("table CSV schema item {item:?} is missing ':'"),
+            )
+        })?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(LoomError::new(
+                Code::InvalidArgument,
+                format!("table CSV schema item {item:?} has an empty name"),
+            ));
+        }
+        columns.push((name.to_string(), parse_table_csv_column_type(ty.trim())?));
+    }
+    if columns.is_empty() {
+        return Err(LoomError::new(
+            Code::InvalidArgument,
+            "table CSV schema is empty",
+        ));
+    }
+    Ok(columns)
+}
+
+fn parse_table_csv_column_type(value: &str) -> Result<ColumnType, LoomError> {
+    match value {
+        "int" | "integer" => Ok(ColumnType::Int),
+        "float" | "double" => Ok(ColumnType::Float),
+        "text" | "string" => Ok(ColumnType::Text),
+        "bool" | "boolean" => Ok(ColumnType::Bool),
+        "i8" => Ok(ColumnType::I8),
+        "i16" => Ok(ColumnType::I16),
+        "i32" => Ok(ColumnType::I32),
+        "i128" => Ok(ColumnType::I128),
+        "u8" => Ok(ColumnType::U8),
+        "u16" => Ok(ColumnType::U16),
+        "u32" => Ok(ColumnType::U32),
+        "u64" => Ok(ColumnType::U64),
+        "u128" => Ok(ColumnType::U128),
+        "f32" => Ok(ColumnType::F32),
+        "decimal" | "numeric" => Ok(ColumnType::Decimal),
+        "date" => Ok(ColumnType::Date),
+        "time" => Ok(ColumnType::Time),
+        "timestamp" => Ok(ColumnType::Timestamp),
+        "uuid" => Ok(ColumnType::Uuid),
+        other => Err(LoomError::new(
+            Code::InvalidArgument,
+            format!(
+                "unsupported table CSV column type {other:?}; expected int, float, text, bool, decimal, date, time, timestamp, uuid, or sized integer/float aliases"
+            ),
+        )),
+    }
+}
+
+fn parse_ticket_import_field_policy(
+    field_policy: &str,
+) -> Result<loom_interchange_io::TicketImportFieldPolicy, LoomError> {
+    loom_interchange_io::TicketImportFieldPolicy::parse(field_policy)
+}
+
+fn retained_import_input_from_bytes<S: loom_core::ObjectStore>(
+    loom: &Loom<S>,
+    source_scope: &str,
+    snapshot_payload: &[u8],
+) -> loom_interchange_io::ResolvedImportInput {
+    loom_interchange_io::ResolvedImportInput {
+        source_scope: source_scope.to_string(),
+        kind: loom_interchange_io::ImportInputKind::File,
+        source_digest: Digest::hash(loom.store().digest_algo(), snapshot_payload),
+        size_bytes: snapshot_payload.len() as u64,
+        item_count: 1,
+        path: PathBuf::from(source_scope),
+        bytes: Some(snapshot_payload.to_vec()),
+    }
+}
+
+fn persist_profile_import_artifacts(
+    loom: &mut Loom<FileStore>,
+    ns: WorkspaceId,
+    profile: &str,
+    input: &loom_interchange_io::ResolvedImportInput,
+    report: &loom_interchange::ImportReport,
+) -> Result<bool, LoomError> {
+    if report.dry_run {
+        return Ok(false);
+    }
+    let retained = loom_interchange_io::retain_import_input(loom, ns, profile, input, None)?;
+    let checkpoint_id = format!("{}:{}", profile, input.source_digest);
+    let mut checkpoint = input.checkpoint(profile, &checkpoint_id)?;
+    checkpoint.profile_state_digest = Some(retained.manifest_digest);
+    loom_interchange_io::persist_import_checkpoint(loom, ns, &checkpoint, None)?;
+    Ok(true)
 }
 
 fn update_lane_metadata(lane: &mut Lane, updated_by: &str) {
@@ -94,6 +405,13 @@ fn lane_actor_for_update(
         .unwrap_or_else(|| workspace_id.to_string()))
 }
 
+fn service_workspace_selector(workspace: &str) -> WsSelector {
+    match WorkspaceId::parse(workspace) {
+        Ok(id) => WsSelector::Id(id),
+        Err(_) => WsSelector::Name(workspace.to_string()),
+    }
+}
+
 pub struct LaneUpdateInput<'a> {
     pub lane_id: &'a str,
     pub title: Option<&'a str>,
@@ -102,6 +420,91 @@ pub struct LaneUpdateInput<'a> {
     pub status_report: Option<&'a str>,
     pub reviewer_feedback: Option<&'a str>,
     pub updated_by: &'a str,
+}
+
+pub fn apply_pages_update_text(
+    loom: &mut Loom<FileStore>,
+    workspace: &str,
+    page_workspace_id: &str,
+    page_id: &str,
+    body_text: &str,
+    expected_root: Option<&str>,
+) -> Result<loom_pages::PageUpdateSummary, LoomError> {
+    let ns = loom
+        .registry()
+        .open(&service_workspace_selector(workspace))?;
+    loom_pages::update_page_text(
+        loom,
+        ns,
+        page_workspace_id,
+        page_id,
+        body_text,
+        now_ms(),
+        expected_root,
+    )
+}
+
+pub fn apply_pages_publish(
+    loom: &mut Loom<FileStore>,
+    workspace: &str,
+    page_workspace_id: &str,
+    page_id: &str,
+    expected_root: Option<&str>,
+) -> Result<loom_pages::PagePublishSummary, LoomError> {
+    let ns = loom
+        .registry()
+        .open(&service_workspace_selector(workspace))?;
+    loom_pages::publish_page(
+        loom,
+        ns,
+        page_workspace_id,
+        page_id,
+        now_ms(),
+        expected_root,
+    )
+}
+
+pub fn apply_lanes_update(
+    loom: &mut Loom<FileStore>,
+    workspace: &str,
+    input: LaneUpdateInput<'_>,
+) -> Result<Lane, LoomError> {
+    if input.title.is_none()
+        && input.description.is_none()
+        && input.lane_status.is_none()
+        && input.status_report.is_none()
+        && input.reviewer_feedback.is_none()
+    {
+        return Err(LoomError::invalid(
+            "lane update requires at least one field",
+        ));
+    }
+    let ns = read_ns(loom, workspace, FacetKind::Document)?
+        .ok_or_else(|| LoomError::new(Code::NotFound, "lane workspace not found"))?;
+    let mut lane = loom_lanes::get_lane(loom, ns, input.lane_id)?
+        .ok_or_else(|| LoomError::new(Code::NotFound, "lane not found"))?;
+    let prior_lane = lane.clone();
+    if let Some(title) = input.title {
+        lane.title = title.to_string();
+    }
+    if let Some(description) = input.description {
+        lane.description = description.to_string();
+    }
+    if let Some(lane_status) = input.lane_status {
+        lane.lane_status = loom_lanes::LaneStatus::parse(lane_status)?
+            .as_str()
+            .to_string();
+    }
+    if let Some(status_report) = input.status_report {
+        lane.status_report = status_report.to_string();
+    }
+    if let Some(reviewer_feedback) = input.reviewer_feedback {
+        lane.reviewer_feedback = reviewer_feedback.to_string();
+    }
+    let actor = lane_actor_for_update(loom, ns, input.updated_by)?;
+    update_lane_metadata(&mut lane, &actor);
+    loom_lanes::put_lane_current_record(loom, ns, &lane, Some(&prior_lane))?;
+    Ok(lane)
 }
 
 pub struct LaneCloseoutInput<'a> {
@@ -268,8 +671,8 @@ fn ticket_title(ticket: &loom_tickets::TicketSummary) -> String {
         .unwrap_or_default()
 }
 
-fn enforce_document_entity_tag(
-    loom: &Loom<FileStore>,
+fn enforce_document_entity_tag<S: ObjectStore>(
+    loom: &Loom<S>,
     ns: WorkspaceId,
     collection: &str,
     id: &str,
@@ -285,6 +688,136 @@ fn enforce_document_entity_tag(
             loom_types::ConflictReason::ExpectedTagMismatch.as_str(),
         )),
     }
+}
+
+struct PlannedDocumentPut {
+    result: Vec<u8>,
+    state: Vec<u8>,
+    overlay: loom_core::MutableOverlay,
+    transaction: WorkflowTransaction,
+}
+
+fn plan_document_put(
+    loom: &mut Loom<loom_core::provider::PlanningObjectStore<'_, FileStore>>,
+    workspace: &str,
+    collection: &str,
+    id: &str,
+    bytes: Vec<u8>,
+    expected_entity_tag: Option<&str>,
+) -> Result<PlannedDocumentPut, LoomError> {
+    let ns = loom.registry_mut().ensure_for_write(
+        &ns_selector(workspace, FacetKind::Document),
+        mint_workspace_id()?,
+    )?;
+    enforce_document_entity_tag(loom, ns, collection, id, expected_entity_tag)?;
+    let digest = Digest::hash(loom.store().digest_algo(), &bytes);
+    loom_reference::put_document_indexed(loom, ns, collection, id, bytes)?;
+    let result = loom_wire::document::put_result_to_cbor(
+        &digest.to_string(),
+        &loom_core::document_entity_tag_string_from_digest(digest),
+    )?;
+    let (root, state_objects) = loom.save_state_objects()?;
+    let mut objects = loom.store().objects()?;
+    objects.extend(state_objects);
+    let state = loom.export_state();
+    let overlay = loom.mutable_overlay().clone();
+    let direct_controls = loom.store().direct_control_writes()?;
+    if !direct_controls.is_empty() {
+        return Err(LoomError::corrupt(
+            "document put planning candidate left direct control writes",
+        ));
+    }
+    let mut workflow_transactions = loom.store().workflow_transactions()?;
+    if workflow_transactions.len() != 1 {
+        return Err(LoomError::corrupt(
+            "document put planning candidate must publish exactly one workflow transaction",
+        ));
+    }
+    let mut transaction = workflow_transactions.remove(0);
+    transaction.owner_state.objects.extend(objects);
+    transaction.owner_state.reference = WorkflowReferenceUpdate::Set(Some(root));
+    Ok(PlannedDocumentPut {
+        result,
+        state,
+        overlay,
+        transaction,
+    })
+}
+
+fn synchronize_document_transaction_receipt<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    receipt: &CommitReceipt,
+) -> Result<(), LoomError> {
+    for outcome in &receipt.writes {
+        let current = loom
+            .store()
+            .mutable_overlay_current_entry(&outcome.target)?
+            .ok_or_else(|| {
+                LoomError::corrupt("document workflow transaction omitted current record")
+            })?;
+        loom.mutable_overlay_mut()
+            .synchronize_current_entry(current)?;
+    }
+    Ok(())
+}
+
+fn publish_document_put_candidate(
+    loom: &mut Loom<FileStore>,
+    planned: PlannedDocumentPut,
+    before_commit: impl FnOnce(&mut Loom<FileStore>) -> Result<(), LoomError>,
+) -> Result<Vec<u8>, LoomError> {
+    let result = planned.result.clone();
+    before_commit(loom)?;
+    let receipt = loom
+        .store()
+        .commit_workflow_transaction(planned.transaction)?;
+    loom.import_state(&planned.state)?;
+    *loom.mutable_overlay_mut() = planned.overlay;
+    synchronize_document_transaction_receipt(loom, &receipt)?;
+    Ok(result)
+}
+
+pub fn publish_document_put_binary(
+    loom: &mut Loom<FileStore>,
+    workspace: &str,
+    collection: &str,
+    id: &str,
+    bytes: Vec<u8>,
+    expected_entity_tag: Option<&str>,
+    before_commit: impl FnOnce(&mut Loom<FileStore>) -> Result<(), LoomError>,
+) -> Result<Vec<u8>, LoomError> {
+    let mut candidate =
+        loom.fork_state_into(loom_core::provider::PlanningObjectStore::new(loom.store()))?;
+    let planned = plan_document_put(
+        &mut candidate,
+        workspace,
+        collection,
+        id,
+        bytes,
+        expected_entity_tag,
+    )?;
+    drop(candidate);
+    publish_document_put_candidate(loom, planned, before_commit)
+}
+
+pub fn publish_document_put_text(
+    loom: &mut Loom<FileStore>,
+    workspace: &str,
+    collection: &str,
+    id: &str,
+    text: &str,
+    expected_entity_tag: Option<&str>,
+    before_commit: impl FnOnce(&mut Loom<FileStore>) -> Result<(), LoomError>,
+) -> Result<Vec<u8>, LoomError> {
+    publish_document_put_binary(
+        loom,
+        workspace,
+        collection,
+        id,
+        text.as_bytes().to_vec(),
+        expected_entity_tag,
+        before_commit,
+    )
 }
 
 fn mint_workspace_id() -> Result<WorkspaceId, LoomError> {
@@ -389,6 +922,25 @@ fn ns_selector_by_name(workspace: &str) -> WsSelector {
     }
 }
 
+fn ensure_generated_facet_workspace<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    workspace: &str,
+    facet: FacetKind,
+) -> Result<WorkspaceId, LoomError> {
+    let selector = match WorkspaceId::parse(workspace) {
+        Ok(id) => WsSelector::Id(id),
+        Err(_) => WsSelector::Typed {
+            ty: facet,
+            name: workspace.to_string(),
+        },
+    };
+    let ns = loom
+        .registry_mut()
+        .ensure_for_write(&selector, mint_workspace_id()?)?;
+    loom.registry_mut().add_facet(ns, facet)?;
+    Ok(ns)
+}
+
 /// Resolve a workspace for a read, returning `None` when it does not exist yet (so absent facets read
 /// as empty rather than an error).
 fn read_ns(
@@ -489,6 +1041,8 @@ enum TaskWork {
         session: LoomSession,
         workspace: String,
         src_path: String,
+        author: Option<String>,
+        message: Option<String>,
         commit: bool,
         dry_run: bool,
     },
@@ -504,6 +1058,10 @@ enum TaskWork {
         workspace: String,
         src_path: String,
         kind: String,
+        gzip_output_path: Option<String>,
+        commit: bool,
+        author: Option<String>,
+        message: Option<String>,
         dry_run: bool,
     },
     ArchiveExportAsync {
@@ -547,15 +1105,239 @@ pub struct LocalLoomClient {
     tasks: Mutex<HashMap<u64, TaskState>>,
     result_views: Mutex<HashMap<u64, loom_result::result_view::ResultPayload>>,
     next_id: Mutex<u64>,
-    coordinator: Mutex<LockCoordinator>,
+    locks: Arc<dyn LocksAuthority>,
+    lock_session_namespace: u64,
     last_error: Mutex<Option<LoomError>>,
     transfers: Mutex<HashMap<Vec<u8>, TransferEntry>>,
+    store_maintenance_clock: Arc<dyn StoreMaintenanceClock + Send + Sync>,
+}
+
+pub struct VectorTextUpsertRequest {
+    pub workspace: String,
+    pub name: String,
+    pub id: String,
+    pub vector: Vec<f32>,
+    pub metadata: BTreeMap<String, Value>,
+    pub source_text: String,
+    pub model: Option<EmbeddingModel>,
+    pub create: bool,
+    pub metric: Metric,
+    pub condition: VectorCondition,
+}
+
+pub fn vector_text_upsert_request_from_cbor(
+    request: &[u8],
+) -> Result<VectorTextUpsertRequest, LoomError> {
+    let request = loom_wire::vector::text_upsert_request_from_cbor(request)?;
+    if request.expected_token.is_some() && request.expect_absent {
+        return Err(LoomError::new(
+            Code::InvalidArgument,
+            "expected_token and expect_absent are mutually exclusive",
+        ));
+    }
+    let vector = loom_wire::vector::floats_from_bytes(&request.vector)?;
+    let metadata = loom_wire::vector::metadata_from_cbor(&request.metadata)?;
+    let source_text = std::str::from_utf8(&request.source_text)
+        .map_err(|err| LoomError::new(Code::InvalidArgument, format!("source_text: {err}")))?
+        .to_string();
+    let model = request
+        .model_id
+        .map(|id| loom_core::EmbeddingModel::new(id, vector.len(), request.weights_digest));
+    let metric = loom_wire::vector::metric_from_int(request.metric)?;
+    let condition = if let Some(token) = request.expected_token {
+        loom_core::VectorCondition::Exact(loom_core::VectorExactToken::from_bytes(token))
+    } else if request.expect_absent {
+        loom_core::VectorCondition::Absent
+    } else {
+        loom_core::VectorCondition::Any
+    };
+    Ok(VectorTextUpsertRequest {
+        workspace: request.workspace,
+        name: request.name,
+        id: request.id,
+        vector,
+        metadata,
+        source_text,
+        model,
+        create: request.create,
+        metric,
+        condition,
+    })
+}
+
+pub fn apply_vector_text_upsert_generated(
+    loom: &mut Loom<FileStore>,
+    request: VectorTextUpsertRequest,
+) -> Result<Vec<u8>, LoomError> {
+    if let loom_core::VectorCondition::Exact(expected) = &request.condition {
+        let ns = loom
+            .registry()
+            .open(&ns_selector(&request.workspace, FacetKind::Vector))
+            .map_err(|error| {
+                if error.code == Code::NotFound {
+                    LoomError::new(Code::Conflict, "vector exact condition did not match")
+                } else {
+                    error
+                }
+            })?;
+        match vector_exact_token(loom, ns, &request.name, &request.id) {
+            Ok(Some(current)) if &current == expected => {}
+            Ok(_) => {
+                return Err(LoomError::new(
+                    Code::Conflict,
+                    "vector exact condition did not match",
+                ));
+            }
+            Err(error) if error.code == Code::NotFound => {
+                return Err(LoomError::new(
+                    Code::Conflict,
+                    "vector exact condition did not match",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let ns = if request.create {
+        loom.registry_mut().ensure_for_write(
+            &ns_selector(&request.workspace, FacetKind::Vector),
+            mint_workspace_id()?,
+        )?
+    } else {
+        loom.registry()
+            .open(&ns_selector(&request.workspace, FacetKind::Vector))?
+    };
+    if request.create {
+        match vector_create(
+            loom,
+            ns,
+            &request.name,
+            request
+                .model
+                .as_ref()
+                .map_or(request.vector.len(), |model| model.dimension),
+            request.metric,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.code == Code::Conflict => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let id = request.id.clone();
+    let name = request.name.clone();
+    let token = vector_upsert_with_source_conditioned(
+        loom,
+        ns,
+        &request.name,
+        &request.id,
+        request.vector,
+        request.metadata,
+        &request.source_text,
+        request.model,
+        request.condition,
+    )?;
+    Ok(loom_wire::vector::text_upsert_report_with_token_to_cbor(
+        &id,
+        &name,
+        token.as_bytes(),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VectorWorkspaceConfigureRequest {
+    embedding_instance: String,
+}
+
+pub fn parse_vector_workspace_configure_request(
+    request_json: &str,
+) -> Result<VectorWorkspaceConfigureRequest, LoomError> {
+    serde_json::from_str(request_json).map_err(|error| {
+        LoomError::new(
+            Code::InvalidArgument,
+            format!("invalid vector workspace configure request: {error}"),
+        )
+    })
+}
+
+pub fn apply_vector_workspace_configure_json(
+    loom: &mut Loom<FileStore>,
+    workspace: &str,
+    request: VectorWorkspaceConfigureRequest,
+) -> Result<String, LoomError> {
+    let workspace_id = loom.registry().open(&ns_selector_by_name(workspace))?;
+    let mut state = inference_instance_state(loom, workspace_id)?;
+    let instance = state
+        .find_instance(&request.embedding_instance)
+        .cloned()
+        .ok_or_else(|| {
+            LoomError::new(
+                Code::NotFound,
+                format!(
+                    "inference instance {:?} not found",
+                    request.embedding_instance
+                ),
+            )
+        })?;
+    if instance.kind != InferenceModelKind::TextEmbedding {
+        return Err(LoomError::new(
+            Code::InvalidArgument,
+            format!(
+                "inference instance {:?} is not a text-embedding instance",
+                request.embedding_instance
+            ),
+        ));
+    }
+    let binding = loom_inference::VectorWorkspaceBinding {
+        workspace: workspace_id.to_string(),
+        embedding_instance: request.embedding_instance,
+    };
+    state.upsert_vector_binding(binding.clone());
+    put_inference_instance_state(loom, workspace_id, &state)?;
+    serde_json::to_string(&binding)
+        .map_err(|error| LoomError::new(Code::CorruptObject, format!("json: {error}")))
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct StudioReindexReport {
+    pub workspace: String,
+    pub profile: String,
+    pub job_path: String,
+    pub state: String,
+    pub source_digest: String,
+    pub model_id: String,
+    pub vector_records_indexed: u64,
+    pub vector_records_deleted: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct StudioRevisionRebuildReport {
+    pub workspace: String,
+    pub scope_id: String,
+    pub profile: String,
+    pub index_present_before: bool,
+    pub candidates: u64,
+    pub inserted: u64,
+    pub skipped_existing: u64,
+    pub dry_run: bool,
+}
+
+struct StudioVectorDrainSummary {
+    indexed: u64,
+    deleted: u64,
+}
+
+struct ResolvedStudioTextEmbeddingInstance {
+    instance: loom_types::InferenceInstanceDescriptor,
+    handle: loom_inference::TextEmbeddingHandle,
 }
 
 #[derive(Clone)]
 struct LocalSessionSlot {
     loom: Arc<Mutex<Loom<FileStore>>>,
     auth_view: LocalSessionAuthView,
+    lock_owner_session: Option<String>,
 }
 
 #[derive(Clone)]
@@ -590,8 +1372,36 @@ pub struct DocumentReplaceTextArgs<'a> {
 }
 
 impl LocalLoomClient {
+    pub(crate) fn store_path(&self) -> &Path {
+        &self.path
+    }
+
     /// Bind a client to a local `.loom` path. The path is opened lazily by [`LocalLoomClient::open`].
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self::with_store_maintenance_clock(path, Arc::new(SystemStoreMaintenanceClock))
+    }
+
+    /// Bind a local client to a shared coordination-lock authority.
+    pub fn with_locks_authority(path: impl Into<PathBuf>, locks: Arc<dyn LocksAuthority>) -> Self {
+        Self::with_locks_authority_and_clock(path, locks, Arc::new(SystemStoreMaintenanceClock))
+    }
+
+    pub(crate) fn with_store_maintenance_clock(
+        path: impl Into<PathBuf>,
+        store_maintenance_clock: Arc<dyn StoreMaintenanceClock + Send + Sync>,
+    ) -> Self {
+        Self::with_locks_authority_and_clock(
+            path,
+            Arc::new(InProcessLocksAuthority::default()),
+            store_maintenance_clock,
+        )
+    }
+
+    fn with_locks_authority_and_clock(
+        path: impl Into<PathBuf>,
+        locks: Arc<dyn LocksAuthority>,
+        store_maintenance_clock: Arc<dyn StoreMaintenanceClock + Send + Sync>,
+    ) -> Self {
         Self {
             path: path.into(),
             sessions: Mutex::new(HashMap::new()),
@@ -601,9 +1411,11 @@ impl LocalLoomClient {
             tasks: Mutex::new(HashMap::new()),
             result_views: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
-            coordinator: Mutex::new(LockCoordinator::default()),
+            locks,
+            lock_session_namespace: NEXT_LOCK_SESSION_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             last_error: Mutex::new(None),
             transfers: Mutex::new(HashMap::new()),
+            store_maintenance_clock,
         }
     }
 
@@ -624,6 +1436,27 @@ impl LocalLoomClient {
     /// Returns [`LoomError`] if the store cannot be opened.
     pub fn open(&self) -> Result<LoomSession, LoomError> {
         self.register_open_loom(open_loom(&self.path)?)
+    }
+
+    pub fn open_with_local_auth(
+        &self,
+        auth: &LocalOpenAuth,
+        daemon_authorized: bool,
+    ) -> Result<LoomSession, LoomError> {
+        let loom = if daemon_authorized {
+            open_loom_daemon_authorized_unlocked(&self.path, auth.unlock_key.as_ref())?
+        } else {
+            open_loom_unlocked(&self.path, auth.unlock_key.as_ref())?
+        };
+        self.register_open_loom(attach_local_auth(loom, auth)?)
+    }
+
+    /// Open a read-only session over the bound store and register it, returning its handle.
+    ///
+    /// # Errors
+    /// Returns [`LoomError`] if the store cannot be opened.
+    pub fn open_read(&self) -> Result<LoomSession, LoomError> {
+        self.register_open_loom(open_loom_read(&self.path)?)
     }
 
     /// Open a metadata-only session over the bound store.
@@ -697,6 +1530,16 @@ impl LocalLoomClient {
         self.open_with_key(KeySpec::passphrase(passphrase))
     }
 
+    /// Open a read-only encrypted-store session unlocked with `passphrase`.
+    ///
+    /// # Errors
+    /// Returns [`LoomError`] for a non-utf-8 passphrase, a wrong key, or an open failure.
+    pub fn open_read_keyed(&self, passphrase: &[u8]) -> Result<LoomSession, LoomError> {
+        let passphrase = std::str::from_utf8(passphrase)
+            .map_err(|_| LoomError::new(Code::InvalidArgument, "passphrase is not valid utf-8"))?;
+        self.open_read_with_key(KeySpec::passphrase(passphrase))
+    }
+
     /// Open a metadata-only encrypted-store session unlocked with `passphrase`.
     ///
     /// # Errors
@@ -718,8 +1561,20 @@ impl LocalLoomClient {
         self.open_with_key(KeySpec::raw_kek(kek))
     }
 
+    /// Open a read-only encrypted-store session unlocked with a raw 256-bit KEK.
+    ///
+    /// # Errors
+    /// Returns [`LoomError`] for a wrong key or an open failure.
+    pub fn open_read_with_kek(&self, kek: [u8; KEY_LEN]) -> Result<LoomSession, LoomError> {
+        self.open_read_with_key(KeySpec::raw_kek(kek))
+    }
+
     fn open_with_key(&self, spec: KeySpec) -> Result<LoomSession, LoomError> {
         self.register_open_loom(open_loom_unlocked(&self.path, Some(&spec))?)
+    }
+
+    fn open_read_with_key(&self, spec: KeySpec) -> Result<LoomSession, LoomError> {
+        self.register_open_loom(open_loom_read_unlocked(&self.path, Some(&spec))?)
     }
 
     fn register_open_loom(&self, mut loom: Loom<FileStore>) -> Result<LoomSession, LoomError> {
@@ -739,6 +1594,7 @@ impl LocalLoomClient {
             LocalSessionSlot {
                 loom: Arc::new(Mutex::new(loom)),
                 auth_view: LocalSessionAuthView::Preserve,
+                lock_owner_session: None,
             },
         );
         Ok(LoomSession(HandleId {
@@ -767,10 +1623,14 @@ impl LocalLoomClient {
             },
             None => LocalSessionAuthView::Clear,
         };
-        self.sessions
-            .lock()
-            .expect("session lock")
-            .insert(id, LocalSessionSlot { loom, auth_view });
+        self.sessions.lock().expect("session lock").insert(
+            id,
+            LocalSessionSlot {
+                loom,
+                auth_view,
+                lock_owner_session: None,
+            },
+        );
         Ok(LoomSession(HandleId {
             kind: "session".to_string(),
             id: id.to_be_bytes().to_vec(),
@@ -1705,44 +2565,7 @@ impl LocalLoomClient {
         workspace: &str,
         input: LaneUpdateInput<'_>,
     ) -> Result<Lane, LoomError> {
-        if input.title.is_none()
-            && input.description.is_none()
-            && input.lane_status.is_none()
-            && input.status_report.is_none()
-            && input.reviewer_feedback.is_none()
-        {
-            return Err(LoomError::invalid(
-                "lane update requires at least one field",
-            ));
-        }
-        self.with_session(session, |loom| {
-            let ns = read_ns(loom, workspace, FacetKind::Document)?
-                .ok_or_else(|| LoomError::new(Code::NotFound, "lane workspace not found"))?;
-            let mut lane = loom_lanes::get_lane(loom, ns, input.lane_id)?
-                .ok_or_else(|| LoomError::new(Code::NotFound, "lane not found"))?;
-            let prior_lane = lane.clone();
-            if let Some(title) = input.title {
-                lane.title = title.to_string();
-            }
-            if let Some(description) = input.description {
-                lane.description = description.to_string();
-            }
-            if let Some(lane_status) = input.lane_status {
-                lane.lane_status = loom_lanes::LaneStatus::parse(lane_status)?
-                    .as_str()
-                    .to_string();
-            }
-            if let Some(status_report) = input.status_report {
-                lane.status_report = status_report.to_string();
-            }
-            if let Some(reviewer_feedback) = input.reviewer_feedback {
-                lane.reviewer_feedback = reviewer_feedback.to_string();
-            }
-            let actor = lane_actor_for_update(loom, ns, input.updated_by)?;
-            update_lane_metadata(&mut lane, &actor);
-            loom_lanes::put_lane_current_record(loom, ns, &lane, Some(&prior_lane))?;
-            Ok(lane)
-        })
+        self.with_session(session, |loom| apply_lanes_update(loom, workspace, input))
     }
 
     pub fn lanes_ticket_add(
@@ -2051,17 +2874,14 @@ impl LocalLoomClient {
         expected_entity_tag: Option<&str>,
     ) -> Result<Vec<u8>, LoomError> {
         self.with_session(session, |loom| {
-            let ns = loom.registry_mut().ensure_for_write(
-                &ns_selector(workspace, FacetKind::Document),
-                mint_workspace_id()?,
-            )?;
-            enforce_document_entity_tag(loom, ns, collection, id, expected_entity_tag)?;
-            let bytes = text.as_bytes().to_vec();
-            let digest = Digest::hash(loom.store().digest_algo(), &bytes);
-            loom_reference::put_document_indexed(loom, ns, collection, id, bytes)?;
-            loom_wire::document::put_result_to_cbor(
-                &digest.to_string(),
-                &loom_core::document_entity_tag_string_from_digest(digest),
+            publish_document_put_text(
+                loom,
+                workspace,
+                collection,
+                id,
+                text,
+                expected_entity_tag,
+                |_| exec_apply_candidate_save_hook(&self.path),
             )
         })
     }
@@ -2115,17 +2935,14 @@ impl LocalLoomClient {
         expected_entity_tag: Option<&str>,
     ) -> Result<Vec<u8>, LoomError> {
         self.with_session(session, |loom| {
-            let ns = loom.registry_mut().ensure_for_write(
-                &ns_selector(workspace, FacetKind::Document),
-                mint_workspace_id()?,
-            )?;
-            enforce_document_entity_tag(loom, ns, collection, id, expected_entity_tag)?;
-            let bytes = bytes.to_vec();
-            let digest = Digest::hash(loom.store().digest_algo(), &bytes);
-            loom_reference::put_document_indexed(loom, ns, collection, id, bytes)?;
-            loom_wire::document::put_result_to_cbor(
-                &digest.to_string(),
-                &loom_core::document_entity_tag_string_from_digest(digest),
+            publish_document_put_binary(
+                loom,
+                workspace,
+                collection,
+                id,
+                bytes.to_vec(),
+                expected_entity_tag,
+                |_| exec_apply_candidate_save_hook(&self.path),
             )
         })
     }
@@ -2519,6 +3336,8 @@ impl LocalLoomClient {
         session: &LoomSession,
         workspace: &str,
         src_path: &str,
+        author: Option<&str>,
+        message: Option<&str>,
         commit: bool,
         dry_run: bool,
     ) -> Result<Vec<u8>, LoomError> {
@@ -2527,12 +3346,311 @@ impl LocalLoomClient {
                 &ns_selector(workspace, FacetKind::Files),
                 mint_workspace_id()?,
             )?;
-            let mut options = loom_interchange_io::FsImportOptions::new(workspace);
+            let mut options = loom_interchange_io::FsImportOptions::new(src_path);
+            if let Some(author) = author {
+                options.author = author.to_string();
+            }
+            if let Some(message) = message {
+                options.message = message.to_string();
+            }
             options.commit = commit;
             options.dry_run = dry_run;
             let report =
                 loom_interchange_io::import_fs(loom, ns, std::path::Path::new(src_path), &options)?;
             if !dry_run {
+                save_loom(loom)?;
+            }
+            Ok(import_report_to_cbor(&report))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_table_csv(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        source_scope: &str,
+        csv_payload: &[u8],
+        database: &str,
+        table: &str,
+        schema: &str,
+        primary_key: &str,
+        mode: &str,
+        commit: bool,
+        author: Option<&str>,
+        message: Option<&str>,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        let columns = parse_table_csv_schema(schema)?;
+        let primary_key = parse_table_csv_primary_key(primary_key)?;
+        let mode = parse_table_csv_import_mode(mode)?;
+        self.with_session(session, |loom| {
+            let ns = if dry_run {
+                resolve_ns_read(loom, workspace)?
+            } else {
+                loom.registry_mut().ensure_for_write(
+                    &ns_selector(workspace, FacetKind::Sql),
+                    mint_workspace_id()?,
+                )?
+            };
+            let mut options = loom_interchange_io::TableCsvImportOptions::new(
+                source_scope,
+                database,
+                table,
+                columns,
+                primary_key,
+            );
+            options.mode = mode;
+            options.commit = commit;
+            if let Some(author) = author {
+                options.author = author.to_string();
+            }
+            if let Some(message) = message {
+                options.message = message.to_string();
+            }
+            options.dry_run = dry_run;
+            let report =
+                loom_interchange_io::import_table_csv_bytes(loom, ns, csv_payload, &options)?;
+            if !dry_run {
+                save_loom(loom)?;
+            }
+            Ok(import_report_to_cbor(&report))
+        })
+    }
+
+    pub fn import_redmine(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        profile: &str,
+        source_scope: &str,
+        snapshot_payload: &[u8],
+        field_policy: &str,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        let field_policy = parse_ticket_import_field_policy(field_policy)?;
+        self.with_session(session, |loom| {
+            let ns = resolve_ns_read(loom, workspace)?;
+            let input = retained_import_input_from_bytes(loom, source_scope, snapshot_payload);
+            let report = loom_interchange_io::import_redmine_bytes_with_field_policy(
+                loom,
+                ns,
+                profile,
+                source_scope,
+                snapshot_payload,
+                dry_run,
+                field_policy,
+            )?;
+            let persisted = persist_profile_import_artifacts(loom, ns, profile, &input, &report)?;
+            if !dry_run && (report.operations_applied > 0 || persisted) {
+                save_loom(loom)?;
+            }
+            Ok(import_report_to_cbor(&report))
+        })
+    }
+
+    pub fn import_asana(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        profile: &str,
+        source_scope: &str,
+        snapshot_payload: &[u8],
+        field_policy: &str,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        let field_policy = parse_ticket_import_field_policy(field_policy)?;
+        self.with_session(session, |loom| {
+            let ns = resolve_ns_read(loom, workspace)?;
+            let input = retained_import_input_from_bytes(loom, source_scope, snapshot_payload);
+            let report = loom_interchange_io::import_asana_bytes_with_field_policy(
+                loom,
+                ns,
+                profile,
+                source_scope,
+                snapshot_payload,
+                dry_run,
+                field_policy,
+            )?;
+            let persisted = persist_profile_import_artifacts(loom, ns, profile, &input, &report)?;
+            if !dry_run && (report.operations_applied > 0 || persisted) {
+                save_loom(loom)?;
+            }
+            Ok(import_report_to_cbor(&report))
+        })
+    }
+
+    pub fn import_jira(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        profile: &str,
+        source_scope: &str,
+        snapshot_payload: &[u8],
+        field_policy: &str,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        let field_policy = parse_ticket_import_field_policy(field_policy)?;
+        self.with_session(session, |loom| {
+            let ns = resolve_ns_read(loom, workspace)?;
+            let input = retained_import_input_from_bytes(loom, source_scope, snapshot_payload);
+            let report = loom_interchange_io::import_jira_bytes_with_field_policy(
+                loom,
+                ns,
+                profile,
+                source_scope,
+                snapshot_payload,
+                dry_run,
+                field_policy,
+            )?;
+            let persisted = persist_profile_import_artifacts(loom, ns, profile, &input, &report)?;
+            if !dry_run && (report.operations_applied > 0 || persisted) {
+                save_loom(loom)?;
+            }
+            Ok(import_report_to_cbor(&report))
+        })
+    }
+
+    pub fn import_confluence(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        profile: &str,
+        source_scope: &str,
+        snapshot_payload: &[u8],
+        default_space: &str,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            let ns = resolve_ns_read(loom, workspace)?;
+            let input = retained_import_input_from_bytes(loom, source_scope, snapshot_payload);
+            let report = loom_interchange_io::import_confluence_bytes(
+                loom,
+                ns,
+                profile,
+                source_scope,
+                default_space,
+                snapshot_payload,
+                dry_run,
+            )?;
+            let persisted = persist_profile_import_artifacts(loom, ns, profile, &input, &report)?;
+            if !dry_run && (report.operations_applied > 0 || persisted) {
+                save_loom(loom)?;
+            }
+            Ok(import_report_to_cbor(&report))
+        })
+    }
+
+    pub fn import_slack(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        profile: &str,
+        source_scope: &str,
+        snapshot_payload: &[u8],
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            let ns = resolve_ns_read(loom, workspace)?;
+            let input = retained_import_input_from_bytes(loom, source_scope, snapshot_payload);
+            let report = loom_interchange_io::import_slack_bytes(
+                loom,
+                ns,
+                profile,
+                source_scope,
+                snapshot_payload,
+                dry_run,
+            )?;
+            let persisted = persist_profile_import_artifacts(loom, ns, profile, &input, &report)?;
+            if !dry_run && (report.operations_applied > 0 || persisted) {
+                save_loom(loom)?;
+            }
+            Ok(import_report_to_cbor(&report))
+        })
+    }
+
+    pub fn import_drive(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        profile: &str,
+        source_scope: &str,
+        archive_payload: &[u8],
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            let ns = resolve_ns_read(loom, workspace)?;
+            let input = retained_import_input_from_bytes(loom, source_scope, archive_payload);
+            let report = loom_interchange_io::import_drive_archive_bytes(
+                loom,
+                ns,
+                profile,
+                source_scope,
+                archive_payload,
+                dry_run,
+            )?;
+            let persisted = persist_profile_import_artifacts(loom, ns, profile, &input, &report)?;
+            if !dry_run && (report.operations_applied > 0 || persisted) {
+                save_loom(loom)?;
+            }
+            Ok(import_report_to_cbor(&report))
+        })
+    }
+
+    pub fn import_markdown(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        profile: &str,
+        source_scope: &str,
+        archive_payload: &[u8],
+        space: &str,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            let ns = resolve_ns_read(loom, workspace)?;
+            let input = retained_import_input_from_bytes(loom, source_scope, archive_payload);
+            let report = loom_interchange_io::import_markdown_archive_bytes(
+                loom,
+                ns,
+                profile,
+                source_scope,
+                archive_payload,
+                space,
+                dry_run,
+            )?;
+            let persisted = persist_profile_import_artifacts(loom, ns, profile, &input, &report)?;
+            if !dry_run && (report.operations_applied > 0 || persisted) {
+                save_loom(loom)?;
+            }
+            Ok(import_report_to_cbor(&report))
+        })
+    }
+
+    pub fn import_notion(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        profile: &str,
+        source_scope: &str,
+        snapshot_payload: &[u8],
+        default_space: &str,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            let ns = resolve_ns_read(loom, workspace)?;
+            let input = retained_import_input_from_bytes(loom, source_scope, snapshot_payload);
+            let report = loom_interchange_io::import_notion_bytes(
+                loom,
+                ns,
+                profile,
+                source_scope,
+                default_space,
+                snapshot_payload,
+                dry_run,
+            )?;
+            let persisted = persist_profile_import_artifacts(loom, ns, profile, &input, &report)?;
+            if !dry_run && (report.operations_applied > 0 || persisted) {
                 save_loom(loom)?;
             }
             Ok(import_report_to_cbor(&report))
@@ -2743,6 +3861,8 @@ impl LocalLoomClient {
         session: &LoomSession,
         workspace: &str,
         src_path: &str,
+        author: Option<&str>,
+        message: Option<&str>,
         commit: bool,
         dry_run: bool,
     ) -> Task {
@@ -2750,6 +3870,8 @@ impl LocalLoomClient {
             session: session.clone(),
             workspace: workspace.to_string(),
             src_path: src_path.to_string(),
+            author: author.map(str::to_string),
+            message: message.map(str::to_string),
             commit,
             dry_run,
         })
@@ -2780,12 +3902,20 @@ impl LocalLoomClient {
     ///
     /// # Errors
     /// Returns [`LoomError`] for an unknown session, an unknown archive kind, or an import failure.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the generated Archive IDL signature"
+    )]
     pub fn archive_import(
         &self,
         session: &LoomSession,
         workspace: &str,
         src_path: &str,
         kind: &str,
+        gzip_output_path: Option<&str>,
+        commit: bool,
+        author: Option<&str>,
+        message: Option<&str>,
         dry_run: bool,
     ) -> Result<Vec<u8>, LoomError> {
         let kind = archive_kind_from_str(kind)?;
@@ -2794,7 +3924,15 @@ impl LocalLoomClient {
                 &ns_selector(workspace, FacetKind::Files),
                 mint_workspace_id()?,
             )?;
-            let mut options = loom_interchange_io::ArchiveImportOptions::new(workspace);
+            let mut options = loom_interchange_io::ArchiveImportOptions::new(src_path);
+            options.gzip_output_path = gzip_output_path.map(str::to_string);
+            options.commit = commit;
+            if let Some(author) = author {
+                options.author = author.to_string();
+            }
+            if let Some(message) = message {
+                options.message = message.to_string();
+            }
             options.dry_run = dry_run;
             let result = loom_interchange_io::import_archive(
                 loom,
@@ -2806,7 +3944,7 @@ impl LocalLoomClient {
             if !dry_run {
                 save_loom(loom)?;
             }
-            Ok(archive_import_result_to_cbor(&result))
+            result.encode()
         })
     }
 
@@ -2842,12 +3980,20 @@ impl LocalLoomClient {
     }
 
     /// Immediate-complete [`Task`] form of [`LocalLoomClient::archive_import`] (runs on first `task_poll`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the generated Archive IDL signature"
+    )]
     pub fn archive_import_async(
         &self,
         session: &LoomSession,
         workspace: &str,
         src_path: &str,
         kind: &str,
+        gzip_output_path: Option<&str>,
+        commit: bool,
+        author: Option<&str>,
+        message: Option<&str>,
         dry_run: bool,
     ) -> Task {
         self.spawn_task(TaskWork::ArchiveImportAsync {
@@ -2855,6 +4001,10 @@ impl LocalLoomClient {
             workspace: workspace.to_string(),
             src_path: src_path.to_string(),
             kind: kind.to_string(),
+            gzip_output_path: gzip_output_path.map(str::to_string),
+            commit,
+            author: author.map(str::to_string),
+            message: message.map(str::to_string),
             dry_run,
         })
     }
@@ -4268,6 +5418,117 @@ impl LocalLoomClient {
         })
     }
 
+    pub fn columnar_import_arrow(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        name: &str,
+        payload: &[u8],
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        let target_segment_rows = usize::try_from(target_segment_rows).map_err(|_| {
+            LoomError::new(
+                Code::InvalidArgument,
+                "target_segment_rows does not fit in usize",
+            )
+        })?;
+        let dataset = columnar_from_arrow_ipc(payload, target_segment_rows)?;
+        self.columnar_import_dataset(
+            session,
+            workspace,
+            name,
+            "arrow-ipc",
+            payload.len(),
+            dataset,
+            replace,
+            dry_run,
+        )
+    }
+
+    pub fn columnar_import_parquet(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        name: &str,
+        payload: &[u8],
+        target_segment_rows: u64,
+        replace: bool,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        let target_segment_rows = usize::try_from(target_segment_rows).map_err(|_| {
+            LoomError::new(
+                Code::InvalidArgument,
+                "target_segment_rows does not fit in usize",
+            )
+        })?;
+        let dataset = columnar_from_parquet(payload, target_segment_rows)?;
+        self.columnar_import_dataset(
+            session,
+            workspace,
+            name,
+            "parquet",
+            payload.len(),
+            dataset,
+            replace,
+            dry_run,
+        )
+    }
+
+    fn columnar_import_dataset(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        name: &str,
+        format: &str,
+        bytes_in: usize,
+        dataset: loom_core::ColumnarSet,
+        replace: bool,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            let existing_ns = read_ns(loom, workspace, FacetKind::Columnar)?;
+            let replaced = match existing_ns {
+                Some(ns) => match get_columnar(loom, ns, name) {
+                    Ok(_) => {
+                        if !replace {
+                            return Err(LoomError::new(
+                                Code::Conflict,
+                                format!(
+                                    "columnar dataset {name:?} already exists; replace is required"
+                                ),
+                            ));
+                        }
+                        true
+                    }
+                    Err(error) if error.code == Code::NotFound => false,
+                    Err(error) => return Err(error),
+                },
+                None => false,
+            };
+            let report = loom_wire::columnar::ColumnarImportReport {
+                format: format.to_string(),
+                columns: dataset.columns().to_vec(),
+                rows: dataset.rows(),
+                segment_count: dataset.segment_count(),
+                target_segment_rows: dataset.target_segment_rows(),
+                bytes_in,
+                replaced,
+                dry_run,
+            };
+            if !dry_run {
+                let ns = loom.registry_mut().ensure_for_write(
+                    &ns_selector(workspace, FacetKind::Columnar),
+                    mint_workspace_id()?,
+                )?;
+                put_columnar(loom, ns, name, &dataset)?;
+                save_loom(loom)?;
+            }
+            Ok(loom_wire::columnar::import_report_to_cbor(report))
+        })
+    }
+
     /// Create a vector set `name` of dimension `dim` under `metric`, ensuring the workspace, and
     /// persist.
     ///
@@ -4422,6 +5683,288 @@ impl LocalLoomClient {
                 .open(&ns_selector(workspace, FacetKind::Vector))?;
             vector_upsert_with_source(loom, ns, name, id, vector, metadata, source_text, model)?;
             save_loom(loom)
+        })
+    }
+
+    pub fn vector_text_upsert_generated(
+        &self,
+        session: &LoomSession,
+        request: VectorTextUpsertRequest,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            let bytes = apply_vector_text_upsert_generated(loom, request)?;
+            save_loom(loom)?;
+            Ok(bytes)
+        })
+    }
+
+    pub fn vector_workspace_configure_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        request_json: &str,
+    ) -> Result<String, LoomError> {
+        let request = parse_vector_workspace_configure_request(request_json)?;
+        self.with_session(session, |loom| {
+            let json = apply_vector_workspace_configure_json(loom, workspace, request)?;
+            save_loom(loom)?;
+            Ok(json)
+        })
+    }
+
+    pub fn inference_instance_create_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        name: String,
+        model: String,
+        kind: String,
+        runtime: String,
+        preset: Option<String>,
+        settings_json: &str,
+    ) -> Result<String, LoomError> {
+        self.inference_instance_mutate_audited(
+            session,
+            workspace,
+            name.clone(),
+            "inference.instance.create",
+            |state| {
+                let kind = InferenceModelKind::parse(&kind)?;
+                let runtime = loom_types::RuntimeKind::parse(&runtime)?;
+                let settings = inference_instance_settings_from_json(settings_json)?;
+                if state.find_instance(&name).is_some() {
+                    return Err(LoomError::new(
+                        Code::AlreadyExists,
+                        format!("inference instance {name:?} already exists"),
+                    ));
+                }
+                let model = loom_types::ModelRef::new(kind, model);
+                let instance = loom_inference::build_instance_descriptor(
+                    name, model.kind, model, runtime, preset, settings,
+                )?;
+                state.upsert_instance(instance.clone());
+                inference_instance_view_json(state, &instance)
+            },
+        )
+        .map(|receipt| receipt.result_json)
+    }
+
+    pub fn inference_instance_list_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        kind: Option<String>,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let workspace_id = loom.registry().open(&ns_selector_by_name(workspace))?;
+            loom.authorize(workspace_id, FacetKind::Inference, AclRight::Read)?;
+            let state = inference_instance_state(loom, workspace_id)?;
+            let kind = kind.as_deref().map(InferenceModelKind::parse).transpose()?;
+            let instances = state
+                .instances
+                .iter()
+                .filter(|instance| kind.is_none_or(|kind| instance.kind == kind))
+                .map(|instance| InferenceInstanceJsonView {
+                    instance,
+                    refs: state.instance_ref_count(&instance.name),
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&instances)
+                .map_err(|error| LoomError::new(Code::CorruptObject, format!("json: {error}")))
+        })
+    }
+
+    pub fn inference_instance_get_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        name: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let workspace_id = loom.registry().open(&ns_selector_by_name(workspace))?;
+            loom.authorize(workspace_id, FacetKind::Inference, AclRight::Read)?;
+            let state = inference_instance_state(loom, workspace_id)?;
+            let instance = state.find_instance(name).ok_or_else(|| {
+                LoomError::new(
+                    Code::NotFound,
+                    format!("inference instance {name:?} not found"),
+                )
+            })?;
+            inference_instance_view_json(&state, instance)
+        })
+    }
+
+    pub fn inference_instance_update_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        name: String,
+        preset: Option<String>,
+        settings_json: &str,
+    ) -> Result<String, LoomError> {
+        self.inference_instance_mutate_audited(
+            session,
+            workspace,
+            name.clone(),
+            "inference.instance.update",
+            |state| {
+                let settings = inference_instance_settings_from_json(settings_json)?;
+                let instance = state.find_instance(&name).cloned().ok_or_else(|| {
+                    LoomError::new(
+                        Code::NotFound,
+                        format!("inference instance {name:?} not found"),
+                    )
+                })?;
+                let instance =
+                    loom_inference::update_instance_descriptor(instance, preset, settings)?;
+                state.upsert_instance(instance.clone());
+                inference_instance_view_json(state, &instance)
+            },
+        )
+        .map(|receipt| receipt.result_json)
+    }
+
+    pub fn inference_instance_delete_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        name: String,
+    ) -> Result<String, LoomError> {
+        self.inference_instance_mutate_audited(
+            session,
+            workspace,
+            name.clone(),
+            "inference.instance.delete",
+            |state| {
+                let refs = state.instance_ref_count(&name);
+                if refs != 0 {
+                    return Err(LoomError::new(
+                        Code::Conflict,
+                        format!(
+                            "inference instance {name:?} is still referenced by {refs} binding(s)"
+                        ),
+                    ));
+                }
+                state.remove_instance(&name).ok_or_else(|| {
+                    LoomError::new(
+                        Code::NotFound,
+                        format!("inference instance {name:?} not found"),
+                    )
+                })?;
+                inference_instance_delete_result_json(&name)
+            },
+        )
+        .map(|receipt| receipt.result_json)
+    }
+
+    fn inference_instance_mutate_audited(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        instance_name: String,
+        action: &'static str,
+        mutate: impl FnOnce(&mut loom_inference::InferenceInstanceState) -> Result<String, LoomError>,
+    ) -> Result<InferenceInstanceMutationReceipt, LoomError> {
+        self.inference_instance_mutate_audited_with_commit(
+            session,
+            workspace,
+            &instance_name,
+            action,
+            mutate,
+            loom_store::put_saved_state_and_audit,
+        )
+    }
+
+    fn inference_instance_mutate_audited_with_commit(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        instance_name: &str,
+        action: &'static str,
+        mutate: impl FnOnce(&mut loom_inference::InferenceInstanceState) -> Result<String, LoomError>,
+        commit: impl FnOnce(
+            &FileStore,
+            loom_core::vcs::SavedStateObjects,
+            Vec<WorkflowAuditWrite>,
+        ) -> Result<loom_store::SavedStateAndAuditReceipt, LoomError>,
+    ) -> Result<InferenceInstanceMutationReceipt, LoomError> {
+        self.with_session(session, |loom| {
+            let state_before = loom.export_state();
+            let result = (|| {
+                let workspace_id = loom
+                    .registry()
+                    .open(&ns_selector(workspace, FacetKind::Inference))?;
+                loom.authorize(workspace_id, FacetKind::Inference, AclRight::Write)?;
+                let principal = loom.effective_principal()?;
+                let mut state = inference_instance_state(loom, workspace_id)?;
+                let result_json = mutate(&mut state)?;
+                put_inference_instance_state(loom, workspace_id, &state)?;
+                let saved = loom.save_state_objects()?;
+                let receipt = commit(
+                    loom.store(),
+                    saved,
+                    vec![WorkflowAuditWrite {
+                        principal,
+                        action: action.to_string(),
+                        target: Some(inference_instance_audit_target(workspace_id, instance_name)),
+                    }],
+                )?;
+                let audit_sequence = receipt
+                    .audit_sequences
+                    .first()
+                    .copied()
+                    .ok_or_else(|| LoomError::corrupt("inference audit sequence missing"))?;
+                if receipt.audit_sequences.len() != 1 {
+                    return Err(LoomError::corrupt("inference audit sequence count"));
+                }
+                Ok(InferenceInstanceMutationReceipt {
+                    result_json: inference_instance_result_with_audit_sequence(
+                        &result_json,
+                        audit_sequence,
+                    )?,
+                    audit_sequence,
+                })
+            })();
+            match result {
+                Ok(receipt) => Ok(receipt),
+                Err(error) => {
+                    loom.import_state(&state_before)?;
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    pub fn studio_reindex_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        profile: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let ns = resolve_ns_read(loom, workspace)?;
+            let report = studio_reindex(loom, ns, profile)?;
+            save_loom(loom)?;
+            serde_json::to_string(&report)
+                .map_err(|error| LoomError::new(Code::CorruptObject, format!("json: {error}")))
+        })
+    }
+
+    pub fn studio_revisions_rebuild_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        profile: &str,
+        dry_run: bool,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let ns = resolve_ns_read(loom, workspace)?;
+            let report = rebuild_studio_revision_index(loom, ns, profile, dry_run)?;
+            if !dry_run && report.inserted > 0 {
+                save_loom(loom)?;
+            }
+            serde_json::to_string(&report)
+                .map_err(|error| LoomError::new(Code::CorruptObject, format!("json: {error}")))
         })
     }
 
@@ -6111,6 +7654,454 @@ impl LocalLoomClient {
         })
     }
 
+    /// Apply a gated proposal fork described by canonical `loom.exec.apply.request.v1` CBOR, persist
+    /// successful outcomes, and return canonical `loom.exec.apply.result.v1` CBOR.
+    ///
+    /// # Errors
+    /// Returns [`LoomError`] for an unknown session, malformed request, absent workspace or branch,
+    /// merge failure, or save failure.
+    pub fn apply_cbor(&self, session: &LoomSession, request: &[u8]) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            let request = decode_exec_apply_request(request)?;
+            let mut candidate =
+                loom.fork_state_into(loom_core::provider::PlanningObjectStore::new(loom.store()))?;
+            let ns = candidate
+                .registry()
+                .open(&ns_selector_by_name(&request.workspace))?;
+            let outcome = apply(
+                &mut candidate,
+                ns,
+                &request.base,
+                &request.fork,
+                &request.author,
+                request.timestamp_ms,
+            )
+            .map_err(exec_error_to_loom)?;
+            let result = encode_exec_apply_result(&outcome)?;
+            let candidate_state =
+                save_exec_apply_candidate(&self.path, loom.store(), &mut candidate)?;
+            drop(candidate);
+            loom.import_engine_state_preserving_mutable_overlay(&candidate_state)?;
+            Ok(result)
+        })
+    }
+
+    /// Import a normalized Meetings snapshot and return canonical import-report JSON.
+    ///
+    /// # Errors
+    /// Returns [`LoomError`] for an unknown session, missing write authorization, malformed profile
+    /// or snapshot input, import failure, or save failure.
+    pub fn meetings_import_snapshot(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        input_profile: &str,
+        snapshot: &[u8],
+        dry_run: bool,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let mut candidate =
+                loom.fork_state_into(loom_core::provider::PlanningObjectStore::new(loom.store()))?;
+            let workspace_id =
+                ensure_generated_facet_workspace(&mut candidate, workspace, FacetKind::Vcs)?;
+            meetings_import_test_hook(
+                &self.path,
+                MeetingsImportTestHookPoint::AfterWorkspaceCreation,
+            )?;
+            candidate.authorize(workspace_id, FacetKind::Vcs, AclRight::Write)?;
+            let input_profile = loom_interchange_io::parse_meetings_input_profile(input_profile)?;
+            let previous = load_meetings_snapshot(loom, &workspace_id.to_string())?;
+            let mut plan = loom_interchange_io::plan_meetings_import(
+                &mut candidate,
+                workspace_id,
+                input_profile,
+                snapshot,
+                previous,
+                dry_run,
+            )?;
+            meetings_import_test_hook(
+                &self.path,
+                MeetingsImportTestHookPoint::AfterPayloadRevisionPlanning,
+            )?;
+            let report = plan.report_json.clone();
+            if !dry_run && (!plan.writes.is_empty() || !plan.owner_state.is_empty()) {
+                for (digest, canonical) in candidate.store().objects()? {
+                    if !plan
+                        .owner_state
+                        .objects
+                        .iter()
+                        .any(|(existing, _)| existing == &digest)
+                    {
+                        plan.owner_state.objects.push((digest, canonical));
+                    }
+                }
+                let expected_generation = if loom.store().uses_mutable_overlay_current_records() {
+                    loom.store().mutable_overlay_generation()?
+                } else {
+                    loom.mutable_overlay_snapshot().generation()
+                };
+                meetings_import_test_hook(
+                    &self.path,
+                    MeetingsImportTestHookPoint::BeforePublication,
+                )?;
+                let receipt = loom
+                    .store()
+                    .commit_workflow_transaction(WorkflowTransaction {
+                        workspace: plan.workspace_id,
+                        actor: loom.effective_principal()?.unwrap_or(plan.workspace_id),
+                        expected_generation: Some(expected_generation),
+                        writes: plan.writes,
+                        prepared_operations: Vec::new(),
+                        revision_metadata: Vec::new(),
+                        delivery_intents: Vec::new(),
+                        durability: OverlayDurabilityPolicy::Normal,
+                        boundary: AtomicityBoundary::Single,
+                        idempotency: None,
+                        owner_state: plan.owner_state,
+                        post_commit_delta: None,
+                    })?;
+                for outcome in receipt.writes {
+                    let current = loom
+                        .store()
+                        .mutable_overlay_current_entry(&outcome.target)?
+                        .ok_or_else(|| {
+                            LoomError::corrupt(
+                                "workflow transaction omitted committed current record",
+                            )
+                        })?;
+                    loom.mutable_overlay_mut()
+                        .synchronize_current_entry(current)?;
+                }
+                loom.import_engine_state_preserving_mutable_overlay(&plan.engine_state)?;
+            }
+            Ok(report)
+        })
+    }
+
+    pub fn drive_create_folder_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        parent_folder_id: &str,
+        folder_id: &str,
+        name: &str,
+        expected_root: &str,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::create_folder(
+                loom,
+                workspace,
+                drive_workspace_id,
+                parent_folder_id,
+                folder_id,
+                name,
+                expected_root,
+            )
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the generated Drive IDL signature"
+    )]
+    pub fn drive_create_upload_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        upload_id: &str,
+        parent_folder_id: &str,
+        name: &str,
+        file_id: &str,
+        expected_root: &str,
+        created_at_ms: u64,
+        replace_file: bool,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::create_upload(
+                loom,
+                workspace,
+                loom_drive::HostedDriveCreateUpload {
+                    workspace_id: drive_workspace_id,
+                    upload_id,
+                    parent_folder_id,
+                    name,
+                    file_id,
+                    expected_root,
+                    created_at_ms,
+                    replace_file,
+                },
+            )
+        })
+    }
+
+    pub fn drive_upload_chunk_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        upload_id: &str,
+        chunk: &[u8],
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::upload_chunk(loom, workspace, drive_workspace_id, upload_id, chunk)
+        })
+    }
+
+    pub fn drive_commit_upload_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        upload_id: &str,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::commit_upload(loom, workspace, drive_workspace_id, upload_id)
+        })
+    }
+
+    pub fn drive_rename_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        folder_id: &str,
+        node_id: &str,
+        new_name: &str,
+        expected_root: &str,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::rename_node(
+                loom,
+                workspace,
+                drive_workspace_id,
+                folder_id,
+                node_id,
+                new_name,
+                expected_root,
+            )
+        })
+    }
+
+    pub fn drive_move_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        source_folder_id: &str,
+        target_folder_id: &str,
+        node_id: &str,
+        expected_root: &str,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::move_node(
+                loom,
+                workspace,
+                drive_workspace_id,
+                source_folder_id,
+                target_folder_id,
+                node_id,
+                expected_root,
+            )
+        })
+    }
+
+    pub fn drive_delete_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        folder_id: &str,
+        node_id: &str,
+        expected_root: &str,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::delete_node(
+                loom,
+                workspace,
+                drive_workspace_id,
+                folder_id,
+                node_id,
+                expected_root,
+            )
+        })
+    }
+
+    pub fn drive_resolve_conflict_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        conflict_id: &str,
+        resolution: &str,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            let resolution = parse_drive_conflict_resolution(resolution)?;
+            loom_drive::resolve_conflict(
+                loom,
+                workspace,
+                drive_workspace_id,
+                conflict_id,
+                resolution,
+            )
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the generated Drive IDL signature"
+    )]
+    pub fn drive_pin_retention_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        pin_id: &str,
+        kind: &str,
+        root: &str,
+        target_entity_id: Option<&str>,
+        added_at_ms: u64,
+        expires_at_ms: Option<u64>,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::pin_retention(
+                loom,
+                workspace,
+                loom_drive::HostedDrivePinRetention {
+                    workspace_id: drive_workspace_id,
+                    pin_id,
+                    kind,
+                    root,
+                    target_entity_id,
+                    added_at_ms,
+                    expires_at_ms,
+                },
+            )
+        })
+    }
+
+    pub fn drive_unpin_retention_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        pin_id: &str,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::unpin_retention(loom, workspace, drive_workspace_id, pin_id)
+        })
+    }
+
+    pub fn drive_apply_retention_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        now_ms: u64,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::apply_retention(loom, workspace, drive_workspace_id, now_ms)
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the generated Drive IDL signature"
+    )]
+    pub fn drive_grant_share_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        grant_id: &str,
+        target_kind: &str,
+        target_id: &str,
+        principal: &str,
+        role: &str,
+        granted_at_ms: u64,
+        expires_at_ms: Option<u64>,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::grant_share(
+                loom,
+                workspace,
+                loom_drive::HostedDriveGrantShare {
+                    workspace_id: drive_workspace_id,
+                    grant_id,
+                    target_kind,
+                    target_id,
+                    principal,
+                    role,
+                    granted_at_ms,
+                    expires_at_ms,
+                },
+            )
+        })
+    }
+
+    pub fn drive_revoke_share_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::revoke_share(loom, workspace, drive_workspace_id, grant_id)
+        })
+    }
+
+    pub fn drive_apply_share_expiry_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        now_ms: u64,
+    ) -> Result<String, LoomError> {
+        self.drive_write_json(session, workspace, drive_workspace_id, |loom, workspace| {
+            loom_drive::apply_share_expiry(loom, workspace, drive_workspace_id, now_ms)
+        })
+    }
+
+    fn drive_write_json<T: serde::Serialize>(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        operation: impl FnOnce(
+            &mut Loom<loom_core::provider::PlanningObjectStore<'_, FileStore>>,
+            WorkspaceId,
+        ) -> Result<T, LoomError>,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let mut candidate =
+                loom.fork_state_into(loom_core::provider::PlanningObjectStore::new(loom.store()))?;
+            let workspace = candidate.registry().open(&ns_selector_by_name(workspace))?;
+            authorize_generated_drive_collection(&candidate, workspace, drive_workspace_id)?;
+            let write = operation(&mut candidate, workspace)?;
+            let published =
+                save_generated_planning_candidate(&self.path, loom.store(), &mut candidate)?;
+            drop(candidate);
+            for receipt in &published.workflow_receipts {
+                for outcome in &receipt.writes {
+                    let current = loom
+                        .store()
+                        .mutable_overlay_current_entry(&outcome.target)?
+                        .ok_or_else(|| {
+                            LoomError::corrupt(
+                                "workflow transaction omitted committed current record",
+                            )
+                        })?;
+                    loom.mutable_overlay_mut()
+                        .synchronize_current_entry(current)?;
+                }
+            }
+            loom.import_engine_state_preserving_mutable_overlay(&published.engine_state)?;
+            json_string(&write)
+        })
+    }
+
     /// Subscribe to `branch` in `workspace` from `from` (or the current head), returning an opaque
     /// resume cursor string.
     ///
@@ -6306,6 +8297,183 @@ impl LocalLoomClient {
         loom_core::VERSION.to_string()
     }
 
+    pub fn lifecycle_define_standard_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        kind: &str,
+        version: &str,
+        completion_predicate_digest: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let workspace_id = loom.registry_mut().ensure_for_write(
+                &ns_selector(workspace, FacetKind::Vcs),
+                mint_workspace_id()?,
+            )?;
+            let profile_id = workspace_id.to_string();
+            let definition = loom_lifecycle::define_standard_lifecycle(
+                loom,
+                workspace_id,
+                loom_lifecycle::StandardLifecycleRequest {
+                    workspace_id: &profile_id,
+                    kind,
+                    version,
+                    completion_predicate_digest,
+                },
+            )?;
+            save_loom(loom)?;
+            json_string(&definition)
+        })
+    }
+
+    pub fn lifecycle_define_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        definition: &[u8],
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let workspace_id = loom.registry_mut().ensure_for_write(
+                &ns_selector(workspace, FacetKind::Vcs),
+                mint_workspace_id()?,
+            )?;
+            let profile_id = workspace_id.to_string();
+            let definition =
+                loom_lifecycle::define_lifecycle(loom, workspace_id, &profile_id, definition)?;
+            save_loom(loom)?;
+            json_string(&definition)
+        })
+    }
+
+    pub fn lifecycle_instantiate_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        instance_id: &str,
+        definition_id: &str,
+        subject_refs: Vec<String>,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let workspace_id = loom
+                .registry()
+                .open(&ns_selector(workspace, FacetKind::Vcs))?;
+            let profile_id = workspace_id.to_string();
+            let instance = loom_lifecycle::instantiate(
+                loom,
+                workspace_id,
+                &profile_id,
+                instance_id,
+                definition_id,
+                subject_refs,
+            )?;
+            save_loom(loom)?;
+            json_string(&instance)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn lifecycle_transition_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        instance_id: &str,
+        transition_id: &str,
+        to_stage_id: &str,
+        actor_principal_id: Option<&str>,
+        gate_evaluations_json: &str,
+        snapshot_digest: Option<&str>,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let workspace_id = loom
+                .registry()
+                .open(&ns_selector(workspace, FacetKind::Vcs))?;
+            let profile_id = workspace_id.to_string();
+            let now = now_ms();
+            let gate_evaluations = parse_lifecycle_gate_evaluations(gate_evaluations_json, now)?;
+            let actor = actor_principal_id.unwrap_or(&profile_id);
+            let result = loom_lifecycle::transition(
+                loom,
+                workspace_id,
+                loom_lifecycle::LifecycleTransitionRequest {
+                    workspace_id: &profile_id,
+                    instance_id,
+                    transition_id,
+                    to_stage_id,
+                    actor_principal_id: actor,
+                    gate_evaluations,
+                    snapshot_digest,
+                    recorded_at_ms: now,
+                },
+            )?;
+            save_loom(loom)?;
+            json_string(&result)
+        })
+    }
+
+    pub fn refs_reconcile_json(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        max: usize,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            let workspace_id = loom.registry().open(&ns_selector_by_name(workspace))?;
+            let profile_id = workspace_id.to_string();
+            let principal = loom.effective_principal()?.unwrap_or(workspace_id);
+            let state_before = loom.export_state();
+            let result = (|| {
+                let ticket =
+                    reconcile_ticket_references(loom, workspace_id, &profile_id, now_ms(), max)?;
+                let chat = reconcile_chat_references(
+                    loom,
+                    workspace_id,
+                    &profile_id,
+                    now_ms(),
+                    max.saturating_sub(ticket.processed as usize),
+                )?;
+                Ok((ticket, chat))
+            })();
+            let (ticket, chat) = match result {
+                Ok(summary) => summary,
+                Err(error) => {
+                    loom.import_state(&state_before)?;
+                    return Err(error);
+                }
+            };
+            let summary = loom_reference::ReconciliationSummary {
+                pending: chat.pending,
+                resolved: chat.resolved,
+                failed: chat.failed,
+                processed: ticket.processed.saturating_add(chat.processed),
+            };
+            if summary.processed > 0 {
+                let target = format!(
+                    "workspace={profile_id};processed={};resolved={};failed={};pending={}",
+                    summary.processed, summary.resolved, summary.failed, summary.pending
+                );
+                let result = (|| {
+                    let saved = loom.save_state_objects()?;
+                    loom_store::put_saved_state_and_audit(
+                        loom.store(),
+                        saved,
+                        vec![WorkflowAuditWrite {
+                            principal: Some(principal),
+                            action: "refs.reconcile".to_string(),
+                            target: Some(target),
+                        }],
+                    )
+                })();
+                if let Err(error) = result {
+                    loom.import_state(&state_before)?;
+                    return Err(error);
+                }
+            } else {
+                save_loom(loom)?;
+            }
+            json_string(&summary)
+        })
+    }
+
     /// The protected-ref policies in `workspace`, as `(ref_name, policy)` pairs.
     ///
     /// # Errors
@@ -6350,6 +8518,7 @@ impl LocalLoomClient {
         policy: ProtectedRefPolicy,
     ) -> Result<(), LoomError> {
         self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
             let ns = loom.registry().open(&ns_selector_by_name(workspace))?;
             loom.set_protected_ref_policy(ns, ref_name, policy)?;
             save_loom(loom)
@@ -6368,6 +8537,7 @@ impl LocalLoomClient {
         ref_name: &str,
     ) -> Result<bool, LoomError> {
         self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
             let ns = loom.registry().open(&ns_selector_by_name(workspace))?;
             let removed = loom.remove_protected_ref_policy(ns, ref_name)?;
             if removed {
@@ -6397,6 +8567,7 @@ impl LocalLoomClient {
     /// Returns [`LoomError`] (`INVALID_ARGUMENT` for an empty rights set) or for an unknown session.
     pub fn acl_grant(&self, session: &LoomSession, grant: AclGrant) -> Result<(), LoomError> {
         self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
             let mut acl = loom.store().acl_store()?.unwrap_or_default();
             acl.grant(grant)?;
             loom.store().save_acl_store(&acl)?;
@@ -6411,6 +8582,7 @@ impl LocalLoomClient {
     /// Returns [`LoomError`] for an unknown session or a store failure.
     pub fn acl_revoke(&self, session: &LoomSession, grant: &AclGrant) -> Result<bool, LoomError> {
         self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
             let mut acl = loom.store().acl_store()?.unwrap_or_default();
             let removed = acl.revoke(grant);
             if removed {
@@ -6421,50 +8593,158 @@ impl LocalLoomClient {
         })
     }
 
-    /// Acquire a lock on `key` for `(principal, session)` under `mode` with a `lease_ms` lease, from the
-    /// store's in-process coordinator (per the coordination model: the store owner drives the
-    /// coordinator).
+    /// Acquire a lock for the authenticated store session.
     ///
     /// # Errors
     /// Returns [`LoomError`] (`LOCKED` on contention, `INVALID_ARGUMENT` for a zero lease).
     pub fn lock_acquire(
         &self,
+        session: &LoomSession,
         key: &[u8],
-        principal: &str,
-        session: &str,
         mode: LockMode,
         lease_ms: u64,
+        wait_ms: u64,
     ) -> Result<LockToken, LoomError> {
-        let owner = LockOwner {
-            principal: principal.to_string(),
-            session: session.to_string(),
-        };
-        self.coordinator
-            .lock()
-            .expect("lock coordinator")
-            .try_acquire(key.to_vec(), owner, mode, lease_ms, now_ms())
+        self.locks.acquire(
+            self.lock_owner_for_session(session)?,
+            key.to_vec(),
+            mode,
+            lease_ms,
+            wait_ms,
+        )
     }
 
     /// Refresh a held lock's lease, returning the updated token.
     ///
     /// # Errors
     /// Returns [`LoomError`] (`LOCK_LEASE_EXPIRED`, `LOCK_NOT_HELD`) or a zero lease.
-    pub fn lock_refresh(&self, token: &LockToken, lease_ms: u64) -> Result<LockToken, LoomError> {
-        self.coordinator
-            .lock()
-            .expect("lock coordinator")
-            .refresh(token, lease_ms, now_ms())
+    pub fn lock_refresh(
+        &self,
+        session: &LoomSession,
+        token: &LockToken,
+        lease_ms: u64,
+    ) -> Result<LockToken, LoomError> {
+        self.locks
+            .refresh(&self.lock_owner_for_session(session)?, token, lease_ms)
     }
 
     /// Release a held lock.
     ///
     /// # Errors
     /// Returns [`LoomError`] (`LOCK_LEASE_EXPIRED`, `LOCK_NOT_HELD`).
-    pub fn lock_release(&self, token: &LockToken) -> Result<(), LoomError> {
-        self.coordinator
+    pub fn lock_release(&self, session: &LoomSession, token: &LockToken) -> Result<(), LoomError> {
+        self.locks
+            .release(&self.lock_owner_for_session(session)?, token)
+    }
+
+    pub fn lock_owner_for_session(&self, session: &LoomSession) -> Result<LockOwner, LoomError> {
+        let key = handle_key(session)?;
+        let (auth_view, logical_session) = self
+            .sessions
             .lock()
-            .expect("lock coordinator")
-            .release(token, now_ms())
+            .expect("session lock")
+            .get(&key)
+            .map(|slot| (slot.auth_view.clone(), slot.lock_owner_session.clone()))
+            .ok_or_else(|| LoomError::new(Code::NotFound, "unknown session handle"))?;
+        match auth_view {
+            LocalSessionAuthView::Authenticated {
+                principal,
+                session_id,
+            } => Ok(LockOwner {
+                principal: principal.to_string(),
+                session: session_id,
+            }),
+            LocalSessionAuthView::Clear => Ok(LockOwner {
+                principal: "unauthenticated-root".to_string(),
+                session: logical_session
+                    .unwrap_or_else(|| format!("{}:{key}", self.lock_session_namespace)),
+            }),
+            LocalSessionAuthView::Preserve => {
+                let principal = self.with_session(session, |loom| {
+                    Ok(loom
+                        .effective_principal()?
+                        .map(|principal| principal.to_string())
+                        .unwrap_or_else(|| "unauthenticated-root".to_string()))
+                })?;
+                Ok(LockOwner {
+                    principal,
+                    session: format!("{}:{key}", self.lock_session_namespace),
+                })
+            }
+        }
+    }
+
+    /// Bind an unauthenticated engine handle to a stable runtime-owned logical lock session.
+    pub fn bind_clear_logical_lock_session(
+        &self,
+        session: &LoomSession,
+        logical_session: String,
+    ) -> Result<(), LoomError> {
+        let key = handle_key(session)?;
+        let auth_view = self
+            .sessions
+            .lock()
+            .expect("session lock")
+            .get(&key)
+            .ok_or_else(|| LoomError::new(Code::NotFound, "unknown session handle"))?
+            .auth_view
+            .clone();
+        if matches!(auth_view, LocalSessionAuthView::Preserve) {
+            let principal = self.with_session(session, |loom| loom.effective_principal())?;
+            if principal.is_some() {
+                return Err(LoomError::new(
+                    Code::PermissionDenied,
+                    "logical clear-session binding requires unauthenticated-root mode",
+                ));
+            }
+        } else if !matches!(auth_view, LocalSessionAuthView::Clear) {
+            return Err(LoomError::new(
+                Code::PermissionDenied,
+                "logical clear-session binding requires unauthenticated-root mode",
+            ));
+        }
+        let mut sessions = self.sessions.lock().expect("session lock");
+        let slot = sessions
+            .get_mut(&key)
+            .ok_or_else(|| LoomError::new(Code::NotFound, "unknown session handle"))?;
+        slot.auth_view = LocalSessionAuthView::Clear;
+        slot.lock_owner_session = Some(logical_session);
+        Ok(())
+    }
+
+    /// Authenticate and bind an engine handle to a runtime-owned logical session identity.
+    pub fn authenticate_passphrase_for_logical_session(
+        &self,
+        session: &LoomSession,
+        principal: PrincipalId,
+        passphrase: &[u8],
+        logical_session: String,
+    ) -> Result<(), LoomError> {
+        let key = handle_key(session)?;
+        let passphrase = std::str::from_utf8(passphrase)
+            .map_err(|_| LoomError::new(Code::InvalidArgument, "passphrase is not valid utf-8"))?;
+        self.with_session(session, |loom| {
+            let mut identity = loom.store().identity_store()?.ok_or_else(|| {
+                LoomError::new(
+                    Code::Unsupported,
+                    "store is in unauthenticated-root mode; no identity is configured",
+                )
+            })?;
+            let bound =
+                identity.authenticate_passphrase(principal, passphrase, logical_session.clone())?;
+            loom.set_session(bound.id);
+            loom.set_identity_store(identity);
+            Ok(())
+        })?;
+        let mut sessions = self.sessions.lock().expect("session lock");
+        let slot = sessions
+            .get_mut(&key)
+            .ok_or_else(|| LoomError::new(Code::NotFound, "unknown session handle"))?;
+        slot.auth_view = LocalSessionAuthView::Authenticated {
+            principal,
+            session_id: logical_session,
+        };
+        Ok(())
     }
 
     /// List the principals recorded in the store's identity control plane. An unauthenticated-root
@@ -6840,6 +9120,99 @@ impl LocalLoomClient {
         })
     }
 
+    pub fn identity_force_detach_authority_json(
+        &self,
+        session: &LoomSession,
+        principal: PrincipalId,
+        generation: u64,
+        reason: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            IdentityAuthorityPolicyService::force_detach_authority_json(
+                loom, principal, generation, reason,
+            )
+        })
+    }
+
+    pub fn identity_authority_witness(
+        &self,
+        session: &LoomSession,
+    ) -> Result<loom_core::IdentityAuthorityWitness, LoomError> {
+        self.with_session(session, IdentityAuthorityPolicyService::authority_witness)
+    }
+
+    pub fn identity_list_authority_replication(
+        &self,
+        session: &LoomSession,
+    ) -> Result<Vec<loom_store::AuthorityReplicationPolicy>, LoomError> {
+        self.with_session(
+            session,
+            IdentityAuthorityPolicyService::authority_replication_policies,
+        )
+    }
+
+    pub fn identity_replicate_authority_json(
+        &self,
+        session: &LoomSession,
+        source: &str,
+        become_authority: bool,
+    ) -> Result<String, LoomError> {
+        let source_loom = open_loom_read(source)?;
+        source_loom.authorize_global_admin()?;
+        let source_identity = source_loom.store().identity_store()?.ok_or_else(|| {
+            LoomError::new(Code::Unsupported, "source identity store not initialized")
+        })?;
+        self.with_session(session, |loom| {
+            IdentityAuthorityPolicyService::replicate_authority_json(
+                loom,
+                &source_identity,
+                source,
+                become_authority,
+            )
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the generated Identity IDL signature"
+    )]
+    pub fn identity_configure_authority_replication_json(
+        &self,
+        session: &LoomSession,
+        id: &str,
+        source: &str,
+        disabled: bool,
+        pull_on_start: bool,
+        interval_ms: Option<u64>,
+        jitter_ms: u64,
+        backoff_ms: u64,
+        publish_witness: bool,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            IdentityAuthorityPolicyService::configure_authority_replication_json(
+                loom,
+                id,
+                source,
+                disabled,
+                pull_on_start,
+                interval_ms,
+                jitter_ms,
+                backoff_ms,
+                publish_witness,
+            )
+        })
+    }
+
+    pub fn identity_remove_authority_replication_json(
+        &self,
+        session: &LoomSession,
+        id: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            IdentityAuthorityPolicyService::remove_authority_replication_json(loom, id)
+        })
+    }
+
     /// Authenticate a principal by passphrase and bind the resulting session to the engine, mirroring
     /// the local-open auth wiring (`attach_local_auth`). The session id is derived from the handle.
     ///
@@ -6943,7 +9316,575 @@ impl LocalLoomClient {
         })
     }
 
+    // ---- Audit, certificate, and network-access administration ----
+
+    pub fn audit_config_show_json(&self, session: &LoomSession) -> Result<String, LoomError> {
+        self.with_session(session, SecurityAdminService::audit_config_show_json)
+    }
+
+    pub fn audit_config_set_json(
+        &self,
+        session: &LoomSession,
+        retention_days: Option<u32>,
+        legal_hold: Option<bool>,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            SecurityAdminService::audit_config_set_json(loom, retention_days, legal_hold)
+        })
+    }
+
+    pub fn audit_list_json(&self, session: &LoomSession) -> Result<String, LoomError> {
+        self.with_session(session, SecurityAdminService::audit_list_json)
+    }
+
+    pub fn audit_view_json(
+        &self,
+        session: &LoomSession,
+        record: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            SecurityAdminService::audit_view_json(loom, record)
+        })
+    }
+
+    pub fn certificate_list_json(&self, session: &LoomSession) -> Result<String, LoomError> {
+        self.with_session(session, SecurityAdminService::certificate_list_json)
+    }
+
+    pub fn certificate_import_json(
+        &self,
+        session: &LoomSession,
+        name: &str,
+        cert_chain_pem: Vec<u8>,
+        private_key_pem: Vec<u8>,
+        trust_bundle_pem: Option<Vec<u8>>,
+        force: bool,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            SecurityAdminService::certificate_import_json(
+                loom,
+                name,
+                cert_chain_pem,
+                private_key_pem,
+                trust_bundle_pem,
+                force,
+            )
+        })
+    }
+
+    pub fn certificate_export(
+        &self,
+        session: &LoomSession,
+        name: &str,
+        include_cert_chain: bool,
+        include_private_key: bool,
+        include_trust_bundle: bool,
+        force: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            SecurityAdminService::certificate_export(
+                loom,
+                name,
+                include_cert_chain,
+                include_private_key,
+                include_trust_bundle,
+                force,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn certificate_generate_self_signed_json(
+        &self,
+        session: &LoomSession,
+        name: &str,
+        dns_names: Vec<String>,
+        ip_addresses: Vec<String>,
+        cn: Option<&str>,
+        days: u32,
+        algorithm: &str,
+        force: bool,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            SecurityAdminService::certificate_generate_self_signed_json(
+                loom,
+                name,
+                dns_names,
+                ip_addresses,
+                cn,
+                days,
+                algorithm,
+                force,
+            )
+        })
+    }
+
+    pub fn certificate_remove_json(
+        &self,
+        session: &LoomSession,
+        name: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            SecurityAdminService::certificate_remove_json(loom, name)
+        })
+    }
+
+    pub fn certificate_audit_json(
+        &self,
+        session: &LoomSession,
+        name: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            SecurityAdminService::certificate_audit_json(loom, name)
+        })
+    }
+
+    pub fn network_access_list_json(&self, session: &LoomSession) -> Result<String, LoomError> {
+        self.with_session(session, SecurityAdminService::network_access_list_json)
+    }
+
+    pub fn network_access_set_json(
+        &self,
+        session: &LoomSession,
+        name: &str,
+        description: Option<&str>,
+        default_action: &str,
+        rules_json: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            SecurityAdminService::network_access_set_json(
+                loom,
+                name,
+                description,
+                default_action,
+                rules_json,
+            )
+        })
+    }
+
+    pub fn network_access_remove_json(
+        &self,
+        session: &LoomSession,
+        name: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            SecurityAdminService::network_access_remove_json(loom, name)
+        })
+    }
+
+    pub fn network_access_audit_json(
+        &self,
+        session: &LoomSession,
+        name: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            SecurityAdminService::network_access_audit_json(loom, name)
+        })
+    }
+
+    pub fn serve_listener_configure_json(
+        &self,
+        session: &LoomSession,
+        request_json: &str,
+    ) -> Result<String, LoomError> {
+        self.serve_listener_configure_json_with_commit(
+            session,
+            request_json,
+            loom_store::put_saved_state_served_listener_controls_audited,
+        )
+    }
+
+    fn serve_listener_configure_json_with_commit(
+        &self,
+        session: &LoomSession,
+        request_json: &str,
+        commit: impl FnOnce(
+            &FileStore,
+            loom_core::vcs::SavedStateObjects,
+            &loom_store::ServedListenerRecord,
+            Vec<WorkflowControlWrite>,
+            Vec<WorkflowAuditWrite>,
+            Option<WorkspaceId>,
+            &str,
+            Option<&str>,
+        ) -> Result<loom_store::SavedStateAndAuditReceipt, LoomError>,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
+            let actor = loom.effective_principal()?;
+            let request: crate::serve_config::ServeListenerConfigureRequest =
+                serde_json::from_str(request_json).map_err(|err| {
+                    LoomError::new(
+                        Code::InvalidArgument,
+                        format!("serve listener request: {err}"),
+                    )
+                })?;
+            crate::serve_config::validate_bind(&request.bind)?;
+            let surface = crate::serve_config::normalize_surface(&request.surface)?;
+            crate::serve_config::validate_selector_shape(surface, &request.selectors)?;
+            let transport =
+                crate::serve_config::normalize_transport(surface, request.transport.as_deref())?;
+            crate::serve_config::validate_transport(surface, transport)?;
+            let profile = crate::serve_config::normalize_profile(
+                surface,
+                transport,
+                request.profile.as_deref(),
+                request.mode.as_deref(),
+            )?;
+            let mut record = FileStore::served_listener_record_with_profile(
+                surface,
+                request.selectors.clone(),
+                transport,
+                profile,
+                &request.bind,
+                request.enabled,
+            )?;
+            crate::serve_config::apply_listener_policy(&mut record, request);
+            crate::serve_config::validate_listener_references(loom, &record)?;
+            let mut candidate =
+                loom.fork_state_into(loom_core::provider::PlanningObjectStore::new(loom.store()))?;
+            crate::serve_config::configure_memcached_cache_mode(
+                &mut candidate,
+                |candidate, workspace| {
+                    candidate.registry_mut().ensure_for_write(
+                        &ns_selector(workspace, FacetKind::Kv),
+                        mint_workspace_id()?,
+                    )
+                },
+                surface,
+                record.profile.as_deref(),
+                &record.selectors,
+            )?;
+            let drive_policy = if surface == "drive" {
+                let workspace = candidate
+                    .registry()
+                    .open(&ns_selector_by_name(&record.selectors[0]))?;
+                Some(serve_drive_policy_registry_write(
+                    loom.store(),
+                    actor,
+                    workspace,
+                )?)
+            } else {
+                None
+            };
+            let mut objects = candidate.store().objects()?;
+            let (root, state_objects) = candidate.save_state_objects()?;
+            objects.extend(state_objects);
+            let candidate_state = candidate.export_state();
+            let saved = (root, objects);
+            let target = crate::serve_config::listener_target(&record);
+            let (controls, audits) = drive_policy
+                .map(|policy| (vec![policy.0], vec![policy.1]))
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
+            let receipt = commit(
+                loom.store(),
+                saved,
+                &record,
+                controls,
+                audits,
+                actor,
+                "serve.listener.configure",
+                Some(&target),
+            )?;
+            drop(candidate);
+            loom.import_engine_state_preserving_mutable_overlay(&candidate_state)?;
+            let seq = receipt
+                .audit_sequences
+                .first()
+                .copied()
+                .ok_or_else(|| LoomError::corrupt("served listener audit sequence missing"))?;
+            record.last_modified_audit_seq = Some(seq);
+            crate::serve_config::listener_json(&record, seq)
+        })
+    }
+
+    pub fn serve_listener_list_json(&self, session: &LoomSession) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
+            let actor = loom.effective_principal()?;
+            let listeners = loom.store().served_listeners()?;
+            let seq = loom
+                .store()
+                .audit_append(actor, "serve.listener.list", Some("listeners"))?;
+            let mut out = format!("{{\"seq\":{seq},\"listeners\":[");
+            for (idx, listener) in listeners.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                out.push_str(&crate::serve_config::listener_record_json(listener)?);
+            }
+            out.push_str("]}");
+            Ok(out)
+        })
+    }
+
+    pub fn serve_listener_set_enabled_json(
+        &self,
+        session: &LoomSession,
+        listener_id: &str,
+        enabled: bool,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
+            let actor = loom.effective_principal()?;
+            let mut record = loom
+                .store()
+                .served_listener(listener_id)?
+                .ok_or_else(|| LoomError::not_found("served listener not found"))?;
+            record.enabled = enabled;
+            let target = crate::serve_config::listener_target(&record);
+            let action = if enabled {
+                "serve.listener.enable"
+            } else {
+                "serve.listener.disable"
+            };
+            let seq =
+                loom.store()
+                    .save_served_listener_audited(&record, actor, action, Some(&target))?;
+            record.last_modified_audit_seq = Some(seq);
+            crate::serve_config::listener_json(&record, seq)
+        })
+    }
+
+    pub fn serve_listener_remove_json(
+        &self,
+        session: &LoomSession,
+        listener_id: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
+            let actor = loom.effective_principal()?;
+            let record = loom
+                .store()
+                .served_listener(listener_id)?
+                .ok_or_else(|| LoomError::not_found("served listener not found"))?;
+            let target = crate::serve_config::listener_target(&record);
+            let seq = loom.store().remove_served_listener_audited(
+                listener_id,
+                actor,
+                "serve.listener.remove",
+                Some(&target),
+            )?;
+            Ok(format!(
+                "{{\"seq\":{seq},\"id\":{}}}",
+                json_string(&listener_id)?
+            ))
+        })
+    }
+
+    pub fn serve_web_route_list_json(
+        &self,
+        session: &LoomSession,
+        listener_id: &str,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
+            let actor = loom.effective_principal()?;
+            let record = crate::serve_config::require_web_listener_record(loom, listener_id)?;
+            let web_listener =
+                crate::serve_config::web_listener_from_record(loom, &record, |loom, workspace| {
+                    loom.registry().open(&ns_selector_by_name(workspace))
+                })?;
+            let seq = loom.store().audit_append(
+                actor,
+                "serve.web.route.list",
+                Some(&format!("listener={listener_id}")),
+            )?;
+            crate::serve_config::web_listener_json(&web_listener, Some(seq))
+        })
+    }
+
+    pub fn serve_web_route_set_json(
+        &self,
+        session: &LoomSession,
+        request_json: &str,
+    ) -> Result<String, LoomError> {
+        self.serve_web_route_set_json_with_commit(
+            session,
+            request_json,
+            |store, key, value, actor, action, target| {
+                store.control_set_audited(&key, value, actor, action, Some(target))
+            },
+        )
+    }
+
+    fn serve_web_route_set_json_with_commit(
+        &self,
+        session: &LoomSession,
+        request_json: &str,
+        commit: impl FnOnce(
+            &FileStore,
+            Vec<u8>,
+            Vec<u8>,
+            Option<WorkspaceId>,
+            &str,
+            &str,
+        ) -> Result<u64, LoomError>,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
+            let actor = loom.effective_principal()?;
+            let request: crate::serve_config::ServeWebRouteSetRequest =
+                serde_json::from_str(request_json).map_err(|err| {
+                    LoomError::new(
+                        Code::InvalidArgument,
+                        format!("serve web route request: {err}"),
+                    )
+                })?;
+            let record = crate::serve_config::require_web_listener_record(loom, &request.listener)?;
+            let mut web_listener =
+                crate::serve_config::web_listener_from_record(loom, &record, |loom, workspace| {
+                    loom.registry().open(&ns_selector_by_name(workspace))
+                })?;
+            let workspace = request
+                .workspace
+                .as_deref()
+                .map(|workspace| loom.registry().open(&ns_selector_by_name(workspace)))
+                .transpose()?;
+            let mut route = loom_substrate::web::WebRoute::new(
+                request.route.clone(),
+                vec![
+                    loom_substrate::web::WebMethod::Get,
+                    loom_substrate::web::WebMethod::Head,
+                ],
+                request.host.clone(),
+                &request.prefix,
+                &request.root,
+                loom_substrate::web::WebRouteMode::StaticFile,
+            )?;
+            route.workspace = workspace;
+            web_listener
+                .routes
+                .routes
+                .retain(|existing| existing.route_id != route.route_id);
+            web_listener.routes.routes.push(route);
+            web_listener
+                .routes
+                .routes
+                .sort_by(|left, right| left.route_id.cmp(&right.route_id));
+            web_listener.routes =
+                loom_substrate::web::WebRouteTable::new(web_listener.routes.routes)?;
+            let key = crate::serve_config::web_listener_control_key(&web_listener.listener_id)?;
+            let value = web_listener.encode()?;
+            let target = format!("listener={};route={}", request.listener, request.route);
+            let seq = commit(
+                loom.store(),
+                key,
+                value,
+                actor,
+                "serve.web.route.set",
+                &target,
+            )?;
+            crate::serve_config::web_listener_json(&web_listener, Some(seq))
+        })
+    }
+
+    pub fn serve_web_route_remove_json(
+        &self,
+        session: &LoomSession,
+        listener_id: &str,
+        route_id: &str,
+    ) -> Result<String, LoomError> {
+        self.serve_web_route_remove_json_with_commit(
+            session,
+            listener_id,
+            route_id,
+            |store, key, value, actor, action, target| {
+                store.control_set_audited(&key, value, actor, action, Some(target))
+            },
+        )
+    }
+
+    fn serve_web_route_remove_json_with_commit(
+        &self,
+        session: &LoomSession,
+        listener_id: &str,
+        route_id: &str,
+        commit: impl FnOnce(
+            &FileStore,
+            Vec<u8>,
+            Vec<u8>,
+            Option<WorkspaceId>,
+            &str,
+            &str,
+        ) -> Result<u64, LoomError>,
+    ) -> Result<String, LoomError> {
+        self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
+            let actor = loom.effective_principal()?;
+            let record = crate::serve_config::require_web_listener_record(loom, listener_id)?;
+            let mut web_listener =
+                crate::serve_config::web_listener_from_record(loom, &record, |loom, workspace| {
+                    loom.registry().open(&ns_selector_by_name(workspace))
+                })?;
+            let before = web_listener.routes.routes.len();
+            web_listener
+                .routes
+                .routes
+                .retain(|existing| existing.route_id != route_id);
+            if web_listener.routes.routes.len() == before {
+                return Err(LoomError::not_found("web route not found"));
+            }
+            web_listener
+                .routes
+                .routes
+                .sort_by(|left, right| left.route_id.cmp(&right.route_id));
+            web_listener.routes =
+                loom_substrate::web::WebRouteTable::new(web_listener.routes.routes)?;
+            let key = crate::serve_config::web_listener_control_key(&web_listener.listener_id)?;
+            let value = web_listener.encode()?;
+            let target = format!("listener={listener_id};route={route_id}");
+            let seq = commit(
+                loom.store(),
+                key,
+                value,
+                actor,
+                "serve.web.route.remove",
+                &target,
+            )?;
+            crate::serve_config::web_listener_json(&web_listener, Some(seq))
+        })
+    }
+
     // ---- StoreAdmin (server-owned store administration, specs/0067 §13, task 640) ----
+
+    fn store_policy_result(
+        policy: StorePolicy,
+        audit_seq: Option<u64>,
+    ) -> loom_wire::store_admin::StorePolicyResult {
+        let facet_durability_overrides = FacetKind::ALL
+            .into_iter()
+            .filter_map(|facet| {
+                policy.facet_durability_overrides[facet.stable_tag() as usize].map(|durability| {
+                    loom_wire::store_admin::StoreFacetDurabilityAssignment { facet, durability }
+                })
+            })
+            .collect();
+        loom_wire::store_admin::StorePolicyResult {
+            fips_required: policy.fips_required,
+            default_durability: policy.default_durability,
+            facet_durability_overrides,
+            audit_seq,
+        }
+    }
+
+    fn store_policy_audit_target(policy: &StorePolicy) -> String {
+        let mut target = format!(
+            "fips_required={},default_durability={}",
+            policy.fips_required,
+            policy.default_durability.as_str()
+        );
+        for facet in FacetKind::ALL {
+            if let Some(durability) = policy.facet_durability_overrides[facet.stable_tag() as usize]
+            {
+                target.push(',');
+                target.push_str(facet.as_str());
+                target.push('=');
+                target.push_str(durability.as_str());
+            }
+        }
+        target
+    }
 
     /// StoreAdmin: the store maintenance/size snapshot, as canonical `loom.store.stat.v1` CBOR. Requires
     /// global-admin authorization (fail-closed in authenticated mode).
@@ -6975,10 +9916,7 @@ impl LocalLoomClient {
             loom.authorize_global_admin()?;
             let policy = loom.store().store_policy()?;
             Ok(loom_wire::store_admin::store_policy_result_to_cbor(
-                &loom_wire::store_admin::StorePolicyResult {
-                    fips_required: policy.fips_required,
-                    audit_seq: None,
-                },
+                &Self::store_policy_result(policy, None),
             ))
         })
     }
@@ -6988,14 +9926,26 @@ impl LocalLoomClient {
     pub fn store_policy_set(
         &self,
         session: &LoomSession,
-        fips_required: bool,
+        update: &[u8],
     ) -> Result<Vec<u8>, LoomError> {
+        let update = loom_wire::store_admin::store_policy_update_from_cbor(update)?;
         self.with_session(session, |loom| {
             loom.authorize_global_admin()?;
             let actor = loom.effective_principal()?;
-            let target = format!("fips_required={fips_required}");
             let mut policy = loom.store().store_policy()?;
-            policy.fips_required = fips_required;
+            if let Some(value) = update.fips_required {
+                policy.fips_required = value;
+            }
+            if let Some(value) = update.default_durability {
+                policy.set_default_durability(value)?;
+            }
+            for assignment in update.facet_durability_assignments {
+                policy.set_facet_durability(assignment.facet, Some(assignment.durability))?;
+            }
+            for facet in update.clear_facet_durability {
+                policy.set_facet_durability(facet, None)?;
+            }
+            let target = Self::store_policy_audit_target(&policy);
             let seq = loom.store().save_store_policy_audited(
                 policy,
                 actor,
@@ -7003,10 +9953,7 @@ impl LocalLoomClient {
                 Some(&target),
             )?;
             Ok(loom_wire::store_admin::store_policy_result_to_cbor(
-                &loom_wire::store_admin::StorePolicyResult {
-                    fips_required,
-                    audit_seq: Some(seq),
-                },
+                &Self::store_policy_result(policy, Some(seq)),
             ))
         })
     }
@@ -7022,17 +9969,23 @@ impl LocalLoomClient {
     pub fn store_rekey(
         &self,
         session: &LoomSession,
-        new_passphrase: &[u8],
-        reseal: bool,
-        suite: Option<&str>,
+        request: &[u8],
         salt: Vec<u8>,
         wrap_nonce: Vec<u8>,
         new_dek: Option<[u8; KEY_LEN]>,
     ) -> Result<Vec<u8>, LoomError> {
-        let passphrase = std::str::from_utf8(new_passphrase).map_err(|_| {
-            LoomError::new(Code::InvalidArgument, "new passphrase is not valid utf-8")
-        })?;
-        let spec = KeySpec::passphrase(passphrase);
+        let request = loom_wire::store_admin::store_rekey_request_from_cbor(request)?;
+        let spec = match request.credential {
+            loom_wire::store_admin::StoreRekeyCredential::Passphrase(secret) => {
+                let passphrase = std::str::from_utf8(&secret).map_err(|_| {
+                    LoomError::new(Code::InvalidArgument, "new passphrase is not valid utf-8")
+                })?;
+                KeySpec::passphrase(passphrase)
+            }
+            loom_wire::store_admin::StoreRekeyCredential::RawKek(secret) => {
+                KeySpec::raw_kek(secret)
+            }
+        };
         self.with_session(session, |loom| {
             loom.authorize_global_admin()?;
             let actor = loom.effective_principal()?;
@@ -7042,8 +9995,8 @@ impl LocalLoomClient {
                     "store is not encrypted; rekey requires an encrypted store",
                 )
             })?;
-            let (resealed, suite_str, bytes_before, bytes_after) = if reseal {
-                let target_suite = match suite {
+            let (resealed, suite_str, bytes_before, bytes_after) = if request.reseal {
+                let target_suite = match request.suite.as_deref() {
                     Some(s) => Suite::parse(s)?,
                     None => meta.active_suite,
                 };
@@ -7062,7 +10015,7 @@ impl LocalLoomClient {
                     Some(stats.after),
                 )
             } else {
-                if let Some(s) = suite {
+                if let Some(s) = request.suite.as_deref() {
                     let want = Suite::parse(s)?;
                     if want != meta.active_suite {
                         return Err(LoomError::new(
@@ -7091,6 +10044,398 @@ impl LocalLoomClient {
                     bytes_after,
                 },
             ))
+        })
+    }
+
+    pub fn store_bundle_import(
+        &self,
+        session: &LoomSession,
+        bundle_bytes: &[u8],
+        dry_run: bool,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            let (bytes, persist) =
+                apply_store_bundle_import_generated(loom, bundle_bytes, dry_run)?;
+            if persist {
+                save_loom(loom)?;
+            }
+            Ok(bytes)
+        })
+    }
+
+    fn maintenance_policy_record(
+        policy: &loom_store::StoreMaintenancePolicy,
+    ) -> loom_wire::store_admin::StoreMaintenancePolicyRecord {
+        loom_wire::store_admin::StoreMaintenancePolicyRecord {
+            min_candidate_pages: policy.min_candidate_pages,
+            min_reusable_pages: policy.min_reusable_pages,
+            interval_ms: policy.interval_ms,
+            backoff_ms: policy.backoff_ms,
+            max_segments: policy.max_segments,
+            max_pages: policy.max_pages,
+            full_compaction_enabled: policy.full_compaction_enabled,
+            tail_trim_enabled: policy.tail_trim_enabled,
+            tail_compaction_enabled: policy.tail_compaction_enabled,
+            tail_compaction_max_pages: policy.tail_compaction_max_pages,
+            tail_compaction_max_objects: policy.tail_compaction_max_objects,
+            tail_compaction_max_bytes: policy.tail_compaction_max_bytes,
+            tail_compaction_interval_ms: policy.tail_compaction_interval_ms,
+            tail_compaction_backoff_ms: policy.tail_compaction_backoff_ms,
+        }
+    }
+
+    fn maintenance_run_state_record(
+        state: &loom_store::StoreMaintenanceRunState,
+    ) -> loom_wire::store_admin::StoreMaintenanceRunStateRecord {
+        loom_wire::store_admin::StoreMaintenanceRunStateRecord {
+            last_run_ms: state.last_run_ms,
+            next_eligible_ms: state.next_eligible_ms,
+            last_skip_reason: state.last_skip_reason.clone(),
+            last_error: state.last_error.clone(),
+            last_tail_trim_attempted: state.last_tail_trim_attempted,
+            last_tail_trim_pages: state.last_tail_trim_pages,
+            last_tail_trim_bytes: state.last_tail_trim_bytes,
+            last_tail_compaction_attempted: state.last_tail_compaction_attempted,
+            last_tail_compaction_relocated_objects: state.last_tail_compaction_relocated_objects,
+            last_tail_compaction_relocated_pages: state.last_tail_compaction_relocated_pages,
+            last_tail_compaction_relocated_bytes: state.last_tail_compaction_relocated_bytes,
+            last_tail_compaction_truncated_pages: state.last_tail_compaction_truncated_pages,
+            last_tail_compaction_conflicts: state.last_tail_compaction_conflicts,
+            last_shrink_skip_reason: state.last_shrink_skip_reason.clone(),
+            last_progress_steps: state.last_progress_steps,
+            last_yield_count: state.last_yield_count,
+            last_overrun_count: state.last_overrun_count,
+        }
+    }
+
+    fn maintenance_report_record(
+        report: &loom_store::StoreMaintenanceReport,
+    ) -> loom_wire::store_admin::StoreMaintenanceReportRecord {
+        let status = &report.status;
+        let group = &status.group_commit;
+        let overlay = &report.overlay_health;
+        let mvcc = &report.mvcc_snapshots;
+        loom_wire::store_admin::StoreMaintenanceReportRecord {
+            status: loom_wire::store_admin::StoreMaintenanceStatusRecord {
+                generation: status.generation,
+                object_count: status.object_count,
+                physical_page_count: status.physical_page_count,
+                physical_bytes: status.physical_bytes,
+                reusable_free_pages: status.reusable_free_pages,
+                candidate_dead_pages: status.candidate_dead_pages,
+                tail_free_pages: status.tail_free_pages,
+                tail_free_bytes: status.tail_free_bytes,
+                last_validated_mark_epoch: status.last_validated_mark_epoch,
+                touched_segments: status.touched_segments.clone(),
+                candidate_segments: status.candidate_segments.clone(),
+                segment_overflow: status.segment_overflow,
+                group_commit: loom_wire::store_admin::StoreGroupCommitDiagnosticsRecord {
+                    group_commit_batches_total: group.group_commit_batches_total,
+                    group_commit_transactions_total: group.group_commit_transactions_total,
+                    group_commit_records_total: group.group_commit_records_total,
+                    fsync_total_micros: group.fsync_total_micros,
+                    fsync_count: group.fsync_count,
+                    write_lock_wait_total_micros: group.write_lock_wait_total_micros,
+                    write_lock_wait_count: group.write_lock_wait_count,
+                    pending_durable_window_transactions: group.pending_durable_window_transactions,
+                    pending_durable_window_records: group.pending_durable_window_records,
+                    pinned_reader_blockers: group.pinned_reader_blockers,
+                },
+            },
+            overlay_health: loom_wire::store_admin::StoreMutableOverlayHealthRecord {
+                current_generation: overlay.current_generation,
+                current_record_count: overlay.current_record_count,
+                tombstone_count: overlay.tombstone_count,
+                live_checkpoint_references: overlay.live_checkpoint_references,
+                reclaimable_overlay_pages: overlay.reclaimable_overlay_pages,
+                blocked_reclamation_reasons: overlay.blocked_reclamation_reasons.clone(),
+                hot_write_count: overlay.hot_write_count,
+                active_writer_contention_indicators: overlay.active_writer_contention_indicators,
+            },
+            mvcc_snapshots: loom_wire::store_admin::StoreMvccSnapshotDiagnosticsRecord {
+                active_snapshot_count: mvcc.active_snapshot_count,
+                oldest_pinned_overlay_generation: mvcc
+                    .oldest_pinned_overlay_generation
+                    .map(|generation| generation.as_u64()),
+                pins: mvcc
+                    .pins
+                    .iter()
+                    .map(|pin| loom_wire::store_admin::StoreMvccSnapshotPinRecord {
+                        pin_id: pin.pin_id,
+                        identity: loom_wire::store_admin::StoreMvccSnapshotIdentityRecord {
+                            overlay_generation: pin.identity.overlay_generation.as_u64(),
+                            immutable_base_root: pin
+                                .identity
+                                .immutable_base_root
+                                .map(|digest| digest.to_string()),
+                        },
+                        owner: pin.owner.clone(),
+                    })
+                    .collect(),
+            },
+            policy: Self::maintenance_policy_record(&report.policy),
+            run_state: Self::maintenance_run_state_record(&report.run_state),
+            mark_epoch: report.mark_epoch,
+            mark_completed: report.mark_completed,
+            marked_live_objects: report.marked_live_objects,
+            marked_live_bytes: report.marked_live_bytes,
+            live_bytes: report.live_bytes,
+            candidate_reclaimable_bytes: report.candidate_reclaimable_bytes,
+            reusable_free_bytes: report.reusable_free_bytes,
+            overlay_obsolete_record_count: report.overlay_obsolete_record_count,
+            overlay_obsolete_page_count: report.overlay_obsolete_page_count,
+            tail_free_pages: report.tail_free_pages,
+            tail_free_bytes: report.tail_free_bytes,
+            tail_trim_eligible: report.tail_trim_eligible,
+            tail_blocked_by_live_objects: report.tail_blocked_by_live_objects,
+            tail_compaction_eligible: report.tail_compaction_eligible,
+            full_compaction_required_for_shrink: report.full_compaction_required_for_shrink,
+            tail_trim_attempted: report.tail_trim_attempted,
+            tail_trim_pages: report.tail_trim_pages,
+            tail_trim_bytes: report.tail_trim_bytes,
+            tail_compaction_attempted: report.tail_compaction_attempted,
+            tail_compaction_relocated_objects: report.tail_compaction_relocated_objects,
+            tail_compaction_relocated_pages: report.tail_compaction_relocated_pages,
+            tail_compaction_relocated_bytes: report.tail_compaction_relocated_bytes,
+            tail_compaction_truncated_pages: report.tail_compaction_truncated_pages,
+            tail_compaction_conflicts: report.tail_compaction_conflicts,
+            last_shrink_skip_reason: report.last_shrink_skip_reason.clone(),
+            retained_control_roots: report.retained_control_roots,
+            derived_payload_count: report.derived_payload_count,
+            growth_domains: report
+                .growth_domains
+                .iter()
+                .map(|domain| loom_wire::store_admin::StoreGrowthDomainRecord {
+                    domain: domain.domain.clone(),
+                    current_records: domain.current_records,
+                    obsolete_records: domain.obsolete_records,
+                    payload_bytes: domain.payload_bytes,
+                })
+                .collect(),
+            eligible: report.eligible,
+            reason: report.reason.clone(),
+        }
+    }
+
+    fn live_root_diagnostics_record(
+        diagnostics: &loom_core::LiveRootDiagnostics,
+    ) -> loom_wire::store_admin::StoreLiveRootDiagnosticsRecord {
+        loom_wire::store_admin::StoreLiveRootDiagnosticsRecord {
+            sample_limit: u64::try_from(diagnostics.sample_limit).unwrap_or(u64::MAX),
+            classes: diagnostics
+                .classes
+                .iter()
+                .map(
+                    |class| loom_wire::store_admin::StoreLiveRootClassDiagnosticsRecord {
+                        class: class.class.to_string(),
+                        count: class.count,
+                        examples: class
+                            .examples
+                            .iter()
+                            .map(
+                                |example| loom_wire::store_admin::StoreLiveRootExampleRecord {
+                                    id: example.id.clone(),
+                                    digest: example.digest.to_string(),
+                                },
+                            )
+                            .collect(),
+                        truncated: class.truncated,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    pub fn audit_compact(
+        &self,
+        session: &LoomSession,
+        through_seq: u64,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
+            let actor = loom.effective_principal()?;
+            let stats = loom.store().audit_prune_through(actor, through_seq)?;
+            Ok(loom_wire::audit::audit_compact_result_to_cbor(
+                &loom_wire::audit::AuditCompactResult {
+                    pruned: stats.pruned,
+                    checkpoint_seq: stats.checkpoint_seq,
+                    checkpoint_hash: stats.checkpoint_hash,
+                    audit_seq: stats.audit_seq,
+                },
+            ))
+        })
+    }
+
+    pub fn store_maintenance_status(
+        &self,
+        session: &LoomSession,
+        request_bytes: &[u8],
+    ) -> Result<Vec<u8>, LoomError> {
+        let clock = Arc::clone(&self.store_maintenance_clock);
+        self.with_session(session, |loom| {
+            let request =
+                loom_wire::store_admin::store_maintenance_status_request_from_cbor(request_bytes)?;
+            let report = loom.store().store_maintenance_report(clock.now_ms())?;
+            let live_root_diagnostics = if request.include_live_root_diagnostics {
+                Some(Self::live_root_diagnostics_record(
+                    &loom_store::maintenance_live_root_diagnostics(loom)?,
+                ))
+            } else {
+                None
+            };
+            Ok(
+                loom_wire::store_admin::store_maintenance_status_result_to_cbor(
+                    &loom_wire::store_admin::StoreMaintenanceStatusResult {
+                        report: Self::maintenance_report_record(&report),
+                        live_root_diagnostics,
+                    },
+                ),
+            )
+        })
+    }
+
+    pub fn store_maintenance_policy_set(
+        &self,
+        session: &LoomSession,
+        update_bytes: &[u8],
+    ) -> Result<Vec<u8>, LoomError> {
+        let clock = Arc::clone(&self.store_maintenance_clock);
+        self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
+            let update =
+                loom_wire::store_admin::store_maintenance_policy_update_from_cbor(update_bytes)?;
+            let mut policy = loom.store().store_maintenance_policy()?;
+            if let Some(value) = update.min_candidate_pages {
+                policy.min_candidate_pages = value;
+            }
+            if let Some(value) = update.min_reusable_pages {
+                policy.min_reusable_pages = value;
+            }
+            if let Some(value) = update.interval_ms {
+                policy.interval_ms = value;
+            }
+            if let Some(value) = update.backoff_ms {
+                policy.backoff_ms = value;
+            }
+            if let Some(value) = update.max_segments {
+                policy.max_segments = value;
+            }
+            if let Some(value) = update.max_pages {
+                policy.max_pages = value;
+            }
+            if let Some(value) = update.full_compaction_enabled {
+                policy.full_compaction_enabled = value;
+            }
+            if let Some(value) = update.tail_trim_enabled {
+                policy.tail_trim_enabled = value;
+            }
+            if let Some(value) = update.tail_compaction_enabled {
+                policy.tail_compaction_enabled = value;
+            }
+            if let Some(value) = update.tail_compaction_max_pages {
+                policy.tail_compaction_max_pages = value;
+            }
+            if let Some(value) = update.tail_compaction_max_objects {
+                policy.tail_compaction_max_objects = value;
+            }
+            if let Some(value) = update.tail_compaction_max_bytes {
+                policy.tail_compaction_max_bytes = value;
+            }
+            if let Some(value) = update.tail_compaction_interval_ms {
+                policy.tail_compaction_interval_ms = value;
+            }
+            if let Some(value) = update.tail_compaction_backoff_ms {
+                policy.tail_compaction_backoff_ms = value;
+            }
+            let actor = loom.effective_principal()?;
+            loom.store().save_store_maintenance_policy_audited(
+                policy,
+                actor,
+                "store.maintenance.policy.set",
+                Some("updated"),
+            )?;
+            let report = loom.store().store_maintenance_report(clock.now_ms())?;
+            Ok(
+                loom_wire::store_admin::store_maintenance_status_result_to_cbor(
+                    &loom_wire::store_admin::StoreMaintenanceStatusResult {
+                        report: Self::maintenance_report_record(&report),
+                        live_root_diagnostics: None,
+                    },
+                ),
+            )
+        })
+    }
+
+    pub fn store_maintenance_run(
+        &self,
+        session: &LoomSession,
+        request_bytes: &[u8],
+    ) -> Result<Vec<u8>, LoomError> {
+        let clock = Arc::clone(&self.store_maintenance_clock);
+        self.with_session(session, |loom| {
+            loom.authorize_global_admin()?;
+            let request =
+                loom_wire::store_admin::store_maintenance_run_request_from_cbor(request_bytes)?;
+            let outcome = run_store_maintenance_once_with_clock(
+                loom,
+                true,
+                request.max_segments,
+                request.max_pages,
+                None,
+                None,
+                clock.as_ref(),
+            )?;
+            let actor = loom.effective_principal()?;
+            loom.store().control_set_audited(
+                b"store.maintenance.run.last",
+                format!("{:?}", outcome.kind).into_bytes(),
+                actor,
+                "store.maintenance.run",
+                Some("manual=true"),
+            )?;
+            let kind = match outcome.kind {
+                loom_store::StoreMaintenanceRunKind::Skipped => {
+                    loom_wire::store_admin::StoreMaintenanceRunKind::Skipped
+                }
+                loom_store::StoreMaintenanceRunKind::Marked => {
+                    loom_wire::store_admin::StoreMaintenanceRunKind::Marked
+                }
+                loom_store::StoreMaintenanceRunKind::Compacted => {
+                    loom_wire::store_admin::StoreMaintenanceRunKind::Compacted
+                }
+                loom_store::StoreMaintenanceRunKind::Reclaimed => {
+                    loom_wire::store_admin::StoreMaintenanceRunKind::Reclaimed
+                }
+            };
+            Ok(
+                loom_wire::store_admin::store_maintenance_run_result_to_cbor(
+                    &loom_wire::store_admin::StoreMaintenanceRunResult {
+                        kind,
+                        reason: outcome.reason,
+                        visited: outcome.visited,
+                        pending: outcome.pending,
+                        before: outcome.before,
+                        after: outcome.after,
+                        reclaimed: outcome.reclaimed,
+                        required_temp_bytes: outcome.required_temp_bytes,
+                        available_temp_bytes: outcome.available_temp_bytes,
+                        segments_reclaimed: outcome.segments_reclaimed,
+                        pages_freed: outcome.pages_freed,
+                        tail_trim_pages: outcome.tail_trim_pages,
+                        tail_trim_bytes: outcome.tail_trim_bytes,
+                        tail_compaction_attempted: outcome.tail_compaction_attempted,
+                        tail_compaction_relocated_objects: outcome
+                            .tail_compaction_relocated_objects,
+                        tail_compaction_relocated_pages: outcome.tail_compaction_relocated_pages,
+                        tail_compaction_truncated_pages: outcome.tail_compaction_truncated_pages,
+                        objects_relocated: outcome.objects_relocated,
+                        objects_dropped: outcome.objects_dropped,
+                        elapsed_ms: outcome.elapsed_ms,
+                        run_state: Self::maintenance_run_state_record(&outcome.run_state),
+                        report: Self::maintenance_report_record(&outcome.report),
+                    },
+                ),
+            )
         })
     }
 
@@ -7337,6 +10682,18 @@ impl LocalLoomClient {
                 ));
             }
             Ok(bytes)
+        })
+    }
+
+    pub fn sql_exec_result(
+        &self,
+        session: &LoomSession,
+        workspace: &str,
+        db: &str,
+        sql: &str,
+    ) -> Result<Vec<u8>, LoomError> {
+        self.with_session(session, |loom| {
+            execute_generated_sql_result(&self.path, loom, workspace, db, sql)
         })
     }
 
@@ -7914,9 +11271,19 @@ impl LocalLoomClient {
                 session,
                 workspace,
                 src_path,
+                author,
+                message,
                 commit,
                 dry_run,
-            } => self.import_fs(session, workspace, src_path, *commit, *dry_run),
+            } => self.import_fs(
+                session,
+                workspace,
+                src_path,
+                author.as_deref(),
+                message.as_deref(),
+                *commit,
+                *dry_run,
+            ),
             TaskWork::ExportFsAsync {
                 session,
                 workspace,
@@ -7929,8 +11296,22 @@ impl LocalLoomClient {
                 workspace,
                 src_path,
                 kind,
+                gzip_output_path,
+                commit,
+                author,
+                message,
                 dry_run,
-            } => self.archive_import(session, workspace, src_path, kind, *dry_run),
+            } => self.archive_import(
+                session,
+                workspace,
+                src_path,
+                kind,
+                gzip_output_path.as_deref(),
+                *commit,
+                author.as_deref(),
+                message.as_deref(),
+                *dry_run,
+            ),
             TaskWork::ArchiveExportAsync {
                 session,
                 workspace,
@@ -8402,29 +11783,7 @@ fn apply_transfer_import(
 }
 
 fn import_report_to_value(r: &loom_interchange::ImportReport) -> loom_codec::Value {
-    use loom_codec::Value;
-    Value::Array(vec![
-        Value::Text(r.profile.clone()),
-        Value::Text(r.source_scope.clone()),
-        r.commit
-            .as_ref()
-            .map_or(Value::Null, |d| Value::Text(d.to_string())),
-        Value::Uint(r.objects_added),
-        Value::Uint(r.bytes_in),
-        Value::Uint(r.bytes_stored),
-        Value::Uint(r.rows_imported),
-        Value::Uint(r.skipped),
-        Value::Uint(r.operations_planned),
-        Value::Uint(r.operations_applied),
-        Value::Bool(r.dry_run),
-        Value::Array(r.warnings.iter().cloned().map(Value::Text).collect()),
-        Value::Array(
-            r.fidelity_issues
-                .iter()
-                .map(fidelity_issue_to_value)
-                .collect(),
-        ),
-    ])
+    r.to_value()
 }
 
 /// Canonical CBOR of an [`loom_interchange::ImportReport`]. The sync `import_fs` and the async
@@ -8490,26 +11849,16 @@ fn archive_kind_from_str(kind: &str) -> Result<loom_interchange::ArchiveKind, Lo
     })
 }
 
-/// An [`loom_interchange::ArchiveManifest`] as a canonical-CBOR array `[archive_id, kind, root_digest,
-/// entry_count]`. The entry list is summarized by count in the v1 wire form.
+/// An [`loom_interchange::ArchiveManifest`] as a canonical-CBOR array
+/// `[archive_id, kind, root_digest, entries]`.
 fn archive_manifest_to_value(m: &loom_interchange::ArchiveManifest) -> loom_codec::Value {
     use loom_codec::Value;
     Value::Array(vec![
         Value::Text(m.archive_id.clone()),
         Value::Text(archive_kind_str(m.kind).to_string()),
         Value::Text(m.root_digest.to_string()),
-        Value::Uint(m.entries.len() as u64),
+        Value::Array(m.entries.iter().map(|entry| entry.to_value()).collect()),
     ])
-}
-
-/// Canonical CBOR of an [`loom_interchange_io::ArchiveImportResult`] as `[manifest, import_report]`.
-fn archive_import_result_to_cbor(r: &loom_interchange_io::ArchiveImportResult) -> Vec<u8> {
-    use loom_codec::Value;
-    loom_codec::encode(&Value::Array(vec![
-        archive_manifest_to_value(&r.manifest),
-        import_report_to_value(&r.report),
-    ]))
-    .expect("canonical CBOR encode of ArchiveImportResult")
 }
 
 /// Canonical CBOR of an [`loom_interchange_io::ArchiveExportResult`] as `[manifest, export_report]`.
@@ -8628,6 +11977,107 @@ fn trace_query_result_to_cbor(result: &TraceQueryResult) -> Result<Vec<u8>, Loom
     .map_err(|e| LoomError::new(Code::Internal, format!("encode trace query result: {e}")))
 }
 
+fn serve_drive_policy_registry_write(
+    store: &FileStore,
+    actor: Option<WorkspaceId>,
+    workspace: WorkspaceId,
+) -> Result<(WorkflowControlWrite, WorkflowAuditWrite), LoomError> {
+    let mut registry = store
+        .control_get(&drive_policy_registry_key())?
+        .map(|bytes| DrivePolicyRegistry::decode(&bytes))
+        .transpose()?
+        .unwrap_or_else(DrivePolicyRegistry::empty);
+    let workspace_id = workspace.to_string();
+    registry.upsert_enabled(DrivePolicyTarget::new(
+        workspace,
+        workspace_id.clone(),
+        true,
+    )?)?;
+    let target = format!("workspace={workspace};profile={workspace_id};enabled=true");
+    Ok((
+        WorkflowControlWrite::Put {
+            key: drive_policy_registry_key(),
+            payload: registry.encode()?,
+        },
+        WorkflowAuditWrite {
+            principal: actor,
+            action: "drive.policy_registry.configure".to_string(),
+            target: Some(target),
+        },
+    ))
+}
+
+fn inference_instance_settings_from_json(
+    settings_json: &str,
+) -> Result<BTreeMap<String, String>, LoomError> {
+    serde_json::from_str(settings_json).map_err(|error| {
+        LoomError::new(
+            Code::InvalidArgument,
+            format!("invalid inference instance settings JSON: {error}"),
+        )
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct InferenceInstanceJsonView<'a> {
+    instance: &'a loom_types::InferenceInstanceDescriptor,
+    refs: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct InferenceInstanceDeleteJson {
+    name: String,
+    deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InferenceInstanceMutationReceipt {
+    result_json: String,
+    audit_sequence: u64,
+}
+
+fn inference_instance_view_json(
+    state: &loom_inference::InferenceInstanceState,
+    instance: &loom_types::InferenceInstanceDescriptor,
+) -> Result<String, LoomError> {
+    serde_json::to_string(&InferenceInstanceJsonView {
+        instance,
+        refs: state.instance_ref_count(&instance.name),
+    })
+    .map_err(|error| LoomError::new(Code::CorruptObject, format!("json: {error}")))
+}
+
+fn inference_instance_delete_result_json(name: &str) -> Result<String, LoomError> {
+    serde_json::to_string(&InferenceInstanceDeleteJson {
+        name: name.to_string(),
+        deleted: true,
+    })
+    .map_err(|error| LoomError::new(Code::CorruptObject, format!("json: {error}")))
+}
+
+fn inference_instance_audit_target(workspace: WorkspaceId, instance: &str) -> String {
+    format!("workspace={workspace};instance={instance}")
+}
+
+fn inference_instance_result_with_audit_sequence(
+    json: &str,
+    audit_sequence: u64,
+) -> Result<String, LoomError> {
+    let mut value = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|error| LoomError::new(Code::CorruptObject, format!("json: {error}")))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| LoomError::corrupt("inference mutation result must be a JSON object"))?;
+    object.insert(
+        "audit-sequence".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(audit_sequence)),
+    );
+    serde_json::to_string(&value)
+        .map_err(|error| LoomError::new(Code::CorruptObject, format!("json: {error}")))
+}
+
 /// Canonical CBOR of a [`loom_interchange::FidelityIssue`]: `[severity_tag, source_entity_id, field,
 /// reason, source_digest?]` (severity 0=Info, 1=Warning, 2=Error).
 fn fidelity_issue_to_value(fi: &loom_interchange::FidelityIssue) -> loom_codec::Value {
@@ -8648,6 +12098,184 @@ fn fidelity_issue_to_value(fi: &loom_interchange::FidelityIssue) -> loom_codec::
     ])
 }
 
+#[derive(Debug)]
+struct BundlePlanStore {
+    algo: Algo,
+    objects: Mutex<BTreeMap<[u8; 32], Vec<u8>>>,
+}
+
+impl BundlePlanStore {
+    fn new(algo: Algo) -> Self {
+        Self {
+            algo,
+            objects: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl ObjectStore for BundlePlanStore {
+    fn put(&self, canonical: &[u8]) -> Result<Digest, LoomError> {
+        let digest = Digest::hash(self.algo, canonical);
+        self.objects
+            .lock()
+            .expect("bundle plan store lock")
+            .entry(*digest.bytes())
+            .or_insert_with(|| canonical.to_vec());
+        Ok(digest)
+    }
+
+    fn get(&self, digest: &Digest) -> Result<Option<Vec<u8>>, LoomError> {
+        Ok(self
+            .objects
+            .lock()
+            .expect("bundle plan store lock")
+            .get(digest.bytes())
+            .cloned())
+    }
+
+    fn has(&self, digest: &Digest) -> Result<bool, LoomError> {
+        Ok(self
+            .objects
+            .lock()
+            .expect("bundle plan store lock")
+            .contains_key(digest.bytes()))
+    }
+
+    fn len(&self) -> usize {
+        self.objects.lock().expect("bundle plan store lock").len()
+    }
+
+    fn digest_algo(&self) -> Algo {
+        self.algo
+    }
+}
+
+fn decode_store_bundle(bundle_bytes: &[u8]) -> Result<Bundle, LoomError> {
+    Bundle::decode(bundle_bytes).map_err(|error| {
+        LoomError::new(Code::InvalidArgument, format!("bundle: {}", error.message))
+    })
+}
+
+pub fn apply_store_bundle_import_generated(
+    loom: &mut Loom<FileStore>,
+    bundle_bytes: &[u8],
+    dry_run: bool,
+) -> Result<(Vec<u8>, bool), LoomError> {
+    loom.authorize_global_admin()?;
+    let bundle = decode_store_bundle(bundle_bytes)?;
+    let report = if dry_run {
+        plan_store_bundle_import(loom, &bundle)?
+    } else {
+        plan_store_bundle_import(loom, &bundle)?;
+        let (workspace, sync_report) = bundle_import(loom, &bundle)?;
+        store_bundle_import_result(&bundle, workspace, sync_report, false)
+    };
+    Ok((
+        loom_wire::store_admin::store_bundle_import_result_to_cbor(&report),
+        !dry_run,
+    ))
+}
+
+fn check_store_bundle_profile(loom: &Loom<FileStore>, bundle: &Bundle) -> Result<(), LoomError> {
+    let dst_algo = loom.store().digest_algo();
+    if bundle.digest_algo == dst_algo {
+        Ok(())
+    } else {
+        Err(LoomError::new(
+            Code::Conflict,
+            format!(
+                "identity-profile mismatch: source is {}, destination is {}; sync requires matching profiles",
+                bundle.digest_algo.as_str(),
+                dst_algo.as_str()
+            ),
+        ))
+    }
+}
+
+fn reject_existing_bundle_workspace(
+    loom: &Loom<FileStore>,
+    bundle: &Bundle,
+) -> Result<(), LoomError> {
+    match loom
+        .registry()
+        .open(&WsSelector::Name(bundle.ns_name.clone()))
+    {
+        Ok(_) => {
+            return Err(LoomError::new(
+                Code::AlreadyExists,
+                format!("workspace {:?} already exists", bundle.ns_name),
+            ));
+        }
+        Err(error) if error.code == Code::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match loom.registry().open(&WsSelector::Id(bundle.ns_id)) {
+        Ok(_) => Err(LoomError::new(
+            Code::AlreadyExists,
+            format!("workspace id {} already in use", bundle.ns_id),
+        )),
+        Err(error) if error.code == Code::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn plan_store_bundle_import(
+    loom: &Loom<FileStore>,
+    bundle: &Bundle,
+) -> Result<loom_wire::store_admin::StoreBundleImportResult, LoomError> {
+    check_store_bundle_profile(loom, bundle)?;
+    reject_existing_bundle_workspace(loom, bundle)?;
+    let dst_algo = loom.store().digest_algo();
+    let mut temp = Loom::new(BundlePlanStore::new(dst_algo));
+    let mut report = loom_core::SyncReport::default();
+    for frame in &bundle.objects {
+        let digest = Digest::hash(dst_algo, frame);
+        if loom.has_object(digest)? {
+            report.objects_skipped = report.objects_skipped.saturating_add(1);
+        } else {
+            report.objects_transferred = report.objects_transferred.saturating_add(1);
+        }
+        temp.ingest_object(frame)?;
+    }
+    for (_, tip) in bundle.branches.iter().chain(bundle.tags.iter()) {
+        temp.reachable(&[*tip], &BTreeSet::new())?;
+    }
+    for (branch, tip) in &bundle.branches {
+        report.new_tips.push((branch.clone(), *tip));
+    }
+    Ok(store_bundle_import_result(
+        bundle,
+        bundle.ns_id,
+        report,
+        true,
+    ))
+}
+
+fn store_bundle_import_result(
+    bundle: &Bundle,
+    workspace: WorkspaceId,
+    report: loom_core::SyncReport,
+    dry_run: bool,
+) -> loom_wire::store_admin::StoreBundleImportResult {
+    loom_wire::store_admin::StoreBundleImportResult {
+        workspace_id: workspace.to_string(),
+        workspace_name: bundle.ns_name.clone(),
+        facets: bundle
+            .facets
+            .iter()
+            .map(|facet| facet.as_str().to_string())
+            .collect(),
+        objects_transferred: report.objects_transferred,
+        objects_skipped: report.objects_skipped,
+        new_tips: report
+            .new_tips
+            .into_iter()
+            .map(|(name, tip)| format!("{name}:{tip}"))
+            .collect(),
+        dry_run,
+    }
+}
+
 /// Resolve a workspace by UUID or by unique name for a read; a name or UUID identifies a workspace on its
 /// own.
 fn resolve_ns_read(loom: &Loom<FileStore>, name: &str) -> Result<WorkspaceId, LoomError> {
@@ -8656,6 +12284,1045 @@ fn resolve_ns_read(loom: &Loom<FileStore>, name: &str) -> Result<WorkspaceId, Lo
         Err(_) => WsSelector::Name(name.to_string()),
     };
     loom.registry().open(&selector)
+}
+
+pub fn execute_generated_sql_result(
+    path: &Path,
+    loom: &mut Loom<FileStore>,
+    workspace: &str,
+    db: &str,
+    sql: &str,
+) -> Result<Vec<u8>, LoomError> {
+    let mut candidate =
+        loom.fork_state_into(loom_core::provider::PlanningObjectStore::new(loom.store()))?;
+    let ns = resolve_ns_read(loom, workspace)?;
+    candidate.authorize(ns, FacetKind::Sql, AclRight::Write)?;
+    candidate.registry_mut().add_facet(ns, FacetKind::Sql)?;
+    let mut store = LoomSqlStore::load_eager_write(&candidate, ns, db)?;
+    let out = store.exec_cbor(sql)?;
+    if store.in_transaction() {
+        return Err(LoomError::invalid(
+            "BEGIN without a matching COMMIT/ROLLBACK in one exec",
+        ));
+    }
+    if store.is_dirty() {
+        store.persist(&mut candidate, ns, db)?;
+        let published = save_generated_planning_candidate(path, loom.store(), &mut candidate)?;
+        drop(candidate);
+        loom.import_engine_state_preserving_mutable_overlay(&published.engine_state)?;
+    }
+    Ok(out)
+}
+
+fn studio_reindex(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    profile: &str,
+) -> Result<StudioReindexReport, LoomError> {
+    let source_digest = studio_reindex_source_digest(loom, workspace, profile)?;
+    let job = studio_reindex_job(workspace, profile, source_digest, None)?;
+    let job_path = job.job_path(loom.store().digest_algo())?;
+    loom.create_directory_reserved(workspace, EMBEDDING_PROJECTION_JOBS_DIR, true)?;
+    loom.write_file_reserved(workspace, &job_path, &job.encode()?, 0o100644)?;
+    let mut vector_records_indexed = 0;
+    let mut vector_records_deleted = 0;
+    if let Some(resolved) = resolve_optional_vector_binding(loom, workspace, None)? {
+        let summary = drain_meetings_vector_outputs(loom, workspace, profile, &resolved)?;
+        vector_records_indexed = summary.indexed;
+        vector_records_deleted = summary.deleted;
+    }
+    Ok(StudioReindexReport {
+        workspace: workspace.to_string(),
+        profile: profile.to_string(),
+        job_path,
+        state: job.state.as_str().to_string(),
+        source_digest: source_digest.to_string(),
+        model_id: job.stamp.model_id,
+        vector_records_indexed,
+        vector_records_deleted,
+    })
+}
+
+fn studio_reindex_source_digest(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    profile: &str,
+) -> Result<Digest, LoomError> {
+    let head = loom.registry().head_branch(workspace)?;
+    if let Some(tip) = loom.registry().branch_tip(workspace, &head)? {
+        Ok(tip)
+    } else {
+        let seed = format!("studio-reindex:{workspace}:{profile}");
+        Ok(Digest::hash(loom.store().digest_algo(), seed.as_bytes()))
+    }
+}
+
+fn studio_reindex_job(
+    workspace: WorkspaceId,
+    profile: &str,
+    source_digest: Digest,
+    instance: Option<&loom_types::InferenceInstanceDescriptor>,
+) -> Result<EmbeddingProjectionJob, LoomError> {
+    let key = EmbeddingProjectionKey::new(workspace.to_string(), "studio", profile, "reindex")?;
+    let stamp = match instance {
+        Some(instance) => studio_reindex_stamp_for_instance(source_digest, instance)?,
+        None => EmbeddingProjectionStamp::new(
+            source_digest,
+            "loom-built-in-embedding",
+            None,
+            "unconfigured",
+        )?,
+    };
+    let job = EmbeddingProjectionJob::queued(key, stamp);
+    match instance {
+        Some(_) => Ok(job),
+        None => Ok(job.no_engine("built-in embedding inference is not configured")?),
+    }
+}
+
+fn studio_reindex_stamp_for_instance(
+    source_digest: Digest,
+    instance: &loom_types::InferenceInstanceDescriptor,
+) -> Result<EmbeddingProjectionStamp, LoomError> {
+    let descriptor_bytes = serde_json::to_vec(instance)
+        .map_err(|error| LoomError::new(Code::CorruptObject, format!("json: {error}")))?;
+    let descriptor_digest = Digest::hash(source_digest.algo(), &descriptor_bytes);
+    EmbeddingProjectionStamp::new(
+        source_digest,
+        format!(
+            "{}@{}",
+            instance.model.repo_id,
+            instance.model.revision.value()
+        ),
+        None,
+        format!(
+            "{}:{}",
+            instance.runtime.as_str(),
+            descriptor_digest.to_hex()
+        ),
+    )
+}
+
+fn resolve_optional_vector_binding(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    instance: Option<&loom_types::InferenceInstanceDescriptor>,
+) -> Result<Option<ResolvedStudioTextEmbeddingInstance>, LoomError> {
+    let cache_dir = inference_cache_dir()?;
+    let mut hardware = loom_inference::probe_hardware()?;
+    hardware.hf_cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+    let state = inference_instance_state(loom, workspace)?;
+    let instance_name = match instance {
+        Some(instance) => instance.name.clone(),
+        None => match state
+            .vector_bindings
+            .iter()
+            .find(|binding| binding.workspace == workspace.to_string())
+        {
+            Some(binding) => binding.embedding_instance.clone(),
+            None => return Ok(None),
+        },
+    };
+    let instance = state
+        .find_instance(&instance_name)
+        .cloned()
+        .ok_or_else(|| {
+            LoomError::new(
+                Code::NotFound,
+                format!("inference instance {instance_name:?} not found"),
+            )
+        })?;
+    if instance.kind != InferenceModelKind::TextEmbedding {
+        return Err(LoomError::new(
+            Code::InvalidArgument,
+            format!("inference instance {instance_name:?} is not a text-embedding instance"),
+        ));
+    }
+    let record =
+        loom_inference::discover_installed_model(&cache_dir, &instance.model, instance.runtime)?
+            .ok_or_else(|| {
+                LoomError::new(
+                    Code::NotFound,
+                    format!(
+                        "model {:?} is not installed for runtime {}",
+                        instance.model.repo_id,
+                        instance.runtime.as_str()
+                    ),
+                )
+            })?;
+    let handle = loom_inference::activate_text_embedding(&record, &hardware, &cache_dir)?;
+    Ok(Some(ResolvedStudioTextEmbeddingInstance {
+        instance,
+        handle,
+    }))
+}
+
+fn inference_cache_dir() -> Result<PathBuf, LoomError> {
+    if let Some(hf_home) = std::env::var_os("HF_HOME") {
+        return Ok(PathBuf::from(hf_home).join("hub"));
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| LoomError::new(Code::Unavailable, "home directory is unavailable"))?;
+    Ok(home.join(".cache").join("huggingface").join("hub"))
+}
+
+fn drain_meetings_vector_outputs(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    profile: &str,
+    resolved: &ResolvedStudioTextEmbeddingInstance,
+) -> Result<StudioVectorDrainSummary, LoomError> {
+    let model = resolved.handle.model().ok_or_else(|| {
+        LoomError::new(
+            Code::Unavailable,
+            "text embedding provider did not expose a model",
+        )
+    })?;
+    let mut summary = StudioVectorDrainSummary {
+        indexed: 0,
+        deleted: 0,
+    };
+    for profile_id in studio_meetings_profile_ids(workspace, profile) {
+        let Some(snapshot) = load_meetings_snapshot(loom, &profile_id)? else {
+            continue;
+        };
+        let profile_root = Digest::hash(loom.store().digest_algo(), &snapshot.encode()?);
+        let output_set = ProjectionOutputSet::from_snapshot(&snapshot)?;
+        let collection = meetings_vector_collection(&profile_id);
+        match vector_create(
+            loom,
+            workspace,
+            &collection,
+            model.dimension,
+            Metric::Cosine,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.code == Code::Conflict => {}
+            Err(error) => return Err(error),
+        }
+        for output in output_set.outputs_for(ProjectionKind::Vector) {
+            let job = meetings_vector_projection_job(
+                workspace,
+                &profile_id,
+                profile_root,
+                output,
+                resolved,
+            )?;
+            let path = job.job_path(loom.store().digest_algo())?;
+            match output.action {
+                ProjectionAction::Upsert | ProjectionAction::Append => {
+                    loom_core::vector_upsert_text(
+                        loom,
+                        workspace,
+                        &collection,
+                        &meetings_vector_id(output),
+                        &output.text_body(),
+                        meetings_vector_metadata(output),
+                        &resolved.handle,
+                    )?;
+                    summary.indexed = summary.indexed.saturating_add(1);
+                }
+                ProjectionAction::Invalidate | ProjectionAction::RetainMetadata => {
+                    if vector_delete(loom, workspace, &collection, &meetings_vector_id(output))? {
+                        summary.deleted = summary.deleted.saturating_add(1);
+                    }
+                }
+            }
+            loom.create_directory_reserved(workspace, EMBEDDING_PROJECTION_JOBS_DIR, true)?;
+            loom.write_file_reserved(workspace, &path, &job.ready().encode()?, 0o100644)?;
+        }
+    }
+    Ok(summary)
+}
+
+fn load_meetings_snapshot(
+    loom: &Loom<FileStore>,
+    profile_id: &str,
+) -> Result<Option<MeetingsProfileSnapshot>, LoomError> {
+    let key = meetings_profile_key(profile_id)?;
+    loom.store()
+        .control_get(&key)?
+        .map(|bytes| MeetingsProfileSnapshot::decode(&bytes))
+        .transpose()
+}
+
+fn studio_meetings_profile_ids(workspace: WorkspaceId, profile: &str) -> Vec<String> {
+    match profile {
+        "all" | "meetings" => vec![workspace.to_string()],
+        profile => vec![profile.to_string()],
+    }
+}
+
+fn meetings_vector_collection(profile_id: &str) -> String {
+    format!("meetings/{profile_id}")
+}
+
+fn meetings_vector_id(output: &ProjectionOutput) -> String {
+    output
+        .output_ref
+        .strip_prefix("vector:")
+        .unwrap_or(&output.output_ref)
+        .to_string()
+}
+
+fn meetings_vector_metadata(output: &ProjectionOutput) -> BTreeMap<String, Value> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "entity_kind".to_string(),
+        Value::Text(output.entity_kind.clone()),
+    );
+    metadata.insert(
+        "entity_id".to_string(),
+        Value::Text(output.entity_id.clone()),
+    );
+    metadata.insert(
+        "output_ref".to_string(),
+        Value::Text(output.output_ref.clone()),
+    );
+    metadata.insert(
+        "output_id".to_string(),
+        Value::Text(output.output_id.clone()),
+    );
+    metadata.insert(
+        "source_ids".to_string(),
+        Value::List(output.source_ids.iter().cloned().map(Value::Text).collect()),
+    );
+    metadata
+}
+
+fn meetings_vector_projection_job(
+    workspace: WorkspaceId,
+    profile_id: &str,
+    source_digest: Digest,
+    output: &ProjectionOutput,
+    resolved: &ResolvedStudioTextEmbeddingInstance,
+) -> Result<EmbeddingProjectionJob, LoomError> {
+    let key = EmbeddingProjectionKey::new(
+        workspace.to_string(),
+        "meetings",
+        profile_id,
+        &output.output_id,
+    )?;
+    let stamp = studio_reindex_stamp_for_instance(source_digest, &resolved.instance)?;
+    Ok(EmbeddingProjectionJob::queued(key, stamp))
+}
+
+fn rebuild_studio_revision_index(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    profile: &str,
+    dry_run: bool,
+) -> Result<StudioRevisionRebuildReport, LoomError> {
+    let scope_id = workspace.to_string();
+    match profile {
+        "drive" => rebuild_drive_revision_index(loom, workspace, &scope_id, dry_run),
+        "lifecycle" => rebuild_lifecycle_revision_index(loom, workspace, &scope_id, dry_run),
+        "meetings" => rebuild_meetings_revision_index(loom, workspace, &scope_id, dry_run),
+        "pages" => rebuild_pages_revision_index(loom, workspace, &scope_id, dry_run),
+        other => Err(LoomError::new(
+            Code::InvalidArgument,
+            format!(
+                "unsupported Studio revision rebuild profile {other:?}; supported profiles: drive, lifecycle, meetings, pages"
+            ),
+        )),
+    }
+}
+
+fn rebuild_meetings_revision_index(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    scope_id: &str,
+    dry_run: bool,
+) -> Result<StudioRevisionRebuildReport, LoomError> {
+    loom.authorize(workspace, FacetKind::Vcs, AclRight::Write)?;
+    let key = meetings_profile_key(scope_id)?;
+    let Some(bytes) = loom.store().control_get(&key)? else {
+        return Err(LoomError::new(
+            Code::NotFound,
+            "meetings snapshot not found",
+        ));
+    };
+    let snapshot = MeetingsProfileSnapshot::decode(&bytes)?;
+    let root = Digest::hash(loom.store().digest_algo(), &bytes);
+    let updates = snapshot
+        .meetings
+        .iter()
+        .map(|meeting| {
+            let body = meeting.encode()?;
+            RevisionBackfillUpdate::new(
+                format!("meeting:{}", meeting.meeting_id),
+                format!("meetings:{scope_id}:{}:backfill:1", meeting.meeting_id),
+                BodyRef::new(
+                    Digest::hash(loom.store().digest_algo(), &body),
+                    body.len() as u64,
+                    "application/vnd.uldren.loom.meetings.meeting+cbor",
+                )?,
+                root,
+                meeting.updated_at_ms,
+                format!("{}:backfill:1", meeting.meeting_id),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    apply_revision_backfill(loom, workspace, scope_id, "meetings", dry_run, updates)
+}
+
+fn rebuild_drive_revision_index(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    scope_id: &str,
+    dry_run: bool,
+) -> Result<StudioRevisionRebuildReport, LoomError> {
+    loom.authorize(workspace, FacetKind::Vcs, AclRight::Write)?;
+    let key = drive_operation_log_key(scope_id)?;
+    let Some(bytes) = loom.store().control_get(&key)? else {
+        return Err(LoomError::new(
+            Code::NotFound,
+            "drive operation log not found",
+        ));
+    };
+    let log = DriveOperationLog::decode(&bytes)?;
+    let mut latest = BTreeMap::new();
+    for record in log.records.iter().rev() {
+        let Some(target) = record.target_entity_id.as_deref() else {
+            continue;
+        };
+        let entity_id = format!("drive:metadata:{target}");
+        if latest.contains_key(&entity_id) {
+            continue;
+        }
+        let envelope = OperationEnvelope::decode(&record.envelope)?;
+        latest.insert(
+            entity_id.clone(),
+            revision_backfill_update(
+                loom,
+                entity_id,
+                record.operation_id.clone(),
+                record.root_after,
+                &record.envelope,
+                "application/vnd.uldren.loom.drive.operation+cbor",
+                envelope.timestamp_ms,
+                format!("drive:metadata:{target}:backfill:1"),
+            )?,
+        );
+    }
+    apply_revision_backfill(
+        loom,
+        workspace,
+        scope_id,
+        "drive",
+        dry_run,
+        latest.into_values().collect(),
+    )
+}
+
+fn rebuild_pages_revision_index(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    scope_id: &str,
+    dry_run: bool,
+) -> Result<StudioRevisionRebuildReport, LoomError> {
+    loom.authorize(workspace, FacetKind::Vcs, AclRight::Write)?;
+    let log = loom_pages::page_operation_log(loom.store(), scope_id)?;
+    if log.records.is_empty() {
+        return Err(LoomError::new(
+            Code::NotFound,
+            "pages operation log not found",
+        ));
+    }
+    let mut latest = BTreeMap::new();
+    for record in log.records.iter().rev() {
+        let Some(target) = record.target_entity_id.as_deref() else {
+            continue;
+        };
+        let entity_id = page_operation_revision_entity_id(record.operation_kind.as_str(), target);
+        if latest.contains_key(&entity_id) {
+            continue;
+        }
+        let envelope = OperationEnvelope::decode(&record.envelope)?;
+        latest.insert(
+            entity_id.clone(),
+            revision_backfill_update(
+                loom,
+                entity_id,
+                record.operation_id.clone(),
+                record.root_after,
+                &record.envelope,
+                "application/vnd.uldren.loom.pages.operation+cbor",
+                envelope.timestamp_ms,
+                format!("pages:{scope_id}:{target}:backfill:1"),
+            )?,
+        );
+    }
+    apply_revision_backfill(
+        loom,
+        workspace,
+        scope_id,
+        "pages",
+        dry_run,
+        latest.into_values().collect(),
+    )
+}
+
+fn page_operation_revision_entity_id(operation_kind: &str, target_entity_id: &str) -> String {
+    match operation_kind {
+        "space.created" => format!("space:{target_entity_id}"),
+        "page.created" | "page.updated" => format!("page:draft:{target_entity_id}"),
+        "structure.created" => format!("structure:{target_entity_id}"),
+        "structure.node_added"
+        | "structure.node_updated"
+        | "structure.node_bound"
+        | "structure.node_moved" => format!("structure-node:{target_entity_id}"),
+        "structure.node_linked" => format!("structure-edge:{target_entity_id}"),
+        _ => format!("pages:operation:{target_entity_id}"),
+    }
+}
+
+fn rebuild_lifecycle_revision_index(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    scope_id: &str,
+    dry_run: bool,
+) -> Result<StudioRevisionRebuildReport, LoomError> {
+    loom.authorize(workspace, FacetKind::Vcs, AclRight::Write)?;
+    let mut updates = Vec::new();
+    for (key, bytes) in loom
+        .store()
+        .control_scan_prefix(format!("profile/lifecycle/v1/{scope_id}/definitions/").as_bytes())?
+    {
+        let definition_id = String::from_utf8_lossy(&key)
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let root = Digest::hash(loom.store().digest_algo(), &bytes);
+        updates.push(revision_backfill_update(
+            loom,
+            format!("lifecycle:definition:{definition_id}"),
+            format!("lifecycle.definition.backfill:{scope_id}:{definition_id}"),
+            root,
+            &bytes,
+            "application/vnd.uldren.loom.lifecycle.definition+cbor",
+            0,
+            format!("lifecycle:definition:{definition_id}:backfill:1"),
+        )?);
+    }
+    for (key, bytes) in loom
+        .store()
+        .control_scan_prefix(format!("profile/lifecycle/v1/{scope_id}/instances/").as_bytes())?
+    {
+        let instance_id = String::from_utf8_lossy(&key)
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let root = Digest::hash(loom.store().digest_algo(), &bytes);
+        updates.push(revision_backfill_update(
+            loom,
+            format!("lifecycle:instance:{instance_id}"),
+            format!("lifecycle.instance.backfill:{scope_id}:{instance_id}"),
+            root,
+            &bytes,
+            "application/vnd.uldren.loom.lifecycle.instance+cbor",
+            0,
+            format!("lifecycle:instance:{instance_id}:backfill:1"),
+        )?);
+    }
+    let key = lifecycle_operation_log_key(scope_id)?;
+    if let Some(bytes) = loom.store().control_get(&key)? {
+        let log = LifecycleOperationLog::decode(&bytes)?;
+        for record in log.records.iter().rev() {
+            let entity_id = format!("lifecycle:instance:{}", record.instance_id);
+            if updates.iter().any(|update| update.entity_id == entity_id) {
+                continue;
+            }
+            let envelope = OperationEnvelope::decode(&record.envelope)?;
+            updates.push(revision_backfill_update(
+                loom,
+                entity_id,
+                record.operation_id.clone(),
+                record.root_after,
+                &record.envelope,
+                "application/vnd.uldren.loom.lifecycle.operation+cbor",
+                envelope.timestamp_ms,
+                format!("lifecycle:{}:backfill:1", record.instance_id),
+            )?);
+        }
+    }
+    apply_revision_backfill(loom, workspace, scope_id, "lifecycle", dry_run, updates)
+}
+
+fn apply_revision_backfill(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    scope_id: &str,
+    profile: &str,
+    dry_run: bool,
+    updates: Vec<RevisionBackfillUpdate>,
+) -> Result<StudioRevisionRebuildReport, LoomError> {
+    let (mut index, index_present_before) =
+        match load_optional_current_revision_index(loom, workspace, scope_id)? {
+            Some(index) => (index, true),
+            None => (RevisionIndex::new(), false),
+        };
+    let candidates = updates.len() as u64;
+    let backfill = index.backfill_missing_current(scope_id, updates)?;
+    if !dry_run && backfill.inserted > 0 {
+        persist_current_revision_index(loom, workspace, scope_id, FacetKind::Document, &index)?;
+    }
+    Ok(StudioRevisionRebuildReport {
+        workspace: workspace.to_string(),
+        scope_id: scope_id.to_string(),
+        profile: profile.to_string(),
+        index_present_before,
+        candidates,
+        inserted: backfill.inserted,
+        skipped_existing: backfill.skipped_existing,
+        dry_run,
+    })
+}
+
+fn revision_backfill_update(
+    loom: &Loom<FileStore>,
+    entity_id: String,
+    operation_id: String,
+    root: Digest,
+    body: &[u8],
+    media_type: &str,
+    timestamp_ms: u64,
+    checkpoint_id: String,
+) -> Result<RevisionBackfillUpdate, LoomError> {
+    RevisionBackfillUpdate::new(
+        entity_id,
+        operation_id,
+        BodyRef::new(
+            Digest::hash(loom.store().digest_algo(), body),
+            body.len() as u64,
+            media_type,
+        )?,
+        root,
+        timestamp_ms,
+        checkpoint_id,
+    )
+}
+
+struct ExecApplyRequest {
+    workspace: String,
+    base: String,
+    fork: String,
+    author: String,
+    timestamp_ms: u64,
+}
+
+fn decode_exec_apply_request(bytes: &[u8]) -> Result<ExecApplyRequest, LoomError> {
+    let value = loom_codec::decode(bytes).map_err(|err| {
+        LoomError::new(
+            Code::InvalidArgument,
+            format!("decode exec apply request: {err}"),
+        )
+    })?;
+    let loom_codec::Value::Map(fields) = value else {
+        return Err(LoomError::new(
+            Code::InvalidArgument,
+            "exec apply request must be a CBOR map",
+        ));
+    };
+    let mut workspace = None;
+    let mut base = None;
+    let mut fork = None;
+    let mut author = None;
+    let mut timestamp_ms = None;
+    for (key, value) in fields {
+        let loom_codec::Value::Text(key) = key else {
+            return Err(LoomError::new(
+                Code::InvalidArgument,
+                "exec apply request keys must be text",
+            ));
+        };
+        match key.as_str() {
+            "workspace" => workspace = Some(exec_apply_text_field("workspace", value)?),
+            "base" => base = Some(exec_apply_text_field("base", value)?),
+            "fork" => fork = Some(exec_apply_text_field("fork", value)?),
+            "author" => author = Some(exec_apply_text_field("author", value)?),
+            "timestamp_ms" => {
+                let loom_codec::Value::Uint(value) = value else {
+                    return Err(LoomError::new(
+                        Code::InvalidArgument,
+                        "exec apply timestamp_ms must be an unsigned integer",
+                    ));
+                };
+                timestamp_ms = Some(value);
+            }
+            _ => {
+                return Err(LoomError::new(
+                    Code::InvalidArgument,
+                    format!("unknown exec apply request field {key:?}"),
+                ));
+            }
+        }
+    }
+    Ok(ExecApplyRequest {
+        workspace: workspace.ok_or_else(|| exec_apply_missing_field("workspace"))?,
+        base: base.ok_or_else(|| exec_apply_missing_field("base"))?,
+        fork: fork.ok_or_else(|| exec_apply_missing_field("fork"))?,
+        author: author.ok_or_else(|| exec_apply_missing_field("author"))?,
+        timestamp_ms: timestamp_ms.ok_or_else(|| exec_apply_missing_field("timestamp_ms"))?,
+    })
+}
+
+fn exec_apply_text_field(name: &str, value: loom_codec::Value) -> Result<String, LoomError> {
+    match value {
+        loom_codec::Value::Text(value) => Ok(value),
+        _ => Err(LoomError::new(
+            Code::InvalidArgument,
+            format!("exec apply {name} must be text"),
+        )),
+    }
+}
+
+fn exec_apply_missing_field(name: &str) -> LoomError {
+    LoomError::new(
+        Code::InvalidArgument,
+        format!("exec apply request missing {name}"),
+    )
+}
+
+fn encode_exec_apply_result(outcome: &MergeOutcome) -> Result<Vec<u8>, LoomError> {
+    use loom_codec::Value;
+    let mut fields = vec![
+        (
+            Value::Text("schema".to_string()),
+            Value::Text("loom.exec.apply.result.v1".to_string()),
+        ),
+        (
+            Value::Text("outcome".to_string()),
+            Value::Text(
+                match outcome {
+                    MergeOutcome::UpToDate => "up_to_date",
+                    MergeOutcome::FastForward(_) => "fast_forward",
+                    MergeOutcome::Merged(_) => "merged",
+                    MergeOutcome::Conflicts(_) => "conflicts",
+                }
+                .to_string(),
+            ),
+        ),
+    ];
+    match outcome {
+        MergeOutcome::UpToDate => {}
+        MergeOutcome::FastForward(digest) | MergeOutcome::Merged(digest) => {
+            fields.push((
+                Value::Text("digest".to_string()),
+                Value::Bytes(digest.bytes().to_vec()),
+            ));
+        }
+        MergeOutcome::Conflicts(conflicts) => {
+            fields.push((
+                Value::Text("conflicts".to_string()),
+                Value::Array(conflicts.iter().cloned().map(Value::Text).collect()),
+            ));
+        }
+    }
+    loom_codec::encode(&Value::Map(fields))
+        .map_err(|err| LoomError::new(Code::Internal, format!("encode exec apply result: {err}")))
+}
+
+fn exec_error_to_loom(err: ExecError) -> LoomError {
+    match err {
+        ExecError::Core(err) => err,
+        other => LoomError::new(other.code(), other.to_string()),
+    }
+}
+
+fn authorize_generated_drive_collection<S: ObjectStore>(
+    loom: &Loom<S>,
+    workspace: WorkspaceId,
+    drive_workspace_id: &str,
+) -> Result<(), LoomError> {
+    loom.authorize_resource(
+        AclResource::scoped(
+            workspace,
+            AclDomain::Files,
+            None,
+            AclResourceScope::Prefix {
+                kind: AclScopeKind::Collection,
+                value: drive_workspace_id.as_bytes(),
+            },
+        ),
+        AclRight::Write,
+    )
+}
+
+fn parse_drive_conflict_resolution(
+    resolution: &str,
+) -> Result<loom_drive::HostedDriveConflictResolution, LoomError> {
+    match resolution {
+        "keep_current" | "keep-current" => {
+            Ok(loom_drive::HostedDriveConflictResolution::KeepCurrent)
+        }
+        "keep_conflict" | "keep-conflict" => {
+            Ok(loom_drive::HostedDriveConflictResolution::KeepConflict)
+        }
+        "keep_both" | "keep-both" => Ok(loom_drive::HostedDriveConflictResolution::KeepBoth),
+        _ => Err(LoomError::new(
+            Code::InvalidArgument,
+            "resolution must be keep_current, keep_conflict, or keep_both",
+        )),
+    }
+}
+
+pub(crate) struct GeneratedPlanningCandidatePublication {
+    pub(crate) engine_state: Vec<u8>,
+    pub(crate) workflow_receipts: Vec<loom_core::CommitReceipt>,
+}
+
+fn save_exec_apply_candidate(
+    path: &Path,
+    store: &FileStore,
+    candidate: &mut Loom<loom_core::provider::PlanningObjectStore<'_, FileStore>>,
+) -> Result<Vec<u8>, LoomError> {
+    Ok(save_generated_planning_candidate(path, store, candidate)?.engine_state)
+}
+
+pub(crate) fn save_generated_planning_candidate(
+    path: &Path,
+    store: &FileStore,
+    candidate: &mut Loom<loom_core::provider::PlanningObjectStore<'_, FileStore>>,
+) -> Result<GeneratedPlanningCandidatePublication, LoomError> {
+    save_generated_planning_candidate_with_audits(path, store, candidate, Vec::new())
+}
+
+pub(crate) fn save_generated_planning_candidate_with_audits(
+    path: &Path,
+    store: &FileStore,
+    candidate: &mut Loom<loom_core::provider::PlanningObjectStore<'_, FileStore>>,
+    audits: Vec<WorkflowAuditWrite>,
+) -> Result<GeneratedPlanningCandidatePublication, LoomError> {
+    let (root, state_objects) = candidate.save_state_objects()?;
+    let mut objects = candidate.store().objects()?;
+    objects.extend(state_objects);
+    let state = candidate.export_state();
+    let workflow_transactions = candidate.store().workflow_transactions()?;
+    let direct_controls = candidate.store().direct_control_writes()?;
+    exec_apply_candidate_save_hook(path)?;
+    #[cfg(any(test, feature = "test-hooks"))]
+    generated_candidate_publication_test_observe(
+        path,
+        GeneratedCandidatePublicationTestEvent::Attempt,
+    );
+    let workflow_receipts = if workflow_transactions.is_empty() {
+        if direct_controls.is_empty() {
+            if audits.is_empty() {
+                store.put_batch_and_set_reference_root(&objects, root)?;
+            } else {
+                loom_store::put_saved_state_and_audit(store, (root, objects), audits)?;
+            }
+        } else {
+            if !audits.is_empty() {
+                return Err(LoomError::corrupt(
+                    "generated candidate left audits with direct control writes",
+                ));
+            }
+            store.put_batch_control_delta_and_set_reference_root(
+                &objects,
+                direct_controls,
+                root,
+            )?;
+        }
+        Vec::new()
+    } else {
+        if !audits.is_empty() {
+            return Err(LoomError::corrupt(
+                "generated candidate left audits with workflow transactions",
+            ));
+        }
+        if !direct_controls.is_empty() {
+            return Err(LoomError::corrupt(
+                "workflow candidate left unowned direct control writes",
+            ));
+        }
+        let mut receipts = Vec::new();
+        for mut txn in workflow_transactions {
+            txn.owner_state.objects.extend(objects.clone());
+            txn.owner_state.reference = loom_core::WorkflowReferenceUpdate::Set(Some(root));
+            receipts.push(store.commit_workflow_transaction(txn)?);
+        }
+        receipts
+    };
+    #[cfg(any(test, feature = "test-hooks"))]
+    generated_candidate_publication_test_observe(
+        path,
+        GeneratedCandidatePublicationTestEvent::Success,
+    );
+    Ok(GeneratedPlanningCandidatePublication {
+        engine_state: state,
+        workflow_receipts,
+    })
+}
+
+#[cfg(test)]
+type ExecApplyCandidateSaveHook = Box<dyn FnOnce() -> Result<(), LoomError> + Send>;
+
+#[cfg(test)]
+static EXEC_APPLY_CANDIDATE_SAVE_HOOKS: std::sync::LazyLock<
+    Mutex<HashMap<PathBuf, ExecApplyCandidateSaveHook>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedCandidatePublicationTestEvent {
+    Attempt,
+    Success,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+type GeneratedCandidatePublicationTestObserver =
+    std::sync::Arc<dyn Fn(GeneratedCandidatePublicationTestEvent) + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
+static GENERATED_CANDIDATE_PUBLICATION_TEST_OBSERVERS: std::sync::LazyLock<
+    Mutex<HashMap<PathBuf, (u64, GeneratedCandidatePublicationTestObserver)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeetingsImportTestHookPoint {
+    AfterWorkspaceCreation,
+    AfterPayloadRevisionPlanning,
+    BeforePublication,
+}
+
+#[cfg(test)]
+type MeetingsImportTestHook =
+    Box<dyn FnMut(MeetingsImportTestHookPoint) -> Result<(), LoomError> + Send>;
+
+#[cfg(test)]
+static MEETINGS_IMPORT_TEST_HOOK: Mutex<Option<(PathBuf, MeetingsImportTestHook)>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn install_exec_apply_candidate_save_hook(
+    path: PathBuf,
+    hook: ExecApplyCandidateSaveHook,
+) {
+    EXEC_APPLY_CANDIDATE_SAVE_HOOKS
+        .lock()
+        .expect("exec apply save hook lock")
+        .insert(path, hook);
+}
+
+#[cfg(test)]
+fn exec_apply_candidate_save_hook(path: &Path) -> Result<(), LoomError> {
+    let hook = EXEC_APPLY_CANDIDATE_SAVE_HOOKS
+        .lock()
+        .expect("exec apply save hook lock")
+        .remove(path);
+    if let Some(hook) = hook {
+        hook()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn exec_apply_candidate_save_hook(_path: &Path) -> Result<(), LoomError> {
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn install_generated_candidate_publication_test_observer(
+    path: PathBuf,
+    observer: GeneratedCandidatePublicationTestObserver,
+) -> GeneratedCandidatePublicationTestGuard {
+    let id = GENERATED_CANDIDATE_PUBLICATION_TEST_OBSERVER_IDS.fetch_add(1, Ordering::SeqCst);
+    GENERATED_CANDIDATE_PUBLICATION_TEST_OBSERVERS
+        .lock()
+        .expect("generated candidate publication observer lock")
+        .insert(path.clone(), (id, observer));
+    GeneratedCandidatePublicationTestGuard { path, id }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct GeneratedCandidatePublicationTestGuard {
+    path: PathBuf,
+    id: u64,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for GeneratedCandidatePublicationTestGuard {
+    fn drop(&mut self) {
+        let mut observers = GENERATED_CANDIDATE_PUBLICATION_TEST_OBSERVERS
+            .lock()
+            .expect("generated candidate publication observer lock");
+        if observers
+            .get(&self.path)
+            .is_some_and(|(id, _)| *id == self.id)
+        {
+            observers.remove(&self.path);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+static GENERATED_CANDIDATE_PUBLICATION_TEST_OBSERVER_IDS: std::sync::LazyLock<AtomicU64> =
+    std::sync::LazyLock::new(|| AtomicU64::new(1));
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn generated_candidate_publication_test_observer_registered(path: &Path) -> bool {
+    GENERATED_CANDIDATE_PUBLICATION_TEST_OBSERVERS
+        .lock()
+        .expect("generated candidate publication observer lock")
+        .contains_key(path)
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn generated_candidate_publication_test_observe(
+    path: &Path,
+    event: GeneratedCandidatePublicationTestEvent,
+) {
+    let observer = GENERATED_CANDIDATE_PUBLICATION_TEST_OBSERVERS
+        .lock()
+        .expect("generated candidate publication observer lock")
+        .get(path)
+        .map(|(_, observer)| std::sync::Arc::clone(observer));
+    if let Some(observer) = observer {
+        observer(event);
+    }
+}
+
+#[cfg(test)]
+fn install_meetings_import_test_hook(path: PathBuf, hook: MeetingsImportTestHook) {
+    *MEETINGS_IMPORT_TEST_HOOK
+        .lock()
+        .expect("meetings import hook lock") = Some((path, hook));
+}
+
+#[cfg(test)]
+fn clear_meetings_import_test_hook() {
+    *MEETINGS_IMPORT_TEST_HOOK
+        .lock()
+        .expect("meetings import hook lock") = None;
+}
+
+#[cfg(test)]
+fn meetings_import_test_hook(
+    path: &std::path::Path,
+    point: MeetingsImportTestHookPoint,
+) -> Result<(), LoomError> {
+    let mut guard = MEETINGS_IMPORT_TEST_HOOK
+        .lock()
+        .expect("meetings import hook lock");
+    if let Some((target_path, hook)) = guard.as_mut()
+        && target_path == path
+    {
+        hook(point)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn meetings_import_test_hook(
+    _path: &std::path::Path,
+    _point: MeetingsImportTestHookPoint,
+) -> Result<(), LoomError> {
+    Ok(())
 }
 
 fn task_handle_key(task: &Task) -> Result<u64, LoomError> {
@@ -8694,6 +13361,17 @@ fn ensure_batch_no_open_txn(state: &SqlBatchState) -> Result<(), LoomError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loom_substrate::refs::ReferenceSource;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ExecApplyWorkspaceSnapshot {
+        head: String,
+        main_log: Vec<Digest>,
+        feature_log: Vec<Digest>,
+        staged_file: Vec<u8>,
+        status: Status,
+        merge_in_progress: bool,
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =
@@ -8703,6 +13381,2460 @@ mod tests {
         dir
     }
 
+    fn direct_sql_exec(sql: &str) -> Result<Vec<u8>, LoomError> {
+        let mut store = LoomSqlStore::default();
+        store.exec_cbor(sql)
+    }
+
+    #[derive(Debug)]
+    struct ClientFixedMaintenanceClock {
+        now_ms: u64,
+        instant: std::time::Instant,
+    }
+
+    impl StoreMaintenanceClock for ClientFixedMaintenanceClock {
+        fn now_ms(&self) -> u64 {
+            self.now_ms
+        }
+
+        fn monotonic_now(&self) -> std::time::Instant {
+            self.instant
+        }
+    }
+
+    fn cbor_array(bytes: &[u8]) -> Vec<loom_codec::Value> {
+        match loom_codec::decode(bytes).expect("decode cbor") {
+            loom_codec::Value::Array(items) => items,
+            other => panic!("expected cbor array: {other:?}"),
+        }
+    }
+
+    fn seed_authenticated_user(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+    ) -> (WorkspaceId, WorkspaceId) {
+        let root = WorkspaceId::from_bytes([91; 16]);
+        let user = WorkspaceId::from_bytes([92; 16]);
+        client
+            .with_session(session, |loom| {
+                let mut identity = IdentityStore::new(root);
+                identity.set_passphrase(root, "root-pass", b"root-salt")?;
+                identity.add_principal(user, "user", PrincipalKind::User)?;
+                identity.set_passphrase(user, "user-pass", b"user-salt")?;
+                let mut acl = AclStore::new();
+                acl.allow(AclSubject::Principal(root), None, None, [AclRight::Admin])?;
+                loom.store().save_identity_store(&identity)?;
+                loom.store().save_acl_store(&acl)?;
+                loom.set_identity_store(identity);
+                loom.set_acl_store(acl);
+                Ok(())
+            })
+            .expect("seed auth");
+        (root, user)
+    }
+
+    fn malformed_cbor() -> Vec<u8> {
+        vec![0xff]
+    }
+
+    #[test]
+    fn store_maintenance_generated_unknown_session_is_not_found() {
+        let dir = temp_dir("maintenance-unknown-session");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let unknown = unknown_session(&session);
+        let request = loom_wire::store_admin::store_maintenance_status_request_to_cbor(
+            &loom_wire::store_admin::StoreMaintenanceStatusRequest {
+                include_live_root_diagnostics: false,
+            },
+        );
+        assert_eq!(
+            client
+                .store_maintenance_status(&unknown, &request)
+                .expect_err("unknown session")
+                .code,
+            Code::NotFound
+        );
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_maintenance_generated_authorizes_before_mutation_decode() {
+        let dir = temp_dir("maintenance-auth-before-decode");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let (_root, user) = seed_authenticated_user(&client, &session);
+        client
+            .authenticate_passphrase(&session, user, b"user-pass")
+            .expect("auth user");
+
+        let policy = client
+            .store_maintenance_policy_set(&session, &malformed_cbor())
+            .expect_err("policy denied before decode");
+        assert_eq!(policy.code, Code::PermissionDenied);
+
+        let run = client
+            .store_maintenance_run(&session, &malformed_cbor())
+            .expect_err("run denied before decode");
+        assert_eq!(run.code, Code::PermissionDenied);
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn audit_compact_generated_legal_hold_noop_checkpoint_audit_and_reopen() {
+        let dir = temp_dir("audit-compact-generated");
+        let hold_path = dir.join("hold.loom");
+        let hold = LocalLoomClient::new(&hold_path);
+        hold.create().expect("create hold store");
+        let hold_session = hold.open().expect("open hold");
+        hold.with_session(&hold_session, |loom| {
+            loom.store().save_audit_config_audited(
+                loom_store::AuditConfig {
+                    retention_days: 365,
+                    legal_hold: true,
+                },
+                None,
+                "audit.config.set",
+                Some("legal_hold=true"),
+            )?;
+            Ok(())
+        })
+        .expect("set legal hold");
+        assert_eq!(
+            hold.audit_compact(&hold_session, 0)
+                .expect_err("legal hold")
+                .code,
+            Code::PermissionDenied
+        );
+        hold.close(&hold_session);
+
+        let path = dir.join("compact.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+
+        let noop = cbor_array(
+            &client
+                .audit_compact(&session, 0)
+                .expect("noop audit compact"),
+        );
+        assert_eq!(noop[0], loom_codec::Value::Uint(0));
+        assert_eq!(noop[1], loom_codec::Value::Null);
+        assert_eq!(noop[2], loom_codec::Value::Null);
+        assert_eq!(noop[3], loom_codec::Value::Uint(0));
+
+        client
+            .with_session(&session, |loom| {
+                loom.store().audit_append(None, "seed.one", None)?;
+                loom.store().audit_append(None, "seed.two", None)?;
+                Ok(())
+            })
+            .expect("seed audit");
+        let compact = cbor_array(
+            &client
+                .audit_compact(&session, 2)
+                .expect("checkpoint audit compact"),
+        );
+        assert_eq!(compact[0], loom_codec::Value::Uint(3));
+        assert_eq!(compact[1], loom_codec::Value::Uint(2));
+        assert!(matches!(compact[2], loom_codec::Value::Text(_)));
+        assert_eq!(compact[3], loom_codec::Value::Uint(3));
+        let records = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit records");
+        assert!(records.iter().any(|record| record.action == "audit.prune"));
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let reopened_session = reopened.open().expect("reopen");
+        let reopened_records = reopened
+            .with_session(&reopened_session, |loom| loom.store().audit_records())
+            .expect("reopened audit");
+        assert!(
+            reopened_records
+                .iter()
+                .any(|record| record.action == "audit.prune")
+        );
+        reopened.close(&reopened_session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_maintenance_generated_status_controls_live_root_diagnostics() {
+        let dir = temp_dir("maintenance-status-diagnostics");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+
+        let without = loom_wire::store_admin::store_maintenance_status_request_to_cbor(
+            &loom_wire::store_admin::StoreMaintenanceStatusRequest {
+                include_live_root_diagnostics: false,
+            },
+        );
+        let without = loom_wire::store_admin::store_maintenance_status_result_from_cbor(
+            &client
+                .store_maintenance_status(&session, &without)
+                .expect("status without diagnostics"),
+        )
+        .expect("decode status without diagnostics");
+        assert!(without.live_root_diagnostics.is_none());
+
+        let with = loom_wire::store_admin::store_maintenance_status_request_to_cbor(
+            &loom_wire::store_admin::StoreMaintenanceStatusRequest {
+                include_live_root_diagnostics: true,
+            },
+        );
+        let with = loom_wire::store_admin::store_maintenance_status_result_from_cbor(
+            &client
+                .store_maintenance_status(&session, &with)
+                .expect("status with diagnostics"),
+        )
+        .expect("decode status with diagnostics");
+        assert!(with.live_root_diagnostics.is_some());
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_maintenance_generated_policy_partial_update_validates_and_audits_atomically() {
+        let dir = temp_dir("maintenance-policy-generated");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let before = client
+            .with_session(&session, |loom| loom.store().store_maintenance_policy())
+            .expect("policy before");
+        let update = loom_wire::store_admin::store_maintenance_policy_update_to_cbor(
+            &loom_wire::store_admin::StoreMaintenancePolicyUpdate {
+                max_pages: Some(77),
+                tail_trim_enabled: Some(false),
+                ..loom_wire::store_admin::StoreMaintenancePolicyUpdate {
+                    min_candidate_pages: None,
+                    min_reusable_pages: None,
+                    interval_ms: None,
+                    backoff_ms: None,
+                    max_segments: None,
+                    max_pages: None,
+                    full_compaction_enabled: None,
+                    tail_trim_enabled: None,
+                    tail_compaction_enabled: None,
+                    tail_compaction_max_pages: None,
+                    tail_compaction_max_objects: None,
+                    tail_compaction_max_bytes: None,
+                    tail_compaction_interval_ms: None,
+                    tail_compaction_backoff_ms: None,
+                }
+            },
+        );
+        client
+            .store_maintenance_policy_set(&session, &update)
+            .expect("partial policy update");
+        let after = client
+            .with_session(&session, |loom| loom.store().store_maintenance_policy())
+            .expect("policy after");
+        assert_eq!(after.max_pages, 77);
+        assert!(!after.tail_trim_enabled);
+        assert_eq!(after.min_candidate_pages, before.min_candidate_pages);
+        assert_eq!(after.interval_ms, before.interval_ms);
+        let audit = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit");
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, "store.maintenance.policy.set");
+        assert!(
+            client
+                .with_session(&session, |loom| {
+                    loom.store().control_get(b"store.maintenance.policy.last")
+                })
+                .expect("synthetic key")
+                .is_none()
+        );
+
+        let invalid = loom_wire::store_admin::store_maintenance_policy_update_to_cbor(
+            &loom_wire::store_admin::StoreMaintenancePolicyUpdate {
+                interval_ms: Some(0),
+                ..loom_wire::store_admin::StoreMaintenancePolicyUpdate {
+                    min_candidate_pages: None,
+                    min_reusable_pages: None,
+                    interval_ms: None,
+                    backoff_ms: None,
+                    max_segments: None,
+                    max_pages: None,
+                    full_compaction_enabled: None,
+                    tail_trim_enabled: None,
+                    tail_compaction_enabled: None,
+                    tail_compaction_max_pages: None,
+                    tail_compaction_max_objects: None,
+                    tail_compaction_max_bytes: None,
+                    tail_compaction_interval_ms: None,
+                    tail_compaction_backoff_ms: None,
+                }
+            },
+        );
+        assert_eq!(
+            client
+                .store_maintenance_policy_set(&session, &invalid)
+                .expect_err("invalid policy")
+                .code,
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            client
+                .with_session(&session, |loom| loom.store().store_maintenance_policy())
+                .expect("policy unchanged"),
+            after
+        );
+        assert_eq!(
+            client
+                .with_session(&session, |loom| loom.store().audit_records())
+                .expect("audit unchanged")
+                .len(),
+            1
+        );
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_maintenance_generated_run_uses_injected_clock_and_decodes_typed_outcome() {
+        let dir = temp_dir("maintenance-run-generated");
+        let clock = Arc::new(ClientFixedMaintenanceClock {
+            now_ms: 7_777,
+            instant: std::time::Instant::now(),
+        });
+        let client = LocalLoomClient::with_store_maintenance_clock(dir.join("t.loom"), clock);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+
+        let zero = loom_wire::store_admin::store_maintenance_run_request_to_cbor(
+            &loom_wire::store_admin::StoreMaintenanceRunRequest {
+                max_segments: Some(0),
+                max_pages: None,
+            },
+        );
+        assert_eq!(
+            client
+                .store_maintenance_run(&session, &zero)
+                .expect_err("zero max segments")
+                .code,
+            Code::InvalidArgument
+        );
+
+        let request = loom_wire::store_admin::store_maintenance_run_request_to_cbor(
+            &loom_wire::store_admin::StoreMaintenanceRunRequest {
+                max_segments: Some(1),
+                max_pages: Some(1),
+            },
+        );
+        let outcome = loom_wire::store_admin::store_maintenance_run_result_from_cbor(
+            &client
+                .store_maintenance_run(&session, &request)
+                .expect("maintenance run"),
+        )
+        .expect("decode maintenance run");
+        assert!(matches!(
+            outcome.kind,
+            loom_wire::store_admin::StoreMaintenanceRunKind::Skipped
+                | loom_wire::store_admin::StoreMaintenanceRunKind::Marked
+                | loom_wire::store_admin::StoreMaintenanceRunKind::Compacted
+                | loom_wire::store_admin::StoreMaintenanceRunKind::Reclaimed
+        ));
+        let state = client
+            .with_session(&session, |loom| loom.store().store_maintenance_run_state())
+            .expect("run state");
+        assert_eq!(state.last_run_ms, Some(7_777));
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_l_b_sql_exec_result_uses_existing_workspace_and_persists_dirty_state() {
+        let dir = temp_dir("sql-exec-result");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let workspace = client
+            .workspace_create(&session, Some("repo"), None)
+            .expect("workspace");
+
+        let before = std::fs::read(&path).expect("read before");
+        let readonly = client
+            .sql_exec_result(&session, "repo", "db", "SELECT 1")
+            .expect("readonly sql");
+        assert_eq!(
+            readonly,
+            direct_sql_exec("SELECT 1").expect("direct select")
+        );
+        assert_eq!(std::fs::read(&path).expect("read after readonly"), before);
+        let facets = client
+            .with_session(&session, |loom| loom.registry().facets(workspace))
+            .expect("facets after readonly");
+        assert!(!facets.contains(&FacetKind::Sql));
+
+        let create_sql =
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'a')";
+        let created = client
+            .sql_exec_result(&session, "repo", "db", create_sql)
+            .expect("create table");
+        assert_eq!(created, direct_sql_exec(create_sql).expect("direct create"));
+        let facets = client
+            .with_session(&session, |loom| loom.registry().facets(workspace))
+            .expect("facets after write");
+        assert!(facets.contains(&FacetKind::Sql));
+
+        client
+            .sql_exec_result(
+                &session,
+                &workspace.to_string(),
+                "db",
+                "INSERT INTO t VALUES (2, 'b')",
+            )
+            .expect("uuid insert");
+        let selected = client
+            .sql_query_result(&session, "repo", "db", "SELECT id, v FROM t ORDER BY id")
+            .expect("select live");
+        assert!(!selected.is_empty());
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert_eq!(
+            reopened
+                .sql_query_result(&session, "repo", "db", "SELECT id, v FROM t ORDER BY id")
+                .expect("select reopened"),
+            selected
+        );
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_l_b_sql_exec_result_rejects_dangling_transactions_and_preserves_state() {
+        let dir = temp_dir("sql-exec-result-dangling");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("repo"), None)
+            .expect("workspace");
+        client
+            .sql_exec_result(
+                &session,
+                "repo",
+                "db",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            )
+            .expect("create table");
+        let before = client
+            .sql_query_result(&session, "repo", "db", "SELECT * FROM t")
+            .expect("before");
+        let err = client
+            .sql_exec_result(&session, "repo", "db", "BEGIN; INSERT INTO t VALUES (1)")
+            .expect_err("dangling transaction");
+        assert_eq!(err.code, Code::InvalidArgument);
+        assert_eq!(
+            client
+                .sql_query_result(&session, "repo", "db", "SELECT * FROM t")
+                .expect("after"),
+            before
+        );
+        client.close(&session);
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert_eq!(
+            reopened
+                .sql_query_result(&session, "repo", "db", "SELECT * FROM t")
+                .expect("after reopen"),
+            before
+        );
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_l_b_sql_exec_result_publication_failure_preserves_state() {
+        let dir = temp_dir("sql-exec-result-publication-failure");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("repo"), None)
+            .expect("workspace");
+        client
+            .sql_exec_result(
+                &session,
+                "repo",
+                "db",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'a')",
+            )
+            .expect("seed sql");
+        let before_rows = client
+            .sql_query_result(&session, "repo", "db", "SELECT id, v FROM t ORDER BY id")
+            .expect("before rows");
+        let before_file = std::fs::read(&path).expect("read before");
+        install_exec_apply_candidate_save_hook(
+            path.clone(),
+            Box::new(|| {
+                Err(LoomError::new(
+                    Code::Internal,
+                    "injected sql publication failure",
+                ))
+            }),
+        );
+
+        let err = client
+            .sql_exec_result(&session, "repo", "db", "INSERT INTO t VALUES (2, 'b')")
+            .expect_err("publication failure");
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(
+            client
+                .sql_query_result(&session, "repo", "db", "SELECT id, v FROM t ORDER BY id")
+                .expect("live rows after failure"),
+            before_rows
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read after failure"),
+            before_file
+        );
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert_eq!(
+            reopened
+                .sql_query_result(&session, "repo", "db", "SELECT id, v FROM t ORDER BY id")
+                .expect("reopened rows after failure"),
+            before_rows
+        );
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mu_6h_l_b_sql_exec_result_authorizes_before_sql_parse_or_facet_creation() {
+        let dir = temp_dir("sql-exec-result-auth");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let workspace = client
+            .workspace_create(&session, Some("repo"), None)
+            .expect("workspace");
+        let root = WorkspaceId::from_bytes([41; 16]);
+        let user = WorkspaceId::from_bytes([42; 16]);
+        client
+            .with_session(&session, |loom| {
+                let mut identity = IdentityStore::new(root);
+                identity.set_passphrase(root, "root-pass", b"12345678")?;
+                identity.add_principal(user, "user", PrincipalKind::User)?;
+                identity.set_passphrase(user, "user-pass", b"abcdefgh")?;
+                let mut acl = AclStore::new();
+                acl.allow(AclSubject::Principal(root), None, None, [AclRight::Admin])?;
+                loom.store().save_identity_store(&identity)?;
+                loom.store().save_acl_store(&acl)?;
+                loom.set_identity_store(identity);
+                loom.set_acl_store(acl);
+                save_loom(loom)
+            })
+            .expect("seed auth");
+        client
+            .authenticate_passphrase(&session, user, b"user-pass")
+            .expect("auth user");
+        let err = client
+            .sql_exec_result(&session, "repo", "db", "THIS IS NOT SQL")
+            .expect_err("denied before parse");
+        assert_eq!(err.code, Code::PermissionDenied);
+        let facets = client
+            .with_session(&session, |loom| loom.registry().facets(workspace))
+            .expect("facets");
+        assert!(!facets.contains(&FacetKind::Sql));
+
+        client.clear_authentication(&session).expect("clear auth");
+        client
+            .authenticate_passphrase(&session, root, b"root-pass")
+            .expect("auth root");
+        let direct_error = direct_sql_exec("THIS IS NOT SQL").expect_err("direct sql error");
+        let generated_error = client
+            .sql_exec_result(&session, "repo", "db", "THIS IS NOT SQL")
+            .expect_err("generated sql error");
+        assert_eq!(generated_error.code, direct_error.code);
+        assert_eq!(generated_error.message, direct_error.message);
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn exec_apply_request(workspace: &str, base: &str, fork: &str) -> Vec<u8> {
+        loom_codec::encode(&loom_codec::Value::Map(vec![
+            (
+                loom_codec::Value::Text("workspace".to_string()),
+                loom_codec::Value::Text(workspace.to_string()),
+            ),
+            (
+                loom_codec::Value::Text("base".to_string()),
+                loom_codec::Value::Text(base.to_string()),
+            ),
+            (
+                loom_codec::Value::Text("fork".to_string()),
+                loom_codec::Value::Text(fork.to_string()),
+            ),
+            (
+                loom_codec::Value::Text("author".to_string()),
+                loom_codec::Value::Text("alice".to_string()),
+            ),
+            (
+                loom_codec::Value::Text("timestamp_ms".to_string()),
+                loom_codec::Value::Uint(3_000),
+            ),
+        ]))
+        .expect("encode exec apply request")
+    }
+
+    fn exec_apply_result_value(bytes: &[u8]) -> BTreeMap<String, loom_codec::Value> {
+        let loom_codec::Value::Map(fields) =
+            loom_codec::decode(bytes).expect("decode apply result")
+        else {
+            panic!("apply result must be a map");
+        };
+        fields
+            .into_iter()
+            .map(|(key, value)| {
+                let loom_codec::Value::Text(key) = key else {
+                    panic!("apply result keys must be text");
+                };
+                (key, value)
+            })
+            .collect()
+    }
+
+    fn seed_exec_apply_dirty_feature(client: &LocalLoomClient, session: &LoomSession) {
+        client
+            .write_file(session, "repo", "base.txt", b"base", 0)
+            .expect("write base");
+        client.stage_all(session, "repo").expect("stage base");
+        client
+            .commit(session, "repo", "alice", "base", 1_000)
+            .expect("commit base");
+        client
+            .branch(session, "repo", "feature")
+            .expect("create feature branch");
+        client
+            .checkout(session, "repo", "feature")
+            .expect("checkout feature");
+        client
+            .write_file(session, "repo", "feature.txt", b"feature", 0)
+            .expect("write feature");
+        client.stage_all(session, "repo").expect("stage feature");
+        client
+            .commit(session, "repo", "alice", "feature", 2_000)
+            .expect("commit feature");
+        client
+            .write_file(session, "repo", "staged.txt", b"staged", 0)
+            .expect("write staged");
+        client.stage_all(session, "repo").expect("stage dirty");
+        client
+            .write_file(session, "repo", "staged.txt", b"staged-modified", 0)
+            .expect("modify staged");
+        client
+            .write_file(session, "repo", "untracked.txt", b"untracked", 0)
+            .expect("write untracked");
+    }
+
+    fn exec_apply_snapshot(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+    ) -> ExecApplyWorkspaceSnapshot {
+        ExecApplyWorkspaceSnapshot {
+            head: client
+                .vcs_head_branch(session, "repo")
+                .expect("head branch"),
+            main_log: client.log(session, "repo", "main").expect("main log"),
+            feature_log: client.log(session, "repo", "feature").expect("feature log"),
+            staged_file: client
+                .read_file(session, "repo", "staged.txt")
+                .expect("staged file"),
+            status: client.status(session, "repo").expect("status"),
+            merge_in_progress: client
+                .merge_in_progress(session, "repo")
+                .expect("merge state"),
+        }
+    }
+
+    fn meetings_import_input(profile: &str, source_id: &str, title: &str) -> Vec<u8> {
+        let source_digest =
+            Digest::hash(Algo::Blake3, format!("{source_id}:{title}").as_bytes()).to_string();
+        serde_json::to_vec(&serde_json::json!({
+            "snapshot_version": 1,
+            "profile": profile,
+            "source_system": profile,
+            "source_scope": "local-cache",
+            "observed_at": 500,
+            "coverage": "complete",
+            "items": [{
+                "source_entity_id": source_id,
+                "source_digest": source_digest,
+                "source_sidecar": {"id": source_id, "raw": true},
+                "title": title,
+                "summary_text": format!("{title} summary"),
+                "transcript_spans": [{"text": format!("{title} transcript")}],
+                "decisions": [{"label": format!("{title} decision")}]
+            }]
+        }))
+        .expect("meetings import json")
+    }
+
+    fn meetings_report_value(report: &str) -> serde_json::Value {
+        serde_json::from_str(report).expect("meetings report json")
+    }
+
+    fn meetings_report_field_names(report: &str) -> Vec<String> {
+        let serde_json::Value::Object(fields) =
+            serde_json::from_str(report).expect("meetings report json object")
+        else {
+            panic!("meetings report must be a json object");
+        };
+        fields.keys().cloned().collect()
+    }
+
+    fn meetings_snapshot_count(client: &LocalLoomClient, session: &LoomSession) -> usize {
+        client
+            .with_session(session, |loom| {
+                Ok(loom
+                    .store()
+                    .control_scan_prefix(
+                        loom_substrate::meetings::PROFILE_CONTROL_PREFIX.as_bytes(),
+                    )?
+                    .len())
+            })
+            .expect("meetings snapshot count")
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct MeetingsImportLiveSnapshot {
+        bytes: Vec<u8>,
+        len: u64,
+        modified: SystemTime,
+        workspace_present: bool,
+        vcs_facet_present: bool,
+        profile_controls: usize,
+        checkpoint_controls: usize,
+        revision_index_present: bool,
+        audit_records: usize,
+        mutable_overlay_generation: String,
+        mutable_overlay_entries: usize,
+    }
+
+    fn meetings_import_live_snapshot(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        path: &std::path::Path,
+    ) -> MeetingsImportLiveSnapshot {
+        let bytes = std::fs::read(path).expect("read store bytes");
+        let metadata = std::fs::metadata(path).expect("read store metadata");
+        client
+            .with_session(session, |loom| {
+                let workspace = loom.registry().open(&ns_selector_by_name("studio")).ok();
+                let vcs_facet_present = workspace
+                    .map(|id| loom.registry().has_facet(id, FacetKind::Vcs))
+                    .transpose()?
+                    .unwrap_or(false);
+                let revision_index_present = workspace
+                    .map(|id| {
+                        load_optional_current_revision_index(loom, id, &id.to_string())
+                            .map(|index| index.is_some())
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                Ok(MeetingsImportLiveSnapshot {
+                    bytes,
+                    len: metadata.len(),
+                    modified: metadata.modified().expect("store modified time"),
+                    workspace_present: workspace.is_some(),
+                    vcs_facet_present,
+                    profile_controls: loom
+                        .store()
+                        .control_scan_prefix(
+                            loom_substrate::meetings::PROFILE_CONTROL_PREFIX.as_bytes(),
+                        )?
+                        .len(),
+                    checkpoint_controls: loom
+                        .store()
+                        .control_scan_prefix(b"interchange/checkpoints/meetings/")?
+                        .len(),
+                    revision_index_present,
+                    audit_records: loom.store().audit_records()?.len(),
+                    mutable_overlay_generation: format!(
+                        "{:?}",
+                        loom.store().mutable_overlay_generation()?
+                    ),
+                    mutable_overlay_entries: loom.store().mutable_overlay_current_entries()?.len(),
+                })
+            })
+            .expect("capture meetings import snapshot")
+    }
+
+    fn assert_meetings_import_injected_failure_rolls_back(
+        point: MeetingsImportTestHookPoint,
+        tag: &str,
+    ) {
+        let dir = temp_dir(tag);
+        let store_path = dir.join("t.loom");
+        let client = LocalLoomClient::new(store_path.clone());
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let before = meetings_import_live_snapshot(&client, &session, &store_path);
+        let input = meetings_import_input("granola-app", "note-1", "Planning");
+
+        clear_meetings_import_test_hook();
+        install_meetings_import_test_hook(
+            store_path.clone(),
+            Box::new(move |observed| {
+                if observed == point {
+                    Err(LoomError::new(
+                        Code::Internal,
+                        "injected meetings import failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        let err = client
+            .meetings_import_snapshot(&session, "studio", "granola-app", &input, false)
+            .expect_err("injected failure");
+        clear_meetings_import_test_hook();
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(
+            meetings_import_live_snapshot(&client, &session, &store_path),
+            before
+        );
+
+        client.close(&session);
+        let reopened = LocalLoomClient::new(store_path.clone());
+        let reopened_session = reopened.open().expect("reopen after failure");
+        assert_eq!(
+            meetings_import_live_snapshot(&reopened, &reopened_session, &store_path),
+            before
+        );
+        reopened.close(&reopened_session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn meetings_import_snapshot_imports_and_reopens() {
+        let dir = temp_dir("meetings-import-generated-reopen");
+        let store_path = dir.join("t.loom");
+        let client = LocalLoomClient::new(store_path.clone());
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let input = meetings_import_input("granola-app", "note-1", "Planning");
+
+        let report = client
+            .meetings_import_snapshot(&session, "studio", "granola-app", &input, false)
+            .expect("import meetings");
+        let report = meetings_report_value(&report);
+        assert_eq!(report["profile"], "meetings");
+        assert_eq!(report["source_scope"], "local-cache");
+        assert_eq!(report["rows_imported"], 1);
+        assert_eq!(report["operations_applied"], report["operations_planned"]);
+        assert_eq!(
+            meetings_report_field_names(&serde_json::to_string(&report).expect("report json")),
+            vec![
+                "bytes_in",
+                "bytes_stored",
+                "commit",
+                "dry_run",
+                "fidelity_issues",
+                "objects_added",
+                "operations_applied",
+                "operations_planned",
+                "profile",
+                "rows_imported",
+                "skipped",
+                "source_scope",
+                "warnings"
+            ]
+        );
+
+        let workspace = client
+            .with_session(&session, |loom| {
+                loom.registry().open(&ns_selector_by_name("studio"))
+            })
+            .expect("workspace");
+        let profile_id = workspace.to_string();
+        client
+            .with_session(&session, |loom| {
+                assert_eq!(
+                    loom.store()
+                        .control_scan_prefix(
+                            loom_substrate::meetings::PROFILE_CONTROL_PREFIX.as_bytes()
+                        )?
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    loom.store()
+                        .control_scan_prefix(b"interchange/checkpoints/meetings/")?
+                        .len(),
+                    1
+                );
+                let history = loom_substrate::versioning::load_current_revision_index(
+                    loom,
+                    workspace,
+                    &profile_id,
+                )?;
+                assert_eq!(history.history("meeting:meeting/note-1").len(), 1);
+                assert_eq!(history.checkpoints().len(), 1);
+                assert_eq!(
+                    loom.read_file_reserved(
+                        workspace,
+                        &loom_interchange_io::meetings_source_payload_path(
+                            &profile_id,
+                            "note-1",
+                            "source.json"
+                        ),
+                    )?,
+                    br#"{"id":"note-1","raw":true}"#
+                );
+                assert_eq!(
+                    loom.read_file_reserved(
+                        workspace,
+                        &loom_interchange_io::meetings_source_payload_path(
+                            &profile_id,
+                            "note-1",
+                            "summary.txt"
+                        ),
+                    )?,
+                    b"Planning summary"
+                );
+                let actions = loom
+                    .store()
+                    .audit_records()?
+                    .into_iter()
+                    .map(|record| record.action)
+                    .collect::<Vec<_>>();
+                assert!(actions.contains(&"meetings.import".to_string()));
+                assert!(actions.contains(&"meetings.import.checkpoint".to_string()));
+                Ok(())
+            })
+            .expect("meetings durable conformance");
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(store_path.clone());
+        let session = reopened.open().expect("reopen");
+        reopened
+            .with_session(&session, |loom| {
+                let snapshot = load_meetings_snapshot(loom, &profile_id)?
+                    .ok_or_else(|| LoomError::new(Code::NotFound, "meetings snapshot"))?;
+                assert_eq!(snapshot.sources[0].source_id, "note-1");
+                assert_eq!(snapshot.meetings[0].meeting_id, "meeting/note-1");
+                assert_eq!(snapshot.annotations[0].kind, "Decision");
+                Ok(())
+            })
+            .expect("read reopened meetings");
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn meetings_import_snapshot_injected_failures_leave_live_and_reopened_state_unchanged() {
+        for (point, tag) in [
+            (
+                MeetingsImportTestHookPoint::AfterWorkspaceCreation,
+                "meetings-import-fail-after-workspace",
+            ),
+            (
+                MeetingsImportTestHookPoint::AfterPayloadRevisionPlanning,
+                "meetings-import-fail-after-planning",
+            ),
+            (
+                MeetingsImportTestHookPoint::BeforePublication,
+                "meetings-import-fail-before-publication",
+            ),
+        ] {
+            assert_meetings_import_injected_failure_rolls_back(point, tag);
+        }
+    }
+
+    #[test]
+    fn meetings_import_snapshot_dry_run_does_not_mutate_store_bytes() {
+        let dir = temp_dir("meetings-import-generated-dry-run");
+        let store_path = dir.join("t.loom");
+        let client = LocalLoomClient::new(store_path.clone());
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let before = std::fs::read(&store_path).expect("read before");
+        let before_meta = std::fs::metadata(&store_path).expect("metadata before");
+        let input = meetings_import_input("generic", "source-a", "Planning");
+
+        let report = client
+            .meetings_import_snapshot(&session, "studio", "generic", &input, true)
+            .expect("dry-run meetings");
+        let report = meetings_report_value(&report);
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["operations_applied"], 0);
+        assert_eq!(meetings_snapshot_count(&client, &session), 0);
+        let second_report = client
+            .meetings_import_snapshot(&session, "studio", "generic", &input, true)
+            .expect("second dry-run meetings");
+        assert_eq!(
+            second_report,
+            serde_json::to_string(&report).expect("canonical dry-run report json")
+        );
+        assert_eq!(std::fs::read(&store_path).expect("read after"), before);
+        let after_meta = std::fs::metadata(&store_path).expect("metadata after");
+        assert_eq!(after_meta.len(), before_meta.len());
+        assert_eq!(
+            after_meta.modified().expect("after modified"),
+            before_meta.modified().expect("before modified")
+        );
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn meetings_import_snapshot_retry_is_idempotent() {
+        let dir = temp_dir("meetings-import-generated-idempotent");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let input = meetings_import_input("granola-app", "note-1", "Planning");
+
+        client
+            .meetings_import_snapshot(&session, "studio", "granola-app", &input, false)
+            .expect("first import");
+        let retry = client
+            .meetings_import_snapshot(&session, "studio", "granola-app", &input, false)
+            .expect("retry import");
+        let retry = meetings_report_value(&retry);
+        assert_eq!(retry["operations_applied"], 0);
+        assert!(
+            retry["warnings"]
+                .as_array()
+                .expect("warnings")
+                .iter()
+                .any(|warning| warning == "meetings snapshot already current")
+        );
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn meetings_import_snapshot_rejects_malformed_json_and_profile_mismatch() {
+        let dir = temp_dir("meetings-import-generated-invalid");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+
+        let err = client
+            .meetings_import_snapshot(&session, "studio", "generic", b"not json", false)
+            .expect_err("malformed json");
+        assert_eq!(err.code, Code::InvalidArgument);
+
+        let mismatch = meetings_import_input("granola-app", "note-1", "Planning");
+        let err = client
+            .meetings_import_snapshot(&session, "studio", "generic", &mismatch, false)
+            .expect_err("profile mismatch");
+        assert_eq!(err.code, Code::InvalidArgument);
+
+        let valid = meetings_import_input("generic", "note-1", "Planning");
+        let err = client
+            .meetings_import_snapshot(&session, "studio", "bad-profile", &valid, false)
+            .expect_err("invalid profile");
+        assert_eq!(err.code, Code::InvalidArgument);
+        assert_eq!(meetings_snapshot_count(&client, &session), 0);
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn meetings_import_snapshot_validates_session_and_auth_before_input_parse() {
+        let dir = temp_dir("meetings-import-generated-auth-order");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        seed_authenticated_non_admin(&client, &session);
+        let unknown = unknown_session(&session);
+
+        assert_eq!(
+            client
+                .meetings_import_snapshot(&unknown, "studio", "bad-profile", b"not json", false)
+                .expect_err("unknown before parse")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            client
+                .meetings_import_snapshot(&session, "studio", "bad-profile", b"not json", false)
+                .expect_err("auth before parse")
+                .code,
+            Code::PermissionDenied
+        );
+        assert_eq!(meetings_snapshot_count(&client, &session), 0);
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn seed_refs_workspace(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+        enqueue_candidate: bool,
+    ) -> String {
+        client
+            .with_session(session, |loom| {
+                let ns = loom.registry_mut().ensure_for_write(
+                    &ns_selector(workspace, FacetKind::Vcs),
+                    mint_workspace_id()?,
+                )?;
+                let workspace_id = ns.to_string();
+                let project = loom_tickets::create_project(
+                    loom,
+                    ns,
+                    &workspace_id,
+                    "matrix",
+                    "MX",
+                    "Matrix",
+                    None,
+                )?;
+                let fields = serde_json::json!({"status": "ready", "title": "Reference target"});
+                let labels = Vec::<String>::new();
+                loom_tickets::create_ticket(
+                    loom,
+                    ns,
+                    loom_tickets::TicketCreateRequest {
+                        workspace_id: &workspace_id,
+                        project_id: "matrix",
+                        ticket_type: "task",
+                        external_source: None,
+                        external_id: None,
+                        fields: &fields,
+                        policy_labels: &labels,
+                        expected_root: Some(&project.profile_root),
+                    },
+                )?;
+                if enqueue_candidate {
+                    let candidate =
+                        UnresolvedReference::new(loom_substrate::refs::UnresolvedReferenceInput {
+                            candidate_id: "candidate-1".to_string(),
+                            source: loom_substrate::refs::ReferenceSource::new(
+                                "tickets",
+                                &workspace_id,
+                                "source-ticket",
+                                "body",
+                            )?,
+                            source_operation_id: "operation:candidate-1".to_string(),
+                            source_root: Digest::hash(Algo::Blake3, b"source-ticket"),
+                            alias_text: "!ticket:MX-1".to_string(),
+                            relation: "refers_to".to_string(),
+                            span_start: 0,
+                            span_end: 12,
+                            evidence: "!ticket:MX-1".to_string(),
+                            next_attempt_ms: 0,
+                        })?;
+                    loom_reference::enqueue(loom, ns, &candidate)?;
+                }
+                save_loom(loom)?;
+                Ok(workspace_id)
+            })
+            .expect("seed refs workspace")
+    }
+
+    fn refs_reconcile_audit_targets(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+    ) -> Vec<String> {
+        client
+            .with_session(session, |loom| loom.store().audit_records())
+            .expect("audit records")
+            .into_iter()
+            .filter(|record| record.action == "refs.reconcile")
+            .map(|record| record.target.expect("refs target"))
+            .collect()
+    }
+
+    fn seed_inference_workspace(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        name: &str,
+    ) -> WorkspaceId {
+        client
+            .workspace_create(session, Some(name), Some(FacetKind::Inference))
+            .expect("create inference workspace")
+    }
+
+    fn inference_instance_exists(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+        name: &str,
+    ) -> bool {
+        client
+            .with_session(session, |loom| {
+                let workspace_id = loom.registry().open(&ns_selector_by_name(workspace))?;
+                let state = inference_instance_state(loom, workspace_id)?;
+                Ok(state.find_instance(name).is_some())
+            })
+            .expect("read inference state")
+    }
+
+    fn audit_sequence(json: &str) -> u64 {
+        serde_json::from_str::<serde_json::Value>(json)
+            .expect("json")
+            .get("audit-sequence")
+            .and_then(serde_json::Value::as_u64)
+            .expect("audit sequence")
+    }
+
+    fn unknown_session(session: &LoomSession) -> LoomSession {
+        let mut handle = session.0.clone();
+        handle.id = 999_999u64.to_be_bytes().to_vec();
+        LoomSession(handle)
+    }
+
+    fn seed_authenticated_inference_non_admin(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+    ) -> WorkspaceId {
+        let workspace_id = seed_inference_workspace(client, session, workspace);
+        let principal = mint_workspace_id().expect("principal");
+        client
+            .with_session(session, |loom| {
+                let mut identity = IdentityStore::new(principal);
+                identity.set_passphrase(principal, "pw", b"inference-salt")?;
+                loom.store().save_identity_store(&identity)
+            })
+            .expect("seed identity");
+        client
+            .authenticate_passphrase(session, principal, b"pw")
+            .expect("authenticate principal");
+        workspace_id
+    }
+
+    fn seed_authenticated_non_admin(client: &LocalLoomClient, session: &LoomSession) {
+        let principal = mint_workspace_id().expect("principal");
+        client
+            .with_session(session, |loom| {
+                let mut identity = IdentityStore::new(principal);
+                identity.set_passphrase(principal, "pw", b"serve-salt")?;
+                loom.store().save_identity_store(&identity)
+            })
+            .expect("seed identity");
+        client
+            .authenticate_passphrase(session, principal, b"pw")
+            .expect("authenticate principal");
+    }
+
+    fn serve_configure_request(bind: &str, tls: Option<&str>, network: Option<&str>) -> String {
+        let mut value = serde_json::json!({
+            "surface": "admin",
+            "selectors": [],
+            "bind": bind,
+            "transport": "rest",
+            "enabled": true,
+            "auth_mode": "owner-or-passphrase",
+            "exposure": "read-write",
+            "audit_mode": "management-and-security",
+            "request_size_limit": 4096,
+            "idle_timeout_ms": 1000,
+            "session_timeout_ms": 2000
+        });
+        if let Some(tls) = tls {
+            value["tls_certificate_bundle"] = serde_json::Value::String(tls.to_string());
+        }
+        if let Some(network) = network {
+            value["network_access_policy"] = serde_json::Value::String(network.to_string());
+        }
+        serde_json::to_string(&value).expect("request json")
+    }
+
+    fn served_listener_count(client: &LocalLoomClient, session: &LoomSession) -> usize {
+        client
+            .with_session(session, |loom| loom.store().served_listeners())
+            .expect("served listeners")
+            .len()
+    }
+
+    fn kv_namespace_exists(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+    ) -> bool {
+        client
+            .with_session(session, |loom| read_ns(loom, workspace, FacetKind::Kv))
+            .expect("kv namespace")
+            .is_some()
+    }
+
+    fn overlay_test_key() -> loom_core::OverlayKey {
+        loom_core::OverlayKey::from_segments([
+            b"serve",
+            b"listener",
+            b"rollback",
+            b"mutable",
+            b"overlay",
+            b"entry",
+        ])
+        .expect("overlay key")
+    }
+
+    fn overlay_payload(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        key: &loom_core::OverlayKey,
+    ) -> Option<Vec<u8>> {
+        client
+            .with_session(session, |loom| {
+                Ok(loom
+                    .mutable_overlay()
+                    .current_entry(key)
+                    .map(|entry| entry.payload))
+            })
+            .expect("overlay entry")
+    }
+
+    fn drive_policy_targets(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+    ) -> Vec<(WorkspaceId, String)> {
+        client
+            .with_session(session, |loom| {
+                let registry = loom
+                    .store()
+                    .control_get(&drive_policy_registry_key())?
+                    .map(|bytes| DrivePolicyRegistry::decode(&bytes))
+                    .transpose()?
+                    .unwrap_or_else(DrivePolicyRegistry::empty);
+                Ok(registry
+                    .enabled_targets()
+                    .map(|target| (target.workspace, target.workspace_id.clone()))
+                    .collect())
+            })
+            .expect("drive policy registry")
+    }
+
+    fn seed_drive_listener_workspace(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        name: &str,
+    ) -> WorkspaceId {
+        let workspace = mint_workspace_id().expect("workspace");
+        client
+            .with_session(session, |loom| {
+                loom.registry_mut()
+                    .create(FacetKind::Files, Some(name), workspace)?;
+                save_loom(loom)
+            })
+            .expect("seed drive workspace");
+        workspace
+    }
+
+    fn seed_web_workspace(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        name: &str,
+    ) -> WorkspaceId {
+        seed_drive_listener_workspace(client, session, name)
+    }
+
+    fn web_configure_request(workspace: &str, bind: &str) -> String {
+        serde_json::json!({
+            "surface": "web",
+            "selectors": [workspace],
+            "bind": bind,
+            "transport": "rest",
+            "enabled": true
+        })
+        .to_string()
+    }
+
+    fn web_route_set_request(
+        listener: &str,
+        route: &str,
+        host: Option<&str>,
+        prefix: &str,
+        workspace: Option<&str>,
+        root: &str,
+    ) -> String {
+        let mut value = serde_json::json!({
+            "listener": listener,
+            "route": route,
+            "prefix": prefix,
+            "root": root
+        });
+        if let Some(host) = host {
+            value["host"] = serde_json::Value::String(host.to_string());
+        }
+        if let Some(workspace) = workspace {
+            value["workspace"] = serde_json::Value::String(workspace.to_string());
+        }
+        value.to_string()
+    }
+
+    fn seed_web_listener(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+        bind: &str,
+    ) -> String {
+        if !client
+            .with_session(session, |loom| {
+                Ok(read_ns(loom, workspace, FacetKind::Files)?.is_some())
+            })
+            .expect("check web workspace")
+        {
+            seed_web_workspace(client, session, workspace);
+        }
+        let configured: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_listener_configure_json(session, &web_configure_request(workspace, bind))
+                .expect("configure web listener"),
+        )
+        .expect("configured listener json");
+        configured["id"].as_str().expect("listener id").to_string()
+    }
+
+    fn web_route_ids(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        listener: &str,
+    ) -> Vec<String> {
+        client
+            .with_session(session, |loom| {
+                let key = crate::serve_config::web_listener_control_key(listener)?;
+                let Some(bytes) = loom.store().control_get(&key)? else {
+                    return Ok(Vec::new());
+                };
+                let web_listener = loom_substrate::web::WebListener::decode(&bytes)?;
+                Ok(web_listener
+                    .routes
+                    .routes
+                    .into_iter()
+                    .map(|route| route.route_id)
+                    .collect())
+            })
+            .expect("web routes")
+    }
+
+    fn audit_actions(client: &LocalLoomClient, session: &LoomSession) -> Vec<String> {
+        client
+            .with_session(session, |loom| loom.store().audit_records())
+            .expect("audit records")
+            .into_iter()
+            .map(|record| record.action)
+            .collect()
+    }
+
+    #[test]
+    fn serve_listener_authenticates_and_authorizes_before_json_validation() {
+        let dir = temp_dir("serve-listener-auth-order");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let unknown = unknown_session(&session);
+
+        assert_eq!(
+            client
+                .serve_listener_configure_json(&unknown, "{not json")
+                .expect_err("unknown configure")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            client
+                .serve_listener_list_json(&unknown)
+                .expect_err("unknown list")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            client
+                .serve_listener_set_enabled_json(&unknown, "bad listener", true)
+                .expect_err("unknown set enabled")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            client
+                .serve_listener_remove_json(&unknown, "bad listener")
+                .expect_err("unknown remove")
+                .code,
+            Code::NotFound
+        );
+
+        let dir = temp_dir("serve-listener-auth-denied");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        seed_authenticated_non_admin(&client, &session);
+
+        for error in [
+            client
+                .serve_listener_configure_json(&session, "{not json")
+                .expect_err("denied configure"),
+            client
+                .serve_listener_list_json(&session)
+                .expect_err("denied list"),
+            client
+                .serve_listener_set_enabled_json(&session, "bad listener", true)
+                .expect_err("denied set enabled"),
+            client
+                .serve_listener_remove_json(&session, "bad listener")
+                .expect_err("denied remove"),
+        ] {
+            assert_eq!(error.code, Code::PermissionDenied);
+        }
+        assert_eq!(served_listener_count(&client, &session), 0);
+        let audit = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit records");
+        assert!(audit.is_empty());
+    }
+
+    #[test]
+    fn serve_listener_rejects_missing_references_without_state_or_audit() {
+        let dir = temp_dir("serve-listener-missing-references");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+
+        let missing_cert = serve_configure_request("127.0.0.1:18081", Some("missing-cert"), None);
+        assert_eq!(
+            client
+                .serve_listener_configure_json(&session, &missing_cert)
+                .expect_err("missing cert")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(served_listener_count(&client, &session), 0);
+
+        let missing_policy =
+            serve_configure_request("127.0.0.1:18082", None, Some("missing-policy"));
+        assert_eq!(
+            client
+                .serve_listener_configure_json(&session, &missing_policy)
+                .expect_err("missing policy")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(served_listener_count(&client, &session), 0);
+        let audit = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit records");
+        assert!(audit.is_empty());
+    }
+
+    #[test]
+    fn serve_listener_accepts_complete_shared_surface_registry_entry() {
+        let dir = temp_dir("serve-listener-files-surface");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+
+        let request = serde_json::json!({
+            "surface": "files",
+            "selectors": ["docs"],
+            "bind": "127.0.0.1:18084",
+            "transport": "rest",
+            "enabled": true
+        })
+        .to_string();
+        let configured: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_listener_configure_json(&session, &request)
+                .expect("configure files listener"),
+        )
+        .expect("configured json");
+        assert_eq!(configured["surface"], "files");
+        assert_eq!(configured["selectors"][0], "docs");
+        let id = configured["id"].as_str().expect("listener id").to_string();
+
+        client.close(&session);
+        let reopened = client.open().expect("reopen");
+        let reopened_list: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_listener_list_json(&reopened)
+                .expect("reopen list"),
+        )
+        .expect("reopen list json");
+        assert_eq!(reopened_list["listeners"][0]["id"], id);
+    }
+
+    #[test]
+    fn serve_listener_memcached_publication_failure_rolls_back_state_and_audit() {
+        let dir = temp_dir("serve-listener-memcached-rollback");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+
+        let request = serde_json::json!({
+            "surface": "memcached",
+            "selectors": ["work", "sessions"],
+            "bind": "127.0.0.1:18085",
+            "transport": "text",
+            "mode": "write-through",
+            "enabled": true
+        })
+        .to_string();
+        let overlay_key = overlay_test_key();
+        client
+            .with_session(&session, |loom| {
+                loom.mutable_overlay_mut().put_value(
+                    overlay_key.clone(),
+                    None,
+                    b"live overlay before failure".to_vec(),
+                )?;
+                Ok(())
+            })
+            .expect("seed mutable overlay");
+        let err = client
+            .serve_listener_configure_json_with_commit(
+                &session,
+                &request,
+                |_, _, _, _, _, _, _, _| {
+                    Err(LoomError::new(
+                        Code::Internal,
+                        "injected served listener publication failure",
+                    ))
+                },
+            )
+            .expect_err("injected failure");
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(served_listener_count(&client, &session), 0);
+        assert!(!kv_namespace_exists(&client, &session, "work"));
+        assert_eq!(
+            overlay_payload(&client, &session, &overlay_key).as_deref(),
+            Some(b"live overlay before failure".as_slice())
+        );
+        let audit = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit records");
+        assert!(audit.is_empty());
+
+        client.close(&session);
+        let reopened = client.open().expect("reopen");
+        assert_eq!(served_listener_count(&client, &reopened), 0);
+        assert!(!kv_namespace_exists(&client, &reopened, "work"));
+        let reopened_audit = client
+            .with_session(&reopened, |loom| loom.store().audit_records())
+            .expect("reopened audit");
+        assert!(reopened_audit.is_empty());
+    }
+
+    #[test]
+    fn serve_listener_drive_publishes_listener_policy_and_audits_atomically() {
+        let dir = temp_dir("serve-listener-drive-atomic");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let workspace = seed_drive_listener_workspace(&client, &session, "drive");
+
+        let request = serde_json::json!({
+            "surface": "drive",
+            "selectors": ["drive"],
+            "bind": "127.0.0.1:18086",
+            "transport": "rest",
+            "enabled": true
+        })
+        .to_string();
+        let configured: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_listener_configure_json(&session, &request)
+                .expect("configure drive listener"),
+        )
+        .expect("configured json");
+        let id = configured["id"].as_str().expect("listener id").to_string();
+        assert_eq!(
+            drive_policy_targets(&client, &session),
+            vec![(workspace, workspace.to_string())]
+        );
+        let audit = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit records");
+        let actions = audit
+            .iter()
+            .map(|record| record.action.as_str())
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&"serve.listener.configure"));
+        assert!(actions.contains(&"drive.policy_registry.configure"));
+
+        client.close(&session);
+        let reopened = client.open().expect("reopen");
+        assert_eq!(
+            drive_policy_targets(&client, &reopened),
+            vec![(workspace, workspace.to_string())]
+        );
+        let reopened_list: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_listener_list_json(&reopened)
+                .expect("reopen list"),
+        )
+        .expect("reopen list json");
+        assert_eq!(reopened_list["listeners"][0]["id"], id);
+        let reopened_audit = client
+            .with_session(&reopened, |loom| loom.store().audit_records())
+            .expect("reopened audit");
+        let reopened_actions = reopened_audit
+            .iter()
+            .map(|record| record.action.as_str())
+            .collect::<Vec<_>>();
+        assert!(reopened_actions.contains(&"serve.listener.configure"));
+        assert!(reopened_actions.contains(&"drive.policy_registry.configure"));
+    }
+
+    #[test]
+    fn serve_listener_drive_publication_failure_leaves_policy_listener_and_audit_absent() {
+        let dir = temp_dir("serve-listener-drive-rollback");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        seed_drive_listener_workspace(&client, &session, "drive");
+
+        let request = serde_json::json!({
+            "surface": "drive",
+            "selectors": ["drive"],
+            "bind": "127.0.0.1:18087",
+            "transport": "rest",
+            "enabled": true
+        })
+        .to_string();
+        let err = client
+            .serve_listener_configure_json_with_commit(
+                &session,
+                &request,
+                |_, _, _, _, _, _, _, _| {
+                    Err(LoomError::new(
+                        Code::Internal,
+                        "injected drive listener publication failure",
+                    ))
+                },
+            )
+            .expect_err("injected failure");
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(served_listener_count(&client, &session), 0);
+        assert!(drive_policy_targets(&client, &session).is_empty());
+        let audit = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit records");
+        assert!(audit.is_empty());
+
+        client.close(&session);
+        let reopened = client.open().expect("reopen");
+        assert_eq!(served_listener_count(&client, &reopened), 0);
+        assert!(drive_policy_targets(&client, &reopened).is_empty());
+        let reopened_audit = client
+            .with_session(&reopened, |loom| loom.store().audit_records())
+            .expect("reopened audit");
+        assert!(reopened_audit.is_empty());
+    }
+
+    #[test]
+    fn serve_listener_configure_list_enable_disable_remove_and_reopen() {
+        let dir = temp_dir("serve-listener-authority");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .certificate_generate_self_signed_json(
+                &session,
+                "admin",
+                vec!["localhost".to_string()],
+                Vec::new(),
+                None,
+                1,
+                "p256",
+                true,
+            )
+            .expect("generate cert");
+        let rules = r#"[{"id":"local","action":"allow","source_cidr":"127.0.0.1/32","require_mtls":false}]"#;
+        client
+            .network_access_set_json(&session, "local", None, "deny", rules)
+            .expect("network policy");
+
+        let configured_json = client
+            .serve_listener_configure_json(
+                &session,
+                &serve_configure_request("127.0.0.1:18083", Some("admin"), Some("local")),
+            )
+            .expect("configure listener");
+        let configured: serde_json::Value =
+            serde_json::from_str(&configured_json).expect("configured json");
+        let id = configured["id"].as_str().expect("listener id").to_string();
+        assert_eq!(configured["tls"]["mode"], "direct");
+        assert_eq!(configured["tls"]["certificate_bundle_ref"], "admin");
+        assert_eq!(configured["network_access_policy_ref"], "local");
+        assert_eq!(configured["limits"]["request_size_limit"], 4096);
+
+        let disabled: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_listener_set_enabled_json(&session, &id, false)
+                .expect("disable"),
+        )
+        .expect("disable json");
+        assert_eq!(disabled["enabled"], false);
+        let enabled: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_listener_set_enabled_json(&session, &id, true)
+                .expect("enable"),
+        )
+        .expect("enable json");
+        assert_eq!(enabled["enabled"], true);
+
+        let list: serde_json::Value =
+            serde_json::from_str(&client.serve_listener_list_json(&session).expect("list"))
+                .expect("list json");
+        assert_eq!(list["listeners"].as_array().expect("listeners").len(), 1);
+        assert_eq!(list["listeners"][0]["id"], id);
+
+        client.close(&session);
+        let reopened = client.open().expect("reopen");
+        let reopened_list: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_listener_list_json(&reopened)
+                .expect("reopen list"),
+        )
+        .expect("reopen list json");
+        assert_eq!(reopened_list["listeners"][0]["id"], id);
+
+        let removed: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_listener_remove_json(&reopened, &id)
+                .expect("remove"),
+        )
+        .expect("remove json");
+        assert_eq!(removed["id"], id);
+
+        let audit = client
+            .with_session(&reopened, |loom| loom.store().audit_records())
+            .expect("audit records");
+        let actions = audit
+            .iter()
+            .map(|record| record.action.as_str())
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&"serve.listener.configure"));
+        assert!(actions.contains(&"serve.listener.disable"));
+        assert!(actions.contains(&"serve.listener.enable"));
+        assert!(actions.contains(&"serve.listener.list"));
+        assert!(actions.contains(&"serve.listener.remove"));
+    }
+
+    #[test]
+    fn serve_web_route_authenticates_and_authorizes_before_payload_validation() {
+        let dir = temp_dir("serve-web-route-auth-order");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let unknown = unknown_session(&session);
+
+        assert_eq!(
+            client
+                .serve_web_route_set_json(&unknown, "{not json")
+                .expect_err("unknown set")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            client
+                .serve_web_route_list_json(&unknown, "bad listener")
+                .expect_err("unknown list")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            client
+                .serve_web_route_remove_json(&unknown, "bad listener", "bad route")
+                .expect_err("unknown remove")
+                .code,
+            Code::NotFound
+        );
+
+        let dir = temp_dir("serve-web-route-auth-denied");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        seed_authenticated_non_admin(&client, &session);
+
+        for error in [
+            client
+                .serve_web_route_set_json(&session, "{not json")
+                .expect_err("denied set"),
+            client
+                .serve_web_route_list_json(&session, "bad listener")
+                .expect_err("denied list"),
+            client
+                .serve_web_route_remove_json(&session, "bad listener", "bad route")
+                .expect_err("denied remove"),
+        ] {
+            assert_eq!(error.code, Code::PermissionDenied);
+        }
+        assert!(audit_actions(&client, &session).is_empty());
+    }
+
+    #[test]
+    fn serve_web_route_rejects_invalid_inputs_without_route_state_or_audit() {
+        let dir = temp_dir("serve-web-route-invalid-inputs");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        seed_web_workspace(&client, &session, "site");
+        let admin: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_listener_configure_json(
+                    &session,
+                    &serve_configure_request("127.0.0.1:18088", None, None),
+                )
+                .expect("configure admin listener"),
+        )
+        .expect("admin listener json");
+        let admin_id = admin["id"].as_str().expect("admin id").to_string();
+        let web_id = seed_web_listener(&client, &session, "site", "127.0.0.1:18089");
+
+        assert_eq!(
+            client
+                .serve_web_route_set_json(
+                    &session,
+                    &web_route_set_request(&admin_id, "docs", None, "/docs", None, "/docs")
+                )
+                .expect_err("non-web listener")
+                .code,
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            client
+                .serve_web_route_set_json(
+                    &session,
+                    &web_route_set_request("missing", "docs", None, "/docs", None, "/docs")
+                )
+                .expect_err("missing listener")
+                .code,
+            Code::NotFound
+        );
+        let relative_prefix: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_web_route_set_json(
+                    &session,
+                    &web_route_set_request(&web_id, "docs", None, "docs", None, "/docs"),
+                )
+                .expect("relative prefix is canonicalized"),
+        )
+        .expect("relative prefix json");
+        assert_eq!(relative_prefix["routes"][0]["path_prefix"], "/docs");
+        assert_eq!(web_route_ids(&client, &session, &web_id), vec!["docs"]);
+        client
+            .serve_web_route_remove_json(&session, &web_id, "docs")
+            .expect("remove canonicalized route");
+        let baseline_actions = audit_actions(&client, &session);
+        assert_eq!(
+            client
+                .serve_web_route_set_json(
+                    &session,
+                    &web_route_set_request(&web_id, "docs", None, "/docs", None, "/../secret")
+                )
+                .expect_err("invalid root")
+                .code,
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            client
+                .serve_web_route_set_json(
+                    &session,
+                    &web_route_set_request(
+                        &web_id,
+                        "docs",
+                        None,
+                        "/docs",
+                        Some("missing"),
+                        "/docs"
+                    )
+                )
+                .expect_err("missing workspace")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            client
+                .serve_web_route_set_json(
+                    &session,
+                    &web_route_set_request(&web_id, "docs", None, "", None, "/docs")
+                )
+                .expect_err("empty prefix")
+                .code,
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            client
+                .serve_web_route_set_json(
+                    &session,
+                    &web_route_set_request(&web_id, "docs", None, "/bad\u{0}", None, "/docs")
+                )
+                .expect_err("forbidden prefix character")
+                .code,
+            Code::InvalidArgument
+        );
+        assert!(web_route_ids(&client, &session, &web_id).is_empty());
+        assert_eq!(audit_actions(&client, &session), baseline_actions);
+    }
+
+    #[test]
+    fn serve_web_route_set_list_remove_are_ordered_audited_and_reopened() {
+        let dir = temp_dir("serve-web-route-authority");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let workspace = seed_web_workspace(&client, &session, "site");
+        let id = seed_web_listener(&client, &session, "site", "127.0.0.1:18090");
+
+        let b_json = client
+            .serve_web_route_set_json(
+                &session,
+                &web_route_set_request(
+                    &id,
+                    "route-b",
+                    Some("example.test"),
+                    "/b",
+                    Some("site"),
+                    "/content/b",
+                ),
+            )
+            .expect("set route b");
+        let b: serde_json::Value = serde_json::from_str(&b_json).expect("route b json");
+        assert_eq!(b["routes"][0]["route_id"], "route-b");
+        assert_eq!(b["routes"][0]["workspace"], workspace.to_string());
+        client
+            .serve_web_route_set_json(
+                &session,
+                &web_route_set_request(&id, "route-a", None, "/a", None, "/content/a"),
+            )
+            .expect("set route a");
+
+        let listed: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_web_route_list_json(&session, &id)
+                .expect("list routes"),
+        )
+        .expect("route list json");
+        let routes = listed["routes"].as_array().expect("routes");
+        assert_eq!(routes[0]["route_id"], "route-a");
+        assert_eq!(routes[1]["route_id"], "route-b");
+
+        client.close(&session);
+        let reopened = client.open().expect("reopen");
+        assert_eq!(
+            web_route_ids(&client, &reopened, &id),
+            vec!["route-a".to_string(), "route-b".to_string()]
+        );
+        let removed: serde_json::Value = serde_json::from_str(
+            &client
+                .serve_web_route_remove_json(&reopened, &id, "route-b")
+                .expect("remove route b"),
+        )
+        .expect("remove json");
+        assert_eq!(removed["routes"].as_array().expect("routes").len(), 1);
+        assert_eq!(web_route_ids(&client, &reopened, &id), vec!["route-a"]);
+        let actions = audit_actions(&client, &reopened);
+        assert!(actions.contains(&"serve.web.route.set".to_string()));
+        assert!(actions.contains(&"serve.web.route.list".to_string()));
+        assert!(actions.contains(&"serve.web.route.remove".to_string()));
+    }
+
+    #[test]
+    fn serve_web_route_publication_failure_preserves_route_table_and_audit() {
+        let dir = temp_dir("serve-web-route-rollback");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let id = seed_web_listener(&client, &session, "site", "127.0.0.1:18091");
+        client
+            .serve_web_route_set_json(
+                &session,
+                &web_route_set_request(&id, "stable", None, "/stable", None, "/stable"),
+            )
+            .expect("set stable route");
+        let baseline_routes = web_route_ids(&client, &session, &id);
+        let baseline_actions = audit_actions(&client, &session);
+
+        let err = client
+            .serve_web_route_set_json_with_commit(
+                &session,
+                &web_route_set_request(&id, "new", None, "/new", None, "/new"),
+                |_, _, _, _, _, _| {
+                    Err(LoomError::new(Code::Internal, "injected route set failure"))
+                },
+            )
+            .expect_err("set failure");
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(web_route_ids(&client, &session, &id), baseline_routes);
+        assert_eq!(audit_actions(&client, &session), baseline_actions);
+
+        let err = client
+            .serve_web_route_remove_json_with_commit(&session, &id, "stable", |_, _, _, _, _, _| {
+                Err(LoomError::new(
+                    Code::Internal,
+                    "injected route remove failure",
+                ))
+            })
+            .expect_err("remove failure");
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(web_route_ids(&client, &session, &id), baseline_routes);
+        assert_eq!(audit_actions(&client, &session), baseline_actions);
+
+        client.close(&session);
+        let reopened = client.open().expect("reopen");
+        assert_eq!(web_route_ids(&client, &reopened, &id), baseline_routes);
+        assert_eq!(audit_actions(&client, &reopened), baseline_actions);
+    }
+
+    #[test]
+    fn inference_instance_authenticates_and_authorizes_before_payload_validation() {
+        let dir = temp_dir("inference-instance-auth-order");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        seed_inference_workspace(&client, &session, "ai");
+        let unknown = unknown_session(&session);
+
+        assert_eq!(
+            client
+                .inference_instance_create_json(
+                    &unknown,
+                    "ai",
+                    "bad name".to_string(),
+                    "model".to_string(),
+                    "bad-kind".to_string(),
+                    "bad-runtime".to_string(),
+                    Some("bad preset".to_string()),
+                    r#"{"bad.key":"1"}"#,
+                )
+                .expect_err("unknown create")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            client
+                .inference_instance_update_json(
+                    &unknown,
+                    "ai",
+                    "bad name".to_string(),
+                    Some("bad preset".to_string()),
+                    r#"{"bad.key":"1"}"#,
+                )
+                .expect_err("unknown update")
+                .code,
+            Code::NotFound
+        );
+        assert_eq!(
+            client
+                .inference_instance_delete_json(&unknown, "ai", "bad name".to_string())
+                .expect_err("unknown delete")
+                .code,
+            Code::NotFound
+        );
+        client.close(&session);
+
+        let dir = temp_dir("inference-instance-auth-denied");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        seed_authenticated_inference_non_admin(&client, &session, "ai");
+
+        for error in [
+            client
+                .inference_instance_create_json(
+                    &session,
+                    "ai",
+                    "bad name".to_string(),
+                    "model".to_string(),
+                    "bad-kind".to_string(),
+                    "bad-runtime".to_string(),
+                    Some("bad preset".to_string()),
+                    r#"{"bad.key":"1"}"#,
+                )
+                .expect_err("denied create"),
+            client
+                .inference_instance_update_json(
+                    &session,
+                    "ai",
+                    "bad name".to_string(),
+                    Some("bad preset".to_string()),
+                    r#"{"bad.key":"1"}"#,
+                )
+                .expect_err("denied update"),
+            client
+                .inference_instance_delete_json(&session, "ai", "bad name".to_string())
+                .expect_err("denied delete"),
+        ] {
+            assert_eq!(error.code, Code::PermissionDenied);
+        }
+        assert!(!inference_instance_exists(
+            &client, &session, "ai", "bad name"
+        ));
+        let audit = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit records");
+        assert!(audit.is_empty());
+    }
+
+    #[test]
+    fn inference_instance_mutations_publish_state_and_one_audit_atomically() {
+        let dir = temp_dir("inference-instance-audit");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let workspace_id = seed_inference_workspace(&client, &session, "ai");
+
+        let create = client
+            .inference_instance_create_json(
+                &session,
+                "ai",
+                "embed".to_string(),
+                "BAAI/bge-small-en-v1.5".to_string(),
+                "text-embedding".to_string(),
+                "candle-safetensors".to_string(),
+                None,
+                "{}",
+            )
+            .expect("create instance");
+        assert_eq!(audit_sequence(&create), 0);
+        assert!(inference_instance_exists(&client, &session, "ai", "embed"));
+
+        let update = client
+            .inference_instance_update_json(
+                &session,
+                "ai",
+                "embed".to_string(),
+                Some("balanced".to_string()),
+                "{}",
+            )
+            .expect("update instance");
+        assert_eq!(audit_sequence(&update), 1);
+
+        let delete = client
+            .inference_instance_delete_json(&session, "ai", "embed".to_string())
+            .expect("delete instance");
+        assert_eq!(audit_sequence(&delete), 2);
+
+        let audit = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit records");
+        assert_eq!(audit.len(), 3);
+        assert_eq!(audit[0].seq, 0);
+        assert_eq!(audit[0].action, "inference.instance.create");
+        assert_eq!(
+            audit[0].target.as_deref(),
+            Some(format!("workspace={workspace_id};instance=embed").as_str())
+        );
+        assert_eq!(audit[1].seq, 1);
+        assert_eq!(audit[1].action, "inference.instance.update");
+        assert_eq!(audit[2].seq, 2);
+        assert_eq!(audit[2].action, "inference.instance.delete");
+        client.close(&session);
+
+        let reopened = client.open().expect("reopen");
+        assert!(!inference_instance_exists(
+            &client, &reopened, "ai", "embed"
+        ));
+        let reopened_audit = client
+            .with_session(&reopened, |loom| loom.store().audit_records())
+            .expect("reopened audit");
+        assert_eq!(reopened_audit.len(), 3);
+        assert_eq!(reopened_audit[2].action, "inference.instance.delete");
+    }
+
+    #[test]
+    fn inference_instance_generated_reads_preserve_filters_refs_and_not_found() {
+        let dir = temp_dir("inference-instance-generated-reads");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        seed_inference_workspace(&client, &session, "ai");
+
+        client
+            .inference_instance_create_json(
+                &session,
+                "ai",
+                "embed".to_string(),
+                "embedding-model".to_string(),
+                "text-embedding".to_string(),
+                "candle-safetensors".to_string(),
+                None,
+                r#"{}"#,
+            )
+            .expect("create embedding instance");
+        client
+            .inference_instance_create_json(
+                &session,
+                "ai",
+                "chat".to_string(),
+                "chat-model".to_string(),
+                "llm".to_string(),
+                "candle-safetensors".to_string(),
+                Some("balanced".to_string()),
+                r#"{"temperature":"0.2"}"#,
+            )
+            .expect("create llm instance");
+
+        let listed = client
+            .inference_instance_list_json(&session, "ai", None)
+            .expect("list instances");
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&listed).expect("list json");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["instance"]["name"], "chat");
+        assert_eq!(listed[0]["refs"], 0);
+        assert_eq!(listed[1]["instance"]["name"], "embed");
+
+        let filtered = client
+            .inference_instance_list_json(&session, "ai", Some("text-embedding".to_string()))
+            .expect("filtered instances");
+        let filtered: Vec<serde_json::Value> =
+            serde_json::from_str(&filtered).expect("filtered json");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["instance"]["name"], "embed");
+
+        let shown: serde_json::Value = serde_json::from_str(
+            &client
+                .inference_instance_get_json(&session, "ai", "chat")
+                .expect("get instance"),
+        )
+        .expect("get json");
+        assert_eq!(shown["instance"]["name"], "chat");
+        assert_eq!(shown["refs"], 0);
+
+        let missing = client
+            .inference_instance_get_json(&session, "ai", "missing")
+            .expect_err("missing instance");
+        assert_eq!(missing.code, Code::NotFound);
+    }
+
+    #[test]
+    fn inference_instance_commit_failure_rolls_back_engine_and_store() {
+        let dir = temp_dir("inference-instance-commit-rollback");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        seed_inference_workspace(&client, &session, "ai");
+
+        let failed = client.inference_instance_mutate_audited_with_commit(
+            &session,
+            "ai",
+            "embed",
+            "inference.instance.create",
+            |state| {
+                let instance = loom_inference::build_instance_descriptor(
+                    "embed",
+                    InferenceModelKind::TextEmbedding,
+                    loom_types::ModelRef::new(
+                        InferenceModelKind::TextEmbedding,
+                        "BAAI/bge-small-en-v1.5",
+                    ),
+                    loom_types::RuntimeKind::CandleSafetensors,
+                    None,
+                    BTreeMap::new(),
+                )?;
+                state.upsert_instance(instance.clone());
+                inference_instance_view_json(state, &instance)
+            },
+            |_, _, _| Err(LoomError::new(Code::Internal, "injected commit failure")),
+        );
+        assert_eq!(failed.unwrap_err().code, Code::Internal);
+        assert!(!inference_instance_exists(&client, &session, "ai", "embed"));
+        let audit = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit records");
+        assert!(audit.is_empty());
+        client.close(&session);
+
+        let reopened = client.open().expect("reopen");
+        assert!(!inference_instance_exists(
+            &client, &reopened, "ai", "embed"
+        ));
+        let reopened_audit = client
+            .with_session(&reopened, |loom| loom.store().audit_records())
+            .expect("reopened audit");
+        assert!(reopened_audit.is_empty());
+    }
+
+    #[test]
+    fn refs_reconcile_changed_batch_persists_one_audit_with_state() {
+        let dir = temp_dir("refs-reconcile-audit");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        let workspace_id = seed_refs_workspace(&client, &session, "repo", true);
+
+        let result: loom_reference::ReconciliationSummary =
+            serde_json::from_str(&client.refs_reconcile_json(&session, "repo", 1).unwrap())
+                .expect("summary json");
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.resolved, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.pending, 0);
+        assert_eq!(
+            refs_reconcile_audit_targets(&client, &session),
+            vec![format!(
+                "workspace={workspace_id};processed=1;resolved=1;failed=0;pending=0"
+            )]
+        );
+
+        client.close(&session);
+        let reopened = client.open().expect("reopen");
+        let settled: loom_reference::ReconciliationSummary =
+            serde_json::from_str(&client.refs_reconcile_json(&reopened, "repo", 1).unwrap())
+                .expect("summary json");
+        assert_eq!(settled.processed, 0);
+        assert_eq!(settled.resolved, 1);
+        assert_eq!(
+            refs_reconcile_audit_targets(&client, &reopened),
+            vec![format!(
+                "workspace={workspace_id};processed=1;resolved=1;failed=0;pending=0"
+            )]
+        );
+        client.close(&reopened);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refs_reconcile_noop_batches_emit_no_audit() {
+        let dir = temp_dir("refs-reconcile-noop");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        seed_refs_workspace(&client, &session, "repo", true);
+
+        let max_zero: loom_reference::ReconciliationSummary =
+            serde_json::from_str(&client.refs_reconcile_json(&session, "repo", 0).unwrap())
+                .expect("summary json");
+        assert_eq!(max_zero.processed, 0);
+        assert_eq!(max_zero.pending, 1);
+        assert!(refs_reconcile_audit_targets(&client, &session).is_empty());
+
+        client.close(&session);
+        let empty_session = client.open().expect("reopen");
+        seed_refs_workspace(&client, &empty_session, "empty", false);
+        let no_candidate: loom_reference::ReconciliationSummary = serde_json::from_str(
+            &client
+                .refs_reconcile_json(&empty_session, "empty", 1)
+                .unwrap(),
+        )
+        .expect("summary json");
+        assert_eq!(no_candidate.processed, 0);
+        assert!(refs_reconcile_audit_targets(&client, &empty_session).is_empty());
+        client.close(&empty_session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn store_admin_policy_and_stat_round_trip() {
         let dir = temp_dir("storeadmin-policy");
@@ -8710,12 +15842,35 @@ mod tests {
         client.create().expect("create store");
         let session = client.open().expect("open");
 
+        let update = loom_wire::store_admin::StorePolicyUpdate {
+            fips_required: Some(true),
+            default_durability: Some(OverlayDurabilityPolicy::Strict),
+            facet_durability_assignments: vec![
+                loom_wire::store_admin::StoreFacetDurabilityAssignment {
+                    facet: FacetKind::Document,
+                    durability: OverlayDurabilityPolicy::Relaxed,
+                },
+            ],
+            clear_facet_durability: Vec::new(),
+        };
+        let update = loom_wire::store_admin::store_policy_update_to_cbor(&update);
+
         // policy set is audited (returns a seq); policy get echoes the value with no seq.
         let set = loom_wire::store_admin::store_policy_result_from_cbor(
-            &client.store_policy_set(&session, true).expect("policy set"),
+            &client
+                .store_policy_set(&session, &update)
+                .expect("policy set"),
         )
         .expect("decode set");
         assert!(set.fips_required);
+        assert_eq!(set.default_durability, OverlayDurabilityPolicy::Strict);
+        assert_eq!(
+            set.facet_durability_overrides,
+            vec![loom_wire::store_admin::StoreFacetDurabilityAssignment {
+                facet: FacetKind::Document,
+                durability: OverlayDurabilityPolicy::Relaxed,
+            }]
+        );
         assert!(set.audit_seq.is_some(), "policy_set is audited");
 
         let get = loom_wire::store_admin::store_policy_result_from_cbor(
@@ -8723,6 +15878,11 @@ mod tests {
         )
         .expect("decode get");
         assert!(get.fips_required);
+        assert_eq!(get.default_durability, OverlayDurabilityPolicy::Strict);
+        assert_eq!(
+            get.facet_durability_overrides,
+            set.facet_durability_overrides
+        );
         assert!(get.audit_seq.is_none(), "policy_get carries no audit seq");
 
         // stat decodes as the canonical maintenance snapshot.
@@ -8761,7 +15921,19 @@ mod tests {
             "policy_get must fail closed without global admin"
         );
         assert!(
-            client.store_policy_set(&session, true).is_err(),
+            client
+                .store_policy_set(
+                    &session,
+                    &loom_wire::store_admin::store_policy_update_to_cbor(
+                        &loom_wire::store_admin::StorePolicyUpdate {
+                            fips_required: Some(true),
+                            default_durability: None,
+                            facet_durability_assignments: Vec::new(),
+                            clear_facet_durability: Vec::new(),
+                        },
+                    ),
+                )
+                .is_err(),
             "policy_set must fail closed without global admin"
         );
         assert!(
@@ -8805,7 +15977,17 @@ mod tests {
         let _stat = client.store_stat(&admin).expect("stat as admin");
         let set = loom_wire::store_admin::store_policy_result_from_cbor(
             &client
-                .store_policy_set(&admin, true)
+                .store_policy_set(
+                    &admin,
+                    &loom_wire::store_admin::store_policy_update_to_cbor(
+                        &loom_wire::store_admin::StorePolicyUpdate {
+                            fips_required: Some(true),
+                            default_durability: None,
+                            facet_durability_assignments: Vec::new(),
+                            clear_facet_durability: Vec::new(),
+                        },
+                    ),
+                )
                 .expect("policy set as admin"),
         )
         .expect("decode set");
@@ -8827,9 +16009,15 @@ mod tests {
         let err = client
             .store_rekey(
                 &session,
-                b"newpw",
-                false,
-                None,
+                &loom_wire::store_admin::store_rekey_request_to_cbor(
+                    &loom_wire::store_admin::StoreRekeyRequest {
+                        credential: loom_wire::store_admin::StoreRekeyCredential::Passphrase(
+                            b"newpw".to_vec(),
+                        ),
+                        reseal: false,
+                        suite: None,
+                    },
+                ),
                 vec![0u8; 16],
                 vec![0u8; 24],
                 None,
@@ -9808,6 +16996,1513 @@ mod tests {
     }
 
     #[test]
+    fn exec_apply_validates_session_before_decoding_request() {
+        let dir = temp_dir("exec-apply-session");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let unknown = LoomSession(HandleId {
+            kind: "session".to_string(),
+            id: 999_u64.to_be_bytes().to_vec(),
+            generation: 0,
+            owner_session: Vec::new(),
+        });
+
+        let err = client
+            .apply_cbor(&unknown, b"not a valid apply request")
+            .expect_err("unknown session wins before request decode");
+        assert_eq!(err.code, Code::NotFound);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exec_apply_rejects_malformed_request_and_invalid_revisions() {
+        let dir = temp_dir("exec-apply-invalid");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open session");
+
+        let err = client
+            .apply_cbor(&session, b"not cbor")
+            .expect_err("malformed apply request");
+        assert_eq!(err.code, Code::InvalidArgument);
+
+        let request = exec_apply_request("missing-repo", "main", "feature");
+        let err = client
+            .apply_cbor(&session, &request)
+            .expect_err("missing workspace");
+        assert_eq!(err.code, Code::NotFound);
+
+        client
+            .write_file(&session, "repo", "a.txt", b"base", 0)
+            .expect("write base");
+        client.stage_all(&session, "repo").expect("stage base");
+        client
+            .commit(&session, "repo", "alice", "base", 1_000)
+            .expect("commit base");
+        let request = exec_apply_request("repo", "main", "missing-branch");
+        let err = client
+            .apply_cbor(&session, &request)
+            .expect_err("missing branch");
+        assert_eq!(err.code, Code::NotFound);
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exec_apply_cbor_fast_forward_persists() {
+        let dir = temp_dir("exec-apply-fast-forward");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open session");
+
+        client
+            .write_file(&session, "repo", "a.txt", b"base", 0)
+            .expect("write base");
+        client.stage_all(&session, "repo").expect("stage base");
+        client
+            .commit(&session, "repo", "alice", "base", 1_000)
+            .expect("commit base");
+        client
+            .branch(&session, "repo", "feature")
+            .expect("create feature branch");
+        client
+            .checkout(&session, "repo", "feature")
+            .expect("checkout feature");
+        client
+            .write_file(&session, "repo", "b.txt", b"feature", 0)
+            .expect("write feature");
+        client.stage_all(&session, "repo").expect("stage feature");
+        client
+            .commit(&session, "repo", "alice", "feature", 2_000)
+            .expect("commit feature");
+
+        let request = exec_apply_request("repo", "main", "feature");
+        let result = client
+            .apply_cbor(&session, &request)
+            .expect("apply generated owner");
+        let loom_codec::Value::Map(result_fields) =
+            loom_codec::decode(&result).expect("decode apply result")
+        else {
+            panic!("apply result must be a map");
+        };
+        assert!(result_fields.iter().any(|(key, value)| {
+            matches!(
+                (key, value),
+                (loom_codec::Value::Text(key), loom_codec::Value::Text(value))
+                    if key == "schema" && value == "loom.exec.apply.result.v1"
+            )
+        }));
+        assert!(result_fields.iter().any(|(key, value)| {
+            matches!(
+                (key, value),
+                (loom_codec::Value::Text(key), loom_codec::Value::Text(value))
+                    if key == "outcome" && value == "fast_forward"
+            )
+        }));
+        assert!(result_fields.iter().any(|(key, value)| {
+            matches!(
+                (key, value),
+                (loom_codec::Value::Text(key), loom_codec::Value::Bytes(bytes))
+                    if key == "digest" && bytes.len() == 32
+            )
+        }));
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen store");
+        assert_eq!(
+            reopened
+                .log(&session, "repo", "main")
+                .expect("main log")
+                .len(),
+            2
+        );
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exec_apply_conflict_result_is_deterministic_and_does_not_move_branch_tip() {
+        let dir = temp_dir("exec-apply-conflict");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open session");
+
+        client
+            .write_file(&session, "repo", "shared.txt", b"base", 0)
+            .expect("write base");
+        client.stage_all(&session, "repo").expect("stage base");
+        client
+            .commit(&session, "repo", "alice", "base", 1_000)
+            .expect("commit base");
+        client
+            .branch(&session, "repo", "feature")
+            .expect("create feature branch");
+        client
+            .checkout(&session, "repo", "feature")
+            .expect("checkout feature");
+        client
+            .write_file(&session, "repo", "shared.txt", b"feature", 0)
+            .expect("write feature");
+        client.stage_all(&session, "repo").expect("stage feature");
+        client
+            .commit(&session, "repo", "alice", "feature", 2_000)
+            .expect("commit feature");
+        client
+            .checkout(&session, "repo", "main")
+            .expect("checkout main");
+        client
+            .write_file(&session, "repo", "shared.txt", b"main", 0)
+            .expect("write main");
+        client.stage_all(&session, "repo").expect("stage main");
+        client
+            .commit(&session, "repo", "alice", "main", 3_000)
+            .expect("commit main");
+        let before_main = client.log(&session, "repo", "main").expect("main log");
+
+        let request = exec_apply_request("repo", "main", "feature");
+        let first = client
+            .apply_cbor(&session, &request)
+            .expect("apply conflict result");
+        let fields = exec_apply_result_value(&first);
+        assert_eq!(
+            fields.get("schema"),
+            Some(&loom_codec::Value::Text(
+                "loom.exec.apply.result.v1".to_string()
+            ))
+        );
+        assert_eq!(
+            fields.get("outcome"),
+            Some(&loom_codec::Value::Text("conflicts".to_string()))
+        );
+        assert_eq!(
+            fields.get("conflicts"),
+            Some(&loom_codec::Value::Array(vec![loom_codec::Value::Text(
+                "shared.txt".to_string()
+            )]))
+        );
+        assert_eq!(
+            client.log(&session, "repo", "main").expect("main log"),
+            before_main
+        );
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exec_apply_merge_failure_leaves_live_and_durable_state_unchanged() {
+        let dir = temp_dir("exec-apply-merge-failure");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open session");
+        seed_exec_apply_dirty_feature(&client, &session);
+        let before = exec_apply_snapshot(&client, &session);
+
+        let request = exec_apply_request("repo", "main", "missing-fork");
+        let err = client
+            .apply_cbor(&session, &request)
+            .expect_err("missing fork fails after candidate checkout");
+        assert_eq!(err.code, Code::NotFound);
+        assert_eq!(exec_apply_snapshot(&client, &session), before);
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen store");
+        assert_eq!(exec_apply_snapshot(&reopened, &session), before);
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exec_apply_candidate_save_failure_leaves_live_and_durable_state_unchanged() {
+        let dir = temp_dir("exec-apply-save-failure");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open session");
+        seed_exec_apply_dirty_feature(&client, &session);
+        let before = exec_apply_snapshot(&client, &session);
+
+        install_exec_apply_candidate_save_hook(
+            path.clone(),
+            Box::new(|| {
+                Err(LoomError::new(
+                    Code::Internal,
+                    "injected exec apply candidate save failure",
+                ))
+            }),
+        );
+        let request = exec_apply_request("repo", "main", "feature");
+        let err = client
+            .apply_cbor(&session, &request)
+            .expect_err("save hook rejects candidate publication");
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(exec_apply_snapshot(&client, &session), before);
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen store");
+        assert_eq!(exec_apply_snapshot(&reopened, &session), before);
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn drive_root(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+    ) -> loom_drive::HostedDriveFolder {
+        client
+            .with_session(session, |loom| {
+                let workspace = loom.registry().open(&ns_selector_by_name(workspace))?;
+                loom_drive::list_folder(loom, workspace, drive_workspace_id, "root")
+            })
+            .expect("drive root")
+    }
+
+    fn drive_folder(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        folder_id: &str,
+    ) -> loom_drive::HostedDriveFolder {
+        client
+            .with_session(session, |loom| {
+                let workspace = loom.registry().open(&ns_selector_by_name(workspace))?;
+                loom_drive::list_folder(loom, workspace, drive_workspace_id, folder_id)
+            })
+            .expect("drive folder")
+    }
+
+    fn drive_conflicts(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+    ) -> Vec<loom_drive::HostedDriveConflict> {
+        client
+            .with_session(session, |loom| {
+                let workspace = loom.registry().open(&ns_selector_by_name(workspace))?;
+                loom_drive::list_conflicts(loom, workspace, drive_workspace_id)
+            })
+            .expect("drive conflicts")
+    }
+
+    fn drive_shares(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+    ) -> Vec<loom_drive::HostedDriveShareGrant> {
+        client
+            .with_session(session, |loom| {
+                let workspace = loom.registry().open(&ns_selector_by_name(workspace))?;
+                loom_drive::list_shares(loom, workspace, drive_workspace_id)
+            })
+            .expect("drive shares")
+    }
+
+    fn drive_retention(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+    ) -> Vec<loom_drive::HostedDriveRetentionPin> {
+        client
+            .with_session(session, |loom| {
+                let workspace = loom.registry().open(&ns_selector_by_name(workspace))?;
+                loom_drive::list_retention(loom, workspace, drive_workspace_id)
+            })
+            .expect("drive retention")
+    }
+
+    fn drive_operation_kinds(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        drive_workspace_id: &str,
+    ) -> Vec<String> {
+        client
+            .with_session(session, |loom| {
+                let log = match loom
+                    .store()
+                    .control_get(&drive_operation_log_key(drive_workspace_id)?)?
+                {
+                    Some(bytes) => DriveOperationLog::decode(&bytes)?,
+                    None => DriveOperationLog::new(drive_workspace_id, Vec::new())?,
+                };
+                Ok(log
+                    .records
+                    .into_iter()
+                    .map(|record| record.operation_kind)
+                    .collect())
+            })
+            .expect("drive operation log")
+    }
+
+    fn drive_share_read_allowed(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        target_kind: &str,
+        target_id: &str,
+        principal: WorkspaceId,
+    ) -> bool {
+        client
+            .with_session(session, |loom| {
+                let workspace = loom.registry().open(&ns_selector_by_name(workspace))?;
+                let target = format!("{drive_workspace_id}/{target_kind}/{target_id}");
+                let acl = loom.store().acl_store()?.unwrap_or_default();
+                Ok(acl
+                    .authorize_resource_with_roles(
+                        true,
+                        principal,
+                        [],
+                        AclResource::scoped(
+                            workspace,
+                            AclDomain::Files,
+                            None,
+                            AclResourceScope::Prefix {
+                                kind: AclScopeKind::Collection,
+                                value: target.as_bytes(),
+                            },
+                        ),
+                        AclRight::Read,
+                    )
+                    .is_ok())
+            })
+            .expect("drive share acl check")
+    }
+
+    fn drive_write_value(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("drive write json")
+    }
+
+    fn drive_file_bytes(
+        client: &LocalLoomClient,
+        session: &LoomSession,
+        workspace: &str,
+        drive_workspace_id: &str,
+        file_id: &str,
+    ) -> Vec<u8> {
+        client
+            .with_session(session, |loom| {
+                let workspace = loom.registry().open(&ns_selector_by_name(workspace))?;
+                loom_drive::read_file(loom, workspace, drive_workspace_id, file_id)
+            })
+            .expect("drive file bytes")
+    }
+
+    fn assert_immediate_writable_reopen_after_close(
+        path: &Path,
+        client: LocalLoomClient,
+        session: LoomSession,
+    ) {
+        assert!(client.close(&session));
+        assert_eq!(client.session_count(), 0);
+        drop(session);
+        drop(client);
+        let reopened = LocalLoomClient::new(path);
+        let reopened_session = reopened.open().expect("immediate writable reopen");
+        assert!(reopened.close(&reopened_session));
+        assert_eq!(reopened.session_count(), 0);
+        drop(reopened_session);
+        drop(reopened);
+        let reopened_again = LocalLoomClient::new(path);
+        let reopened_again_session = reopened_again
+            .open()
+            .expect("second immediate writable reopen");
+        assert!(reopened_again.close(&reopened_again_session));
+        std::fs::remove_dir_all(path.parent().expect("test path parent")).ok();
+    }
+
+    #[test]
+    fn drive_generated_hierarchy_writes_persist_after_reopen() {
+        let dir = temp_dir("drive-generated-hierarchy");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+
+        let create_a = client
+            .drive_create_folder_json(&session, "files", drive_id, "root", "folder-a", "A", &root)
+            .expect("create folder a");
+        let create_a = drive_write_value(&create_a);
+        assert_eq!(create_a["operation_kind"], "folder.created");
+        let root = create_a["profile_root"].as_str().expect("profile root");
+        let create_b = client
+            .drive_create_folder_json(&session, "files", drive_id, "root", "folder-b", "B", root)
+            .expect("create folder b");
+        let root = drive_write_value(&create_b)["profile_root"]
+            .as_str()
+            .expect("profile root")
+            .to_string();
+
+        let rename = client
+            .drive_rename_json(&session, "files", drive_id, "root", "folder-a", "A2", &root)
+            .expect("rename folder");
+        let rename = drive_write_value(&rename);
+        assert_eq!(rename["operation_kind"], "file.renamed");
+        let root = rename["profile_root"].as_str().expect("profile root");
+        let moved = client
+            .drive_move_json(
+                &session, "files", drive_id, "root", "folder-b", "folder-a", root,
+            )
+            .expect("move folder");
+        let moved = drive_write_value(&moved);
+        assert_eq!(moved["operation_kind"], "file.moved");
+        let root = moved["profile_root"].as_str().expect("profile root");
+        let deleted = client
+            .drive_delete_json(&session, "files", drive_id, "folder-b", "folder-a", root)
+            .expect("delete folder");
+        let deleted = drive_write_value(&deleted);
+        assert_eq!(deleted["operation_kind"], "file.deleted");
+
+        client.close(&session);
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        let root = drive_root(&reopened, &session, "files", drive_id);
+        assert_eq!(root.entries.len(), 1);
+        assert_eq!(root.entries[0].node_id, "folder-b");
+        assert_eq!(
+            drive_folder(&reopened, &session, "files", drive_id, "folder-b")
+                .entries
+                .len(),
+            0
+        );
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_generated_create_folder_close_releases_writable_store() {
+        let dir = temp_dir("drive-generated-create-folder-close-release");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        client
+            .drive_create_folder_json(&session, "files", drive_id, "root", "folder-a", "A", &root)
+            .expect("create folder");
+        assert_immediate_writable_reopen_after_close(&path, client, session);
+    }
+
+    #[test]
+    fn drive_generated_rename_close_releases_writable_store() {
+        let dir = temp_dir("drive-generated-rename-close-release");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        let created = client
+            .drive_create_folder_json(&session, "files", drive_id, "root", "folder-a", "A", &root)
+            .expect("create folder");
+        let root = drive_write_value(&created)["profile_root"]
+            .as_str()
+            .expect("profile root")
+            .to_string();
+        client
+            .drive_rename_json(&session, "files", drive_id, "root", "folder-a", "A2", &root)
+            .expect("rename");
+        assert_immediate_writable_reopen_after_close(&path, client, session);
+    }
+
+    #[test]
+    fn drive_generated_move_close_releases_writable_store() {
+        let dir = temp_dir("drive-generated-move-close-release");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        let created = client
+            .drive_create_folder_json(&session, "files", drive_id, "root", "folder-a", "A", &root)
+            .expect("create folder a");
+        let root = drive_write_value(&created)["profile_root"]
+            .as_str()
+            .expect("profile root")
+            .to_string();
+        let created = client
+            .drive_create_folder_json(&session, "files", drive_id, "root", "folder-b", "B", &root)
+            .expect("create folder b");
+        let root = drive_write_value(&created)["profile_root"]
+            .as_str()
+            .expect("profile root")
+            .to_string();
+        client
+            .drive_move_json(
+                &session, "files", drive_id, "root", "folder-b", "folder-a", &root,
+            )
+            .expect("move");
+        assert_immediate_writable_reopen_after_close(&path, client, session);
+    }
+
+    #[test]
+    fn drive_generated_stale_delete_close_releases_writable_store() {
+        let dir = temp_dir("drive-generated-stale-delete-close-release");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let stale_root = drive_root(&client, &session, "files", drive_id).profile_root;
+        client
+            .drive_create_folder_json(
+                &session,
+                "files",
+                drive_id,
+                "root",
+                "folder-a",
+                "A",
+                &stale_root,
+            )
+            .expect("create folder");
+        client
+            .drive_delete_json(&session, "files", drive_id, "root", "folder-a", &stale_root)
+            .expect("stale delete");
+        assert_immediate_writable_reopen_after_close(&path, client, session);
+    }
+
+    #[test]
+    fn drive_generated_resolve_conflict_close_releases_writable_store() {
+        let dir = temp_dir("drive-generated-resolve-conflict-close-release");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let stale_root = drive_root(&client, &session, "files", drive_id).profile_root;
+        client
+            .drive_create_folder_json(
+                &session,
+                "files",
+                drive_id,
+                "root",
+                "folder-a",
+                "A",
+                &stale_root,
+            )
+            .expect("create folder");
+        let held_delete = client
+            .drive_delete_json(&session, "files", drive_id, "root", "folder-a", &stale_root)
+            .expect("stale delete");
+        let conflict_id = drive_write_value(&held_delete)["conflict_id"]
+            .as_str()
+            .expect("conflict id")
+            .to_string();
+        client
+            .drive_resolve_conflict_json(&session, "files", drive_id, &conflict_id, "keep_current")
+            .expect("resolve conflict");
+        assert_immediate_writable_reopen_after_close(&path, client, session);
+    }
+
+    #[test]
+    fn drive_generated_create_upload_close_releases_writable_store() {
+        let dir = temp_dir("drive-generated-create-upload-close-release");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        client
+            .drive_create_upload_json(
+                &session, "files", drive_id, "upload-a", "root", "A.bin", "file-a", &root, 10,
+                false,
+            )
+            .expect("create upload");
+        assert_immediate_writable_reopen_after_close(&path, client, session);
+    }
+
+    #[test]
+    fn drive_generated_upload_chunk_close_releases_writable_store() {
+        let dir = temp_dir("drive-generated-upload-chunk-close-release");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        client
+            .drive_create_upload_json(
+                &session, "files", drive_id, "upload-a", "root", "A.bin", "file-a", &root, 10,
+                false,
+            )
+            .expect("create upload");
+        client
+            .drive_upload_chunk_json(&session, "files", drive_id, "upload-a", b"bytes")
+            .expect("upload chunk");
+        assert_immediate_writable_reopen_after_close(&path, client, session);
+    }
+
+    #[test]
+    fn drive_generated_commit_upload_close_releases_writable_store() {
+        let dir = temp_dir("drive-generated-commit-upload-close-release");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        client
+            .drive_create_upload_json(
+                &session, "files", drive_id, "upload-a", "root", "A.bin", "file-a", &root, 10,
+                false,
+            )
+            .expect("create upload");
+        client
+            .drive_upload_chunk_json(&session, "files", drive_id, "upload-a", b"bytes")
+            .expect("upload chunk");
+        client
+            .drive_commit_upload_json(&session, "files", drive_id, "upload-a")
+            .expect("commit upload");
+        assert_immediate_writable_reopen_after_close(&path, client, session);
+    }
+
+    #[test]
+    fn drive_generated_seeded_store_commit_upload_close_releases_writable_store() {
+        let dir = temp_dir("drive-generated-seeded-commit-upload-close-release");
+        let path = dir.join("t.loom");
+        let workspace = WorkspaceId::from_bytes([78; 16]);
+        {
+            let store = FileStore::create_with_profile(&path, Algo::Blake3).expect("create store");
+            let mut loom = Loom::new(store);
+            loom.registry_mut()
+                .create(FacetKind::Files, Some("files"), workspace)
+                .expect("seed fixed files workspace");
+            save_loom(&mut loom).expect("save seeded files workspace");
+        }
+        let client = LocalLoomClient::new(&path);
+        let session = client.open().expect("open");
+        let drive_id = workspace.to_string();
+        let root = drive_root(&client, &session, "files", &drive_id).profile_root;
+        client
+            .drive_create_upload_json(
+                &session, "files", &drive_id, "upload-a", "root", "A.bin", "file-a", &root, 10,
+                false,
+            )
+            .expect("create upload");
+        client
+            .drive_upload_chunk_json(&session, "files", &drive_id, "upload-a", b"bytes")
+            .expect("upload chunk");
+        client
+            .drive_commit_upload_json(&session, "files", &drive_id, "upload-a")
+            .expect("commit upload");
+        assert_immediate_writable_reopen_after_close(&path, client, session);
+    }
+
+    #[test]
+    fn drive_generated_writes_require_collection_auth_before_root_parse() {
+        let dir = temp_dir("drive-generated-auth-order");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        seed_authenticated_non_admin(&client, &session);
+        let before = std::fs::read(&path).expect("read before");
+
+        let err = client
+            .drive_create_folder_json(
+                &session,
+                "files",
+                "drive-local",
+                "root",
+                "folder-a",
+                "A",
+                "not-a-digest",
+            )
+            .expect_err("collection auth wins");
+        assert_eq!(err.code, Code::PermissionDenied);
+        assert_eq!(std::fs::read(&path).expect("read after"), before);
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_generated_denied_malformed_resolution_does_not_parse() {
+        let dir = temp_dir("drive-generated-resolution-auth-order");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        seed_authenticated_non_admin(&client, &session);
+        let before = std::fs::read(&path).expect("read before");
+
+        let err = client
+            .drive_resolve_conflict_json(
+                &session,
+                "files",
+                "drive-local",
+                "conflict-a",
+                "not-a-resolution",
+            )
+            .expect_err("collection auth wins before resolution parsing");
+        assert_eq!(err.code, Code::PermissionDenied);
+        assert_eq!(std::fs::read(&path).expect("read after"), before);
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_generated_candidate_save_failure_leaves_live_and_durable_state_unchanged() {
+        let dir = temp_dir("drive-generated-save-failure");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let before_root = drive_root(&client, &session, "files", drive_id);
+        let before_bytes = std::fs::read(&path).expect("read before");
+
+        install_exec_apply_candidate_save_hook(
+            path.clone(),
+            Box::new(|| {
+                Err(LoomError::new(
+                    Code::Internal,
+                    "injected generated candidate publication failure",
+                ))
+            }),
+        );
+        let err = client
+            .drive_create_folder_json(
+                &session,
+                "files",
+                drive_id,
+                "root",
+                "folder-a",
+                "A",
+                &before_root.profile_root,
+            )
+            .expect_err("candidate publication fails");
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(
+            drive_root(&client, &session, "files", drive_id),
+            before_root
+        );
+        assert_eq!(std::fs::read(&path).expect("read after"), before_bytes);
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert_eq!(
+            drive_root(&reopened, &session, "files", drive_id),
+            before_root
+        );
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_upload_generated_requires_collection_auth_before_parse_or_lookup() {
+        let dir = temp_dir("drive-upload-generated-auth-order");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        seed_authenticated_non_admin(&client, &session);
+        let before = std::fs::read(&path).expect("read before");
+
+        let err = client
+            .drive_create_upload_json(
+                &session,
+                "files",
+                "drive-local",
+                "upload-a",
+                "root",
+                "A",
+                "file-a",
+                "not-a-digest",
+                1,
+                false,
+            )
+            .expect_err("collection auth wins before expected root parsing");
+        assert_eq!(err.code, Code::PermissionDenied);
+
+        let err = client
+            .drive_upload_chunk_json(&session, "files", "drive-local", "missing-upload", b"chunk")
+            .expect_err("collection auth wins before upload session lookup");
+        assert_eq!(err.code, Code::PermissionDenied);
+
+        let err = client
+            .drive_commit_upload_json(&session, "files", "drive-local", "missing-upload")
+            .expect_err("collection auth wins before commit session lookup");
+        assert_eq!(err.code, Code::PermissionDenied);
+        assert_eq!(std::fs::read(&path).expect("read after"), before);
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_upload_generated_preserves_raw_bytes_cleans_session_and_reopens() {
+        let dir = temp_dir("drive-upload-generated-raw-reopen");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+
+        let created = client
+            .drive_create_upload_json(
+                &session, "files", drive_id, "upload-a", "root", "A.bin", "file-a", &root, 10,
+                false,
+            )
+            .expect("create upload");
+        assert_eq!(drive_write_value(&created)["chunk_count"], 0);
+        let first = b"\x00raw-\xff".as_slice();
+        let second = b"\xfe-tail".as_slice();
+        let uploaded = client
+            .drive_upload_chunk_json(&session, "files", drive_id, "upload-a", first)
+            .expect("upload first chunk");
+        assert_eq!(drive_write_value(&uploaded)["chunk_count"], 1);
+        let uploaded = client
+            .drive_upload_chunk_json(&session, "files", drive_id, "upload-a", second)
+            .expect("upload second chunk");
+        assert_eq!(drive_write_value(&uploaded)["total_size"], 12);
+        let committed = client
+            .drive_commit_upload_json(&session, "files", drive_id, "upload-a")
+            .expect("commit upload");
+        let committed = drive_write_value(&committed);
+        assert_eq!(committed["operation_kind"], "file.upload_committed");
+        assert!(committed["conflict_id"].is_null());
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend(first);
+        expected.extend(second);
+        assert_eq!(
+            drive_file_bytes(&client, &session, "files", drive_id, "file-a"),
+            expected
+        );
+        let err = client
+            .drive_upload_chunk_json(&session, "files", drive_id, "upload-a", b"again")
+            .expect_err("committed upload session is cleaned up");
+        assert_eq!(err.code, Code::NotFound);
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert_eq!(
+            drive_file_bytes(&reopened, &session, "files", drive_id, "file-a"),
+            expected
+        );
+        let err = reopened
+            .drive_commit_upload_json(&session, "files", drive_id, "upload-a")
+            .expect_err("upload session remains cleaned after reopen");
+        assert_eq!(err.code, Code::NotFound);
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_upload_generated_preserves_replacement_and_new_file_conflict_semantics() {
+        let dir = temp_dir("drive-upload-generated-conflicts");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+
+        client
+            .drive_create_upload_json(
+                &session,
+                "files",
+                drive_id,
+                "upload-collision",
+                "root",
+                "A2.txt",
+                "file-b",
+                &root,
+                3,
+                false,
+            )
+            .expect("create new-file upload before colliding root advances");
+        client
+            .drive_upload_chunk_json(
+                &session,
+                "files",
+                drive_id,
+                "upload-collision",
+                b"collision",
+            )
+            .expect("collision chunk");
+        client
+            .drive_create_upload_json(
+                &session,
+                "files",
+                drive_id,
+                "upload-base",
+                "root",
+                "A.txt",
+                "file-a",
+                &root,
+                1,
+                false,
+            )
+            .expect("create base upload");
+        client
+            .drive_upload_chunk_json(&session, "files", drive_id, "upload-base", b"base")
+            .expect("base chunk");
+        let base_commit = client
+            .drive_commit_upload_json(&session, "files", drive_id, "upload-base")
+            .expect("base commit");
+        let base_root = drive_write_value(&base_commit)["profile_root"]
+            .as_str()
+            .expect("base profile root")
+            .to_string();
+
+        client
+            .drive_create_upload_json(
+                &session,
+                "files",
+                drive_id,
+                "upload-replace-stale",
+                "root",
+                "A.txt",
+                "file-a",
+                &base_root,
+                2,
+                true,
+            )
+            .expect("create stale replacement upload");
+        client
+            .drive_upload_chunk_json(
+                &session,
+                "files",
+                drive_id,
+                "upload-replace-stale",
+                b"replacement",
+            )
+            .expect("replacement chunk");
+        let renamed = client
+            .drive_rename_json(
+                &session, "files", drive_id, "root", "file-a", "A2.txt", &base_root,
+            )
+            .expect("advance root");
+        let advanced_root = drive_write_value(&renamed)["profile_root"]
+            .as_str()
+            .expect("advanced profile root")
+            .to_string();
+        let err = client
+            .drive_commit_upload_json(&session, "files", drive_id, "upload-replace-stale")
+            .expect_err("stale replacement conflicts");
+        assert_eq!(err.code, Code::Conflict);
+        assert_eq!(
+            drive_file_bytes(&client, &session, "files", drive_id, "file-a"),
+            b"base"
+        );
+
+        let collision = client
+            .drive_commit_upload_json(&session, "files", drive_id, "upload-collision")
+            .expect("new-file collision records conflict");
+        let collision = drive_write_value(&collision);
+        assert_eq!(collision["operation_kind"], "file.upload_committed");
+        assert!(collision["conflict_id"].as_str().is_some());
+        assert_ne!(
+            collision["profile_root"].as_str().expect("collision root"),
+            advanced_root
+        );
+        assert_eq!(
+            drive_conflicts(&client, &session, "files", drive_id)
+                .iter()
+                .filter(|conflict| {
+                    Some(conflict.conflict_id.as_str()) == collision["conflict_id"].as_str()
+                })
+                .count(),
+            1
+        );
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_upload_generated_publication_failure_leaves_live_and_reopened_state_unchanged() {
+        let dir = temp_dir("drive-upload-generated-publication-failure");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        client
+            .drive_create_upload_json(
+                &session, "files", drive_id, "upload-a", "root", "A.txt", "file-a", &root, 1, false,
+            )
+            .expect("create upload");
+        let before_root = drive_root(&client, &session, "files", drive_id);
+        let before_conflicts = drive_conflicts(&client, &session, "files", drive_id);
+        let before_bytes = std::fs::read(&path).expect("read before");
+
+        install_exec_apply_candidate_save_hook(
+            path.clone(),
+            Box::new(|| {
+                Err(LoomError::new(
+                    Code::Internal,
+                    "injected upload candidate publication failure",
+                ))
+            }),
+        );
+        let err = client
+            .drive_upload_chunk_json(&session, "files", drive_id, "upload-a", b"not-published")
+            .expect_err("candidate publication fails before upload chunk persists");
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(
+            drive_root(&client, &session, "files", drive_id),
+            before_root
+        );
+        assert_eq!(
+            drive_conflicts(&client, &session, "files", drive_id),
+            before_conflicts
+        );
+        assert_eq!(std::fs::read(&path).expect("read after"), before_bytes);
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert_eq!(
+            drive_root(&reopened, &session, "files", drive_id),
+            before_root
+        );
+        assert_eq!(
+            drive_conflicts(&reopened, &session, "files", drive_id),
+            before_conflicts
+        );
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_retention_generated_requires_collection_auth_before_parse_or_lookup() {
+        let dir = temp_dir("drive-retention-generated-auth-order");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        seed_authenticated_non_admin(&client, &session);
+        let before = std::fs::read(&path).expect("read before");
+
+        let err = client
+            .drive_pin_retention_json(
+                &session,
+                "files",
+                "drive-local",
+                "pin-bad",
+                "not-a-kind",
+                "not-a-digest",
+                Some("not-a-target"),
+                1,
+                Some(2),
+            )
+            .expect_err("collection auth wins before retention parsing");
+        assert_eq!(err.code, Code::PermissionDenied);
+
+        let err = client
+            .drive_unpin_retention_json(&session, "files", "drive-local", "missing-pin")
+            .expect_err("collection auth wins before retention lookup");
+        assert_eq!(err.code, Code::PermissionDenied);
+
+        let err = client
+            .drive_apply_retention_json(&session, "files", "drive-local", 50)
+            .expect_err("collection auth wins before retention scan");
+        assert_eq!(err.code, Code::PermissionDenied);
+        assert_eq!(std::fs::read(&path).expect("read after"), before);
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_retention_generated_pin_unpin_apply_reopen_and_notifications() {
+        let dir = temp_dir("drive-retention-generated-flow");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        client
+            .drive_create_folder_json(&session, "files", drive_id, "root", "folder-a", "A", &root)
+            .expect("create folder");
+        let current_root = drive_root(&client, &session, "files", drive_id).profile_root;
+        let before_audit = audit_actions(&client, &session);
+
+        let invalid_digest = client
+            .drive_pin_retention_json(
+                &session,
+                "files",
+                drive_id,
+                "pin-invalid",
+                "current_root",
+                "not-a-digest",
+                Some("folder:folder-a"),
+                10,
+                None,
+            )
+            .expect_err("invalid digest");
+        assert_eq!(invalid_digest.code, Code::InvalidArgument);
+        assert!(drive_retention(&client, &session, "files", drive_id).is_empty());
+
+        let malformed_target = client
+            .drive_pin_retention_json(
+                &session,
+                "files",
+                drive_id,
+                "pin-target",
+                "current_root",
+                &current_root,
+                Some("folder-a"),
+                10,
+                None,
+            )
+            .expect_err("malformed target");
+        assert_eq!(malformed_target.code, Code::InvalidArgument);
+        assert!(drive_retention(&client, &session, "files", drive_id).is_empty());
+
+        let pinned = client
+            .drive_pin_retention_json(
+                &session,
+                "files",
+                drive_id,
+                "pin-live",
+                "trash_subtree",
+                &current_root,
+                Some("folder:folder-a"),
+                20,
+                Some(100),
+            )
+            .expect("pin retention");
+        let pinned = drive_write_value(&pinned);
+        assert_eq!(pinned["operation_kind"], "retention.pinned");
+        assert_eq!(pinned["target_entity_id"], "retention:pin-live");
+        assert_eq!(
+            drive_retention(&client, &session, "files", drive_id)
+                .iter()
+                .map(|pin| pin.pin_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["pin-live".to_string()]
+        );
+        let duplicate = client
+            .drive_pin_retention_json(
+                &session,
+                "files",
+                drive_id,
+                "pin-live",
+                "trash_subtree",
+                &current_root,
+                Some("folder:folder-a"),
+                21,
+                Some(101),
+            )
+            .expect_err("duplicate pin");
+        assert_eq!(duplicate.code, Code::AlreadyExists);
+        assert_eq!(
+            drive_retention(&client, &session, "files", drive_id).len(),
+            1
+        );
+
+        let no_op = client
+            .drive_apply_retention_json(&session, "files", drive_id, 50)
+            .expect("no-op apply");
+        let no_op = drive_write_value(&no_op);
+        assert!(no_op["operation"].is_null());
+        assert_eq!(no_op["remaining_pins"], 1);
+        assert_eq!(
+            drive_operation_kinds(&client, &session, drive_id),
+            vec!["folder.created".to_string(), "retention.pinned".to_string()]
+        );
+
+        let expired = client
+            .drive_apply_retention_json(&session, "files", drive_id, 100)
+            .expect("apply expired retention");
+        let expired = drive_write_value(&expired);
+        assert_eq!(expired["expired_pin_ids"], serde_json::json!(["pin-live"]));
+        assert_eq!(expired["operation"]["operation_kind"], "retention.applied");
+        assert!(drive_retention(&client, &session, "files", drive_id).is_empty());
+
+        let missing = client
+            .drive_unpin_retention_json(&session, "files", drive_id, "missing")
+            .expect_err("missing pin");
+        assert_eq!(missing.code, Code::NotFound);
+
+        client
+            .drive_pin_retention_json(
+                &session,
+                "files",
+                drive_id,
+                "pin-remove",
+                "current_root",
+                &current_root,
+                None,
+                200,
+                None,
+            )
+            .expect("pin for unpin");
+        let unpinned = client
+            .drive_unpin_retention_json(&session, "files", drive_id, "pin-remove")
+            .expect("unpin retention");
+        assert_eq!(
+            drive_write_value(&unpinned)["operation_kind"],
+            "retention.unpinned"
+        );
+        assert!(drive_retention(&client, &session, "files", drive_id).is_empty());
+        assert!(drive_retention(&client, &session, "files", "other-drive").is_empty());
+        assert_eq!(audit_actions(&client, &session), before_audit);
+        assert_eq!(
+            drive_operation_kinds(&client, &session, drive_id),
+            vec![
+                "folder.created".to_string(),
+                "retention.pinned".to_string(),
+                "retention.applied".to_string(),
+                "retention.pinned".to_string(),
+                "retention.unpinned".to_string(),
+            ]
+        );
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert!(drive_retention(&reopened, &session, "files", drive_id).is_empty());
+        assert_eq!(audit_actions(&reopened, &session), before_audit);
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_retention_generated_publication_failure_preserves_live_and_reopened_state() {
+        let dir = temp_dir("drive-retention-generated-publication-failure");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        let before_retention = drive_retention(&client, &session, "files", drive_id);
+        let before_operations = drive_operation_kinds(&client, &session, drive_id);
+        let before_audit = audit_actions(&client, &session);
+        let before_bytes = std::fs::read(&path).expect("read before");
+
+        install_exec_apply_candidate_save_hook(
+            path.clone(),
+            Box::new(|| {
+                Err(LoomError::new(
+                    Code::Internal,
+                    "injected retention candidate publication failure",
+                ))
+            }),
+        );
+        let err = client
+            .drive_pin_retention_json(
+                &session,
+                "files",
+                drive_id,
+                "pin-fail",
+                "current_root",
+                &root,
+                None,
+                10,
+                None,
+            )
+            .expect_err("candidate publication fails before retention persists");
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(
+            drive_retention(&client, &session, "files", drive_id),
+            before_retention
+        );
+        assert_eq!(
+            drive_operation_kinds(&client, &session, drive_id),
+            before_operations
+        );
+        assert_eq!(audit_actions(&client, &session), before_audit);
+        assert_eq!(std::fs::read(&path).expect("read after"), before_bytes);
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert_eq!(
+            drive_retention(&reopened, &session, "files", drive_id),
+            before_retention
+        );
+        assert_eq!(
+            drive_operation_kinds(&reopened, &session, drive_id),
+            before_operations
+        );
+        assert_eq!(audit_actions(&reopened, &session), before_audit);
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_generated_stale_and_missing_mutations_preserve_existing_state() {
+        let dir = temp_dir("drive-generated-stale");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let stale_root = drive_root(&client, &session, "files", drive_id).profile_root;
+        let created = client
+            .drive_create_folder_json(
+                &session,
+                "files",
+                drive_id,
+                "root",
+                "folder-a",
+                "A",
+                &stale_root,
+            )
+            .expect("create folder");
+        let current_root = drive_write_value(&created)["profile_root"]
+            .as_str()
+            .expect("profile root")
+            .to_string();
+        let before = drive_root(&client, &session, "files", drive_id);
+
+        let err = client
+            .drive_rename_json(
+                &session,
+                "files",
+                drive_id,
+                "root",
+                "folder-a",
+                "A2",
+                &stale_root,
+            )
+            .expect_err("stale rename conflicts");
+        assert_eq!(err.code, Code::Conflict);
+        assert_eq!(
+            drive_root(&client, &session, "files", drive_id).entries,
+            before.entries
+        );
+
+        let err = client
+            .drive_move_json(
+                &session,
+                "files",
+                drive_id,
+                "root",
+                "folder-a",
+                "missing-node",
+                &current_root,
+            )
+            .expect_err("missing node");
+        assert_eq!(err.code, Code::NotFound);
+        assert_eq!(
+            drive_root(&client, &session, "files", drive_id).entries,
+            before.entries
+        );
+
+        let held_delete = client
+            .drive_delete_json(&session, "files", drive_id, "root", "folder-a", &stale_root)
+            .expect("stale delete creates held conflict");
+        let held_delete = drive_write_value(&held_delete);
+        assert_eq!(held_delete["operation_kind"], "folder.delete_held");
+        let conflict_id = held_delete["conflict_id"]
+            .as_str()
+            .expect("held delete conflict");
+        assert_eq!(
+            drive_root(&client, &session, "files", drive_id).entries,
+            before.entries
+        );
+        assert_eq!(
+            drive_conflicts(&client, &session, "files", drive_id)
+                .iter()
+                .filter(|conflict| conflict.conflict_id == conflict_id)
+                .count(),
+            1
+        );
+
+        let resolved = client
+            .drive_resolve_conflict_json(&session, "files", drive_id, conflict_id, "keep_current")
+            .expect("resolve held delete");
+        assert_eq!(
+            drive_write_value(&resolved)["operation_kind"],
+            "conflict.resolved"
+        );
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert_eq!(
+            drive_root(&reopened, &session, "files", drive_id).entries,
+            before.entries
+        );
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn watch_group_observes_a_new_commit() {
         let dir = temp_dir("watch");
         let client = LocalLoomClient::new(dir.join("t.loom"));
@@ -9838,6 +18533,263 @@ mod tests {
         assert!(!batch.events.is_empty(), "poll sees the second commit");
 
         client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_generated_share_writes_authorize_before_caller_fields() {
+        let dir = temp_dir("drive-generated-share-auth-order");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        seed_authenticated_non_admin(&client, &session);
+        let before = std::fs::read(&path).expect("read before");
+
+        let err = client
+            .drive_grant_share_json(
+                &session,
+                "files",
+                "drive-local",
+                "grant-bad",
+                "not-target-kind",
+                "bad-target",
+                "not-a-principal",
+                "not-a-role",
+                1,
+                Some(2),
+            )
+            .expect_err("collection auth wins before share field parsing");
+        assert_eq!(err.code, Code::PermissionDenied);
+        assert_eq!(std::fs::read(&path).expect("read after"), before);
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_generated_share_grant_revoke_expiry_acl_audit_and_reopen() {
+        let dir = temp_dir("drive-generated-share-flow");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        let created = client
+            .drive_create_folder_json(&session, "files", drive_id, "root", "folder-a", "A", &root)
+            .expect("create folder");
+        assert_eq!(
+            drive_write_value(&created)["operation_kind"],
+            "folder.created"
+        );
+        let grantee = WorkspaceId::from_bytes([77; 16]);
+
+        let grant = client
+            .drive_grant_share_json(
+                &session,
+                "files",
+                drive_id,
+                "grant-live",
+                "folder",
+                "folder-a",
+                &grantee.to_string(),
+                "viewer",
+                10,
+                Some(100),
+            )
+            .expect("grant share");
+        assert_eq!(drive_write_value(&grant)["operation_kind"], "share.granted");
+        assert!(drive_share_read_allowed(
+            &client, &session, "files", drive_id, "folder", "folder-a", grantee
+        ));
+        assert_eq!(
+            drive_shares(&client, &session, "files", drive_id)
+                .iter()
+                .map(|grant| grant.grant_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["grant-live".to_string()]
+        );
+
+        let duplicate = client
+            .drive_grant_share_json(
+                &session,
+                "files",
+                drive_id,
+                "grant-live",
+                "folder",
+                "folder-a",
+                &grantee.to_string(),
+                "viewer",
+                11,
+                None,
+            )
+            .expect_err("duplicate share");
+        assert_eq!(duplicate.code, Code::AlreadyExists);
+        assert_eq!(drive_shares(&client, &session, "files", drive_id).len(), 1);
+
+        let no_op = client
+            .drive_apply_share_expiry_json(&session, "files", drive_id, 50)
+            .expect("no-op expiry");
+        let no_op = drive_write_value(&no_op);
+        assert!(no_op["operation"].is_null());
+        assert_eq!(no_op["remaining_grants"], 1);
+        assert_eq!(
+            drive_operation_kinds(&client, &session, drive_id),
+            vec!["folder.created".to_string(), "share.granted".to_string()]
+        );
+
+        let revoke = client
+            .drive_revoke_share_json(&session, "files", drive_id, "grant-live")
+            .expect("revoke share");
+        assert_eq!(
+            drive_write_value(&revoke)["operation_kind"],
+            "share.revoked"
+        );
+        assert!(!drive_share_read_allowed(
+            &client, &session, "files", drive_id, "folder", "folder-a", grantee
+        ));
+        assert!(drive_shares(&client, &session, "files", drive_id).is_empty());
+        let missing = client
+            .drive_revoke_share_json(&session, "files", drive_id, "missing")
+            .expect_err("missing grant");
+        assert_eq!(missing.code, Code::NotFound);
+
+        client
+            .drive_grant_share_json(
+                &session,
+                "files",
+                drive_id,
+                "grant-expiring",
+                "folder",
+                "folder-a",
+                &grantee.to_string(),
+                "editor",
+                20,
+                Some(30),
+            )
+            .expect("grant expiring share");
+        let expired = client
+            .drive_apply_share_expiry_json(&session, "files", drive_id, 30)
+            .expect("apply expiry");
+        let expired = drive_write_value(&expired);
+        assert_eq!(
+            expired["expired_grant_ids"],
+            serde_json::json!(["grant-expiring"])
+        );
+        assert_eq!(
+            expired["operation"]["operation_kind"],
+            serde_json::json!("share.expired")
+        );
+        assert!(!drive_share_read_allowed(
+            &client, &session, "files", drive_id, "folder", "folder-a", grantee
+        ));
+        assert!(drive_shares(&client, &session, "files", drive_id).is_empty());
+        assert_eq!(
+            audit_actions(&client, &session),
+            vec![
+                "drive.share_acl.grant".to_string(),
+                "drive.share_acl.revoke".to_string(),
+                "drive.share_acl.grant".to_string(),
+                "drive.share_acl.expire".to_string(),
+            ]
+        );
+        assert_eq!(
+            drive_operation_kinds(&client, &session, drive_id),
+            vec![
+                "folder.created".to_string(),
+                "share.granted".to_string(),
+                "share.revoked".to_string(),
+                "share.granted".to_string(),
+                "share.expired".to_string(),
+            ]
+        );
+
+        let other_drive = "drive-other";
+        assert!(drive_shares(&client, &session, "files", other_drive).is_empty());
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert!(drive_shares(&reopened, &session, "files", drive_id).is_empty());
+        assert_eq!(
+            audit_actions(&reopened, &session),
+            vec![
+                "drive.share_acl.grant".to_string(),
+                "drive.share_acl.revoke".to_string(),
+                "drive.share_acl.grant".to_string(),
+                "drive.share_acl.expire".to_string(),
+            ]
+        );
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_generated_share_publication_failure_preserves_live_and_reopened_state() {
+        let dir = temp_dir("drive-generated-share-save-failure");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let session = client.open().expect("open");
+        client
+            .workspace_create(&session, Some("files"), Some(FacetKind::Files))
+            .expect("workspace");
+        let drive_id = "drive-local";
+        let root = drive_root(&client, &session, "files", drive_id).profile_root;
+        client
+            .drive_create_folder_json(&session, "files", drive_id, "root", "folder-a", "A", &root)
+            .expect("create folder");
+        let before_shares = drive_shares(&client, &session, "files", drive_id);
+        let before_audit = audit_actions(&client, &session);
+        let before_bytes = std::fs::read(&path).expect("read before");
+        let grantee = WorkspaceId::from_bytes([78; 16]);
+
+        install_exec_apply_candidate_save_hook(
+            path.clone(),
+            Box::new(|| {
+                Err(LoomError::new(
+                    Code::Internal,
+                    "injected generated candidate publication failure",
+                ))
+            }),
+        );
+        let err = client
+            .drive_grant_share_json(
+                &session,
+                "files",
+                drive_id,
+                "grant-fail",
+                "folder",
+                "folder-a",
+                &grantee.to_string(),
+                "viewer",
+                40,
+                None,
+            )
+            .expect_err("publication fails");
+        assert_eq!(err.code, Code::Internal);
+        assert_eq!(
+            drive_shares(&client, &session, "files", drive_id),
+            before_shares
+        );
+        assert_eq!(audit_actions(&client, &session), before_audit);
+        assert_eq!(std::fs::read(&path).expect("read after"), before_bytes);
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen");
+        assert_eq!(
+            drive_shares(&reopened, &session, "files", drive_id),
+            before_shares
+        );
+        assert_eq!(audit_actions(&reopened, &session), before_audit);
+        reopened.close(&session);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -9956,27 +18908,174 @@ mod tests {
     }
 
     #[test]
-    fn lock_group_acquire_refresh_release() {
-        let client = LocalLoomClient::new("locks.loom");
+    fn canonical_locks_local_client_derives_session_owner() {
+        let dir = temp_dir("locks");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let loom = Arc::new(Mutex::new(open_loom(&path).expect("open shared loom")));
+        let alice = client
+            .register_daemon_shared_loom(Arc::clone(&loom), None)
+            .expect("register alice");
+        let bob = client
+            .register_daemon_shared_loom(loom, None)
+            .expect("register bob");
 
         let token = client
-            .lock_acquire(b"resource", "alice", "s1", LockMode::Exclusive, 60_000)
+            .lock_acquire(&alice, b"resource", LockMode::Exclusive, 60_000, 0)
             .expect("acquire");
+        assert_eq!(token.owner.principal, "unauthenticated-root");
 
-        // While alice holds it, a different owner fails immediately (no queueing/waiting).
         assert!(matches!(
-            client.lock_acquire(b"resource", "bob", "s2", LockMode::Exclusive, 60_000),
+            client.lock_acquire(&bob, b"resource", LockMode::Exclusive, 60_000, 0),
             Err(e) if e.code == Code::Locked
         ));
 
-        let refreshed = client.lock_refresh(&token, 60_000).expect("refresh");
-        client.lock_release(&refreshed).expect("release");
+        let refreshed = client
+            .lock_refresh(&alice, &token, 60_000)
+            .expect("refresh");
+        assert_eq!(
+            client
+                .lock_refresh(&bob, &token, 60_000)
+                .expect_err("foreign refresh")
+                .code,
+            Code::PermissionDenied
+        );
+        assert_eq!(
+            client
+                .lock_release(&bob, &token)
+                .expect_err("foreign release")
+                .code,
+            Code::PermissionDenied
+        );
+        client.lock_release(&alice, &refreshed).expect("release");
 
-        // After release, another owner can take it.
         let token2 = client
-            .lock_acquire(b"resource", "bob", "s2", LockMode::Exclusive, 60_000)
+            .lock_acquire(&bob, b"resource", LockMode::Exclusive, 60_000, 0)
             .expect("re-acquire");
-        client.lock_release(&token2).expect("release 2");
+        client.lock_release(&bob, &token2).expect("release 2");
+        client.close(&alice);
+        client.close(&bob);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn canonical_locks_embedded_logical_session_survives_attachment_replacement() {
+        let dir = temp_dir("embedded-logical-locks");
+        let path = dir.join("store.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let loom = Arc::new(Mutex::new(open_loom(&path).expect("open shared loom")));
+        let first = client
+            .register_daemon_shared_loom(Arc::clone(&loom), None)
+            .expect("first attachment");
+        client
+            .bind_clear_logical_lock_session(&first, "logical-session".to_string())
+            .expect("bind first attachment");
+        let token = client
+            .lock_acquire(&first, b"resource", LockMode::Exclusive, 60_000, 0)
+            .expect("acquire through first attachment");
+        client.close(&first);
+
+        let resumed = client
+            .register_daemon_shared_loom(Arc::clone(&loom), None)
+            .expect("replacement attachment");
+        client
+            .bind_clear_logical_lock_session(&resumed, "logical-session".to_string())
+            .expect("resume logical owner");
+        let refreshed = client
+            .lock_refresh(&resumed, &token, 60_000)
+            .expect("refresh through replacement attachment");
+
+        let foreign = client
+            .register_daemon_shared_loom(loom, None)
+            .expect("foreign attachment");
+        client
+            .bind_clear_logical_lock_session(&foreign, "foreign-session".to_string())
+            .expect("bind foreign owner");
+        assert_eq!(
+            client
+                .lock_release(&foreign, &refreshed)
+                .expect_err("foreign logical session release")
+                .code,
+            Code::PermissionDenied
+        );
+        client
+            .lock_release(&resumed, &refreshed)
+            .expect("release through resumed owner");
+        client.close(&resumed);
+        client.close(&foreign);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn canonical_locks_local_clients_share_injected_authority() {
+        let dir = temp_dir("shared-locks");
+        let authority: Arc<dyn LocksAuthority> = Arc::new(InProcessLocksAuthority::default());
+        let first =
+            LocalLoomClient::with_locks_authority(dir.join("first.loom"), Arc::clone(&authority));
+        let second =
+            LocalLoomClient::with_locks_authority(dir.join("second.loom"), Arc::clone(&authority));
+        first.create().expect("create first");
+        second.create().expect("create second");
+        let first_session = first.open().expect("open first");
+        let second_session = second.open().expect("open second");
+        let token = first
+            .lock_acquire(
+                &first_session,
+                b"shared-resource",
+                LockMode::Exclusive,
+                60_000,
+                0,
+            )
+            .expect("first acquire");
+        assert_eq!(
+            second
+                .lock_acquire(
+                    &second_session,
+                    b"shared-resource",
+                    LockMode::Exclusive,
+                    60_000,
+                    0,
+                )
+                .expect_err("shared contention")
+                .code,
+            Code::Locked
+        );
+        assert_eq!(
+            second
+                .lock_release(&second_session, &token)
+                .expect_err("foreign client release")
+                .code,
+            Code::PermissionDenied
+        );
+        first
+            .lock_release(&first_session, &token)
+            .expect("owner release");
+        first.close(&first_session);
+        second.close(&second_session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn canonical_locks_local_client_uses_registered_authenticated_owner() {
+        let dir = temp_dir("authenticated-locks");
+        let path = dir.join("store.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create store");
+        let loom = Arc::new(Mutex::new(open_loom(&path).expect("open shared loom")));
+        let principal = mint_workspace_id().expect("principal");
+        let session = client
+            .register_daemon_shared_loom(loom, Some((principal, "authenticated-session".into())))
+            .expect("register authenticated session");
+        let token = client
+            .lock_acquire(&session, b"resource", LockMode::Exclusive, 60_000, 0)
+            .expect("acquire");
+        assert_eq!(token.owner.principal, principal.to_string());
+        assert_eq!(token.owner.session, "authenticated-session");
+        client.lock_release(&session, &token).expect("release");
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -10126,6 +19225,183 @@ mod tests {
     }
 
     #[test]
+    fn identity_authority_policy_generated_json_mutations_roundtrip() {
+        use loom_core::identity::IdentityStore;
+        let dir = temp_dir("identity-authority-policy");
+        let source_path = dir.join("source.loom");
+        let destination_path = dir.join("destination.loom");
+        let root = mint_workspace_id().expect("root id");
+
+        let source = LocalLoomClient::new(&source_path);
+        source.create().expect("create source");
+        let source_session = source.open().expect("open source");
+        source
+            .with_session(&source_session, |loom| {
+                let identity = IdentityStore::new(root);
+                loom.store().save_identity_store(&identity)?;
+                loom.set_identity_store(identity);
+                Ok(())
+            })
+            .expect("seed source");
+
+        let client = LocalLoomClient::new(&destination_path);
+        client.create().expect("create destination");
+        let session = client.open().expect("open destination");
+        client
+            .with_session(&session, |loom| {
+                let identity = IdentityStore::new(root);
+                loom.store().save_identity_store(&identity)?;
+                loom.set_identity_store(identity);
+                Ok(())
+            })
+            .expect("seed destination");
+
+        let replicate = client
+            .identity_replicate_authority_json(
+                &session,
+                source_path.to_str().expect("source path"),
+                false,
+            )
+            .expect("replicate");
+        let replicate: serde_json::Value =
+            serde_json::from_str(&replicate).expect("replicate json");
+        assert_eq!(replicate["applied"], false);
+        assert!(replicate["seq"].as_u64().is_some());
+
+        let detach = client
+            .identity_force_detach_authority_json(&session, root, 7, "authority unreachable")
+            .expect("detach");
+        let detach: serde_json::Value = serde_json::from_str(&detach).expect("detach json");
+        assert_eq!(detach["detach"]["new_authority"], root.to_string().as_str());
+        assert_eq!(detach["detach"]["generation"], 7);
+
+        let configured = client
+            .identity_configure_authority_replication_json(
+                &session,
+                "primary",
+                source_path.to_str().expect("source path"),
+                false,
+                true,
+                Some(250),
+                5,
+                60_000,
+                true,
+            )
+            .expect("configure");
+        let configured: serde_json::Value =
+            serde_json::from_str(&configured).expect("configure json");
+        assert_eq!(configured["policy"]["id"], "primary");
+        assert_eq!(configured["policy"]["interval_ms"], 250);
+
+        client.close(&session);
+        let reopened = client.open().expect("reopen destination");
+        let stored_policy = client
+            .with_session(&reopened, |loom| {
+                loom.store().authority_replication_policy_by_id("primary")
+            })
+            .expect("policy lookup")
+            .expect("policy persisted");
+        assert_eq!(stored_policy.id, "primary");
+        assert_eq!(
+            stored_policy.source,
+            source_path.to_str().expect("source path")
+        );
+        assert_eq!(stored_policy.interval_ms, Some(250));
+        client.close(&reopened);
+        let session = client.open().expect("reopen for remove");
+
+        let removed = client
+            .identity_remove_authority_replication_json(&session, "primary")
+            .expect("remove");
+        let removed: serde_json::Value = serde_json::from_str(&removed).expect("remove json");
+        assert_eq!(removed["id"], "primary");
+        assert!(
+            client
+                .with_session(&session, |loom| {
+                    loom.store().authority_replication_policy_by_id("primary")
+                })
+                .expect("policy lookup")
+                .is_none()
+        );
+        let audit = client
+            .with_session(&session, |loom| loom.store().audit_records())
+            .expect("audit records");
+        assert_eq!(audit[0].action, "identity.authority.replicate");
+        assert_eq!(audit[1].action, "identity.authority.force_detach");
+        assert_eq!(audit[2].action, "authority.replication.configure");
+        assert_eq!(audit[3].action, "authority.replication.remove");
+
+        client.close(&session);
+        source.close(&source_session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn identity_authority_policy_denies_before_parsing_attacker_values() {
+        use loom_core::identity::IdentityStore;
+        let dir = temp_dir("identity-authority-policy-auth");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create store");
+        let session = client.open().expect("open destination");
+        let root = mint_workspace_id().expect("root id");
+        client
+            .with_session(&session, |loom| {
+                let mut identity = IdentityStore::new(root);
+                identity.set_passphrase(root, "rootpw", b"root-salt-bytes")?;
+                loom.store().save_identity_store(&identity)?;
+                loom.set_identity_store(identity);
+                let mut acl = AclStore::new();
+                acl.allow(AclSubject::Principal(root), None, None, [AclRight::Admin])?;
+                loom.store().save_acl_store(&acl)?;
+                loom.set_acl_store(acl);
+                Ok(())
+            })
+            .expect("seed authenticated identity");
+
+        let err = client
+            .identity_configure_authority_replication_json(
+                &session,
+                "not allowed",
+                "",
+                false,
+                true,
+                Some(0),
+                0,
+                0,
+                true,
+            )
+            .expect_err("unauthenticated configure must fail before validation");
+        assert_eq!(err.code, Code::AuthenticationFailed);
+        assert!(
+            client
+                .with_session(&session, |loom| loom.store().audit_records())
+                .expect("audit records")
+                .is_empty()
+        );
+
+        client
+            .authenticate_passphrase(&session, root, b"rootpw")
+            .expect("authenticate root");
+        assert!(matches!(
+            client.identity_configure_authority_replication_json(
+                &session,
+                "not allowed",
+                "",
+                false,
+                true,
+                Some(0),
+                0,
+                0,
+                true,
+            ),
+            Err(e) if e.code == Code::InvalidArgument
+        ));
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn identity_app_credential_mint_returns_secret_once_and_redacts() {
         use loom_core::identity::IdentityStore;
         let dir = temp_dir("appcred");
@@ -10239,7 +19515,17 @@ mod tests {
             .expect("create fips-profile store");
         let session = client.open().expect("open fips-profile store");
         client
-            .store_policy_set(&session, true)
+            .store_policy_set(
+                &session,
+                &loom_wire::store_admin::store_policy_update_to_cbor(
+                    &loom_wire::store_admin::StorePolicyUpdate {
+                        fips_required: Some(true),
+                        default_durability: None,
+                        facet_durability_assignments: Vec::new(),
+                        clear_facet_durability: Vec::new(),
+                    },
+                ),
+            )
             .expect("mark fips required");
         client.close(&session);
 
@@ -10681,22 +19967,25 @@ mod tests {
         let session = client.open().expect("open");
 
         // Sync import: 8 bytes in, at least one operation applied.
-        let report = decode_arr(
+        let report = loom_interchange::ImportReport::decode(
             &client
-                .import_fs(&session, "w", src_str, true, false)
+                .import_fs(&session, "w", src_str, None, None, true, false)
                 .expect("import_fs"),
-        );
-        assert_eq!(uint(&report[4]), 8, "bytes_in");
-        assert!(uint(&report[9]) >= 1, "operations_applied");
+        )
+        .expect("decode import report");
+        assert_eq!(report.source_scope, src_str);
+        assert_eq!(report.bytes_in, 8);
+        assert!(report.operations_applied >= 1);
 
         // A dry run plans without applying and flags itself.
-        let dry = decode_arr(
+        let dry = loom_interchange::ImportReport::decode(
             &client
-                .import_fs(&session, "w-dry", src_str, false, true)
+                .import_fs(&session, "w-dry", src_str, None, None, false, true)
                 .expect("dry import"),
-        );
-        assert_eq!(uint(&dry[9]), 0, "dry run applies nothing");
-        assert_eq!(dry[10], loom_codec::Value::Bool(true), "dry_run flag");
+        )
+        .expect("decode dry-run import report");
+        assert_eq!(dry.operations_applied, 0);
+        assert!(dry.dry_run);
 
         // Sync export writes the file back to the host with identical bytes.
         let out = dir.join("out");
@@ -10712,10 +20001,13 @@ mod tests {
         );
 
         // The async form is an immediate-complete task with the same report bytes.
-        let task = client.import_fs_async(&session, "w-async", src_str, false, false);
+        let task = client.import_fs_async(&session, "w-async", src_str, None, None, false, false);
         assert!(client.task_poll(&task).expect("poll"));
-        let async_report = decode_arr(&client.task_result(&task).expect("result"));
-        assert_eq!(uint(&async_report[4]), 8, "async bytes_in");
+        let async_report =
+            loom_interchange::ImportReport::decode(&client.task_result(&task).expect("result"))
+                .expect("decode async import report");
+        assert_eq!(async_report.source_scope, src_str);
+        assert_eq!(async_report.bytes_in, 8);
 
         client.close(&session);
         std::fs::remove_dir_all(&dir).ok();
@@ -10790,7 +20082,15 @@ mod tests {
         client.create().expect("create");
         let session = client.open().expect("open");
         client
-            .import_fs(&session, "w", src.to_str().unwrap(), true, false)
+            .import_fs(
+                &session,
+                "w",
+                src.to_str().unwrap(),
+                None,
+                None,
+                true,
+                false,
+            )
             .expect("seed import");
 
         // Sync export to a plain tar archive; the manifest reports the kind and entries.
@@ -10805,13 +20105,27 @@ mod tests {
             other => panic!("manifest not an array: {other:?}"),
         };
         assert_eq!(text(&manifest[1]), "tar", "kind");
-        assert!(uint(&manifest[3]) >= 1, "entries");
+        let export_entries = match &manifest[3] {
+            loom_codec::Value::Array(items) => items,
+            other => panic!("export manifest entries not an array: {other:?}"),
+        };
+        assert!(!export_entries.is_empty(), "entries");
         assert!(archive.is_file(), "archive written to host");
 
         // Sync import back into a fresh workspace preserves the kind.
         let import = decode_arr(
             &client
-                .archive_import(&session, "w2", archive.to_str().unwrap(), "tar", false)
+                .archive_import(
+                    &session,
+                    "w2",
+                    archive.to_str().unwrap(),
+                    "tar",
+                    None,
+                    true,
+                    Some("archive-author"),
+                    Some("archive message"),
+                    false,
+                )
                 .expect("archive_import"),
         );
         let in_manifest = match &import[0] {
@@ -10819,6 +20133,45 @@ mod tests {
             other => panic!("manifest not an array: {other:?}"),
         };
         assert_eq!(text(&in_manifest[1]), "tar");
+        let in_entries = match &in_manifest[3] {
+            loom_codec::Value::Array(items) => items,
+            other => panic!("manifest entries not an array: {other:?}"),
+        };
+        assert!(!in_entries.is_empty(), "detailed manifest entries");
+        let in_report =
+            loom_interchange::ImportReport::from_value(import[1].clone()).expect("import report");
+        assert_eq!(
+            in_report.source_scope,
+            archive.to_str().unwrap(),
+            "archive import source_scope"
+        );
+        assert!(in_report.commit.is_some(), "archive import commit");
+
+        let task = client.archive_import_async(
+            &session,
+            "w3",
+            archive.to_str().unwrap(),
+            "tar",
+            None,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(client.task_poll(&task).expect("poll archive import"));
+        let async_import = decode_arr(&client.task_result(&task).expect("archive import result"));
+        let async_manifest = match &async_import[0] {
+            loom_codec::Value::Array(items) => items,
+            other => panic!("async manifest not an array: {other:?}"),
+        };
+        assert!(matches!(async_manifest[3], loom_codec::Value::Array(_)));
+        let async_report = loom_interchange::ImportReport::from_value(async_import[1].clone())
+            .expect("async import report");
+        assert_eq!(
+            async_report.source_scope,
+            archive.to_str().unwrap(),
+            "async archive import source_scope"
+        );
 
         // An unknown archive kind is rejected before touching the host.
         assert!(
@@ -10844,6 +20197,193 @@ mod tests {
     }
 
     #[test]
+    fn security_administration_generated_contracts_persist_and_audit() {
+        let dir = temp_dir("security-admin");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create");
+        let session = client.open().expect("open");
+
+        let audit_set: serde_json::Value = serde_json::from_str(
+            &client
+                .audit_config_set_json(&session, Some(30), Some(true))
+                .expect("audit config set"),
+        )
+        .expect("audit set json");
+        assert_eq!(audit_set["config"]["retention_days"], 30);
+        assert_eq!(audit_set["config"]["legal_hold"], true);
+
+        let rules = r#"[{"id":"local","action":"allow","source_cidr":"127.0.0.1/32","require_mtls":false}]"#;
+        let network_set: serde_json::Value = serde_json::from_str(
+            &client
+                .network_access_set_json(&session, "office", Some("office network"), "deny", rules)
+                .expect("network access set"),
+        )
+        .expect("network set json");
+        assert_eq!(network_set["name"], "office");
+        assert_eq!(network_set["rules"][0]["source_cidr"], "127.0.0.1/32");
+
+        let cert: serde_json::Value = serde_json::from_str(
+            &client
+                .certificate_generate_self_signed_json(
+                    &session,
+                    "admin",
+                    vec!["localhost".to_string()],
+                    Vec::new(),
+                    None,
+                    1,
+                    "p256",
+                    true,
+                )
+                .expect("generate certificate"),
+        )
+        .expect("certificate json");
+        assert_eq!(cert["name"], "admin");
+        assert_eq!(cert["unencrypted_private_key_override"], true);
+
+        let exported = client
+            .certificate_export(&session, "admin", true, false, false, false)
+            .expect("certificate export");
+        let loom_codec::Value::Array(fields) =
+            loom_codec::decode(&exported).expect("certificate export cbor")
+        else {
+            panic!("certificate export must be an array");
+        };
+        assert!(matches!(fields[2], loom_codec::Value::Bytes(_)));
+        assert!(matches!(fields[3], loom_codec::Value::Null));
+
+        client.close(&session);
+        let reopened = client.open().expect("reopen");
+        let audit_show: serde_json::Value = serde_json::from_str(
+            &client
+                .audit_config_show_json(&reopened)
+                .expect("audit config show"),
+        )
+        .expect("audit show json");
+        assert_eq!(audit_show["retention_days"], 30);
+        assert_eq!(audit_show["legal_hold"], true);
+
+        let certificates: serde_json::Value = serde_json::from_str(
+            &client
+                .certificate_list_json(&reopened)
+                .expect("certificate list"),
+        )
+        .expect("certificate list json");
+        assert_eq!(certificates["certificates"][0]["name"], "admin");
+
+        let policies: serde_json::Value = serde_json::from_str(
+            &client
+                .network_access_list_json(&reopened)
+                .expect("network access list"),
+        )
+        .expect("network list json");
+        assert_eq!(policies["policies"][0]["name"], "office");
+
+        let audit_list: serde_json::Value =
+            serde_json::from_str(&client.audit_list_json(&reopened).expect("audit list"))
+                .expect("audit list json");
+        let actions = audit_list["records"]
+            .as_array()
+            .expect("audit records")
+            .iter()
+            .filter_map(|record| record["action"].as_str())
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&"audit.config.set"));
+        assert!(actions.contains(&"network-access.policy.set"));
+        assert!(actions.contains(&"certificate.bundle.generate_self_signed.force"));
+
+        client.close(&reopened);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn security_admin_rejects_untrusted_inputs_before_session_and_admin_authorization() {
+        use loom_core::identity::IdentityStore;
+
+        let dir = temp_dir("security-admin-auth-first");
+        let client = LocalLoomClient::new(dir.join("t.loom"));
+        client.create().expect("create");
+        let session = client.open().expect("open");
+        let mut unknown_id = session.0.clone();
+        unknown_id.id = 999_999u64.to_be_bytes().to_vec();
+        let unknown = LoomSession(unknown_id);
+
+        assert!(matches!(
+            client.certificate_import_json(
+                &unknown,
+                "bad",
+                b"not a certificate".to_vec(),
+                b"not a private key".to_vec(),
+                None,
+                false,
+            ),
+            Err(err) if err.code == Code::NotFound
+        ));
+        assert!(matches!(
+            client.certificate_generate_self_signed_json(
+                &unknown,
+                "bad",
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                "not-an-algorithm",
+                false,
+            ),
+            Err(err) if err.code == Code::NotFound
+        ));
+        assert!(matches!(
+            client.network_access_set_json(&unknown, "bad", None, "not-an-action", "not-json"),
+            Err(err) if err.code == Code::NotFound
+        ));
+
+        let root = mint_workspace_id().expect("root id");
+        client
+            .with_session(&session, |loom| {
+                let mut identity = IdentityStore::new(root);
+                identity.set_passphrase(root, "rootpw", b"root-salt-bytes")?;
+                loom.store().save_identity_store(&identity)?;
+                loom.set_identity_store(identity);
+                Ok(())
+            })
+            .expect("seed identity");
+        client
+            .authenticate_passphrase(&session, root, b"rootpw")
+            .expect("authenticate root");
+
+        assert!(matches!(
+            client.certificate_import_json(
+                &session,
+                "bad",
+                b"not a certificate".to_vec(),
+                b"not a private key".to_vec(),
+                None,
+                false,
+            ),
+            Err(err) if err.code == Code::PermissionDenied
+        ));
+        assert!(matches!(
+            client.certificate_generate_self_signed_json(
+                &session,
+                "bad",
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                "not-an-algorithm",
+                false,
+            ),
+            Err(err) if err.code == Code::PermissionDenied
+        ));
+        assert!(matches!(
+            client.network_access_set_json(&session, "bad", None, "not-an-action", "not-json"),
+            Err(err) if err.code == Code::PermissionDenied
+        ));
+
+        client.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn car_export_import_roundtrips_sync_and_async() {
         let dir = temp_dir("car-io");
         let src = dir.join("src");
@@ -10854,7 +20394,15 @@ mod tests {
         client.create().expect("create");
         let session = client.open().expect("open");
         client
-            .import_fs(&session, "w", src.to_str().unwrap(), false, false)
+            .import_fs(
+                &session,
+                "w",
+                src.to_str().unwrap(),
+                None,
+                None,
+                false,
+                false,
+            )
             .expect("seed import");
 
         // Sync export to a CAR file; the result carries a root CID and block count.
@@ -11148,9 +20696,26 @@ mod tests {
     #[test]
     fn document_text_binary_roundtrip_and_errors() {
         let dir = temp_dir("doc-text");
-        let client = LocalLoomClient::new(dir.join("t.loom"));
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
         client.create().expect("create");
         let session = client.open().expect("open");
+
+        let reference_targets = |client: &LocalLoomClient, session: &LoomSession| {
+            client
+                .with_session(session, |loom| {
+                    let ns = read_ns(loom, "w", FacetKind::Document)?
+                        .ok_or_else(|| LoomError::not_found("document workspace missing"))?;
+                    let source = ReferenceSource::new("document", "c", "greeting", "body")?;
+                    let mut targets = loom_reference::references_from(loom, ns, &source)?
+                        .into_iter()
+                        .map(|edge| edge.target.as_str())
+                        .collect::<Vec<_>>();
+                    targets.sort();
+                    Ok(targets)
+                })
+                .expect("reference targets")
+        };
 
         // Absent reads are None (no workspace yet).
         assert_eq!(
@@ -11166,10 +20731,29 @@ mod tests {
             None
         );
 
+        let before_generation = client
+            .with_session(&session, |loom| loom.store().mutable_overlay_generation())
+            .expect("document before generation");
+        let before_fsync = client
+            .with_session(&session, |loom| {
+                Ok(loom.store().group_commit_diagnostics()?.fsync_count)
+            })
+            .expect("document before fsync");
+
         // Text write/read round-trips with the returned content digest.
         let d_text = client
-            .document_put_text(&session, "w", "c", "greeting", "hello", None)
+            .document_put_text(&session, "w", "c", "greeting", "hello !ticket:DOC-1", None)
             .expect("put text");
+        let after_generation = client
+            .with_session(&session, |loom| loom.store().mutable_overlay_generation())
+            .expect("document after generation");
+        let after_fsync = client
+            .with_session(&session, |loom| {
+                Ok(loom.store().group_commit_diagnostics()?.fsync_count)
+            })
+            .expect("document after fsync");
+        assert_eq!(after_generation.as_u64(), before_generation.as_u64() + 1);
+        assert_eq!(after_fsync, before_fsync + 2);
         let (d_text, text_entity_tag) = loom_wire::document::put_result_from_cbor(&d_text).unwrap();
         assert!(d_text.starts_with("blake3:"), "digest: {d_text}");
         let text_cbor = client
@@ -11178,14 +20762,30 @@ mod tests {
             .expect("present");
         let (text, digest, get_text_entity_tag) =
             loom_wire::document::text_result_from_cbor(&text_cbor).unwrap();
-        assert_eq!(text, "hello");
+        assert_eq!(text, "hello !ticket:DOC-1");
         assert_eq!(digest, d_text, "get_text digest matches put_text");
         assert_eq!(get_text_entity_tag, text_entity_tag);
+        assert_eq!(reference_targets(&client, &session), vec!["ticket:DOC-1"]);
 
         // Binary write/read round-trips with the returned content digest.
+        let before_binary_generation = after_generation;
+        let before_binary_fsync = after_fsync;
         let d_bin = client
             .document_put_binary(&session, "w", "c", "blob", &[0xFF, 0xFE, 0x00], None)
             .expect("put binary");
+        let after_binary_generation = client
+            .with_session(&session, |loom| loom.store().mutable_overlay_generation())
+            .expect("document after binary generation");
+        let after_binary_fsync = client
+            .with_session(&session, |loom| {
+                Ok(loom.store().group_commit_diagnostics()?.fsync_count)
+            })
+            .expect("document after binary fsync");
+        assert_eq!(
+            after_binary_generation.as_u64(),
+            before_binary_generation.as_u64() + 1
+        );
+        assert_eq!(after_binary_fsync, before_binary_fsync + 2);
         let (d_bin, bin_entity_tag) = loom_wire::document::put_result_from_cbor(&d_bin).unwrap();
         let bin_cbor = client
             .document_get_binary(&session, "w", "c", "blob")
@@ -11204,22 +20804,90 @@ mod tests {
                 .expect("list binary")
                 .is_empty()
         );
+        client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen document store");
+        let text_cbor = reopened
+            .document_get_text(&session, "w", "c", "greeting")
+            .expect("reopen get text")
+            .expect("reopen text present");
+        let (text, digest, get_text_entity_tag) =
+            loom_wire::document::text_result_from_cbor(&text_cbor).unwrap();
+        assert_eq!(text, "hello !ticket:DOC-1");
+        assert_eq!(digest, d_text, "reopen get_text digest matches put_text");
+        assert_eq!(get_text_entity_tag, text_entity_tag);
+        let bin_cbor = reopened
+            .document_get_binary(&session, "w", "c", "blob")
+            .expect("reopen get binary")
+            .expect("reopen binary present");
+        let (bytes, bdigest, get_bin_entity_tag) =
+            loom_wire::document::binary_result_from_cbor(&bin_cbor).unwrap();
+        assert_eq!(bytes, vec![0xFF, 0xFE, 0x00]);
+        assert_eq!(
+            bdigest, d_bin,
+            "reopen get_binary digest matches put_binary"
+        );
+        assert_eq!(get_bin_entity_tag, bin_entity_tag);
+        assert_eq!(reference_targets(&reopened, &session), vec!["ticket:DOC-1"]);
 
         // A stale/mismatched expected entity tag guard is a CAS_MISMATCH.
-        let conflict = client
+        let before_conflict_generation = reopened
+            .with_session(&session, |loom| loom.store().mutable_overlay_generation())
+            .expect("document before conflict generation");
+        let before_conflict_fsync = reopened
+            .with_session(&session, |loom| {
+                Ok(loom.store().group_commit_diagnostics()?.fsync_count)
+            })
+            .expect("document before conflict fsync");
+        let before_conflict_text = reopened
+            .document_get_text(&session, "w", "c", "greeting")
+            .expect("before conflict text");
+        let before_conflict_list = reopened
+            .document_list_binary(&session, "w", "c")
+            .expect("before conflict list");
+        let before_conflict_refs = reference_targets(&reopened, &session);
+        let conflict = reopened
             .document_put_text(
                 &session,
                 "w",
                 "c",
                 "greeting",
-                "again",
+                "again !ticket:DOC-2",
                 Some(&bin_entity_tag),
             )
             .expect_err("cas conflict");
         assert_eq!(conflict.code, Code::Conflict);
+        assert_eq!(
+            reopened
+                .with_session(&session, |loom| loom.store().mutable_overlay_generation())
+                .expect("document after conflict generation"),
+            before_conflict_generation
+        );
+        assert_eq!(
+            reopened
+                .with_session(&session, |loom| {
+                    Ok(loom.store().group_commit_diagnostics()?.fsync_count)
+                })
+                .expect("document after conflict fsync"),
+            before_conflict_fsync
+        );
+        assert_eq!(
+            reopened
+                .document_get_text(&session, "w", "c", "greeting")
+                .expect("after conflict text"),
+            before_conflict_text
+        );
+        assert_eq!(
+            reopened
+                .document_list_binary(&session, "w", "c")
+                .expect("after conflict list"),
+            before_conflict_list
+        );
+        assert_eq!(reference_targets(&reopened, &session), before_conflict_refs);
 
         // The matching current entity tag as the guard succeeds and produces a new digest.
-        let d_text2 = client
+        let d_text2 = reopened
             .document_put_text(
                 &session,
                 "w",
@@ -11233,12 +20901,148 @@ mod tests {
         assert_ne!(d_text2, d_text, "content changed, so the digest changed");
 
         // Reading non-UTF-8 bytes as text is DOCUMENT_NOT_TEXT.
-        let not_text = client
+        let not_text = reopened
             .document_get_text(&session, "w", "c", "blob")
             .expect_err("not text");
         assert_eq!(not_text.code, Code::DocumentNotText);
 
+        reopened.close(&session);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn document_put_planning_publication_failure_preserves_live_and_durable_state() {
+        let dir = temp_dir("doc-put-publication-failure");
+        let path = dir.join("t.loom");
+        let client = LocalLoomClient::new(&path);
+        client.create().expect("create");
+        let session = client.open().expect("open");
+        client
+            .document_put_text(&session, "w", "c", "greeting", "stable !ticket:DOC-1", None)
+            .expect("seed text");
+        let before_generation = client
+            .with_session(&session, |loom| loom.store().mutable_overlay_generation())
+            .expect("before failure generation");
+        let before_fsync = client
+            .with_session(&session, |loom| {
+                Ok(loom.store().group_commit_diagnostics()?.fsync_count)
+            })
+            .expect("before failure fsync");
+        let before_text = client
+            .document_get_text(&session, "w", "c", "greeting")
+            .expect("before failure text");
+        let before_list = client
+            .document_list_binary(&session, "w", "c")
+            .expect("before failure list");
+        let before_refs = client
+            .with_session(&session, |loom| {
+                let ns = read_ns(loom, "w", FacetKind::Document)?
+                    .ok_or_else(|| LoomError::not_found("document workspace missing"))?;
+                let source = ReferenceSource::new("document", "c", "greeting", "body")?;
+                let mut targets = loom_reference::references_from(loom, ns, &source)?
+                    .into_iter()
+                    .map(|edge| edge.target.as_str())
+                    .collect::<Vec<_>>();
+                targets.sort();
+                Ok(targets)
+            })
+            .expect("before failure refs");
+
+        install_exec_apply_candidate_save_hook(
+            path.clone(),
+            Box::new(|| {
+                Err(LoomError::new(
+                    Code::Internal,
+                    "injected document put publication failure",
+                ))
+            }),
+        );
+        let error = client
+            .document_put_text(
+                &session,
+                "w",
+                "c",
+                "greeting",
+                "changed !ticket:DOC-2",
+                None,
+            )
+            .expect_err("publication failure");
+        assert_eq!(error.code, Code::Internal);
+        assert_eq!(
+            client
+                .with_session(&session, |loom| loom.store().mutable_overlay_generation())
+                .expect("after failure generation"),
+            before_generation
+        );
+        assert_eq!(
+            client
+                .with_session(&session, |loom| {
+                    Ok(loom.store().group_commit_diagnostics()?.fsync_count)
+                })
+                .expect("after failure fsync"),
+            before_fsync
+        );
+        assert_eq!(
+            client
+                .document_get_text(&session, "w", "c", "greeting")
+                .expect("after failure text"),
+            before_text
+        );
+        assert_eq!(
+            client
+                .document_list_binary(&session, "w", "c")
+                .expect("after failure list"),
+            before_list
+        );
+        assert_eq!(
+            client
+                .with_session(&session, |loom| {
+                    let ns = read_ns(loom, "w", FacetKind::Document)?
+                        .ok_or_else(|| LoomError::not_found("document workspace missing"))?;
+                    let source = ReferenceSource::new("document", "c", "greeting", "body")?;
+                    let mut targets = loom_reference::references_from(loom, ns, &source)?
+                        .into_iter()
+                        .map(|edge| edge.target.as_str())
+                        .collect::<Vec<_>>();
+                    targets.sort();
+                    Ok(targets)
+                })
+                .expect("after failure refs"),
+            before_refs
+        );
         client.close(&session);
+
+        let reopened = LocalLoomClient::new(&path);
+        let session = reopened.open().expect("reopen document store");
+        assert_eq!(
+            reopened
+                .document_get_text(&session, "w", "c", "greeting")
+                .expect("reopen after failure text"),
+            before_text
+        );
+        assert_eq!(
+            reopened
+                .document_list_binary(&session, "w", "c")
+                .expect("reopen after failure list"),
+            before_list
+        );
+        assert_eq!(
+            reopened
+                .with_session(&session, |loom| {
+                    let ns = read_ns(loom, "w", FacetKind::Document)?
+                        .ok_or_else(|| LoomError::not_found("document workspace missing"))?;
+                    let source = ReferenceSource::new("document", "c", "greeting", "body")?;
+                    let mut targets = loom_reference::references_from(loom, ns, &source)?
+                        .into_iter()
+                        .map(|edge| edge.target.as_str())
+                        .collect::<Vec<_>>();
+                    targets.sort();
+                    Ok(targets)
+                })
+                .expect("reopen after failure refs"),
+            before_refs
+        );
+        reopened.close(&session);
         std::fs::remove_dir_all(&dir).ok();
     }
 

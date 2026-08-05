@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use gluesql_core::ast::DataType;
 use loom_core::error::{Code, LoomError, Result};
 use loom_core::{FacetKind, Loom, WorkspaceId, WsSelector};
@@ -41,28 +39,15 @@ impl HostedSqlAdapter<'_> {
         db: &str,
         sql: &str,
     ) -> HostedOutcome<Vec<u8>> {
-        let out = (|| {
-            self.kernel
-                .write(auth, |loom| ensure_sql_ns(loom, workspace).map(|_| ()))?;
-            let (out, mut store) = self.kernel.with_read_loom(auth, |read| {
-                let ns = resolve_sql_ns(&read, workspace)?;
-                let mut store = LoomSqlStore::open_write(read, ns, db)?;
-                let out = store.exec_cbor(sql)?;
-                if store.in_transaction() {
-                    return Err(LoomError::invalid(
-                        "BEGIN without a matching COMMIT/ROLLBACK in one exec",
-                    ));
-                }
-                Ok((out, store))
-            })?;
-            if store.is_dirty() {
-                self.kernel.write(auth, |loom| {
-                    let ns = resolve_sql_ns(loom, workspace)?;
-                    store.persist(loom, ns, db)
-                })?;
-            }
-            Ok(out)
-        })();
+        let out = self.kernel.write_current_state(auth, |loom| {
+            loom_client::local::execute_generated_sql_result(
+                self.kernel.path(),
+                loom,
+                workspace,
+                db,
+                sql,
+            )
+        });
         hosted_outcome(out)
     }
 
@@ -99,48 +84,25 @@ fn read_query_cbor(store: &mut LoomSqlStore, sql: &str) -> Result<Vec<u8>> {
 }
 
 fn resolve_sql_ns(loom: &Loom<FileStore>, name: &str) -> Result<WorkspaceId> {
-    loom.registry().open(&WsSelector::Typed {
-        ty: FacetKind::Sql,
-        name: name.to_string(),
-    })
-}
-
-fn ensure_sql_ns(loom: &mut Loom<FileStore>, name: &str) -> Result<WorkspaceId> {
-    match resolve_sql_ns(loom, name) {
-        Ok(ns) => Ok(ns),
-        Err(err) if err.code == Code::NotFound => {
-            loom.authorize_global_admin()?;
-            loom.registry_mut().ensure_for_write(
-                &WsSelector::Typed {
-                    ty: FacetKind::Sql,
-                    name: name.to_string(),
-                },
-                fresh_workspace_id(),
-            )
-        }
+    let selector = match WorkspaceId::parse(name) {
+        Ok(id) => WsSelector::Id(id),
+        Err(_) => WsSelector::Name(name.to_string()),
+    };
+    match loom.registry().open(&selector) {
+        Ok(id) => Ok(id),
+        Err(err) if err.code == Code::NotFound => loom.registry().open(&WsSelector::Typed {
+            ty: FacetKind::Sql,
+            name: name.to_string(),
+        }),
         Err(err) => Err(err),
     }
-}
-
-fn fresh_workspace_id() -> WorkspaceId {
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&nanos.to_be_bytes());
-    bytes[8..12].copy_from_slice(&pid.to_be_bytes());
-    bytes[12..16].copy_from_slice(&seq.to_be_bytes());
-    WorkspaceId::v4_from_bytes(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
+    use loom_client::LocalLoomClient;
     use loom_core::Code;
 
     use crate::test_support::{init, nid, temp_path};
@@ -197,5 +159,41 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, Code::PermissionDenied);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mu_6h_l_b_hosted_sql_exec_delegates_to_generated_owner() {
+        let hosted_path = temp_path("sql-generated-hosted");
+        let local_path = temp_path("sql-generated-local");
+        init(&hosted_path, None);
+        init(&local_path, None);
+
+        let sql_text =
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'a')";
+        let hosted = HostedKernel::new(&hosted_path);
+        let auth = HostedAuth::passphrase(nid(1), "root-pass", "sql-generated-hosted");
+        let hosted_bytes = hosted
+            .sql()
+            .exec_cbor(&auth, "main", "db", sql_text)
+            .expect("hosted exec");
+
+        let local = LocalLoomClient::new(&local_path);
+        let session = local.open().expect("local open");
+        local
+            .authenticate_passphrase(&session, nid(1), b"root-pass")
+            .expect("local auth");
+        let local_bytes = local
+            .sql_exec_result(&session, "main", "db", sql_text)
+            .expect("local generated exec");
+        assert_eq!(hosted_bytes, local_bytes);
+        local.close(&session);
+
+        let selected = hosted
+            .sql()
+            .query_cbor(&auth, "main", "db", "SELECT id, v FROM t")
+            .expect("hosted query after exec");
+        assert!(!selected.is_empty());
+        fs::remove_file(hosted_path).unwrap();
+        fs::remove_file(local_path).unwrap();
     }
 }

@@ -37,6 +37,13 @@ export function authArgs(auth?: LoomAuth): [string, string] {
   return [auth?.principal ?? '', auth?.passphrase ?? ''];
 }
 
+export function jsSafeU64(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
 /** One typed statement result from {@link sqlExec}. */
 export interface LoomStatement {
   kind: string;

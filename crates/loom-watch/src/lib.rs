@@ -30,6 +30,7 @@ const WATCH_DOMAIN_SUPPORTS: &[WatchDomainSupport] = &[
     WatchDomainSupport::unsupported(FacetKind::Metrics, "watch.domain.metrics"),
     WatchDomainSupport::unsupported(FacetKind::Logs, "watch.domain.logs"),
     WatchDomainSupport::unsupported(FacetKind::Traces, "watch.domain.traces"),
+    WatchDomainSupport::unsupported(FacetKind::Inference, "watch.domain.inference"),
 ];
 const EXPECTED_WATCH_DOMAIN_SUPPORT_COUNT: usize = FacetKind::ALL.len() - 1;
 const EXPECTED_WATCH_DOMAIN_SUPPORT_MASK: u128 = expected_watch_domain_support_mask();

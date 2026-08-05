@@ -24,11 +24,13 @@ class AndroidJvmRuntimeSmokeTest {
             verifyWorkspaces(session)
             verifyWatch(session)
             verifyCas(session)
+            verifyMeetings(session)
             verifyQueue(session)
             verifySql(session)
             verifyVector(session)
             verifyIdentityAcl(session)
             verifyOrdinaryOpsAfterAuth(session)
+            verifyAuditAndMaintenance(session)
         } finally {
             Files.deleteIfExists(path)
             Files.deleteIfExists(dir)
@@ -75,6 +77,30 @@ class AndroidJvmRuntimeSmokeTest {
         assertContentEquals(content, session.cas().get("blobs", digest))
         assertTrue(session.cas().listJson("blobs").contains(digest))
         assertEquals(null, session.cas().get("blobs", Loom.blobDigest("missing".bytes())))
+    }
+
+    private fun verifyMeetings(session: LoomSession) {
+        session.workspaces().create("studio", "vcs")
+        val snapshot = """
+            {"snapshot_version":1,"profile":"granola-app","source_system":"granola-app",
+            "source_scope":"local-cache","observed_at":500,"coverage":"complete","items":[{
+            "source_entity_id":"note-1","source_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000",
+            "source_sidecar":{"id":"note-1","raw":true},"title":"Planning",
+            "summary_text":"Planning summary","transcript_spans":[{"text":"Capture decisions."}],
+            "decisions":[{"label":"Use normalized meeting imports."}]}]}""".trimIndent()
+        val report = Loom.meetingsImportSnapshot(
+            session.path,
+            "studio",
+            "granola-app",
+            snapshot.bytes(),
+            false,
+            session.passphrase,
+            session.kek,
+            session.authPrincipal,
+            session.authPassphrase,
+        )
+        assertTrue(report.contains("\"profile\":\"meetings\""))
+        assertTrue(report.contains("\"rows_imported\":1"))
     }
 
     private fun verifyIdentityAcl(session: LoomSession) {
@@ -195,6 +221,67 @@ class AndroidJvmRuntimeSmokeTest {
         session.workspaces().delete(id)
     }
 
+    private fun verifyAuditAndMaintenance(session: LoomSession) {
+        val path = session.path
+        val passphrase = session.passphrase
+        val kek = session.kek
+        val authPrincipal = session.authPrincipal
+        val authPassphrase = session.authPassphrase
+        assertCanonicalArray(Loom.auditCompact(path, 0, passphrase, kek, authPrincipal, authPassphrase))
+        assertCanonicalArray(
+            Loom.storeMaintenanceStatus(
+                path,
+                byteArrayOf(0x81.toByte(), 0xf4.toByte()),
+                passphrase,
+                kek,
+                authPrincipal,
+                authPassphrase,
+            ),
+        )
+        assertCanonicalArray(
+            Loom.storeMaintenancePolicySet(
+                path,
+                byteArrayOf(
+                    0x8e.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                    0xf6.toByte(),
+                ),
+                passphrase,
+                kek,
+                authPrincipal,
+                authPassphrase,
+            ),
+        )
+        assertCanonicalArray(
+            Loom.storeMaintenanceRun(
+                path,
+                byteArrayOf(0x82.toByte(), 0xf6.toByte(), 0xf6.toByte()),
+                passphrase,
+                kek,
+                authPrincipal,
+                authPassphrase,
+            ),
+        )
+
+        assertFails { Loom.auditCompact(path, -1, passphrase, kek, authPrincipal, authPassphrase) }
+        val malformed = byteArrayOf(0xff.toByte())
+        assertFails { Loom.storeMaintenanceStatus(path, malformed, passphrase, kek, authPrincipal, authPassphrase) }
+        assertFails { Loom.storeMaintenancePolicySet(path, malformed, passphrase, kek, authPrincipal, authPassphrase) }
+        assertFails { Loom.storeMaintenanceRun(path, malformed, passphrase, kek, authPrincipal, authPassphrase) }
+    }
+
     private fun verifyQueue(session: LoomSession) {
         val first = "one".bytes()
         val second = "two".bytes()
@@ -292,6 +379,11 @@ class AndroidJvmRuntimeSmokeTest {
             if (matched) return true
         }
         return false
+    }
+
+    private fun assertCanonicalArray(bytes: ByteArray) {
+        assertTrue(bytes.isNotEmpty())
+        assertTrue((bytes[0].toInt() and 0xe0) == 0x80)
     }
 
     private fun rootId(identityJson: String): String {

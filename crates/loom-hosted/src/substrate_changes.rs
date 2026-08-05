@@ -1,7 +1,9 @@
 use loom_core::workspace::{FacetKind, WorkspaceId};
 use loom_core::{AclRight, Code, Loom, LoomError};
 use loom_store::FileStore;
-use loom_substrate::changes::{OperationChangeBatch, OperationChangeCursor, OperationChangeRecord};
+use loom_substrate::changes::{
+    HostedOperationChangeEvent, OperationChangeBatch, OperationChangeCursor,
+};
 use loom_substrate::chat::{ChannelOperationLog, ChatOperationRecord};
 use loom_substrate::pages::PageOperationLog;
 use loom_tickets::{TicketOperationLog, TicketProfileReader};
@@ -54,9 +56,10 @@ pub fn substrate_changes(
     if cursor.starts_with("oplog:") {
         let cursor = OperationChangeCursor::decode(cursor)?;
         let batch = profile_operation_changes(loom, workspace, &cursor, max as usize)?;
+        let batch = loom_substrate::changes::hosted_operation_changes_batch(batch);
         return Ok(HostedSubstrateChangesBatch {
-            events: batch.events.into_iter().map(operation_event).collect(),
-            next: batch.next.encode(),
+            events: batch.events.into_iter().map(Into::into).collect(),
+            next: batch.next,
         });
     }
     let batch = crate::watch::watch_poll(loom, workspace, cursor, max)?;
@@ -142,22 +145,6 @@ fn chat_log(
     ChannelOperationLog::new(workspace_id, channel_id, records)
 }
 
-pub(crate) fn operation_event(record: OperationChangeRecord) -> HostedSubstrateChangeEvent {
-    HostedSubstrateChangeEvent::Operation {
-        workspace_id: record.workspace_id,
-        app_id: record.app_id,
-        scope_id: record.scope_id,
-        operation_id: record.operation_id,
-        operation_kind: record.operation_kind,
-        sequence: record.sequence,
-        actor_principal: record.actor_principal,
-        timestamp_ms: record.timestamp_ms,
-        root_after: record.root_after.to_string(),
-        payload_digest: record.payload_digest.to_string(),
-        policy_labels: record.policy_labels,
-    }
-}
-
 fn validate_max(max: u32) -> loom_core::Result<()> {
     if max == 0 || max > MAX_WATCH_POLL {
         return Err(LoomError::new(
@@ -166,6 +153,38 @@ fn validate_max(max: u32) -> loom_core::Result<()> {
         ));
     }
     Ok(())
+}
+
+impl From<HostedOperationChangeEvent> for HostedSubstrateChangeEvent {
+    fn from(event: HostedOperationChangeEvent) -> Self {
+        match event {
+            HostedOperationChangeEvent::Operation {
+                workspace_id,
+                app_id,
+                scope_id,
+                operation_id,
+                operation_kind,
+                sequence,
+                actor_principal,
+                timestamp_ms,
+                root_after,
+                payload_digest,
+                policy_labels,
+            } => Self::Operation {
+                workspace_id,
+                app_id,
+                scope_id,
+                operation_id,
+                operation_kind,
+                sequence,
+                actor_principal,
+                timestamp_ms,
+                root_after,
+                payload_digest,
+                policy_labels,
+            },
+        }
+    }
 }
 
 impl From<HostedDataChange> for HostedSubstrateChangeEvent {

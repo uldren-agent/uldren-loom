@@ -5,6 +5,42 @@ use loom_core::error::Code;
 use loom_core::{FacetKind, Loom, MemoryStore, WorkspaceId};
 
 #[test]
+fn result_data_type_labels_round_trip_through_inverse() {
+    use gluesql_core::ast::DataType;
+
+    for data_type in [
+        DataType::Boolean,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int,
+        DataType::Int128,
+        DataType::Uint8,
+        DataType::Uint16,
+        DataType::Uint32,
+        DataType::Uint64,
+        DataType::Uint128,
+        DataType::Float32,
+        DataType::Float,
+        DataType::Text,
+        DataType::Bytea,
+        DataType::Inet,
+        DataType::Date,
+        DataType::Timestamp,
+        DataType::Time,
+        DataType::Interval,
+        DataType::Uuid,
+        DataType::Map,
+        DataType::List,
+        DataType::Decimal,
+        DataType::Point,
+    ] {
+        let label = result_data_type_label(&data_type);
+        assert_eq!(data_type_from_result_label(&label).unwrap(), data_type);
+    }
+}
+
+#[test]
 fn conformance_vector_is_stable() {
     // The fixed create/insert/commit script must always yield the pinned commit address. The wasm32
     // build recomputes this live in-browser and asserts equality with CONFORMANCE_COMMIT, so

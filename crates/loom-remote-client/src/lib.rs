@@ -23,7 +23,7 @@ pub mod wire;
 #[cfg(feature = "carrier")]
 pub use carrier::Http2TlsTransport;
 
-pub use client::{CallOptions, RemoteLoomClient};
+pub use client::{CallOptions, LogicalSession, RemoteLoomClient};
 pub use connection::{CLIENT_MAX_VERSION, CLIENT_MIN_VERSION, RemoteConnection};
 pub use http::{
     HttpRequestParts, call_request, discovery_request, parse_response, parse_stream_response,

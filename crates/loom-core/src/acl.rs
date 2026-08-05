@@ -1549,7 +1549,7 @@ mod tests {
         acl.grant(AclGrant {
             subject: AclSubject::Everyone,
             workspace: Some(id(9)),
-            domain: Some(AclDomain::Meetings),
+            domain: Some(AclDomain::Inference),
             ref_glob: None,
             scopes: vec![AclScope::All],
             rights: [AclRight::Read].into_iter().collect(),
@@ -1561,6 +1561,14 @@ mod tests {
         let encoded = acl.encode();
         assert_eq!(&encoded[..4], b"LACL");
         let decoded = AclStore::decode(&encoded).unwrap();
-        assert_eq!(decoded.grants()[0].domain, Some(AclDomain::Meetings));
+        assert_eq!(decoded.grants()[0].domain, Some(AclDomain::Inference));
+    }
+
+    #[test]
+    fn acl_codec_rejects_unknown_domain_tags() {
+        let encoded = [b"LACL".as_slice(), &[1, 0, 0, 1, 27, 0, 0, 1, 0, 1, 0, 0]].concat();
+        let err = AclStore::decode(&encoded).unwrap_err();
+        assert_eq!(err.code, Code::CorruptObject);
+        assert!(err.message.contains("unknown ACL domain 0x1b"));
     }
 }

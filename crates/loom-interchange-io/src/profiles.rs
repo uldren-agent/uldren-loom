@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::io::{Cursor, Read};
+use std::path::Path;
 
 use loom_core::{Algo, Code, Digest, Loom};
 use loom_interchange::{FidelityIssue, FidelitySeverity, ImportReport, ImportReportInput};
@@ -563,10 +563,10 @@ pub struct ConfluencePage {
 }
 
 struct MarkdownImportItem {
-    path: PathBuf,
     relative_path: String,
     page_id: String,
     title: String,
+    markdown: String,
     unsupported_fields: Vec<&'static str>,
 }
 
@@ -2145,14 +2145,55 @@ pub fn import_markdown_path(
     dry_run: bool,
 ) -> Result<ImportReport> {
     let items = collect_markdown_import_items(src)?;
-    let bytes_in = items
-        .iter()
-        .map(|item| {
-            std::fs::metadata(&item.path)
-                .map(|meta| meta.len())
-                .unwrap_or(0)
-        })
-        .sum();
+    let bytes_in = items.iter().map(|item| item.markdown.len() as u64).sum();
+    let vault_fields = markdown_vault_unsupported_fields(src)?;
+    import_markdown_items(
+        loom,
+        ns,
+        workspace_id,
+        source_scope,
+        bytes_in,
+        space_id,
+        items,
+        vault_fields,
+        dry_run,
+    )
+}
+
+pub fn import_markdown_archive_bytes(
+    loom: &mut Loom<FileStore>,
+    ns: WorkspaceId,
+    workspace_id: &str,
+    source_scope: &str,
+    archive_payload: &[u8],
+    space_id: &str,
+    dry_run: bool,
+) -> Result<ImportReport> {
+    let (items, vault_fields) = collect_markdown_archive_import_items(archive_payload)?;
+    import_markdown_items(
+        loom,
+        ns,
+        workspace_id,
+        source_scope,
+        archive_payload.len() as u64,
+        space_id,
+        items,
+        vault_fields,
+        dry_run,
+    )
+}
+
+fn import_markdown_items(
+    loom: &mut Loom<FileStore>,
+    ns: WorkspaceId,
+    workspace_id: &str,
+    source_scope: &str,
+    bytes_in: u64,
+    space_id: &str,
+    items: Vec<MarkdownImportItem>,
+    vault_fields: Vec<&'static str>,
+    dry_run: bool,
+) -> Result<ImportReport> {
     let mut report = ImportReport::new(ImportReportInput {
         profile: "markdown",
         source_scope,
@@ -2166,7 +2207,7 @@ pub fn import_markdown_path(
         operations_applied: 0,
         dry_run,
     })?;
-    add_markdown_vault_fidelity_issues(&mut report, src)?;
+    add_markdown_vault_fidelity_issue_fields(&mut report, vault_fields)?;
     for item in &items {
         add_markdown_fidelity_issues(&mut report, item)?;
     }
@@ -2184,9 +2225,7 @@ pub fn import_markdown_path(
         Err(error) => return Err(error),
     }
     for item in items {
-        let markdown = std::fs::read_to_string(&item.path)
-            .map_err(|e| loom_types::LoomError::new(Code::Io, e.to_string()))?;
-        let body = markdown_body(&markdown)?;
+        let body = markdown_body(&item.markdown)?;
         let body_bytes = body.encode()?;
         apply_page_import(
             loom,
@@ -2199,7 +2238,7 @@ pub fn import_markdown_path(
             body_bytes,
             &mut report,
         )?;
-        report.bytes_stored += markdown.len() as u64;
+        report.bytes_stored += item.markdown.len() as u64;
     }
     Ok(report)
 }
@@ -2251,14 +2290,89 @@ fn collect_markdown_files(
                 .map_err(|e| loom_types::LoomError::new(Code::Io, e.to_string()))?;
             files.push(MarkdownImportItem {
                 page_id,
-                path,
                 relative_path: relative,
                 title,
+                markdown: markdown.clone(),
                 unsupported_fields: markdown_unsupported_fields(&markdown),
             });
         }
     }
     Ok(())
+}
+
+fn collect_markdown_archive_import_items(
+    bytes: &[u8],
+) -> Result<(Vec<MarkdownImportItem>, Vec<&'static str>)> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| loom_types::LoomError::invalid(format!("parse Markdown archive ZIP: {e}")))?;
+    let mut files = Vec::new();
+    let mut vault_fields = BTreeSet::new();
+    let mut seen_entries = BTreeSet::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|e| {
+            loom_types::LoomError::invalid(format!("read Markdown archive entry {index}: {e}"))
+        })?;
+        let relative = normalize_profile_archive_path(entry.name(), "Markdown")?;
+        if !seen_entries.insert(relative.clone()) {
+            return Err(loom_types::LoomError::invalid(format!(
+                "Markdown archive duplicate normalized path {relative:?}"
+            )));
+        }
+        if entry.is_dir() {
+            if relative == ".obsidian" || relative.starts_with(".obsidian/") {
+                vault_fields.insert("obsidian-config");
+            }
+            continue;
+        }
+        if relative == ".obsidian" || relative.starts_with(".obsidian/") {
+            vault_fields.insert("obsidian-config");
+        }
+        match Path::new(&relative)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "md" => {
+                let mut raw = Vec::new();
+                entry
+                    .read_to_end(&mut raw)
+                    .map_err(|e| loom_types::LoomError::new(Code::Io, e.to_string()))?;
+                let markdown = String::from_utf8(raw).map_err(|e| {
+                    loom_types::LoomError::invalid(format!(
+                        "Markdown archive entry {relative:?} is not utf-8: {e}"
+                    ))
+                })?;
+                let (page_id, title) = markdown_page_identity(&relative, Path::new(&relative));
+                files.push(MarkdownImportItem {
+                    page_id,
+                    relative_path: relative,
+                    title,
+                    unsupported_fields: markdown_unsupported_fields(&markdown),
+                    markdown,
+                });
+            }
+            "canvas" => {
+                vault_fields.insert("canvas");
+            }
+            "excalidraw" => {
+                vault_fields.insert("excalidraw");
+            }
+            _ => {}
+        }
+    }
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let mut seen_pages = BTreeSet::new();
+    for item in &mut files {
+        let base = item.page_id.clone();
+        let mut suffix = 2;
+        while !seen_pages.insert(item.page_id.clone()) {
+            item.page_id = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+    }
+    Ok((files, vault_fields.into_iter().collect()))
 }
 
 fn add_markdown_fidelity_issues(
@@ -2276,8 +2390,10 @@ fn add_markdown_fidelity_issues(
     Ok(())
 }
 
-fn add_markdown_vault_fidelity_issues(report: &mut ImportReport, src: &Path) -> Result<()> {
-    let fields = markdown_vault_unsupported_fields(src)?;
+fn add_markdown_vault_fidelity_issue_fields(
+    report: &mut ImportReport,
+    fields: Vec<&'static str>,
+) -> Result<()> {
     for field in fields {
         add_unsupported(
             report,
@@ -2296,6 +2412,40 @@ fn markdown_vault_unsupported_fields(src: &Path) -> Result<Vec<&'static str>> {
     }
     collect_markdown_vault_unsupported_fields(src, &mut fields)?;
     Ok(fields.into_iter().collect())
+}
+
+fn normalize_profile_archive_path(path: &str, profile: &str) -> Result<String> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .next()
+            .is_some_and(|part| part.contains(':'))
+    {
+        return Err(loom_types::LoomError::invalid(format!(
+            "{profile} archive path {path:?} is not relative"
+        )));
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                return Err(loom_types::LoomError::invalid(format!(
+                    "{profile} archive path {path:?} contains parent traversal"
+                )));
+            }
+            value => parts.push(value),
+        }
+    }
+    if parts.is_empty() {
+        return Err(loom_types::LoomError::invalid(format!(
+            "{profile} archive path {path:?} is empty after normalization"
+        )));
+    }
+    Ok(parts.join("/"))
 }
 
 fn collect_markdown_vault_unsupported_fields(
@@ -4738,6 +4888,7 @@ pub fn import_slack_snapshot(
             channel_id,
             &slack_channel_handle(channel),
             &slack_channel_name(channel),
+            None,
         ) {
             Ok(_) => report.operations_applied += 1,
             Err(error) if error.code == Code::AlreadyExists => report.skipped += 1,
@@ -4760,6 +4911,7 @@ pub fn import_slack_snapshot(
             channel_id,
             &slack_channel_fallback_handle(&message.channel_id),
             &message.channel_id,
+            None,
         )?;
         let channel_selector = channel_id.to_string();
         let message_id = slack_message_id(&message.channel_id, &message.ts);
@@ -4783,6 +4935,7 @@ pub fn import_slack_snapshot(
                     &channel_selector,
                     thread,
                     &parent_id,
+                    None,
                 ) {
                     Ok(_) => report.operations_applied += 1,
                     Err(error) if error.code == Code::AlreadyExists => report.skipped += 1,
@@ -4810,6 +4963,7 @@ pub fn import_slack_snapshot(
                 &message_id,
                 thread_id,
                 body.as_bytes().to_vec(),
+                None,
             )?;
             report.operations_applied += 1;
             report.rows_imported += 1;
@@ -4839,16 +4993,272 @@ pub fn import_drive_bytes(
 ) -> Result<ImportReport> {
     let parsed: DriveImportSnapshot = serde_json::from_slice(bytes)
         .map_err(|e| loom_types::LoomError::invalid(format!("parse Drive snapshot JSON: {e}")))?;
-    import_drive_snapshot(
+    import_drive_snapshot_with_resolver(
         loom,
         ns,
         workspace_id,
         source_path,
         bytes.len() as u64,
-        snapshot_dir,
         parsed,
         dry_run,
+        |file| drive_file_bytes(file, snapshot_dir),
     )
+}
+
+const DRIVE_ARCHIVE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DRIVE_ARCHIVE_MAX_ENTRIES: usize = 4096;
+const DRIVE_ARCHIVE_MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+const DRIVE_ARCHIVE_MAX_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
+
+pub fn import_drive_archive_bytes(
+    loom: &mut Loom<FileStore>,
+    ns: WorkspaceId,
+    workspace_id: &str,
+    source_path: &str,
+    bytes: &[u8],
+    dry_run: bool,
+) -> Result<ImportReport> {
+    let (parsed, mut resolver) = parse_drive_archive(bytes)?;
+    import_drive_snapshot_with_resolver(
+        loom,
+        ns,
+        workspace_id,
+        source_path,
+        bytes.len() as u64,
+        parsed,
+        dry_run,
+        |file| resolver.content(file),
+    )
+}
+
+struct DriveArchiveContentResolver<'a> {
+    archive: zip::ZipArchive<Cursor<&'a [u8]>>,
+    content_entries: BTreeMap<String, usize>,
+    expanded: u64,
+}
+
+impl DriveArchiveContentResolver<'_> {
+    fn content(&mut self, file: &DriveFile) -> Result<Vec<u8>> {
+        if let Some(text) = file.text.as_ref() {
+            return Ok(text.as_bytes().to_vec());
+        }
+        if let Some(hex) = file.content_hex.as_ref() {
+            return decode_import_hex(hex);
+        }
+        let path = file.content_path.as_deref().ok_or_else(|| {
+            loom_types::LoomError::invalid(format!(
+                "drive file {} needs text, content_hex, or content_path",
+                file.id
+            ))
+        })?;
+        let normalized = normalize_drive_archive_path(path)?;
+        let index = *self.content_entries.get(&normalized).ok_or_else(|| {
+            loom_types::LoomError::invalid(format!(
+                "drive archive missing referenced content_path {normalized:?}"
+            ))
+        })?;
+        read_drive_archive_entry(&mut self.archive, index, &mut self.expanded)
+    }
+}
+
+fn parse_drive_archive(
+    bytes: &[u8],
+) -> Result<(DriveImportSnapshot, DriveArchiveContentResolver<'_>)> {
+    if bytes.len() > DRIVE_ARCHIVE_MAX_BYTES {
+        return Err(loom_types::LoomError::invalid(
+            "drive archive exceeds maximum byte length",
+        ));
+    }
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| loom_types::LoomError::invalid(format!("parse Drive archive ZIP: {e}")))?;
+    if archive.len() > DRIVE_ARCHIVE_MAX_ENTRIES {
+        return Err(loom_types::LoomError::invalid(
+            "drive archive exceeds maximum entry count",
+        ));
+    }
+
+    let mut files = BTreeMap::new();
+    let mut dirs = BTreeSet::new();
+    for index in 0..archive.len() {
+        let file = archive.by_index(index).map_err(|e| {
+            loom_types::LoomError::invalid(format!("read Drive archive entry {index}: {e}"))
+        })?;
+        let normalized = normalize_drive_archive_path(file.name())?;
+        if file.size() > DRIVE_ARCHIVE_MAX_ENTRY_BYTES {
+            return Err(loom_types::LoomError::invalid(format!(
+                "drive archive entry {normalized:?} exceeds maximum byte length"
+            )));
+        }
+        if file.is_dir() {
+            if files.contains_key(&normalized) || !dirs.insert(normalized.clone()) {
+                return Err(loom_types::LoomError::invalid(format!(
+                    "drive archive duplicate or colliding path {normalized:?}"
+                )));
+            }
+        } else {
+            if dirs.contains(&normalized) || files.insert(normalized.clone(), index).is_some() {
+                return Err(loom_types::LoomError::invalid(format!(
+                    "drive archive duplicate or colliding path {normalized:?}"
+                )));
+            }
+        }
+    }
+
+    let manifest_index = files.remove("manifest.json").ok_or_else(|| {
+        loom_types::LoomError::invalid("drive archive requires exactly one manifest.json")
+    })?;
+    if files.contains_key("manifest.json") || dirs.contains("manifest.json") {
+        return Err(loom_types::LoomError::invalid(
+            "drive archive manifest.json collides with another entry",
+        ));
+    }
+    let mut expanded = 0u64;
+    let manifest = read_drive_archive_entry(&mut archive, manifest_index, &mut expanded)?;
+    let parsed: DriveImportSnapshot = serde_json::from_slice(&manifest)
+        .map_err(|e| loom_types::LoomError::invalid(format!("parse Drive manifest JSON: {e}")))?;
+
+    let mut declared = BTreeSet::new();
+    let mut content_entries = BTreeMap::new();
+    for file in &parsed.files {
+        if let Some(path) = file.content_path.as_deref() {
+            let normalized = normalize_drive_archive_path(path)?;
+            if !declared.insert(normalized.clone()) {
+                return Err(loom_types::LoomError::invalid(format!(
+                    "drive manifest duplicate content_path {normalized:?}"
+                )));
+            }
+            for existing in &declared {
+                if existing != &normalized
+                    && (path_is_parent(existing, &normalized)
+                        || path_is_parent(&normalized, existing))
+                {
+                    return Err(loom_types::LoomError::invalid(format!(
+                        "drive manifest directory/file collision at {normalized:?}"
+                    )));
+                }
+            }
+            let index = files.remove(&normalized).ok_or_else(|| {
+                loom_types::LoomError::invalid(format!(
+                    "drive archive missing referenced content_path {normalized:?}"
+                ))
+            })?;
+            content_entries.insert(normalized, index);
+        }
+    }
+
+    for dir in &dirs {
+        if !declared
+            .iter()
+            .any(|path| path.starts_with(&format!("{dir}/")))
+        {
+            return Err(loom_types::LoomError::invalid(format!(
+                "drive archive undeclared directory entry {dir:?}"
+            )));
+        }
+    }
+    if let Some(path) = files.keys().next() {
+        return Err(loom_types::LoomError::invalid(format!(
+            "drive archive undeclared entry {path:?}"
+        )));
+    }
+    Ok((
+        parsed,
+        DriveArchiveContentResolver {
+            archive,
+            content_entries,
+            expanded,
+        },
+    ))
+}
+
+fn read_drive_archive_entry(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    index: usize,
+    expanded: &mut u64,
+) -> Result<Vec<u8>> {
+    read_drive_archive_entry_with_limits(
+        archive,
+        index,
+        expanded,
+        DRIVE_ARCHIVE_MAX_ENTRY_BYTES,
+        DRIVE_ARCHIVE_MAX_EXPANDED_BYTES,
+    )
+}
+
+fn read_drive_archive_entry_with_limits(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    index: usize,
+    expanded: &mut u64,
+    max_entry_bytes: u64,
+    max_expanded_bytes: u64,
+) -> Result<Vec<u8>> {
+    let mut file = archive.by_index(index).map_err(|e| {
+        loom_types::LoomError::invalid(format!("read Drive archive entry {index}: {e}"))
+    })?;
+    let entry_limit = usize::try_from(max_entry_bytes)
+        .map_err(|_| loom_types::LoomError::invalid("drive archive entry limit is too large"))?;
+    let read_limit = u64::try_from(entry_limit + 1)
+        .map_err(|_| loom_types::LoomError::invalid("drive archive read limit is too large"))?;
+    let mut out = Vec::new();
+    file.by_ref()
+        .take(read_limit)
+        .read_to_end(&mut out)
+        .map_err(|e| loom_types::LoomError::new(Code::Io, e.to_string()))?;
+    if out.len() > entry_limit {
+        return Err(loom_types::LoomError::invalid(format!(
+            "drive archive entry {:?} exceeds maximum byte length",
+            file.name()
+        )));
+    }
+    *expanded = expanded.checked_add(out.len() as u64).ok_or_else(|| {
+        loom_types::LoomError::invalid("drive archive expanded byte count overflow")
+    })?;
+    if *expanded > max_expanded_bytes {
+        return Err(loom_types::LoomError::invalid(
+            "drive archive exceeds maximum expanded byte length",
+        ));
+    }
+    Ok(out)
+}
+
+fn normalize_drive_archive_path(path: &str) -> Result<String> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .next()
+            .is_some_and(|part| part.contains(':'))
+    {
+        return Err(loom_types::LoomError::invalid(format!(
+            "drive archive path {path:?} is not relative"
+        )));
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                return Err(loom_types::LoomError::invalid(format!(
+                    "drive archive path {path:?} contains parent traversal"
+                )));
+            }
+            value => parts.push(value),
+        }
+    }
+    if parts.is_empty() {
+        return Err(loom_types::LoomError::invalid(format!(
+            "drive archive path {path:?} is empty after normalization"
+        )));
+    }
+    Ok(parts.join("/"))
+}
+
+fn path_is_parent(parent: &str, child: &str) -> bool {
+    child.len() > parent.len()
+        && child.as_bytes().get(parent.len()) == Some(&b'/')
+        && child.starts_with(parent)
 }
 
 pub fn import_drive_snapshot(
@@ -4860,6 +5270,28 @@ pub fn import_drive_snapshot(
     snapshot_dir: &Path,
     parsed: DriveImportSnapshot,
     dry_run: bool,
+) -> Result<ImportReport> {
+    import_drive_snapshot_with_resolver(
+        loom,
+        ns,
+        workspace_id,
+        fallback_source_scope,
+        bytes_in,
+        parsed,
+        dry_run,
+        |file| drive_file_bytes(file, snapshot_dir),
+    )
+}
+
+fn import_drive_snapshot_with_resolver(
+    loom: &mut Loom<FileStore>,
+    ns: WorkspaceId,
+    workspace_id: &str,
+    fallback_source_scope: &str,
+    bytes_in: u64,
+    parsed: DriveImportSnapshot,
+    dry_run: bool,
+    mut content_resolver: impl FnMut(&DriveFile) -> Result<Vec<u8>>,
 ) -> Result<ImportReport> {
     let source_scope = parsed
         .source_scope
@@ -4920,7 +5352,7 @@ pub fn import_drive_snapshot(
     }
     for file in &parsed.files {
         let parent = drive_parent_id(file.parent_id.as_deref());
-        let content = drive_file_bytes(file, snapshot_dir)?;
+        let content = content_resolver(file)?;
         let stat = match loom_drive::stat_node(loom, ns, workspace_id, parent, &file.name) {
             Ok(stat) if stat.kind == "file" => Some(stat),
             Ok(_) => {
@@ -5106,7 +5538,7 @@ fn apply_slack_reactions(
             report.skipped += reaction.users.len().max(1) as u64;
             continue;
         }
-        loom_chat::register_emoji(loom, ns, workspace_id, &reaction.name)?;
+        loom_chat::register_emoji(loom, ns, workspace_id, &reaction.name, None)?;
         match loom_chat::add_reaction(
             loom,
             ns,
@@ -5114,6 +5546,7 @@ fn apply_slack_reactions(
             channel_selector,
             message_id,
             &reaction.name,
+            None,
         ) {
             Ok(_) => report.operations_applied += 1,
             Err(error) if error.code == Code::AlreadyExists => report.skipped += 1,
@@ -6056,6 +6489,163 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn drive_zip(entries: &[(&str, &[u8])], compression: zip::CompressionMethod) -> Vec<u8> {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default().compression_method(compression);
+        for (path, bytes) in entries {
+            archive.start_file(*path, options).unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap().into_inner()
+    }
+
+    fn drive_zip_with_manifest(
+        manifest: &[u8],
+        entries: &[(&str, &[u8])],
+        compression: zip::CompressionMethod,
+    ) -> Vec<u8> {
+        let mut all = Vec::with_capacity(entries.len() + 1);
+        all.push(("manifest.json", manifest));
+        all.extend_from_slice(entries);
+        drive_zip(&all, compression)
+    }
+
+    fn drive_import_store(tag: &str) -> (Loom<FileStore>, WorkspaceId, PathBuf) {
+        let temp = std::env::temp_dir().join(format!("loom-drive-import-{tag}-{}", now_ms()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let store_path = temp.join("drive.loom");
+        let store = FileStore::create_with_profile(&store_path, Algo::Blake3).unwrap();
+        let mut loom = Loom::new(store);
+        let workspace = WorkspaceId::from_bytes([77; 16]);
+        loom.registry_mut()
+            .create(loom_core::FacetKind::Vcs, Some("main"), workspace)
+            .unwrap();
+        (loom, workspace, store_path)
+    }
+
+    #[test]
+    fn drive_archive_import_preserves_binary_without_filesystem_extraction() {
+        let manifest = br#"{
+          "source_scope": "drive://archive",
+          "files": [
+            {"id": "payload", "parent_id": "root", "name": "payload.bin", "content_path": "payloads/./payload.bin"}
+          ]
+        }"#;
+        let bytes = [0, 1, 2, 3, 254, 255];
+        let archive = drive_zip_with_manifest(
+            manifest,
+            &[("payloads/payload.bin", &bytes)],
+            zip::CompressionMethod::Deflated,
+        );
+        let (mut loom, workspace, store_path) = drive_import_store("binary");
+        let missing_dir = std::env::temp_dir().join(format!("loom-drive-missing-{}", now_ms()));
+
+        let report = import_drive_archive_bytes(
+            &mut loom,
+            workspace,
+            "drive",
+            missing_dir.to_str().unwrap(),
+            &archive,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.rows_imported, 1);
+        assert_eq!(
+            loom_drive::read_file(&loom, workspace, "drive", "payload").unwrap(),
+            bytes
+        );
+        let _ = std::fs::remove_file(store_path);
+    }
+
+    #[test]
+    fn drive_archive_rejects_highly_compressed_actual_entry_limit() {
+        let manifest = br#"{
+          "files": [
+            {"id": "payload", "parent_id": "root", "name": "payload.bin", "content_path": "payload.bin"}
+          ]
+        }"#;
+        let payload = vec![0u8; DRIVE_ARCHIVE_MAX_ENTRY_BYTES as usize + 1];
+        let archive = drive_zip_with_manifest(
+            manifest,
+            &[("payload.bin", &payload)],
+            zip::CompressionMethod::Deflated,
+        );
+        let (mut loom, workspace, store_path) = drive_import_store("entry-limit");
+
+        let error = import_drive_archive_bytes(
+            &mut loom,
+            workspace,
+            "drive",
+            "memory://drive.zip",
+            &archive,
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, Code::InvalidArgument);
+        let _ = std::fs::remove_file(store_path);
+    }
+
+    #[test]
+    fn drive_archive_bounded_read_rejects_actual_decompressed_bytes() {
+        let payload = vec![0u8; 65];
+        let archive = drive_zip(
+            &[("payload.bin", &payload)],
+            zip::CompressionMethod::Deflated,
+        );
+        let mut archive = zip::ZipArchive::new(Cursor::new(archive.as_slice())).unwrap();
+        let mut expanded = 0;
+
+        let error = read_drive_archive_entry_with_limits(&mut archive, 0, &mut expanded, 64, 128)
+            .unwrap_err();
+
+        assert_eq!(error.code, Code::InvalidArgument);
+    }
+
+    #[test]
+    fn drive_archive_rejects_actual_cumulative_expanded_limit() {
+        let mut manifest = String::from(r#"{"files":["#);
+        for index in 0..8 {
+            if index > 0 {
+                manifest.push(',');
+            }
+            manifest.push_str(&format!(
+                r#"{{"id":"payload-{index}","parent_id":"root","name":"payload-{index}.bin","content_path":"payload-{index}.bin"}}"#
+            ));
+        }
+        manifest.push_str("]}");
+        let payload = vec![0u8; DRIVE_ARCHIVE_MAX_ENTRY_BYTES as usize];
+        let entries = (0..8)
+            .map(|index| (format!("payload-{index}.bin"), payload.as_slice()))
+            .collect::<Vec<_>>();
+        let entries = entries
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), *bytes))
+            .collect::<Vec<_>>();
+        let archive = drive_zip_with_manifest(
+            manifest.as_bytes(),
+            &entries,
+            zip::CompressionMethod::Deflated,
+        );
+        let (mut loom, workspace, store_path) = drive_import_store("expanded-limit");
+
+        let error = import_drive_archive_bytes(
+            &mut loom,
+            workspace,
+            "drive",
+            "memory://drive.zip",
+            &archive,
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, Code::InvalidArgument);
+        let _ = std::fs::remove_file(store_path);
+    }
 
     #[test]
     fn redmine_xml_import_lowers_tickets_pages_and_source_extras() {

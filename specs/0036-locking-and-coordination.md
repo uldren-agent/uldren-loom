@@ -226,6 +226,74 @@ Lifecycle policy:
   lock and stateful runtime operations instead of assuming a visible store path implies a reachable host
   daemon.
 
+### 3.1.1 Logical sessions and transport attachments
+
+A `LoomSession` is an authenticated logical coordinator session, not a transport connection. One
+session may survive the loss and replacement of a CLI, MCP, local IPC, or hosted connection. A
+connection attaches to a session; closing a connection only removes that attachment.
+
+- **Session identity is authority-issued.** The coordinator mints the session id and an opaque resume
+  credential. Callers MUST NOT select, reconstruct, or prove ownership by repeating a principal or
+  session name.
+- **Resume is authenticated and fail-closed.** A resumed session MUST present the opaque credential
+  and authenticate as the same principal. The store identity, coordinator identity, authority epoch,
+  and protocol profile MUST match. Any mismatch creates a new session or fails; it never adopts the
+  prior session's locks.
+- **Connection loss does not release locks.** A transient transport failure cannot be treated as proof
+  that protected work stopped. The session and its held locks remain live until explicit session
+  closure or expiry.
+- **Explicit session closure releases runtime ownership.** Closing a session releases its held locks,
+  removes its waiters, and wakes eligible waiters. Detaching one connection is not session closure.
+- **Expiry is mandatory.** A session that cannot be refreshed expires, and its held locks then release.
+  Individual lock lease deadlines remain authoritative and MAY expire before the owning session.
+- **Ownership remains `(principal, session)`.** Another session for the same principal cannot reenter,
+  refresh, release, or apply the first session's lock token. An authorized administrative break is a
+  separate audited operation and never reuses a fence.
+- **Concurrent attachments serialize through one authority.** If policy permits more than one live
+  attachment to the same session, the coordinator serializes their operations against the same session
+  state. An attachment never creates an independent lock register.
+
+MCP hosts create or resume one logical session and refresh it while active. A clean host shutdown
+closes the session when the host owns that lifecycle; a crash relies on expiry. One-shot CLI commands
+that need only scoped exclusion acquire, perform the guarded operation, and release in one session.
+Independent CLI invocations that acquire, refresh, and release the same lock MUST resume the same
+logical session through an opaque session reference. The CLI MUST derive the principal from
+authentication and MUST NOT expose caller-selected principal/session ownership as the authority.
+
+### 3.1.2 CLI session credential files
+
+The CLI carries resumable session authority in an explicit credential file. The credential file is
+separate from every lock token and is treated as a secret.
+
+```text
+loom daemon session open app.loom --out session.json
+loom lock acquire app.loom resource --session @session.json --out lock.json
+loom lock refresh app.loom --session @session.json --token @lock.json --out lock.json
+loom lock release app.loom --session @session.json --token @lock.json
+loom daemon session close app.loom --session @session.json
+```
+
+- `session open` authenticates normally, asks the authority to mint a logical session and resume
+  credential, and atomically creates `--out` with owner-only permissions. It refuses an existing
+  output, a symlink, or a path whose final file cannot be made private.
+- `--session @path` reads the typed credential from a file. The secret MUST NOT appear in process
+  arguments, normal output, diagnostics, audit payloads, or error messages.
+- The credential records the authority-minted session id and secret plus their principal, store,
+  coordinator, authority-epoch, protocol-profile, and expiry bindings. These fields are validated by
+  the authority rather than trusted from the file.
+- Successful session resume rotates the secret when the authority supports rotation. The CLI replaces
+  the credential file atomically only after the resumed session is accepted. A failed resume leaves the
+  prior file unchanged.
+- `LockToken` remains non-secret resource state. `--token @path` reads its typed representation, and
+  `--out` atomically writes the refreshed token. Principal and session fields in a token are descriptive
+  and never prove authority.
+- `session close` invalidates the credential, releases session-owned runtime resources, and removes
+  the credential file only after the authority confirms closure. Failure leaves the file available for
+  retry.
+- Direct-local, daemon-local, and hosted-remote execution use the same typed credential and validation
+  contract. A daemon-local alias registry and a lock-token-embedded secret are not alternate authority
+  paths.
+
 Binding projection:
 
 - The CLI owns the full local daemon lifecycle: start, stop, restart, status, doctor, pins, sessions,
@@ -535,6 +603,11 @@ Decision Points: none.
   start/stop/restart/status, doctor, session attach/detach, pins,
   lock acquire/refresh/release/apply-fence, explicit manual lifecycle, MCP attached-session
   liveness, stateful pure-ephemeral KV routing, and stateless pure-ephemeral rejection.
+- (P0, target) Promote authenticated logical-session resume through IDL, generated clients, daemon
+  dispatch, hosted transport, and CLI execution. The authority must mint an opaque resume credential,
+  bind it to principal/store/coordinator/epoch, distinguish connection detach from session close, and
+  prove that independent CLI invocations can refresh and release only locks held by the resumed
+  session. MCP reconnects use the same contract rather than a transport-specific fallback.
 - (P0, source-backed) Public fence tokens use the structured `u128` contract. `loom-types` defines
   `Fence` as `authority:u32`, `epoch:u32`, and `sequence:u64` with canonical packing and low/high
   limb conversion. The embedded coordinator maps its durable local sequence as `0:0:sequence`;

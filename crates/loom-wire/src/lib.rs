@@ -9,6 +9,7 @@
 //! Licensed under BUSL-1.1.
 
 pub mod acl;
+pub mod audit;
 pub mod calendar;
 pub mod columnar;
 pub mod document;

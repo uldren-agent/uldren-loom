@@ -7,7 +7,6 @@ use loom_hosted_core::remote::{RemoteAuthMode, RemoteServeOptions, RemoteTlsTrus
 #[derive(Default)]
 pub(crate) struct ServePolicyArgs {
     pub tls_certificate_bundle: Option<String>,
-    pub tls_mode: Option<String>,
     pub auth_mode: Option<String>,
     pub exposure: Option<String>,
     pub audit_mode: Option<String>,
@@ -29,389 +28,6 @@ struct ServeConfigureRequest {
     policy: ServePolicyArgs,
 }
 
-struct ServedSurfaceSpec {
-    surface: &'static str,
-    aliases: &'static [&'static str],
-    min_selectors: usize,
-    max_selectors: usize,
-    default_transport: Option<&'static str>,
-    transports: &'static [&'static str],
-}
-
-const SERVED_SURFACES: &[ServedSurfaceSpec] = &[
-    ServedSurfaceSpec {
-        surface: "admin",
-        aliases: &[],
-        min_selectors: 0,
-        max_selectors: 0,
-        default_transport: Some("rest"),
-        transports: &["rest", "json_rpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "mcp",
-        aliases: &[],
-        min_selectors: 0,
-        max_selectors: 0,
-        default_transport: Some("mcp_http"),
-        transports: &["mcp_http"],
-    },
-    ServedSurfaceSpec {
-        surface: "exec",
-        aliases: &[],
-        min_selectors: 0,
-        max_selectors: 0,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "grpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "cas",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: Some("rest"),
-        transports: &["rest", "json_rpc", "grpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "oci",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: Some("rest"),
-        transports: &["rest"],
-    },
-    ServedSurfaceSpec {
-        surface: "s3",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 2,
-        default_transport: Some("rest"),
-        transports: &["rest"],
-    },
-    ServedSurfaceSpec {
-        surface: "files",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "grpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "web",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: Some("rest"),
-        transports: &["rest"],
-    },
-    ServedSurfaceSpec {
-        surface: "vcs",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "grpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "sql",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "grpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "postgres",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: Some("tcp"),
-        transports: &["tcp"],
-    },
-    ServedSurfaceSpec {
-        surface: "mysql",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: Some("tcp"),
-        transports: &["tcp"],
-    },
-    ServedSurfaceSpec {
-        surface: "kv",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "grpc", "couchbase_kv"],
-    },
-    ServedSurfaceSpec {
-        surface: "etcd",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: Some("tcp"),
-        transports: &["tcp"],
-    },
-    ServedSurfaceSpec {
-        surface: "redis",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: Some("resp"),
-        transports: &["resp"],
-    },
-    ServedSurfaceSpec {
-        surface: "memcached",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: Some("text"),
-        transports: &["text"],
-    },
-    ServedSurfaceSpec {
-        surface: "document",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &[
-            "rest",
-            "json_rpc",
-            "grpc",
-            "mongodb_wire",
-            "couchdb_rest",
-            "couchbase_document",
-        ],
-    },
-    ServedSurfaceSpec {
-        surface: "drive",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: None,
-        transports: &["rest", "json_rpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "chat",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &["rest", "json_rpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "meetings",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: None,
-        transports: &["rest", "json_rpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "queue",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "grpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "kafka",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: Some("tcp"),
-        transports: &["tcp"],
-    },
-    ServedSurfaceSpec {
-        surface: "mqtt",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: Some("tcp"),
-        transports: &["tcp"],
-    },
-    ServedSurfaceSpec {
-        surface: "nats",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: Some("tcp"),
-        transports: &["tcp"],
-    },
-    ServedSurfaceSpec {
-        surface: "time-series",
-        aliases: &["timeseries", "time_series"],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "grpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "influx",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: Some("http"),
-        transports: &["http"],
-    },
-    ServedSurfaceSpec {
-        surface: "prometheus",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: Some("http"),
-        transports: &["http"],
-    },
-    ServedSurfaceSpec {
-        surface: "grafana",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 2,
-        default_transport: Some("http"),
-        transports: &["http"],
-    },
-    ServedSurfaceSpec {
-        surface: "otlp",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: None,
-        transports: &["grpc", "http"],
-    },
-    ServedSurfaceSpec {
-        surface: "columnar",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &[
-            "rest",
-            "json_rpc",
-            "grpc",
-            "arrow_flight",
-            "parquet",
-            "duckdb_like",
-            "snowflake_like",
-            "spark_like",
-            "bigquery_like",
-        ],
-    },
-    ServedSurfaceSpec {
-        surface: "dataframe",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &["rest"],
-    },
-    ServedSurfaceSpec {
-        surface: "vector",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "grpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "fts",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "grpc", "ndjson"],
-    },
-    ServedSurfaceSpec {
-        surface: "graph",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "grpc"],
-    },
-    ServedSurfaceSpec {
-        surface: "neo4j",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: Some("tcp"),
-        transports: &["tcp"],
-    },
-    ServedSurfaceSpec {
-        surface: "ledger",
-        aliases: &[],
-        min_selectors: 2,
-        max_selectors: 2,
-        default_transport: None,
-        transports: &[
-            "rest",
-            "json_rpc",
-            "grpc",
-            "immudb_grpc",
-            "transparency_log",
-        ],
-    },
-    ServedSurfaceSpec {
-        surface: "calendar",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: Some("caldav"),
-        transports: &["rest", "json_rpc", "caldav"],
-    },
-    ServedSurfaceSpec {
-        surface: "contacts",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: Some("carddav"),
-        transports: &["rest", "json_rpc", "carddav"],
-    },
-    ServedSurfaceSpec {
-        surface: "mail",
-        aliases: &[],
-        min_selectors: 1,
-        max_selectors: 1,
-        default_transport: None,
-        transports: &["rest", "json_rpc", "imap", "jmap", "smtp"],
-    },
-];
-
-fn served_surface_spec(surface: &str) -> Option<&'static ServedSurfaceSpec> {
-    SERVED_SURFACES
-        .iter()
-        .find(|spec| spec.surface == surface || spec.aliases.contains(&surface))
-}
-
-fn apply_serve_policy(record: &mut ServedListenerRecord, policy: ServePolicyArgs) {
-    if let Some(value) = policy.tls_certificate_bundle {
-        record.tls.mode = policy.tls_mode.unwrap_or_else(|| "direct".to_string());
-        record.tls.certificate_bundle_ref = Some(value);
-    } else if let Some(value) = policy.tls_mode {
-        record.tls.mode = value;
-    }
-    if let Some(value) = policy.auth_mode {
-        record.auth.mode = value;
-    }
-    if let Some(value) = policy.exposure {
-        record.exposure = value;
-    }
-    if let Some(value) = policy.audit_mode {
-        record.audit.mode = value;
-    }
-    if let Some(value) = policy.request_size_limit {
-        record.limits.request_size_limit = value;
-    }
-    if let Some(value) = policy.idle_timeout_ms {
-        record.limits.idle_timeout_ms = value;
-    }
-    if let Some(value) = policy.session_timeout_ms {
-        record.limits.session_timeout_ms = value;
-    }
-    if let Some(value) = policy.network_access_policy {
-        record.network_access_policy_ref = Some(value);
-    }
-}
-
 pub(crate) fn run_serve(action: ServeCmd, keys: &KeyOpts) -> Result<(), String> {
     match action {
         ServeCmd::Configure(args) => run_serve_configure(
@@ -426,7 +42,6 @@ pub(crate) fn run_serve(action: ServeCmd, keys: &KeyOpts) -> Result<(), String> 
                 disabled: args.disabled,
                 policy: ServePolicyArgs {
                     tls_certificate_bundle: args.tls_certificate_bundle,
-                    tls_mode: args.tls_mode,
                     auth_mode: args.auth_mode,
                     exposure: args.exposure,
                     audit_mode: args.audit_mode,
@@ -643,60 +258,35 @@ fn run_serve_route(action: ServeRouteCmd, keys: &KeyOpts) -> Result<(), String> 
 }
 
 fn run_serve_route_list(store: &str, listener: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let record = require_web_listener_record(&loom, listener)?;
-    let web_listener = web_listener_from_record(&loom, &record)?;
-    let seq = loom
-        .store()
-        .audit_append(
-            Some(actor),
-            "serve.web.route.list",
-            Some(&format!("listener={listener}")),
-        )
-        .map_err(|e| e.to_string())?;
-    println!("{}", web_listener_json(&web_listener, Some(seq)));
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let raw = execute_generated_string(
+        &client,
+        "ServeConfig",
+        "serve_web_route_list_json",
+        vec![listener.to_value()],
+    )?;
+    println!("{raw}");
     Ok(())
 }
 
 fn run_serve_route_set(args: ServeRouteSetArgs, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(&args.store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let record = require_web_listener_record(&loom, &args.listener)?;
-    let mut web_listener = web_listener_from_record(&loom, &record)?;
-    let workspace = args
-        .workspace
-        .as_deref()
-        .map(|workspace| resolve_ns(&loom, workspace))
-        .transpose()?;
-    let mut route = loom_substrate::web::WebRoute::new(
-        args.route.clone(),
-        vec![
-            loom_substrate::web::WebMethod::Get,
-            loom_substrate::web::WebMethod::Head,
-        ],
-        args.host.clone(),
-        &args.prefix,
-        &args.root,
-        loom_substrate::web::WebRouteMode::StaticFile,
-    )
-    .map_err(|e| e.to_string())?;
-    route.workspace = workspace;
-    web_listener
-        .routes
-        .routes
-        .retain(|existing| existing.route_id != route.route_id);
-    web_listener.routes.routes.push(route);
-    web_listener.routes = loom_substrate::web::WebRouteTable::new(web_listener.routes.routes)
-        .map_err(|e| e.to_string())?;
-    let seq = save_web_listener_config(
-        &loom,
-        actor,
-        &web_listener,
-        "serve.web.route.set",
-        &format!("listener={};route={}", args.listener, args.route),
+    let request = serde_json::json!({
+        "listener": args.listener,
+        "route": args.route,
+        "host": args.host,
+        "prefix": args.prefix,
+        "workspace": args.workspace,
+        "root": args.root
+    })
+    .to_string();
+    let client = remote::open_cli_generated_client(&args.store, keys)?;
+    let raw = execute_generated_string(
+        &client,
+        "ServeConfig",
+        "serve_web_route_set_json",
+        vec![request.to_value()],
     )?;
-    println!("{}", web_listener_json(&web_listener, Some(seq)));
+    println!("{raw}");
     Ok(())
 }
 
@@ -706,96 +296,15 @@ fn run_serve_route_remove(
     route: &str,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let record = require_web_listener_record(&loom, listener)?;
-    let mut web_listener = web_listener_from_record(&loom, &record)?;
-    let before = web_listener.routes.routes.len();
-    web_listener
-        .routes
-        .routes
-        .retain(|existing| existing.route_id != route);
-    if web_listener.routes.routes.len() == before {
-        return Err(format!("web route {route:?} not found"));
-    }
-    web_listener.routes = loom_substrate::web::WebRouteTable::new(web_listener.routes.routes)
-        .map_err(|e| e.to_string())?;
-    let seq = save_web_listener_config(
-        &loom,
-        actor,
-        &web_listener,
-        "serve.web.route.remove",
-        &format!("listener={listener};route={route}"),
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let raw = execute_generated_string(
+        &client,
+        "ServeConfig",
+        "serve_web_route_remove_json",
+        vec![listener.to_value(), route.to_value()],
     )?;
-    println!("{}", web_listener_json(&web_listener, Some(seq)));
+    println!("{raw}");
     Ok(())
-}
-
-fn require_web_listener_record(
-    loom: &Loom<FileStore>,
-    listener: &str,
-) -> Result<ServedListenerRecord, String> {
-    let record = loom
-        .store()
-        .served_listener(listener)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("served listener {listener:?} not found"))?;
-    if record.surface != "web" || record.transport != "rest" {
-        return Err(format!(
-            "served listener {listener:?} is not a web rest listener"
-        ));
-    }
-    if record.selectors.len() != 1 {
-        return Err(format!(
-            "served listener {listener:?} must have exactly one workspace selector"
-        ));
-    }
-    Ok(record)
-}
-
-fn web_listener_from_record(
-    loom: &Loom<FileStore>,
-    record: &ServedListenerRecord,
-) -> Result<loom_substrate::web::WebListener, String> {
-    let key =
-        loom_substrate::web::web_profile_listener_key(&record.id).map_err(|e| e.to_string())?;
-    if let Some(bytes) = loom.store().control_get(&key).map_err(|e| e.to_string())? {
-        return loom_substrate::web::WebListener::decode(&bytes).map_err(|e| e.to_string());
-    }
-    let workspace = resolve_ns(loom, &record.selectors[0])?;
-    let addr = record
-        .bind
-        .parse::<std::net::SocketAddr>()
-        .map_err(|e| format!("invalid listener bind address {:?}: {e}", record.bind))?;
-    loom_substrate::web::WebListener::new(
-        &record.id,
-        addr.ip().to_string(),
-        addr.port(),
-        loom_substrate::web::WebProtocol::Http,
-        workspace,
-        "/",
-    )
-    .map_err(|e| e.to_string())
-}
-
-fn save_web_listener_config(
-    loom: &Loom<FileStore>,
-    actor: WorkspaceId,
-    listener: &loom_substrate::web::WebListener,
-    action: &str,
-    target: &str,
-) -> Result<u64, String> {
-    let key =
-        loom_substrate::web::web_profile_listener_key(&listener.listener_id).map_err(|e| {
-            format!(
-                "build Webish listener config key for served listener {}: {e}",
-                listener.listener_id
-            )
-        })?;
-    let value = listener.encode().map_err(|e| e.to_string())?;
-    loom.store()
-        .control_set_audited(&key, value, Some(actor), action, Some(target))
-        .map_err(|e| e.to_string())
 }
 
 fn run_serve_configure(request: ServeConfigureRequest, keys: &KeyOpts) -> Result<(), String> {
@@ -810,139 +319,39 @@ fn run_serve_configure(request: ServeConfigureRequest, keys: &KeyOpts) -> Result
         disabled,
         policy,
     } = request;
-    validate_bind(&bind)?;
-    let surface = normalize_surface(&surface)?;
-    validate_selector_shape(surface, &selector)?;
-    let transport = normalize_transport(surface, transport.as_deref())?;
-    validate_transport(surface, transport)?;
-    let profile = normalize_profile(surface, transport, profile.as_deref(), mode.as_deref())?;
-    let mut loom = cli_open_loom(&store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let drive_policy_target = if surface == "drive" {
-        let workspace = resolve_ns(&loom, &selector[0])?;
-        Some((workspace, workspace.to_string()))
-    } else {
-        None
-    };
-    let mut record = FileStore::served_listener_record_with_profile(
-        surface, selector, transport, profile, &bind, !disabled,
-    )
-    .map_err(|e| e.to_string())?;
-    apply_serve_policy(&mut record, policy);
-    validate_served_listener_certificate_bundle(&loom, &record)?;
-    validate_served_listener_network_access_policy(&loom, &record)?;
-    if configure_memcached_cache_mode(
-        &mut loom,
-        surface,
-        record.profile.as_deref(),
-        &record.selectors,
-    )? {
-        save_loom(&mut loom).map_err(|e| e.to_string())?;
-    }
-    let target = served_listener_target(&record);
-    let seq = loom
-        .store()
-        .save_served_listener_audited(
-            &record,
-            Some(actor),
-            "serve.listener.configure",
-            Some(&target),
-        )
-        .map_err(|e| e.to_string())?;
-    record.last_modified_audit_seq = Some(seq);
-    if let Some((workspace, workspace_id)) = drive_policy_target {
-        register_drive_policy_target(&loom, Some(actor), workspace, &workspace_id)?;
-    }
-    println!("{}", served_listener_json(&record, seq));
-    Ok(())
-}
-
-fn validate_served_listener_network_access_policy(
-    loom: &Loom<FileStore>,
-    record: &ServedListenerRecord,
-) -> Result<(), String> {
-    let Some(name) = record.network_access_policy_ref.as_deref() else {
-        return Ok(());
-    };
-    let Some(policy) = loom
-        .store()
-        .network_access_policy(name)
-        .map_err(|e| e.to_string())?
-    else {
-        return Err(format!("network access policy {name:?} not found"));
-    };
-    if !network_access_policy_requires_mtls(&policy) {
-        return Ok(());
-    }
-    if record.tls.mode != "direct" {
-        return Err(format!(
-            "network access policy {name:?} requires mTLS but listener TLS is not direct"
-        ));
-    }
-    let bundle_name = record
-        .tls
-        .certificate_bundle_ref
-        .as_deref()
-        .ok_or_else(|| {
-            format!("network access policy {name:?} requires a TLS certificate bundle")
-        })?;
-    let bundle = loom
-        .store()
-        .certificate_bundle(bundle_name)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("certificate bundle {bundle_name:?} not found"))?;
-    if bundle.trust_bundle_pem.is_none() {
-        return Err(format!(
-            "network access policy {name:?} requires mTLS but certificate bundle {bundle_name:?} has no trust bundle"
-        ));
-    }
-    Ok(())
-}
-
-fn network_access_policy_requires_mtls(policy: &loom_store::NetworkAccessPolicyRecord) -> bool {
-    policy.rules.iter().any(|rule| {
-        rule.require_mtls
-            || rule.client_cert_subject.is_some()
-            || rule.client_cert_san.is_some()
-            || rule.client_cert_issuer.is_some()
+    let request_json = serde_json::json!({
+        "surface": surface,
+        "selectors": selector,
+        "bind": bind,
+        "transport": transport,
+        "profile": profile,
+        "mode": mode,
+        "enabled": !disabled,
+        "tls_certificate_bundle": policy.tls_certificate_bundle,
+        "auth_mode": policy.auth_mode,
+        "exposure": policy.exposure,
+        "audit_mode": policy.audit_mode,
+        "request_size_limit": policy.request_size_limit,
+        "idle_timeout_ms": policy.idle_timeout_ms,
+        "session_timeout_ms": policy.session_timeout_ms,
+        "network_access_policy": policy.network_access_policy
     })
-}
-
-fn validate_served_listener_certificate_bundle(
-    loom: &Loom<FileStore>,
-    record: &ServedListenerRecord,
-) -> Result<(), String> {
-    let Some(name) = record.tls.certificate_bundle_ref.as_deref() else {
-        return Ok(());
-    };
-    if loom
-        .store()
-        .certificate_bundle(name)
-        .map_err(|e| e.to_string())?
-        .is_none()
-    {
-        return Err(format!("certificate bundle {name:?} not found"));
-    }
+    .to_string();
+    let client = remote::open_cli_generated_client(&store, keys)?;
+    let raw = execute_generated_string(
+        &client,
+        "ServeConfig",
+        "serve_listener_configure_json",
+        vec![request_json.to_value()],
+    )?;
+    println!("{raw}");
     Ok(())
 }
 
 fn run_serve_list(store: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let listeners = loom.store().served_listeners().map_err(|e| e.to_string())?;
-    let seq = loom
-        .store()
-        .audit_append(Some(actor), "serve.listener.list", Some("listeners"))
-        .map_err(|e| e.to_string())?;
-    let mut out = format!("{{\"seq\":{seq},\"listeners\":[");
-    for (idx, listener) in listeners.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&served_listener_record_json(listener));
-    }
-    out.push_str("]}");
-    println!("{out}");
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let raw = execute_generated_string(&client, "ServeConfig", "serve_listener_list_json", vec![])?;
+    println!("{raw}");
     Ok(())
 }
 
@@ -952,412 +361,66 @@ fn run_serve_set_enabled(
     enabled: bool,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let mut record = loom
-        .store()
-        .served_listener(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("served listener {id:?} not found"))?;
-    record.enabled = enabled;
-    let target = served_listener_target(&record);
-    let audit_action = if enabled {
-        "serve.listener.enable"
-    } else {
-        "serve.listener.disable"
-    };
-    let seq = loom
-        .store()
-        .save_served_listener_audited(&record, Some(actor), audit_action, Some(&target))
-        .map_err(|e| e.to_string())?;
-    record.last_modified_audit_seq = Some(seq);
-    println!("{}", served_listener_json(&record, seq));
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let raw = execute_generated_string(
+        &client,
+        "ServeConfig",
+        "serve_listener_set_enabled_json",
+        vec![id.to_value(), enabled.to_value()],
+    )?;
+    println!("{raw}");
     Ok(())
 }
 
 fn run_serve_remove(store: &str, id: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let record = loom
-        .store()
-        .served_listener(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("served listener {id:?} not found"))?;
-    let target = served_listener_target(&record);
-    let seq = loom
-        .store()
-        .remove_served_listener_audited(id, Some(actor), "serve.listener.remove", Some(&target))
-        .map_err(|e| e.to_string())?;
-    println!("{{\"seq\":{seq},\"id\":{}}}", json_string(id));
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let raw = execute_generated_string(
+        &client,
+        "ServeConfig",
+        "serve_listener_remove_json",
+        vec![id.to_value()],
+    )?;
+    println!("{raw}");
     Ok(())
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn validate_bind(bind: &str) -> Result<(), String> {
-    let addr = bind
-        .parse::<std::net::SocketAddr>()
-        .map_err(|e| format!("invalid --bind address {bind:?}: {e}"))?;
-    if addr.port() == 0 {
-        return Err("--bind port must not be 0 for durable listener configuration".to_string());
-    }
-    Ok(())
+    loom_client::serve_config::validate_bind(bind).map_err(loom_client::serve_config::cli_error)
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn normalize_surface(surface: &str) -> Result<&'static str, String> {
-    served_surface_spec(surface)
-        .map(|spec| spec.surface)
-        .ok_or_else(|| format!("unsupported served surface {surface:?}"))
+    loom_client::serve_config::normalize_surface(surface)
+        .map_err(loom_client::serve_config::cli_error)
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn normalize_transport(surface: &str, transport: Option<&str>) -> Result<&'static str, String> {
-    let spec = served_surface_spec(surface)
-        .ok_or_else(|| format!("unsupported served surface {surface:?}"))?;
-    match transport {
-        Some(value) => normalize_transport_name(value),
-        None => spec
-            .default_transport
-            .ok_or_else(|| format!("served surface {surface:?} requires an explicit --transport")),
-    }
+    loom_client::serve_config::normalize_transport(surface, transport)
+        .map_err(loom_client::serve_config::cli_error)
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn normalize_transport_name(transport: &str) -> Result<&'static str, String> {
-    match transport {
-        "rest" => Ok("rest"),
-        "json-rpc" | "json_rpc" => Ok("json_rpc"),
-        "mcp-http" | "mcp_http" => Ok("mcp_http"),
-        "grpc" => Ok("grpc"),
-        "tcp" => Ok("tcp"),
-        "http" => Ok("http"),
-        "resp" => Ok("resp"),
-        "text" => Ok("text"),
-        "s3" => Ok("s3"),
-        "oci-distribution" | "oci_distribution" => Ok("oci_distribution"),
-        "car" => Ok("car"),
-        "pg-wire" | "pg_wire" => Ok("pg_wire"),
-        "mysql-wire" | "mysql_wire" => Ok("mysql_wire"),
-        "couchbase-kv" | "couchbase_kv" => Ok("couchbase_kv"),
-        "mongodb-wire" | "mongodb_wire" => Ok("mongodb_wire"),
-        "couchdb-rest" | "couchdb_rest" => Ok("couchdb_rest"),
-        "couchbase-document" | "couchbase_document" => Ok("couchbase_document"),
-        "kafka" => Ok("kafka"),
-        "nats" => Ok("nats"),
-        "amqp" => Ok("amqp"),
-        "arrow-flight" | "arrow_flight" => Ok("arrow_flight"),
-        "parquet" => Ok("parquet"),
-        "duckdb-like" | "duckdb_like" => Ok("duckdb_like"),
-        "snowflake-like" | "snowflake_like" => Ok("snowflake_like"),
-        "spark-like" | "spark_like" => Ok("spark_like"),
-        "bigquery-like" | "bigquery_like" => Ok("bigquery_like"),
-        "ndjson" => Ok("ndjson"),
-        "bolt" => Ok("bolt"),
-        "gremlin" => Ok("gremlin"),
-        "immudb-grpc" | "immudb_grpc" => Ok("immudb_grpc"),
-        "transparency-log" | "transparency_log" => Ok("transparency_log"),
-        "caldav" => Ok("caldav"),
-        "carddav" => Ok("carddav"),
-        "imap" => Ok("imap"),
-        "jmap" => Ok("jmap"),
-        "smtp" => Ok("smtp"),
-        other => Err(format!("unsupported served transport {other:?}")),
-    }
+    loom_client::serve_config::normalize_transport_name(transport)
+        .map_err(loom_client::serve_config::cli_error)
 }
 
-fn normalize_profile(
-    surface: &str,
-    transport: &str,
-    profile: Option<&str>,
-    mode: Option<&str>,
-) -> Result<Option<&'static str>, String> {
-    if surface == "memcached" {
-        if profile.is_some() {
-            return Err("served surface \"memcached\" uses --mode, not --profile".to_string());
-        }
-        let Some(mode) = mode else {
-            return Ok(None);
-        };
-        return match mode {
-            "volatile" => Ok(None),
-            "versioned" => Ok(Some("versioned")),
-            "read-through" => Ok(Some("read-through")),
-            "write-through" => Ok(Some("write-through")),
-            "write-around" => Ok(Some("write-around")),
-            "write-behind" => Ok(Some("write-behind")),
-            other => Err(format!(
-                "unsupported memcached --mode {other:?} (expected `volatile`, `versioned`, `read-through`, `write-through`, `write-around`, or `write-behind`)"
-            )),
-        };
-    }
-    if mode.is_some() {
-        return Err(format!("served surface {surface:?} does not accept --mode"));
-    }
-    if surface != "vector" {
-        return match profile {
-            Some(value) => Err(format!(
-                "served surface {surface:?} does not accept --profile {value:?}"
-            )),
-            None => Ok(None),
-        };
-    }
-    let Some(profile) = profile else {
-        return Err(
-            "served surface \"vector\" requires explicit --profile for rest, json-rpc, or grpc"
-                .to_string(),
-        );
-    };
-    match (profile, transport) {
-        ("generic", "rest" | "json_rpc" | "grpc") => Ok(Some("generic")),
-        ("qdrant", "rest" | "grpc") => Ok(Some("qdrant")),
-        ("pinecone", "rest") => Ok(Some("pinecone")),
-        ("qdrant", _) => Err(format!(
-            "vector profile \"qdrant\" supports --transport rest or grpc, not {transport:?}"
-        )),
-        ("pinecone", _) => Err(format!(
-            "vector profile \"pinecone\" supports --transport rest, not {transport:?}"
-        )),
-        ("generic", _) => Err(format!(
-            "vector profile \"generic\" supports --transport rest, json-rpc, or grpc, not {transport:?}"
-        )),
-        other => Err(format!(
-            "unsupported vector --profile {other:?} (expected `generic`, `qdrant`, or `pinecone`)"
-        )),
-    }
-}
-
-fn configure_memcached_cache_mode(
-    loom: &mut Loom<FileStore>,
-    surface: &str,
-    profile: Option<&str>,
-    selector: &[String],
-) -> Result<bool, String> {
-    if surface != "memcached" {
-        return Ok(false);
-    }
-    let Some(mode) = profile else {
-        return Ok(false);
-    };
-    let [workspace, cache] = selector else {
-        return Err("memcached listener expects workspace and cache selectors".to_string());
-    };
-    let ns = ensure_facet_workspace(loom, workspace, FacetKind::Kv)?;
-    let config = memcached_kv_config(mode)?;
-    loom.configure_kv_map(ns, cache, config)
-        .map_err(|e| e.to_string())?;
-    Ok(true)
-}
-
-fn memcached_kv_config(mode: &str) -> Result<KvMapConfig, String> {
-    Ok(match mode {
-        "versioned" => KvMapConfig::VERSIONED,
-        "read-through" => KvMapConfig {
-            read_through: true,
-            ..KvMapConfig::EPHEMERAL
-        },
-        "write-through" => KvMapConfig {
-            write_through: true,
-            ..KvMapConfig::EPHEMERAL
-        },
-        "write-around" => KvMapConfig {
-            write_around: true,
-            ..KvMapConfig::EPHEMERAL
-        },
-        "write-behind" => KvMapConfig {
-            write_behind: true,
-            ..KvMapConfig::EPHEMERAL
-        },
-        other => {
-            return Err(format!("unsupported memcached mode {other:?}"));
-        }
-    })
-}
-
+#[cfg(all(test, feature = "integration-tests"))]
 fn validate_transport(surface: &str, transport: &str) -> Result<(), String> {
-    let spec = served_surface_spec(surface)
-        .ok_or_else(|| format!("unsupported served surface {surface:?}"))?;
-    if spec.transports.contains(&transport) {
-        Ok(())
-    } else {
-        Err(format!(
-            "transport {transport:?} is not valid for served surface {surface:?}"
-        ))
-    }
+    loom_client::serve_config::validate_transport(surface, transport)
+        .map_err(loom_client::serve_config::cli_error)
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
 fn validate_selector_shape(surface: &str, selectors: &[String]) -> Result<(), String> {
-    let spec = served_surface_spec(surface)
-        .ok_or_else(|| format!("unsupported served surface {surface:?}"))?;
-    let count = selectors.len();
-    if (spec.min_selectors..=spec.max_selectors).contains(&count) {
-        Ok(())
-    } else if spec.min_selectors == spec.max_selectors {
-        Err(format!(
-            "served surface {surface:?} expects {} selector(s), got {}",
-            spec.min_selectors, count
-        ))
-    } else {
-        Err(format!(
-            "served surface {surface:?} expects {} to {} selector(s), got {}",
-            spec.min_selectors, spec.max_selectors, count
-        ))
-    }
+    loom_client::serve_config::validate_selector_shape(surface, selectors)
+        .map_err(loom_client::serve_config::cli_error)
 }
 
 pub(crate) fn served_listener_target(record: &ServedListenerRecord) -> String {
-    let profile = record.profile.as_deref().unwrap_or("");
-    format!(
-        "id={};surface={};transport={};profile={};bind={};enabled={}",
-        record.id, record.surface, record.transport, profile, record.bind, record.enabled
-    )
-}
-
-fn served_listener_json(record: &ServedListenerRecord, seq: u64) -> String {
-    let mut out = String::new();
-    out.push('{');
-    out.push_str("\"seq\":");
-    out.push_str(&seq.to_string());
-    out.push(',');
-    out.push_str(&served_listener_record_json(record)[1..]);
-    out
-}
-
-fn served_listener_record_json(record: &ServedListenerRecord) -> String {
-    let mut out = String::new();
-    out.push('{');
-    out.push_str("\"id\":");
-    out.push_str(&json_string(&record.id));
-    out.push_str(",\"schema_version\":");
-    out.push_str(&record.schema_version.to_string());
-    out.push_str(",\"surface\":");
-    out.push_str(&json_string(&record.surface));
-    out.push_str(",\"selectors\":[");
-    for (idx, selector) in record.selectors.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&json_string(selector));
-    }
-    out.push_str("],\"transport\":");
-    out.push_str(&json_string(&record.transport));
-    out.push_str(",\"profile\":");
-    push_json_option(&mut out, record.profile.as_deref());
-    out.push_str(",\"bind\":");
-    out.push_str(&json_string(&record.bind));
-    out.push_str(",\"enabled\":");
-    out.push_str(if record.enabled { "true" } else { "false" });
-    out.push_str(",\"tls\":{\"mode\":");
-    out.push_str(&json_string(&record.tls.mode));
-    out.push_str(",\"certificate_bundle_ref\":");
-    push_json_option(&mut out, record.tls.certificate_bundle_ref.as_deref());
-    out.push('}');
-    out.push_str(",\"auth\":{\"mode\":");
-    out.push_str(&json_string(&record.auth.mode));
-    out.push('}');
-    out.push_str(",\"limits\":{\"request_size_limit\":");
-    out.push_str(&record.limits.request_size_limit.to_string());
-    out.push_str(",\"idle_timeout_ms\":");
-    out.push_str(&record.limits.idle_timeout_ms.to_string());
-    out.push_str(",\"session_timeout_ms\":");
-    out.push_str(&record.limits.session_timeout_ms.to_string());
-    out.push('}');
-    out.push_str(",\"audit\":{\"mode\":");
-    out.push_str(&json_string(&record.audit.mode));
-    out.push('}');
-    out.push_str(",\"route_scope\":");
-    out.push_str(&json_string(&record.route_scope));
-    out.push_str(",\"exposure\":");
-    out.push_str(&json_string(&record.exposure));
-    out.push_str(",\"network_access_policy_ref\":");
-    push_json_option(&mut out, record.network_access_policy_ref.as_deref());
-    out.push_str(",\"last_modified_audit_seq\":");
-    push_json_u64_option(&mut out, record.last_modified_audit_seq);
-    out.push('}');
-    out
-}
-
-fn web_listener_json(listener: &loom_substrate::web::WebListener, seq: Option<u64>) -> String {
-    let mut out = String::new();
-    out.push('{');
-    out.push_str("\"seq\":");
-    push_json_u64_option(&mut out, seq);
-    out.push_str(",\"listener\":");
-    out.push_str(&json_string(&listener.listener_id));
-    out.push_str(",\"default_workspace\":");
-    out.push_str(&json_string(&listener.default_workspace.to_string()));
-    out.push_str(",\"root_path\":");
-    out.push_str(&json_string(&listener.root_path));
-    out.push_str(",\"routes\":[");
-    for (idx, route) in listener.routes.routes.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&web_route_json(route));
-    }
-    out.push_str("]}");
-    out
-}
-
-fn web_route_json(route: &loom_substrate::web::WebRoute) -> String {
-    let mut out = String::new();
-    out.push('{');
-    out.push_str("\"route_id\":");
-    out.push_str(&json_string(&route.route_id));
-    out.push_str(",\"methods\":[");
-    for (idx, method) in route.methods.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&json_string(web_method_name(*method)));
-    }
-    out.push_str("],\"host_pattern\":");
-    push_json_option(&mut out, route.host_pattern.as_deref());
-    out.push_str(",\"path_prefix\":");
-    out.push_str(&json_string(&route.path_prefix));
-    out.push_str(",\"workspace\":");
-    match route.workspace {
-        Some(workspace) => out.push_str(&json_string(&workspace.to_string())),
-        None => out.push_str("null"),
-    }
-    out.push_str(",\"root_path\":");
-    out.push_str(&json_string(&route.root_path));
-    out.push_str(",\"mode\":");
-    out.push_str(&json_string(web_route_mode_name(route.mode)));
-    out.push('}');
-    out
-}
-
-fn web_method_name(method: loom_substrate::web::WebMethod) -> &'static str {
-    match method {
-        loom_substrate::web::WebMethod::Get => "GET",
-        loom_substrate::web::WebMethod::Head => "HEAD",
-        loom_substrate::web::WebMethod::Post => "POST",
-        loom_substrate::web::WebMethod::Put => "PUT",
-        loom_substrate::web::WebMethod::Patch => "PATCH",
-        loom_substrate::web::WebMethod::Delete => "DELETE",
-        loom_substrate::web::WebMethod::Options => "OPTIONS",
-    }
-}
-
-fn web_route_mode_name(mode: loom_substrate::web::WebRouteMode) -> &'static str {
-    match mode {
-        loom_substrate::web::WebRouteMode::StaticFile => "static-file",
-        loom_substrate::web::WebRouteMode::Presentation => "presentation",
-        loom_substrate::web::WebRouteMode::Program => "program",
-        loom_substrate::web::WebRouteMode::Redirect => "redirect",
-        loom_substrate::web::WebRouteMode::ReverseProxy => "reverse-proxy",
-        loom_substrate::web::WebRouteMode::Error => "error",
-    }
-}
-
-fn push_json_u64_option(out: &mut String, value: Option<u64>) {
-    match value {
-        Some(value) => out.push_str(&value.to_string()),
-        None => out.push_str("null"),
-    }
-}
-
-fn push_json_option(out: &mut String, value: Option<&str>) {
-    match value {
-        Some(value) => out.push_str(&json_string(value)),
-        None => out.push_str("null"),
-    }
+    loom_client::serve_config::listener_target(record)
 }
 
 #[cfg(all(test, feature = "integration-tests"))]
@@ -1694,6 +757,101 @@ mod tests {
                 .any(|action| action == "serve.web.route.remove")
         );
         let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn mu_6h_h_d_serve_commands_delegate_to_generated_contracts() {
+        let store = temp_store("serve-generated-delegation");
+        let fs = FileStore::create_with_profile(&store, Algo::Blake3).unwrap();
+        let root = WorkspaceId::v4_from_bytes([43; 16]);
+        let workspace = WorkspaceId::v4_from_bytes([44; 16]);
+        let mut loom = Loom::new(fs);
+        loom.registry_mut()
+            .create(FacetKind::Files, Some("work"), workspace)
+            .unwrap();
+        let identity = IdentityStore::new(root);
+        let mut acl = AclStore::new();
+        acl.allow(AclSubject::Principal(root), None, None, [AclRight::Admin])
+            .unwrap();
+        loom.store().save_identity_store(&identity).unwrap();
+        loom.store().save_acl_store(&acl).unwrap();
+        save_loom(&mut loom).unwrap();
+        drop(loom);
+
+        run_serve_configure(
+            ServeConfigureRequest {
+                store: store.clone(),
+                surface: "web".to_string(),
+                selector: selectors(&["work"]),
+                bind: "127.0.0.1:18082".to_string(),
+                transport: None,
+                profile: None,
+                mode: None,
+                disabled: true,
+                policy: ServePolicyArgs::default(),
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        let fs = FileStore::open_read(&store).unwrap();
+        let listener = fs.served_listeners().unwrap().remove(0);
+        drop(fs);
+
+        run_serve_list(&store, &KeyOpts::default()).unwrap();
+        run_serve_set_enabled(&store, &listener.id, true, &KeyOpts::default()).unwrap();
+        run_serve_set_enabled(&store, &listener.id, false, &KeyOpts::default()).unwrap();
+        run_serve_route_set(
+            ServeRouteSetArgs {
+                store: store.clone(),
+                listener: listener.id.clone(),
+                route: "docs".to_string(),
+                host: None,
+                prefix: "docs".to_string(),
+                workspace: None,
+                root: "site/docs".to_string(),
+            },
+            &KeyOpts::default(),
+        )
+        .unwrap();
+        run_serve_route_list(&store, &listener.id, &KeyOpts::default()).unwrap();
+        run_serve_route_remove(&store, &listener.id, "docs", &KeyOpts::default()).unwrap();
+        run_serve_remove(&store, &listener.id, &KeyOpts::default()).unwrap();
+
+        let fs = FileStore::open_read(&store).unwrap();
+        let actions = fs
+            .audit_records()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.action)
+            .collect::<Vec<_>>();
+        for action in [
+            "serve.listener.configure",
+            "serve.listener.list",
+            "serve.listener.enable",
+            "serve.listener.disable",
+            "serve.web.route.set",
+            "serve.web.route.list",
+            "serve.web.route.remove",
+            "serve.listener.remove",
+        ] {
+            assert!(actions.iter().any(|seen| seen == action), "{action}");
+        }
+        assert!(fs.served_listeners().unwrap().is_empty());
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn mu_6h_h_d_no_direct_serve_cli_mutation_paths_remain() {
+        let source = include_str!("serve_cmd.rs");
+        for forbidden in [
+            concat!("save_served", "_listener_audited"),
+            concat!("remove_served", "_listener_audited"),
+            concat!("control_set", "_audited"),
+            concat!("put_saved_state", "_served_listener"),
+            concat!("audit", "_append"),
+        ] {
+            assert!(!source.contains(forbidden), "{forbidden}");
+        }
     }
 
     #[cfg(feature = "serve")]

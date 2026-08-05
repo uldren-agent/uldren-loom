@@ -2,6 +2,7 @@
  * The same shim serves the Android and the desktop-JVM targets (identical class name).
  * Licensed under BUSL-1.1. (c) Uldren Technologies LLC. */
 #include <jni.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -329,7 +330,7 @@ Java_ai_uldren_loom_LoomNative_nativeExecCbor(JNIEnv *env, jobject thiz, jstring
     jsize req_len = (*env)->GetArrayLength(env, request);
     unsigned char *out = NULL;
     uintptr_t out_len = 0;
-    int32_t st = loom_exec_cbor(h, (const unsigned char *)req, (uintptr_t)req_len, &out, &out_len);
+    int32_t st = loom_apply_cbor(h, (const unsigned char *)req, (uintptr_t)req_len, &out, &out_len);
     (*env)->ReleaseByteArrayElements(env, request, req, JNI_ABORT);
     loom_close(h);
     if (st != 0) {
@@ -341,6 +342,962 @@ Java_ai_uldren_loom_LoomNative_nativeExecCbor(JNIEnv *env, jobject thiz, jstring
         (*env)->SetByteArrayRegion(env, r, 0, (jsize)out_len, (const jbyte *)out);
     }
     loom_bytes_free(out, out_len);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeLifecycleDefineStandardJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring kind, jstring version,
+    jstring completion_predicate_digest, jbyteArray passphrase, jbyteArray kek,
+    jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *kind_chars = (*env)->GetStringUTFChars(env, kind, NULL);
+    const char *version_chars = (*env)->GetStringUTFChars(env, version, NULL);
+    const char *digest_chars = (*env)->GetStringUTFChars(env, completion_predicate_digest, NULL);
+    char *out = NULL;
+    int32_t st = loom_lifecycle_define_standard_json(
+        h, workspace_chars, kind_chars, version_chars, digest_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    (*env)->ReleaseStringUTFChars(env, kind, kind_chars);
+    (*env)->ReleaseStringUTFChars(env, version, version_chars);
+    (*env)->ReleaseStringUTFChars(env, completion_predicate_digest, digest_chars);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeLifecycleDefineJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jbyteArray definition,
+    jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    jbyte *definition_bytes = (*env)->GetByteArrayElements(env, definition, NULL);
+    jsize definition_len = (*env)->GetArrayLength(env, definition);
+    char *out = NULL;
+    int32_t st = loom_lifecycle_define_json(
+        h, workspace_chars, (const unsigned char *)definition_bytes, (uintptr_t)definition_len, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    (*env)->ReleaseByteArrayElements(env, definition, definition_bytes, JNI_ABORT);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeLifecycleInstantiateJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring instance_id,
+    jstring definition_id, jstring subject_refs_json, jbyteArray passphrase, jbyteArray kek,
+    jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *instance_chars = (*env)->GetStringUTFChars(env, instance_id, NULL);
+    const char *definition_chars = (*env)->GetStringUTFChars(env, definition_id, NULL);
+    const char *subjects_chars = (*env)->GetStringUTFChars(env, subject_refs_json, NULL);
+    char *out = NULL;
+    int32_t st = loom_lifecycle_instantiate_json(
+        h, workspace_chars, instance_chars, definition_chars, subjects_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    (*env)->ReleaseStringUTFChars(env, instance_id, instance_chars);
+    (*env)->ReleaseStringUTFChars(env, definition_id, definition_chars);
+    (*env)->ReleaseStringUTFChars(env, subject_refs_json, subjects_chars);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeLifecycleTransitionJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring instance_id,
+    jstring transition_id, jstring to_stage_id, jstring actor_principal_id,
+    jstring gate_evaluations_json, jstring snapshot_digest, jbyteArray passphrase, jbyteArray kek,
+    jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *instance_chars = (*env)->GetStringUTFChars(env, instance_id, NULL);
+    const char *transition_chars = (*env)->GetStringUTFChars(env, transition_id, NULL);
+    const char *stage_chars = (*env)->GetStringUTFChars(env, to_stage_id, NULL);
+    const char *actor_chars =
+        actor_principal_id ? (*env)->GetStringUTFChars(env, actor_principal_id, NULL) : NULL;
+    const char *gate_chars = (*env)->GetStringUTFChars(env, gate_evaluations_json, NULL);
+    const char *snapshot_chars =
+        snapshot_digest ? (*env)->GetStringUTFChars(env, snapshot_digest, NULL) : NULL;
+    char *out = NULL;
+    int32_t st = loom_lifecycle_transition_json(
+        h, workspace_chars, instance_chars, transition_chars, stage_chars, actor_chars, gate_chars,
+        snapshot_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    (*env)->ReleaseStringUTFChars(env, instance_id, instance_chars);
+    (*env)->ReleaseStringUTFChars(env, transition_id, transition_chars);
+    (*env)->ReleaseStringUTFChars(env, to_stage_id, stage_chars);
+    if (actor_chars) (*env)->ReleaseStringUTFChars(env, actor_principal_id, actor_chars);
+    (*env)->ReleaseStringUTFChars(env, gate_evaluations_json, gate_chars);
+    if (snapshot_chars) (*env)->ReleaseStringUTFChars(env, snapshot_digest, snapshot_chars);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeRefsReconcileJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jlong max, jbyteArray passphrase,
+    jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    char *out = NULL;
+    int32_t st = loom_refs_reconcile_json(h, workspace_chars, (uint64_t)max, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+static jstring finish_store_string(JNIEnv *env, LoomSession *h, int32_t st, char *out) {
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+static jbyteArray finish_store_bytes(JNIEnv *env, LoomSession *h, int32_t st, unsigned char *out,
+                                     uintptr_t out_len) {
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jbyteArray r = (*env)->NewByteArray(env, (jsize)out_len);
+    if (r && out_len > 0) {
+        (*env)->SetByteArrayRegion(env, r, 0, (jsize)out_len, (const jbyte *)out);
+    }
+    loom_bytes_free(out, out_len);
+    return r;
+}
+
+static int parse_decimal_u64(JNIEnv *env, jstring value, uint64_t *out) {
+    if (!value) {
+        jclass ex = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
+        (*env)->ThrowNew(env, ex, "value must be an unsigned 64-bit decimal string");
+        return 0;
+    }
+    const char *text = (*env)->GetStringUTFChars(env, value, NULL);
+    if (!text) return 0;
+    int valid = text[0] != '\0' && text[0] != '+' && text[0] != '-';
+    for (const char *p = text; valid && *p != '\0'; ++p) {
+        valid = *p >= '0' && *p <= '9';
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(text, &end, 10);
+    valid = valid && errno != ERANGE && end && *end == '\0';
+    (*env)->ReleaseStringUTFChars(env, value, text);
+    if (!valid) {
+        jclass ex = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
+        (*env)->ThrowNew(env, ex, "value must be an unsigned 64-bit decimal string");
+        return 0;
+    }
+    *out = (uint64_t)parsed;
+    return 1;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeStudioReindexJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring profile,
+    jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *profile_chars = (*env)->GetStringUTFChars(env, profile, NULL);
+    char *out = NULL;
+    int32_t st = loom_studio_reindex_json(h, workspace_chars, profile_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    (*env)->ReleaseStringUTFChars(env, profile, profile_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeStudioRevisionsRebuildJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring profile, jboolean dry_run,
+    jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *profile_chars = (*env)->GetStringUTFChars(env, profile, NULL);
+    char *out = NULL;
+    int32_t st =
+        loom_studio_revisions_rebuild_json(h, workspace_chars, profile_chars, dry_run ? 1 : 0, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    (*env)->ReleaseStringUTFChars(env, profile, profile_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_LoomNative_nativeStoreBundleImport(
+    JNIEnv *env, jobject thiz, jstring path, jbyteArray bundle, jboolean dry_run,
+    jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    jbyte *bundle_bytes = (*env)->GetByteArrayElements(env, bundle, NULL);
+    jsize bundle_len = (*env)->GetArrayLength(env, bundle);
+    unsigned char *out = NULL;
+    uintptr_t out_len = 0;
+    int32_t st = loom_store_bundle_import(h, (const unsigned char *)bundle_bytes,
+                                          (uintptr_t)bundle_len, dry_run ? 1 : 0, &out, &out_len);
+    (*env)->ReleaseByteArrayElements(env, bundle, bundle_bytes, JNI_ABORT);
+    return finish_store_bytes(env, h, st, out, out_len);
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_LoomNative_nativeAuditCompact(
+    JNIEnv *env, jobject thiz, jstring path, jlong through_seq, jbyteArray passphrase,
+    jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    if (through_seq < 0) {
+        jclass ex = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
+        (*env)->ThrowNew(env, ex, "throughSeq must be non-negative");
+        return NULL;
+    }
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    unsigned char *out = NULL;
+    uintptr_t out_len = 0;
+    int32_t st = loom_audit_compact(h, (uint64_t)through_seq, &out, &out_len);
+    return finish_store_bytes(env, h, st, out, out_len);
+}
+
+#define STORE_MAINTENANCE_BYTES(java_name, c_name, arg_name) \
+JNIEXPORT jbyteArray JNICALL \
+Java_ai_uldren_loom_LoomNative_##java_name( \
+    JNIEnv *env, jobject thiz, jstring path, jbyteArray arg_name, jbyteArray passphrase, \
+    jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) { \
+    (void)thiz; \
+    LoomSession *h = \
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase); \
+    if (!h) return NULL; \
+    jbyte *input = (*env)->GetByteArrayElements(env, arg_name, NULL); \
+    jsize input_len = (*env)->GetArrayLength(env, arg_name); \
+    unsigned char *out = NULL; \
+    uintptr_t out_len = 0; \
+    int32_t st = c_name(h, (const unsigned char *)input, (uintptr_t)input_len, &out, &out_len); \
+    (*env)->ReleaseByteArrayElements(env, arg_name, input, JNI_ABORT); \
+    return finish_store_bytes(env, h, st, out, out_len); \
+}
+
+STORE_MAINTENANCE_BYTES(nativeStoreMaintenanceStatus, loom_store_maintenance_status, request)
+STORE_MAINTENANCE_BYTES(nativeStoreMaintenancePolicySet, loom_store_maintenance_policy_set, update)
+STORE_MAINTENANCE_BYTES(nativeStoreMaintenanceRun, loom_store_maintenance_run, request)
+
+#undef STORE_MAINTENANCE_BYTES
+
+JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_LoomNative_nativeImportTableCsv(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring source_scope,
+    jbyteArray csv_payload, jstring database, jstring table, jstring schema, jstring primary_key,
+    jstring mode, jboolean commit, jstring author, jstring message, jboolean dry_run,
+    jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *scope_chars = (*env)->GetStringUTFChars(env, source_scope, NULL);
+    jbyte *payload = (*env)->GetByteArrayElements(env, csv_payload, NULL);
+    jsize payload_len = (*env)->GetArrayLength(env, csv_payload);
+    const char *database_chars = (*env)->GetStringUTFChars(env, database, NULL);
+    const char *table_chars = (*env)->GetStringUTFChars(env, table, NULL);
+    const char *schema_chars = (*env)->GetStringUTFChars(env, schema, NULL);
+    const char *primary_key_chars = (*env)->GetStringUTFChars(env, primary_key, NULL);
+    const char *mode_chars = (*env)->GetStringUTFChars(env, mode, NULL);
+    const char *author_chars = author ? (*env)->GetStringUTFChars(env, author, NULL) : NULL;
+    const char *message_chars = message ? (*env)->GetStringUTFChars(env, message, NULL) : NULL;
+    unsigned char *out = NULL;
+    uintptr_t out_len = 0;
+    int32_t st = loom_import_table_csv(
+        h, workspace_chars, scope_chars, (const unsigned char *)payload, (uintptr_t)payload_len,
+        database_chars, table_chars, schema_chars, primary_key_chars, mode_chars, commit ? 1 : 0,
+        author_chars, message_chars, dry_run ? 1 : 0, &out, &out_len);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    (*env)->ReleaseStringUTFChars(env, source_scope, scope_chars);
+    (*env)->ReleaseByteArrayElements(env, csv_payload, payload, JNI_ABORT);
+    (*env)->ReleaseStringUTFChars(env, database, database_chars);
+    (*env)->ReleaseStringUTFChars(env, table, table_chars);
+    (*env)->ReleaseStringUTFChars(env, schema, schema_chars);
+    (*env)->ReleaseStringUTFChars(env, primary_key, primary_key_chars);
+    (*env)->ReleaseStringUTFChars(env, mode, mode_chars);
+    if (author_chars) (*env)->ReleaseStringUTFChars(env, author, author_chars);
+    if (message_chars) (*env)->ReleaseStringUTFChars(env, message, message_chars);
+    return finish_store_bytes(env, h, st, out, out_len);
+}
+
+#define TICKET_IMPORT_JNI(java_name, c_name) \
+JNIEXPORT jbyteArray JNICALL \
+Java_ai_uldren_loom_LoomNative_##java_name( \
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring profile, \
+    jstring source_scope, jbyteArray snapshot_payload, jstring field_policy, jboolean dry_run, \
+    jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) { \
+    (void)thiz; \
+    LoomSession *h = \
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase); \
+    if (!h) return NULL; \
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL); \
+    const char *profile_chars = (*env)->GetStringUTFChars(env, profile, NULL); \
+    const char *scope_chars = (*env)->GetStringUTFChars(env, source_scope, NULL); \
+    jbyte *payload = (*env)->GetByteArrayElements(env, snapshot_payload, NULL); \
+    jsize payload_len = (*env)->GetArrayLength(env, snapshot_payload); \
+    const char *policy_chars = (*env)->GetStringUTFChars(env, field_policy, NULL); \
+    unsigned char *out = NULL; \
+    uintptr_t out_len = 0; \
+    int32_t st = c_name(h, workspace_chars, profile_chars, scope_chars, \
+                        (const unsigned char *)payload, (uintptr_t)payload_len, \
+                        policy_chars, dry_run ? 1 : 0, &out, &out_len); \
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars); \
+    (*env)->ReleaseStringUTFChars(env, profile, profile_chars); \
+    (*env)->ReleaseStringUTFChars(env, source_scope, scope_chars); \
+    (*env)->ReleaseByteArrayElements(env, snapshot_payload, payload, JNI_ABORT); \
+    (*env)->ReleaseStringUTFChars(env, field_policy, policy_chars); \
+    return finish_store_bytes(env, h, st, out, out_len); \
+}
+
+TICKET_IMPORT_JNI(nativeImportRedmine, loom_import_redmine)
+TICKET_IMPORT_JNI(nativeImportAsana, loom_import_asana)
+TICKET_IMPORT_JNI(nativeImportJira, loom_import_jira)
+
+#undef TICKET_IMPORT_JNI
+
+#define STRING_PAYLOAD_IMPORT_JNI(java_name, c_name, payload_name, text_name) \
+JNIEXPORT jbyteArray JNICALL \
+Java_ai_uldren_loom_LoomNative_##java_name( \
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring profile, \
+    jstring source_scope, jbyteArray payload_name, jstring text_name, jboolean dry_run, \
+    jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) { \
+    (void)thiz; \
+    LoomSession *h = \
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase); \
+    if (!h) return NULL; \
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL); \
+    const char *profile_chars = (*env)->GetStringUTFChars(env, profile, NULL); \
+    const char *scope_chars = (*env)->GetStringUTFChars(env, source_scope, NULL); \
+    jbyte *payload = (*env)->GetByteArrayElements(env, payload_name, NULL); \
+    jsize payload_len = (*env)->GetArrayLength(env, payload_name); \
+    const char *text_chars = (*env)->GetStringUTFChars(env, text_name, NULL); \
+    unsigned char *out = NULL; \
+    uintptr_t out_len = 0; \
+    int32_t st = c_name(h, workspace_chars, profile_chars, scope_chars, \
+                        (const unsigned char *)payload, (uintptr_t)payload_len, \
+                        text_chars, dry_run ? 1 : 0, &out, &out_len); \
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars); \
+    (*env)->ReleaseStringUTFChars(env, profile, profile_chars); \
+    (*env)->ReleaseStringUTFChars(env, source_scope, scope_chars); \
+    (*env)->ReleaseByteArrayElements(env, payload_name, payload, JNI_ABORT); \
+    (*env)->ReleaseStringUTFChars(env, text_name, text_chars); \
+    return finish_store_bytes(env, h, st, out, out_len); \
+}
+
+STRING_PAYLOAD_IMPORT_JNI(nativeImportConfluence, loom_import_confluence, snapshot_payload, default_space)
+STRING_PAYLOAD_IMPORT_JNI(nativeImportMarkdown, loom_import_markdown, archive_payload, space)
+STRING_PAYLOAD_IMPORT_JNI(nativeImportNotion, loom_import_notion, snapshot_payload, default_space)
+
+#undef STRING_PAYLOAD_IMPORT_JNI
+
+#define SIMPLE_IMPORT_JNI(java_name, c_name, payload_name) \
+JNIEXPORT jbyteArray JNICALL \
+Java_ai_uldren_loom_LoomNative_##java_name( \
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring profile, \
+    jstring source_scope, jbyteArray payload_name, jboolean dry_run, jbyteArray passphrase, \
+    jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) { \
+    (void)thiz; \
+    LoomSession *h = \
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase); \
+    if (!h) return NULL; \
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL); \
+    const char *profile_chars = (*env)->GetStringUTFChars(env, profile, NULL); \
+    const char *scope_chars = (*env)->GetStringUTFChars(env, source_scope, NULL); \
+    jbyte *payload = (*env)->GetByteArrayElements(env, payload_name, NULL); \
+    jsize payload_len = (*env)->GetArrayLength(env, payload_name); \
+    unsigned char *out = NULL; \
+    uintptr_t out_len = 0; \
+    int32_t st = c_name(h, workspace_chars, profile_chars, scope_chars, \
+                        (const unsigned char *)payload, (uintptr_t)payload_len, \
+                        dry_run ? 1 : 0, &out, &out_len); \
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars); \
+    (*env)->ReleaseStringUTFChars(env, profile, profile_chars); \
+    (*env)->ReleaseStringUTFChars(env, source_scope, scope_chars); \
+    (*env)->ReleaseByteArrayElements(env, payload_name, payload, JNI_ABORT); \
+    return finish_store_bytes(env, h, st, out, out_len); \
+}
+
+SIMPLE_IMPORT_JNI(nativeImportSlack, loom_import_slack, snapshot_payload)
+SIMPLE_IMPORT_JNI(nativeImportDrive, loom_import_drive, archive_payload)
+
+#undef SIMPLE_IMPORT_JNI
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeInferenceInstanceCreateJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring name, jstring model,
+    jstring kind, jstring runtime, jstring preset, jstring settings_json, jbyteArray passphrase,
+    jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *name_chars = (*env)->GetStringUTFChars(env, name, NULL);
+    const char *model_chars = (*env)->GetStringUTFChars(env, model, NULL);
+    const char *kind_chars = (*env)->GetStringUTFChars(env, kind, NULL);
+    const char *runtime_chars = (*env)->GetStringUTFChars(env, runtime, NULL);
+    const char *preset_chars = preset ? (*env)->GetStringUTFChars(env, preset, NULL) : NULL;
+    const char *settings_chars =
+        settings_json ? (*env)->GetStringUTFChars(env, settings_json, NULL) : NULL;
+    char *out = NULL;
+    int32_t st = loom_inference_instance_create_json(
+        h, workspace_chars, name_chars, model_chars, kind_chars, runtime_chars, preset_chars,
+        settings_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    (*env)->ReleaseStringUTFChars(env, name, name_chars);
+    (*env)->ReleaseStringUTFChars(env, model, model_chars);
+    (*env)->ReleaseStringUTFChars(env, kind, kind_chars);
+    (*env)->ReleaseStringUTFChars(env, runtime, runtime_chars);
+    if (preset_chars) (*env)->ReleaseStringUTFChars(env, preset, preset_chars);
+    if (settings_chars) (*env)->ReleaseStringUTFChars(env, settings_json, settings_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeInferenceInstanceUpdateJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring name, jstring preset,
+    jstring settings_json, jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
+    jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *name_chars = (*env)->GetStringUTFChars(env, name, NULL);
+    const char *preset_chars = preset ? (*env)->GetStringUTFChars(env, preset, NULL) : NULL;
+    const char *settings_chars =
+        settings_json ? (*env)->GetStringUTFChars(env, settings_json, NULL) : NULL;
+    char *out = NULL;
+    int32_t st = loom_inference_instance_update_json(
+        h, workspace_chars, name_chars, preset_chars, settings_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    (*env)->ReleaseStringUTFChars(env, name, name_chars);
+    if (preset_chars) (*env)->ReleaseStringUTFChars(env, preset, preset_chars);
+    if (settings_chars) (*env)->ReleaseStringUTFChars(env, settings_json, settings_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeInferenceInstanceDeleteJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring name,
+    jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *workspace_chars = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *name_chars = (*env)->GetStringUTFChars(env, name, NULL);
+    char *out = NULL;
+    int32_t st = loom_inference_instance_delete_json(h, workspace_chars, name_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, workspace_chars);
+    (*env)->ReleaseStringUTFChars(env, name, name_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeServeListenerConfigureJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring request_json, jbyteArray passphrase,
+    jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *request_chars = (*env)->GetStringUTFChars(env, request_json, NULL);
+    char *out = NULL;
+    int32_t st = loom_serve_listener_configure_json(h, request_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, request_json, request_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeServeListenerListJson(
+    JNIEnv *env, jobject thiz, jstring path, jbyteArray passphrase, jbyteArray kek,
+    jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    char *out = NULL;
+    int32_t st = loom_serve_listener_list_json(h, &out);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeServeListenerSetEnabledJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring listener_id, jboolean enabled,
+    jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *listener_chars = (*env)->GetStringUTFChars(env, listener_id, NULL);
+    char *out = NULL;
+    int32_t st = loom_serve_listener_set_enabled_json(h, listener_chars, enabled ? 1 : 0, &out);
+    (*env)->ReleaseStringUTFChars(env, listener_id, listener_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeServeListenerRemoveJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring listener_id, jbyteArray passphrase,
+    jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *listener_chars = (*env)->GetStringUTFChars(env, listener_id, NULL);
+    char *out = NULL;
+    int32_t st = loom_serve_listener_remove_json(h, listener_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, listener_id, listener_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeServeWebRouteListJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring listener_id, jbyteArray passphrase,
+    jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *listener_chars = (*env)->GetStringUTFChars(env, listener_id, NULL);
+    char *out = NULL;
+    int32_t st = loom_serve_web_route_list_json(h, listener_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, listener_id, listener_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeServeWebRouteSetJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring request_json, jbyteArray passphrase,
+    jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *request_chars = (*env)->GetStringUTFChars(env, request_json, NULL);
+    char *out = NULL;
+    int32_t st = loom_serve_web_route_set_json(h, request_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, request_json, request_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeServeWebRouteRemoveJson(
+    JNIEnv *env, jobject thiz, jstring path, jstring listener_id, jstring route_id,
+    jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h =
+        open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *listener_chars = (*env)->GetStringUTFChars(env, listener_id, NULL);
+    const char *route_chars = (*env)->GetStringUTFChars(env, route_id, NULL);
+    char *out = NULL;
+    int32_t st = loom_serve_web_route_remove_json(h, listener_chars, route_chars, &out);
+    (*env)->ReleaseStringUTFChars(env, listener_id, listener_chars);
+    (*env)->ReleaseStringUTFChars(env, route_id, route_chars);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeAuditConfigShowJson(JNIEnv *env, jobject thiz, jstring path,
+                                                   jbyteArray passphrase, jbyteArray kek,
+                                                   jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    char *out = NULL;
+    int32_t st = loom_audit_config_show_json(h, &out);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeAuditConfigSetJson(JNIEnv *env, jobject thiz, jstring path,
+                                                  jint retention_days, jboolean has_retention_days,
+                                                  jboolean legal_hold, jboolean has_legal_hold,
+                                                  jbyteArray passphrase, jbyteArray kek,
+                                                  jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    char *out = NULL;
+    int32_t st = loom_audit_config_set_json(h, retention_days, has_retention_days ? 1 : 0,
+                                            legal_hold ? 1 : 0, has_legal_hold ? 1 : 0, &out);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeAuditListJson(JNIEnv *env, jobject thiz, jstring path,
+                                             jbyteArray passphrase, jbyteArray kek,
+                                             jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    char *out = NULL;
+    int32_t st = loom_audit_list_json(h, &out);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeAuditViewJson(JNIEnv *env, jobject thiz, jstring path,
+                                             jstring record, jbyteArray passphrase, jbyteArray kek,
+                                             jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *r0 = (*env)->GetStringUTFChars(env, record, NULL);
+    char *out = NULL;
+    int32_t st = loom_audit_view_json(h, r0, &out);
+    (*env)->ReleaseStringUTFChars(env, record, r0);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeCertificateListJson(JNIEnv *env, jobject thiz, jstring path,
+                                                   jbyteArray passphrase, jbyteArray kek,
+                                                   jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    char *out = NULL;
+    int32_t st = loom_certificate_list_json(h, &out);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeCertificateImportJson(JNIEnv *env, jobject thiz, jstring path,
+                                                     jstring name, jbyteArray cert_chain_pem,
+                                                     jbyteArray private_key_pem,
+                                                     jbyteArray trust_bundle_pem, jboolean force,
+                                                     jbyteArray passphrase, jbyteArray kek,
+                                                     jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    jbyte *cert = (*env)->GetByteArrayElements(env, cert_chain_pem, NULL);
+    jbyte *key = (*env)->GetByteArrayElements(env, private_key_pem, NULL);
+    jbyte *trust = trust_bundle_pem ? (*env)->GetByteArrayElements(env, trust_bundle_pem, NULL) : NULL;
+    jsize cert_len = (*env)->GetArrayLength(env, cert_chain_pem);
+    jsize key_len = (*env)->GetArrayLength(env, private_key_pem);
+    jsize trust_len = trust_bundle_pem ? (*env)->GetArrayLength(env, trust_bundle_pem) : 0;
+    char *out = NULL;
+    int32_t st = loom_certificate_import_json(h, n, (const unsigned char *)cert, (uintptr_t)cert_len,
+                                              (const unsigned char *)key, (uintptr_t)key_len,
+                                              (const unsigned char *)trust, (uintptr_t)trust_len,
+                                              force ? 1 : 0, &out);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    (*env)->ReleaseByteArrayElements(env, cert_chain_pem, cert, JNI_ABORT);
+    (*env)->ReleaseByteArrayElements(env, private_key_pem, key, JNI_ABORT);
+    if (trust_bundle_pem) (*env)->ReleaseByteArrayElements(env, trust_bundle_pem, trust, JNI_ABORT);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_LoomNative_nativeCertificateExport(JNIEnv *env, jobject thiz, jstring path,
+                                                 jstring name, jboolean include_cert_chain,
+                                                 jboolean include_private_key,
+                                                 jboolean include_trust_bundle, jboolean force,
+                                                 jbyteArray passphrase, jbyteArray kek,
+                                                 jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    unsigned char *out = NULL;
+    uintptr_t out_len = 0;
+    int32_t st = loom_certificate_export(h, n, include_cert_chain ? 1 : 0, include_private_key ? 1 : 0,
+                                         include_trust_bundle ? 1 : 0, force ? 1 : 0, &out, &out_len);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jbyteArray r = (*env)->NewByteArray(env, (jsize)out_len);
+    if (r && out_len > 0) {
+        (*env)->SetByteArrayRegion(env, r, 0, (jsize)out_len, (const jbyte *)out);
+    }
+    loom_bytes_free(out, out_len);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeCertificateGenerateSelfSignedJson(JNIEnv *env, jobject thiz,
+                                                                 jstring path, jstring name,
+                                                                 jstring dns_names_json,
+                                                                 jstring ip_addresses_json,
+                                                                 jstring cn, jint days,
+                                                                 jstring algorithm, jboolean force,
+                                                                 jbyteArray passphrase, jbyteArray kek,
+                                                                 jstring auth_principal,
+                                                                 jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    const char *dns = (*env)->GetStringUTFChars(env, dns_names_json, NULL);
+    const char *ips = (*env)->GetStringUTFChars(env, ip_addresses_json, NULL);
+    const char *cn0 = cn ? (*env)->GetStringUTFChars(env, cn, NULL) : NULL;
+    const char *alg = (*env)->GetStringUTFChars(env, algorithm, NULL);
+    char *out = NULL;
+    int32_t st = loom_certificate_generate_self_signed_json(h, n, dns, ips, cn0, (uint32_t)days,
+                                                            alg, force ? 1 : 0, &out);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    (*env)->ReleaseStringUTFChars(env, dns_names_json, dns);
+    (*env)->ReleaseStringUTFChars(env, ip_addresses_json, ips);
+    if (cn) (*env)->ReleaseStringUTFChars(env, cn, cn0);
+    (*env)->ReleaseStringUTFChars(env, algorithm, alg);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeCertificateRemoveJson(JNIEnv *env, jobject thiz, jstring path,
+                                                     jstring name, jbyteArray passphrase,
+                                                     jbyteArray kek, jstring auth_principal,
+                                                     jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    char *out = NULL;
+    int32_t st = loom_certificate_remove_json(h, n, &out);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeCertificateAuditJson(JNIEnv *env, jobject thiz, jstring path,
+                                                    jstring name, jbyteArray passphrase,
+                                                    jbyteArray kek, jstring auth_principal,
+                                                    jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    char *out = NULL;
+    int32_t st = loom_certificate_audit_json(h, n, &out);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeNetworkAccessListJson(JNIEnv *env, jobject thiz, jstring path,
+                                                     jbyteArray passphrase, jbyteArray kek,
+                                                     jstring auth_principal,
+                                                     jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    char *out = NULL;
+    int32_t st = loom_network_access_list_json(h, &out);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeNetworkAccessSetJson(JNIEnv *env, jobject thiz, jstring path,
+                                                    jstring name, jstring description,
+                                                    jstring default_action, jstring rules_json,
+                                                    jbyteArray passphrase, jbyteArray kek,
+                                                    jstring auth_principal,
+                                                    jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    const char *d = description ? (*env)->GetStringUTFChars(env, description, NULL) : NULL;
+    const char *a = (*env)->GetStringUTFChars(env, default_action, NULL);
+    const char *rules = (*env)->GetStringUTFChars(env, rules_json, NULL);
+    char *out = NULL;
+    int32_t st = loom_network_access_set_json(h, n, d, a, rules, &out);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    if (description) (*env)->ReleaseStringUTFChars(env, description, d);
+    (*env)->ReleaseStringUTFChars(env, default_action, a);
+    (*env)->ReleaseStringUTFChars(env, rules_json, rules);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeNetworkAccessRemoveJson(JNIEnv *env, jobject thiz,
+                                                       jstring path, jstring name,
+                                                       jbyteArray passphrase, jbyteArray kek,
+                                                       jstring auth_principal,
+                                                       jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    char *out = NULL;
+    int32_t st = loom_network_access_remove_json(h, n, &out);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return r;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeNetworkAccessAuditJson(JNIEnv *env, jobject thiz,
+                                                      jstring path, jstring name,
+                                                      jbyteArray passphrase, jbyteArray kek,
+                                                      jstring auth_principal,
+                                                      jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    char *out = NULL;
+    int32_t st = loom_network_access_audit_json(h, n, &out);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring r = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
     return r;
 }
 
@@ -653,6 +1610,143 @@ Java_ai_uldren_loom_LoomNative_nativeIdentityRevokePublicKey(JNIEnv *env, jobjec
     if (st != 0) {
         throw_loom(env);
     }
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeIdentityForceDetachAuthorityJson(JNIEnv *env, jobject thiz,
+                                                                 jstring path, jstring principal,
+                                                                 jlong generation, jstring reason,
+                                                                 jbyteArray passphrase,
+                                                                 jbyteArray kek,
+                                                                 jstring auth_principal,
+                                                                 jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_store_handle(env, path, passphrase, kek);
+    if (!h) return NULL;
+    const char *p = (*env)->GetStringUTFChars(env, principal, NULL);
+    const char *r = (*env)->GetStringUTFChars(env, reason, NULL);
+    char *out = NULL;
+    int32_t st = authenticate_handle(env, h, auth_principal, auth_passphrase);
+    if (st == 0) {
+        st = loom_identity_force_detach_authority_json(h, p, (uint64_t)generation, r, &out);
+    }
+    (*env)->ReleaseStringUTFChars(env, principal, p);
+    (*env)->ReleaseStringUTFChars(env, reason, r);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring result = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return result;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeIdentityReplicateAuthorityJson(JNIEnv *env, jobject thiz,
+                                                               jstring path, jstring source,
+                                                               jboolean become_authority,
+                                                               jbyteArray passphrase,
+                                                               jbyteArray kek,
+                                                               jstring auth_principal,
+                                                               jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_store_handle(env, path, passphrase, kek);
+    if (!h) return NULL;
+    const char *s = (*env)->GetStringUTFChars(env, source, NULL);
+    char *out = NULL;
+    int32_t st = authenticate_handle(env, h, auth_principal, auth_passphrase);
+    if (st == 0) {
+        st = loom_identity_replicate_authority_json(h, s, become_authority ? 1 : 0, &out);
+    }
+    (*env)->ReleaseStringUTFChars(env, source, s);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring result = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return result;
+}
+
+static uint64_t nullable_long_value(JNIEnv *env, jobject value, int32_t *present) {
+    if (value == NULL) {
+        *present = 0;
+        return 0;
+    }
+    jclass cls = (*env)->FindClass(env, "java/lang/Long");
+    jmethodID method = (*env)->GetMethodID(env, cls, "longValue", "()J");
+    *present = 1;
+    return (uint64_t)(*env)->CallLongMethod(env, value, method);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeIdentityConfigureAuthorityReplicationJson(JNIEnv *env, jobject thiz,
+                                                                         jstring path,
+                                                                         jstring id,
+                                                                         jstring source,
+                                                                         jboolean disabled,
+                                                                         jboolean pull_on_start,
+                                                                         jobject interval_ms,
+                                                                         jlong jitter_ms,
+                                                                         jlong backoff_ms,
+                                                                         jboolean publish_witness,
+                                                                         jbyteArray passphrase,
+                                                                         jbyteArray kek,
+                                                                         jstring auth_principal,
+                                                                         jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_store_handle(env, path, passphrase, kek);
+    if (!h) return NULL;
+    const char *i = (*env)->GetStringUTFChars(env, id, NULL);
+    const char *s = (*env)->GetStringUTFChars(env, source, NULL);
+    int32_t interval_present = 0;
+    uint64_t interval = nullable_long_value(env, interval_ms, &interval_present);
+    char *out = NULL;
+    int32_t st = authenticate_handle(env, h, auth_principal, auth_passphrase);
+    if (st == 0) {
+        st = loom_identity_configure_authority_replication_json(
+            h, i, s, disabled ? 1 : 0, pull_on_start ? 1 : 0, interval, interval_present,
+            (uint64_t)jitter_ms, (uint64_t)backoff_ms, publish_witness ? 1 : 0, &out);
+    }
+    (*env)->ReleaseStringUTFChars(env, id, i);
+    (*env)->ReleaseStringUTFChars(env, source, s);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring result = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return result;
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeIdentityRemoveAuthorityReplicationJson(JNIEnv *env, jobject thiz,
+                                                                       jstring path, jstring id,
+                                                                       jbyteArray passphrase,
+                                                                       jbyteArray kek,
+                                                                       jstring auth_principal,
+                                                                       jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_store_handle(env, path, passphrase, kek);
+    if (!h) return NULL;
+    const char *i = (*env)->GetStringUTFChars(env, id, NULL);
+    char *out = NULL;
+    int32_t st = authenticate_handle(env, h, auth_principal, auth_passphrase);
+    if (st == 0) {
+        st = loom_identity_remove_authority_replication_json(h, i, &out);
+    }
+    (*env)->ReleaseStringUTFChars(env, id, i);
+    loom_close(h);
+    if (st != 0) {
+        throw_loom(env);
+        return NULL;
+    }
+    jstring result = (*env)->NewStringUTF(env, out ? out : "");
+    if (out) loom_string_free(out);
+    return result;
 }
 
 JNIEXPORT jstring JNICALL
@@ -1282,6 +2376,26 @@ Java_ai_uldren_loom_LoomNative_nativeSqlReadTable(JNIEnv *env, jobject thiz, jst
         return NULL;
     }
     return owned_bytes(env, ptr, len);
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_LoomNative_nativeSqlExecResult(JNIEnv *env, jobject thiz, jstring path, jstring workspace,
+                                             jstring db, jstring sql, jbyteArray passphrase,
+                                             jbyteArray kek, jstring auth_principal,
+                                             jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *w = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *d = (*env)->GetStringUTFChars(env, db, NULL);
+    const char *q = (*env)->GetStringUTFChars(env, sql, NULL);
+    unsigned char *ptr = NULL;
+    uintptr_t len = 0;
+    int32_t st = loom_sql_exec_result(h, w, d, q, &ptr, &len);
+    (*env)->ReleaseStringUTFChars(env, workspace, w);
+    (*env)->ReleaseStringUTFChars(env, db, d);
+    (*env)->ReleaseStringUTFChars(env, sql, q);
+    return finish_store_bytes(env, h, st, ptr, len);
 }
 
 JNIEXPORT jbyteArray JNICALL
@@ -1975,13 +3089,13 @@ Java_ai_uldren_loom_LoomNative_nativeTicketsProjectRekeyJson(
 JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeTicketsProjectSettingsGetJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring ticket_workspace_id,
-        jstring project_id, jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
-        jbyteArray auth_passphrase) {
+        jstring project_id, jboolean include_contracts, jbyteArray passphrase, jbyteArray kek,
+        jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     TICKETS_OPEN();
     const char *project = (*env)->GetStringUTFChars(env, project_id, NULL);
     char *out = NULL;
-    int32_t st = loom_tickets_project_settings_get_json(h, n, tw, project, &out);
+    int32_t st = loom_tickets_project_settings_get_json(h, n, tw, project, include_contracts, &out);
     TICKETS_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, project_id, project);
     return drive_string_result(env, h, st, out);
@@ -1993,7 +3107,12 @@ Java_ai_uldren_loom_LoomNative_nativeTicketsProjectSettingsSetJson(
         jstring project_id, jstring default_projection, jstring enable_projections_json,
         jstring disable_projections_json, jstring actor_enforcement,
         jstring project_owner_principal, jboolean clear_project_owner_principal,
-        jstring acceptance_authorities_json, jstring expected_root, jbyteArray passphrase,
+        jstring acceptance_authorities_json, jboolean acceptance_evidence_enforcement,
+        jboolean has_acceptance_evidence_enforcement,
+        jstring required_acceptance_evidence_keys_json,
+        jstring required_acceptance_reviews_json, jstring owner_contract_summary,
+        jstring owner_contract_details, jstring worker_contract_summary,
+        jstring worker_contract_details, jstring expected_root, jbyteArray passphrase,
         jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     TICKETS_OPEN();
@@ -2004,11 +3123,20 @@ Java_ai_uldren_loom_LoomNative_nativeTicketsProjectSettingsSetJson(
     const char *actor = actor_enforcement ? (*env)->GetStringUTFChars(env, actor_enforcement, NULL) : NULL;
     const char *owner = project_owner_principal ? (*env)->GetStringUTFChars(env, project_owner_principal, NULL) : NULL;
     const char *authorities = acceptance_authorities_json ? (*env)->GetStringUTFChars(env, acceptance_authorities_json, NULL) : NULL;
+    const char *required_keys = required_acceptance_evidence_keys_json ? (*env)->GetStringUTFChars(env, required_acceptance_evidence_keys_json, NULL) : NULL;
+    const char *required_reviews = required_acceptance_reviews_json ? (*env)->GetStringUTFChars(env, required_acceptance_reviews_json, NULL) : NULL;
+    const char *owner_summary = owner_contract_summary ? (*env)->GetStringUTFChars(env, owner_contract_summary, NULL) : NULL;
+    const char *owner_details = owner_contract_details ? (*env)->GetStringUTFChars(env, owner_contract_details, NULL) : NULL;
+    const char *worker_summary = worker_contract_summary ? (*env)->GetStringUTFChars(env, worker_contract_summary, NULL) : NULL;
+    const char *worker_details = worker_contract_details ? (*env)->GetStringUTFChars(env, worker_contract_details, NULL) : NULL;
     const char *root = (*env)->GetStringUTFChars(env, expected_root, NULL);
     char *out = NULL;
     int32_t st = loom_tickets_project_settings_set_json(
             h, n, tw, project, def, enable, disable, actor, owner,
-            clear_project_owner_principal, authorities, root, &out);
+            clear_project_owner_principal, authorities, acceptance_evidence_enforcement,
+            has_acceptance_evidence_enforcement, required_keys,
+            required_reviews, owner_summary, owner_details,
+            worker_summary, worker_details, root, &out);
     TICKETS_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, project_id, project);
     if (def) (*env)->ReleaseStringUTFChars(env, default_projection, def);
@@ -2017,6 +3145,12 @@ Java_ai_uldren_loom_LoomNative_nativeTicketsProjectSettingsSetJson(
     if (actor) (*env)->ReleaseStringUTFChars(env, actor_enforcement, actor);
     if (owner) (*env)->ReleaseStringUTFChars(env, project_owner_principal, owner);
     if (authorities) (*env)->ReleaseStringUTFChars(env, acceptance_authorities_json, authorities);
+    if (required_keys) (*env)->ReleaseStringUTFChars(env, required_acceptance_evidence_keys_json, required_keys);
+    if (required_reviews) (*env)->ReleaseStringUTFChars(env, required_acceptance_reviews_json, required_reviews);
+    if (owner_summary) (*env)->ReleaseStringUTFChars(env, owner_contract_summary, owner_summary);
+    if (owner_details) (*env)->ReleaseStringUTFChars(env, owner_contract_details, owner_details);
+    if (worker_summary) (*env)->ReleaseStringUTFChars(env, worker_contract_summary, worker_summary);
+    if (worker_details) (*env)->ReleaseStringUTFChars(env, worker_contract_details, worker_details);
     (*env)->ReleaseStringUTFChars(env, expected_root, root);
     return drive_string_result(env, h, st, out);
 }
@@ -2755,24 +3889,22 @@ Java_ai_uldren_loom_LoomNative_nativeLanesUpdate(
 JNIEXPORT jbyteArray JNICALL
 Java_ai_uldren_loom_LoomNative_nativeLanesTicketAdd(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring lane_id, jstring ticket_id,
-        jstring updated_by, jstring placement, jstring anchor, jbyteArray passphrase,
+        jstring updated_by, jint placement, jstring anchor, jbyteArray passphrase,
         jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     LANES_OPEN();
     const char *lane = (*env)->GetStringUTFChars(env, lane_id, NULL);
     const char *ticket = (*env)->GetStringUTFChars(env, ticket_id, NULL);
     const char *actor = (*env)->GetStringUTFChars(env, updated_by, NULL);
-    const char *place = optional_jstring_chars(env, placement);
     const char *anchor_chars = optional_jstring_chars(env, anchor);
     unsigned char *ptr = NULL;
     uintptr_t len = 0;
     int32_t st =
-        loom_lanes_ticket_add_cbor(h, n, lane, ticket, actor, place, anchor_chars, &ptr, &len);
+        loom_lanes_ticket_add_cbor(h, n, lane, ticket, actor, placement, anchor_chars, &ptr, &len);
     LANES_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, lane_id, lane);
     (*env)->ReleaseStringUTFChars(env, ticket_id, ticket);
     (*env)->ReleaseStringUTFChars(env, updated_by, actor);
-    release_optional_jstring_chars(env, placement, place);
     release_optional_jstring_chars(env, anchor, anchor_chars);
     return drive_bytes_result(env, h, st, ptr, len);
 }
@@ -2801,36 +3933,40 @@ static uint64_t chat_parse_u64(JNIEnv *env, jstring value) {
 JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatCreateChannelJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
-        jstring channel_id, jstring channel_handle, jstring name, jbyteArray passphrase,
-        jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+        jstring channel_id, jstring channel_handle, jstring name, jstring expected_entity_tag,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
     const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
     const char *handle = (*env)->GetStringUTFChars(env, channel_handle, NULL);
     const char *nm = (*env)->GetStringUTFChars(env, name, NULL);
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_create_channel_json(h, n, cw, channel, handle, nm, &out);
+    int32_t st = loom_chat_create_channel_json(h, n, cw, channel, handle, nm, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, channel_handle, handle);
     (*env)->ReleaseStringUTFChars(env, name, nm);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
 JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatRenameChannelJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
-        jstring selector, jstring channel_handle, jbyteArray passphrase, jbyteArray kek,
-        jstring auth_principal, jbyteArray auth_passphrase) {
+        jstring selector, jstring channel_handle, jstring expected_entity_tag,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
     const char *sel = (*env)->GetStringUTFChars(env, selector, NULL);
     const char *handle = (*env)->GetStringUTFChars(env, channel_handle, NULL);
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_rename_channel_json(h, n, cw, sel, handle, &out);
+    int32_t st = loom_chat_rename_channel_json(h, n, cw, sel, handle, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, selector, sel);
     (*env)->ReleaseStringUTFChars(env, channel_handle, handle);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
@@ -2851,7 +3987,7 @@ JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatPostMessageJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
         jstring channel_id, jstring message_id, jstring thread_id, jstring body_text,
-        jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
+        jstring expected_entity_tag, jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
         jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
@@ -2859,70 +3995,130 @@ Java_ai_uldren_loom_LoomNative_nativeChatPostMessageJson(
     const char *message = (*env)->GetStringUTFChars(env, message_id, NULL);
     const char *thread = thread_id ? (*env)->GetStringUTFChars(env, thread_id, NULL) : NULL;
     const char *body = (*env)->GetStringUTFChars(env, body_text, NULL);
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_post_message_json(h, n, cw, channel, message, thread, body, &out);
+    int32_t st = loom_chat_post_message_json(h, n, cw, channel, message, thread, body, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, message_id, message);
     if (thread) (*env)->ReleaseStringUTFChars(env, thread_id, thread);
     (*env)->ReleaseStringUTFChars(env, body_text, body);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
+    return drive_string_result(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeChatPostMessageBytesJson(
+        JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
+        jstring channel_id, jstring message_id, jstring thread_id, jbyteArray body_bytes,
+        jstring expected_entity_tag, jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
+        jbyteArray auth_passphrase) {
+    (void)thiz;
+    CHAT_OPEN();
+    const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
+    const char *message = (*env)->GetStringUTFChars(env, message_id, NULL);
+    const char *thread = thread_id ? (*env)->GetStringUTFChars(env, thread_id, NULL) : NULL;
+    jbyte *body = body_bytes ? (*env)->GetByteArrayElements(env, body_bytes, NULL) : NULL;
+    jsize body_len = body_bytes ? (*env)->GetArrayLength(env, body_bytes) : 0;
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
+    char *out = NULL;
+    int32_t st = loom_chat_post_message_bytes_json(h, n, cw, channel, message, thread,
+                                                   (const unsigned char *)body, (uintptr_t)body_len,
+                                                   expected, &out);
+    CHAT_RELEASE_NS();
+    (*env)->ReleaseStringUTFChars(env, channel_id, channel);
+    (*env)->ReleaseStringUTFChars(env, message_id, message);
+    if (thread) (*env)->ReleaseStringUTFChars(env, thread_id, thread);
+    if (body) (*env)->ReleaseByteArrayElements(env, body_bytes, body, JNI_ABORT);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
 JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatEditMessageJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
-        jstring channel_id, jstring message_id, jstring body_text, jbyteArray passphrase,
-        jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+        jstring channel_id, jstring message_id, jstring body_text, jstring expected_entity_tag,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
     const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
     const char *message = (*env)->GetStringUTFChars(env, message_id, NULL);
     const char *body = (*env)->GetStringUTFChars(env, body_text, NULL);
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_edit_message_json(h, n, cw, channel, message, body, &out);
+    int32_t st = loom_chat_edit_message_json(h, n, cw, channel, message, body, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, message_id, message);
     (*env)->ReleaseStringUTFChars(env, body_text, body);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
+    return drive_string_result(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeChatEditMessageBytesJson(
+        JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
+        jstring channel_id, jstring message_id, jbyteArray body_bytes, jstring expected_entity_tag,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    CHAT_OPEN();
+    const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
+    const char *message = (*env)->GetStringUTFChars(env, message_id, NULL);
+    jbyte *body = body_bytes ? (*env)->GetByteArrayElements(env, body_bytes, NULL) : NULL;
+    jsize body_len = body_bytes ? (*env)->GetArrayLength(env, body_bytes) : 0;
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
+    char *out = NULL;
+    int32_t st = loom_chat_edit_message_bytes_json(h, n, cw, channel, message,
+                                                   (const unsigned char *)body, (uintptr_t)body_len,
+                                                   expected, &out);
+    CHAT_RELEASE_NS();
+    (*env)->ReleaseStringUTFChars(env, channel_id, channel);
+    (*env)->ReleaseStringUTFChars(env, message_id, message);
+    if (body) (*env)->ReleaseByteArrayElements(env, body_bytes, body, JNI_ABORT);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
 JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatRedactMessageJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
-        jstring channel_id, jstring message_id, jstring reason, jbyteArray passphrase,
-        jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+        jstring channel_id, jstring message_id, jstring reason, jstring expected_entity_tag,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
     const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
     const char *message = (*env)->GetStringUTFChars(env, message_id, NULL);
     const char *why = reason ? (*env)->GetStringUTFChars(env, reason, NULL) : NULL;
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_redact_message_json(h, n, cw, channel, message, why, &out);
+    int32_t st = loom_chat_redact_message_json(h, n, cw, channel, message, why, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, message_id, message);
     if (why) (*env)->ReleaseStringUTFChars(env, reason, why);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
 JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatCreateThreadJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
-        jstring channel_id, jstring thread_id, jstring parent_message_id, jbyteArray passphrase,
-        jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+        jstring channel_id, jstring thread_id, jstring parent_message_id,
+        jstring expected_entity_tag, jbyteArray passphrase, jbyteArray kek,
+        jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
     const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
     const char *thread = (*env)->GetStringUTFChars(env, thread_id, NULL);
     const char *parent = (*env)->GetStringUTFChars(env, parent_message_id, NULL);
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_create_thread_json(h, n, cw, channel, thread, parent, &out);
+    int32_t st = loom_chat_create_thread_json(h, n, cw, channel, thread, parent, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, thread_id, thread);
     (*env)->ReleaseStringUTFChars(env, parent_message_id, parent);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
@@ -2930,7 +4126,7 @@ JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatCreateTaskJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
         jstring channel_id, jstring task_id, jstring message_id, jstring title,
-        jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
+        jstring expected_entity_tag, jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
         jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
@@ -2938,13 +4134,15 @@ Java_ai_uldren_loom_LoomNative_nativeChatCreateTaskJson(
     const char *task = (*env)->GetStringUTFChars(env, task_id, NULL);
     const char *message = (*env)->GetStringUTFChars(env, message_id, NULL);
     const char *ttl = (*env)->GetStringUTFChars(env, title, NULL);
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_create_task_json(h, n, cw, channel, task, message, ttl, &out);
+    int32_t st = loom_chat_create_task_json(h, n, cw, channel, task, message, ttl, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, task_id, task);
     (*env)->ReleaseStringUTFChars(env, message_id, message);
     (*env)->ReleaseStringUTFChars(env, title, ttl);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
@@ -2952,7 +4150,7 @@ JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatClaimTaskJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
         jstring channel_id, jstring task_id, jstring claim_id, jstring lease_token,
-        jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
+        jstring expected_entity_tag, jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
         jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
@@ -2960,13 +4158,15 @@ Java_ai_uldren_loom_LoomNative_nativeChatClaimTaskJson(
     const char *task = (*env)->GetStringUTFChars(env, task_id, NULL);
     const char *claim = (*env)->GetStringUTFChars(env, claim_id, NULL);
     const char *lease = lease_token ? (*env)->GetStringUTFChars(env, lease_token, NULL) : NULL;
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_claim_task_json(h, n, cw, channel, task, claim, lease, &out);
+    int32_t st = loom_chat_claim_task_json(h, n, cw, channel, task, claim, lease, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, task_id, task);
     (*env)->ReleaseStringUTFChars(env, claim_id, claim);
     if (lease) (*env)->ReleaseStringUTFChars(env, lease_token, lease);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
@@ -2974,7 +4174,7 @@ JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatCompleteTaskJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
         jstring channel_id, jstring task_id, jstring claim_id, jstring result_message_id,
-        jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
+        jstring expected_entity_tag, jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
         jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
@@ -2982,13 +4182,15 @@ Java_ai_uldren_loom_LoomNative_nativeChatCompleteTaskJson(
     const char *task = (*env)->GetStringUTFChars(env, task_id, NULL);
     const char *claim = (*env)->GetStringUTFChars(env, claim_id, NULL);
     const char *result = result_message_id ? (*env)->GetStringUTFChars(env, result_message_id, NULL) : NULL;
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_complete_task_json(h, n, cw, channel, task, claim, result, &out);
+    int32_t st = loom_chat_complete_task_json(h, n, cw, channel, task, claim, result, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, task_id, task);
     (*env)->ReleaseStringUTFChars(env, claim_id, claim);
     if (result) (*env)->ReleaseStringUTFChars(env, result_message_id, result);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
@@ -2996,8 +4198,8 @@ JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatInvokeAgentJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
         jstring channel_id, jstring invocation_id, jstring agent_principal,
-        jstring source_message_ids_json, jstring prompt_text, jbyteArray passphrase,
-        jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+        jstring source_message_ids_json, jstring prompt_text, jstring expected_entity_tag,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
     const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
@@ -3005,33 +4207,66 @@ Java_ai_uldren_loom_LoomNative_nativeChatInvokeAgentJson(
     const char *agent = (*env)->GetStringUTFChars(env, agent_principal, NULL);
     const char *sources = (*env)->GetStringUTFChars(env, source_message_ids_json, NULL);
     const char *prompt = (*env)->GetStringUTFChars(env, prompt_text, NULL);
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_invoke_agent_json(h, n, cw, channel, invocation, agent, sources, prompt, &out);
+    int32_t st = loom_chat_invoke_agent_json(h, n, cw, channel, invocation, agent, sources, prompt, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, invocation_id, invocation);
     (*env)->ReleaseStringUTFChars(env, agent_principal, agent);
     (*env)->ReleaseStringUTFChars(env, source_message_ids_json, sources);
     (*env)->ReleaseStringUTFChars(env, prompt_text, prompt);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
+    return drive_string_result(env, h, st, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeChatInvokeAgentBytesJson(
+        JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
+        jstring channel_id, jstring invocation_id, jstring agent_principal,
+        jstring source_message_ids_json, jbyteArray prompt_bytes, jstring expected_entity_tag,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+    (void)thiz;
+    CHAT_OPEN();
+    const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
+    const char *invocation = (*env)->GetStringUTFChars(env, invocation_id, NULL);
+    const char *agent = (*env)->GetStringUTFChars(env, agent_principal, NULL);
+    const char *sources = (*env)->GetStringUTFChars(env, source_message_ids_json, NULL);
+    jbyte *prompt = prompt_bytes ? (*env)->GetByteArrayElements(env, prompt_bytes, NULL) : NULL;
+    jsize prompt_len = prompt_bytes ? (*env)->GetArrayLength(env, prompt_bytes) : 0;
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
+    char *out = NULL;
+    int32_t st = loom_chat_invoke_agent_bytes_json(h, n, cw, channel, invocation, agent, sources,
+                                                   (const unsigned char *)prompt,
+                                                   (uintptr_t)prompt_len, expected, &out);
+    CHAT_RELEASE_NS();
+    (*env)->ReleaseStringUTFChars(env, channel_id, channel);
+    (*env)->ReleaseStringUTFChars(env, invocation_id, invocation);
+    (*env)->ReleaseStringUTFChars(env, agent_principal, agent);
+    (*env)->ReleaseStringUTFChars(env, source_message_ids_json, sources);
+    if (prompt) (*env)->ReleaseByteArrayElements(env, prompt_bytes, prompt, JNI_ABORT);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
 JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatAgentReplyJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
-        jstring channel_id, jstring invocation_id, jstring message_id, jbyteArray passphrase,
-        jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
+        jstring channel_id, jstring invocation_id, jstring message_id, jstring expected_entity_tag,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
     const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
     const char *invocation = (*env)->GetStringUTFChars(env, invocation_id, NULL);
     const char *message = (*env)->GetStringUTFChars(env, message_id, NULL);
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_agent_reply_json(h, n, cw, channel, invocation, message, &out);
+    int32_t st = loom_chat_agent_reply_json(h, n, cw, channel, invocation, message, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, invocation_id, invocation);
     (*env)->ReleaseStringUTFChars(env, message_id, message);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
@@ -3039,8 +4274,8 @@ JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatRequestHandoffJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
         jstring channel_id, jstring handoff_id, jstring from_agent_principal,
-        jstring to_principal, jstring reason, jbyteArray passphrase, jbyteArray kek,
-        jstring auth_principal, jbyteArray auth_passphrase) {
+        jstring to_principal, jstring reason, jstring expected_entity_tag, jbyteArray passphrase,
+        jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
     const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
@@ -3048,14 +4283,16 @@ Java_ai_uldren_loom_LoomNative_nativeChatRequestHandoffJson(
     const char *from = (*env)->GetStringUTFChars(env, from_agent_principal, NULL);
     const char *to = to_principal ? (*env)->GetStringUTFChars(env, to_principal, NULL) : NULL;
     const char *why = reason ? (*env)->GetStringUTFChars(env, reason, NULL) : NULL;
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_request_handoff_json(h, n, cw, channel, handoff, from, to, why, &out);
+    int32_t st = loom_chat_request_handoff_json(h, n, cw, channel, handoff, from, to, why, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
     (*env)->ReleaseStringUTFChars(env, handoff_id, handoff);
     (*env)->ReleaseStringUTFChars(env, from_agent_principal, from);
     if (to) (*env)->ReleaseStringUTFChars(env, to_principal, to);
     if (why) (*env)->ReleaseStringUTFChars(env, reason, why);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
@@ -3063,19 +4300,21 @@ Java_ai_uldren_loom_LoomNative_nativeChatRequestHandoffJson(
 JNIEXPORT jstring JNICALL \
 Java_ai_uldren_loom_LoomNative_##name( \
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id, \
-        jstring channel_id, jstring message_id, jstring kind, jbyteArray passphrase, \
-        jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) { \
+        jstring channel_id, jstring message_id, jstring kind, jstring expected_entity_tag, \
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal, jbyteArray auth_passphrase) { \
     (void)thiz; \
     CHAT_OPEN(); \
     const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL); \
     const char *message = (*env)->GetStringUTFChars(env, message_id, NULL); \
     const char *kd = (*env)->GetStringUTFChars(env, kind, NULL); \
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL; \
     char *out = NULL; \
-    int32_t st = c_name(h, n, cw, channel, message, kd, &out); \
+    int32_t st = c_name(h, n, cw, channel, message, kd, expected, &out); \
     CHAT_RELEASE_NS(); \
     (*env)->ReleaseStringUTFChars(env, channel_id, channel); \
     (*env)->ReleaseStringUTFChars(env, message_id, message); \
     (*env)->ReleaseStringUTFChars(env, kind, kd); \
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected); \
     return drive_string_result(env, h, st, out); \
 }
 
@@ -3099,15 +4338,17 @@ Java_ai_uldren_loom_LoomNative_nativeChatEmojiListJson(
 JNIEXPORT jstring JNICALL \
 Java_ai_uldren_loom_LoomNative_##name( \
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id, \
-        jstring kind, jbyteArray passphrase, jbyteArray kek, jstring auth_principal, \
+        jstring kind, jstring expected_entity_tag, jbyteArray passphrase, jbyteArray kek, jstring auth_principal, \
         jbyteArray auth_passphrase) { \
     (void)thiz; \
     CHAT_OPEN(); \
     const char *kd = (*env)->GetStringUTFChars(env, kind, NULL); \
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL; \
     char *out = NULL; \
-    int32_t st = c_name(h, n, cw, kd, &out); \
+    int32_t st = c_name(h, n, cw, kd, expected, &out); \
     CHAT_RELEASE_NS(); \
     (*env)->ReleaseStringUTFChars(env, kind, kd); \
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected); \
     return drive_string_result(env, h, st, out); \
 }
 
@@ -3136,16 +4377,19 @@ CHAT_CHANNEL_FUNC(nativeChatCursorJson, loom_chat_cursor_json)
 JNIEXPORT jstring JNICALL
 Java_ai_uldren_loom_LoomNative_nativeChatUpdateCursorJson(
         JNIEnv *env, jobject thiz, jstring path, jstring ns, jstring chat_workspace_id,
-        jstring channel_id, jstring next_sequence, jbyteArray passphrase, jbyteArray kek,
-        jstring auth_principal, jbyteArray auth_passphrase) {
+        jstring channel_id, jstring next_sequence, jstring expected_entity_tag,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
+        jbyteArray auth_passphrase) {
     (void)thiz;
     CHAT_OPEN();
     const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
     uint64_t next = chat_parse_u64(env, next_sequence);
+    const char *expected = expected_entity_tag ? (*env)->GetStringUTFChars(env, expected_entity_tag, NULL) : NULL;
     char *out = NULL;
-    int32_t st = loom_chat_update_cursor_json(h, n, cw, channel, next, &out);
+    int32_t st = loom_chat_update_cursor_json(h, n, cw, channel, next, expected, &out);
     CHAT_RELEASE_NS();
     (*env)->ReleaseStringUTFChars(env, channel_id, channel);
+    if (expected) (*env)->ReleaseStringUTFChars(env, expected_entity_tag, expected);
     return drive_string_result(env, h, st, out);
 }
 
@@ -3158,7 +4402,7 @@ Java_ai_uldren_loom_LoomNative_nativeChatFetchEventsJson(
     CHAT_OPEN();
     const char *channel = (*env)->GetStringUTFChars(env, channel_id, NULL);
     uint64_t from = chat_parse_u64(env, from_sequence);
-    uintptr_t limit = (uintptr_t)chat_parse_u64(env, max);
+    uint64_t limit = chat_parse_u64(env, max);
     char *out = NULL;
     int32_t st = loom_chat_fetch_events_json(h, n, cw, channel, from, limit, &out);
     CHAT_RELEASE_NS();
@@ -3177,19 +4421,24 @@ Java_ai_uldren_loom_LoomNative_nativeChatFetchEventsJson(
 
 JNIEXPORT jbyteArray JNICALL
 Java_ai_uldren_loom_LoomNative_nativeFsImport(JNIEnv *env, jobject thiz, jstring path,
-                                        jstring ns, jstring src_path, jboolean commit,
-                                        jboolean dry_run, jbyteArray passphrase, jbyteArray kek,
+                                        jstring ns, jstring src_path, jstring author,
+                                        jstring message, jboolean commit, jboolean dry_run,
+                                        jbyteArray passphrase, jbyteArray kek,
                                         jstring auth_principal, jbyteArray auth_passphrase) {
     (void)thiz;
     LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
     if (!h) return NULL;
     const char *n = (*env)->GetStringUTFChars(env, ns, NULL);
     const char *src = (*env)->GetStringUTFChars(env, src_path, NULL);
+    const char *a = optional_utf(env, author);
+    const char *m = optional_utf(env, message);
     unsigned char *ptr = NULL;
     uintptr_t len = 0;
-    int32_t st = loom_fs_import(h, n, src, commit ? 1 : 0, dry_run ? 1 : 0, &ptr, &len);
+    int32_t st = loom_fs_import(h, n, src, a, m, commit ? 1 : 0, dry_run ? 1 : 0, &ptr, &len);
     (*env)->ReleaseStringUTFChars(env, ns, n);
     (*env)->ReleaseStringUTFChars(env, src_path, src);
+    release_optional_utf(env, author, a);
+    release_optional_utf(env, message, m);
     loom_close(h);
     if (st != 0) {
         throw_loom(env);
@@ -3226,8 +4475,9 @@ Java_ai_uldren_loom_LoomNative_nativeFsExport(JNIEnv *env, jobject thiz, jstring
 JNIEXPORT jbyteArray JNICALL
 Java_ai_uldren_loom_LoomNative_nativeArchiveImport(JNIEnv *env, jobject thiz, jstring path,
                                              jstring ns, jstring src_path, jstring kind,
-                                             jboolean dry_run, jbyteArray passphrase,
-                                             jbyteArray kek, jstring auth_principal,
+                                             jstring gzip_output_path, jboolean commit,
+                                             jstring author, jstring message, jboolean dry_run,
+                                             jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
                                              jbyteArray auth_passphrase) {
     (void)thiz;
     LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
@@ -3235,12 +4485,18 @@ Java_ai_uldren_loom_LoomNative_nativeArchiveImport(JNIEnv *env, jobject thiz, js
     const char *n = (*env)->GetStringUTFChars(env, ns, NULL);
     const char *src = (*env)->GetStringUTFChars(env, src_path, NULL);
     const char *k = (*env)->GetStringUTFChars(env, kind, NULL);
+    const char *gzip = optional_utf(env, gzip_output_path);
+    const char *a = optional_utf(env, author);
+    const char *m = optional_utf(env, message);
     unsigned char *ptr = NULL;
     uintptr_t len = 0;
-    int32_t st = loom_archive_import(h, n, src, k, dry_run ? 1 : 0, &ptr, &len);
+    int32_t st = loom_archive_import(h, n, src, k, gzip, commit ? 1 : 0, a, m, dry_run ? 1 : 0, &ptr, &len);
     (*env)->ReleaseStringUTFChars(env, ns, n);
     (*env)->ReleaseStringUTFChars(env, src_path, src);
     (*env)->ReleaseStringUTFChars(env, kind, k);
+    release_optional_utf(env, gzip_output_path, gzip);
+    release_optional_utf(env, author, a);
+    release_optional_utf(env, message, m);
     loom_close(h);
     if (st != 0) {
         throw_loom(env);
@@ -6335,6 +7591,40 @@ Java_ai_uldren_loom_LoomNative_nativeVectorUpsertSource(JNIEnv *env, jobject thi
 }
 
 JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_LoomNative_nativeVectorTextUpsert(JNIEnv *env, jobject thiz, jstring path,
+                                                jbyteArray request, jbyteArray passphrase,
+                                                jbyteArray kek, jstring auth_principal,
+                                                jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    jsize rlen = request ? (*env)->GetArrayLength(env, request) : 0;
+    jbyte *r = request ? (*env)->GetByteArrayElements(env, request, NULL) : NULL;
+    unsigned char *ptr = NULL;
+    uintptr_t len = 0;
+    int32_t st = loom_vector_text_upsert(h, (const unsigned char *)r, (uintptr_t)rlen, &ptr, &len);
+    if (r) (*env)->ReleaseByteArrayElements(env, request, r, JNI_ABORT);
+    return finish_store_bytes(env, h, st, ptr, len);
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_LoomNative_nativeVectorWorkspaceConfigureJson(
+        JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring request_json,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
+        jbyteArray auth_passphrase) {
+    (void)thiz;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *w = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *r = (*env)->GetStringUTFChars(env, request_json, NULL);
+    char *out = NULL;
+    int32_t st = loom_vector_workspace_configure_json(h, w, r, &out);
+    (*env)->ReleaseStringUTFChars(env, workspace, w);
+    (*env)->ReleaseStringUTFChars(env, request_json, r);
+    return finish_store_string(env, h, st, out);
+}
+
+JNIEXPORT jbyteArray JNICALL
 Java_ai_uldren_loom_LoomNative_nativeVectorGet(JNIEnv *env, jobject thiz, jstring path, jstring ns,
                                          jstring name, jstring id, jbyteArray passphrase,
                                          jbyteArray kek, jstring auth_principal,
@@ -6640,6 +7930,57 @@ Java_ai_uldren_loom_LoomNative_nativeColumnarAppend(JNIEnv *env, jobject thiz, j
     if (r) (*env)->ReleaseByteArrayElements(env, row, r, JNI_ABORT);
     loom_close(h);
     if (st != 0) throw_loom(env);
+}
+
+static jbyteArray columnar_import_bytes(JNIEnv *env, jstring path, jstring workspace, jstring name,
+                                        jbyteArray payload, jstring target_segment_rows,
+                                        jboolean replace, jboolean dry_run, jbyteArray passphrase,
+                                        jbyteArray kek, jstring auth_principal,
+                                        jbyteArray auth_passphrase,
+                                        int32_t (*import_fn)(LoomSession *, const char *,
+                                                             const char *, const unsigned char *,
+                                                             uintptr_t, uint64_t, int32_t, int32_t,
+                                                             unsigned char **, uintptr_t *)) {
+    uint64_t rows = 0;
+    if (!parse_decimal_u64(env, target_segment_rows, &rows)) return NULL;
+    LoomSession *h = open_authenticated_store_handle(env, path, passphrase, kek, auth_principal, auth_passphrase);
+    if (!h) return NULL;
+    const char *w = (*env)->GetStringUTFChars(env, workspace, NULL);
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    jsize plen = payload ? (*env)->GetArrayLength(env, payload) : 0;
+    jbyte *p = payload ? (*env)->GetByteArrayElements(env, payload, NULL) : NULL;
+    unsigned char *ptr = NULL;
+    uintptr_t len = 0;
+    int32_t st = import_fn(h, w, n, (const unsigned char *)p, (uintptr_t)plen, rows,
+                           replace ? 1 : 0, dry_run ? 1 : 0, &ptr, &len);
+    (*env)->ReleaseStringUTFChars(env, workspace, w);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    if (p) (*env)->ReleaseByteArrayElements(env, payload, p, JNI_ABORT);
+    return finish_store_bytes(env, h, st, ptr, len);
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_LoomNative_nativeColumnarImportArrow(
+        JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring name,
+        jbyteArray payload, jstring target_segment_rows, jboolean replace, jboolean dry_run,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
+        jbyteArray auth_passphrase) {
+    (void)thiz;
+    return columnar_import_bytes(env, path, workspace, name, payload, target_segment_rows,
+                                 replace, dry_run, passphrase, kek, auth_principal,
+                                 auth_passphrase, loom_columnar_import_arrow);
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_ai_uldren_loom_LoomNative_nativeColumnarImportParquet(
+        JNIEnv *env, jobject thiz, jstring path, jstring workspace, jstring name,
+        jbyteArray payload, jstring target_segment_rows, jboolean replace, jboolean dry_run,
+        jbyteArray passphrase, jbyteArray kek, jstring auth_principal,
+        jbyteArray auth_passphrase) {
+    (void)thiz;
+    return columnar_import_bytes(env, path, workspace, name, payload, target_segment_rows,
+                                 replace, dry_run, passphrase, kek, auth_principal,
+                                 auth_passphrase, loom_columnar_import_parquet);
 }
 
 JNIEXPORT jbyteArray JNICALL

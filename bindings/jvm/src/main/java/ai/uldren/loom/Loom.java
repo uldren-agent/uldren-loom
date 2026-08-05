@@ -195,9 +195,104 @@ public final class Loom {
             LOOKUP.find("loom_identity_revoke_public_key").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
 
+    static final MethodHandle LOOM_IDENTITY_FORCE_DETACH_AUTHORITY_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_identity_force_detach_authority_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IDENTITY_REPLICATE_AUTHORITY_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_identity_replicate_authority_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IDENTITY_CONFIGURE_AUTHORITY_REPLICATION_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_identity_configure_authority_replication_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG,
+                    ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IDENTITY_REMOVE_AUTHORITY_REPLICATION_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_identity_remove_authority_replication_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
     static final MethodHandle LOOM_ACL_LIST_JSON = LINKER.downcallHandle(
             LOOKUP.find("loom_acl_list_json").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_AUDIT_CONFIG_SHOW_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_audit_config_show_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_AUDIT_CONFIG_SET_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_audit_config_set_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_AUDIT_LIST_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_audit_list_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_AUDIT_VIEW_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_audit_view_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_CERTIFICATE_LIST_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_certificate_list_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_CERTIFICATE_IMPORT_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_certificate_import_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_CERTIFICATE_EXPORT = LINKER.downcallHandle(
+            LOOKUP.find("loom_certificate_export").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_CERTIFICATE_GENERATE_SELF_SIGNED_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_certificate_generate_self_signed_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_CERTIFICATE_REMOVE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_certificate_remove_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_CERTIFICATE_AUDIT_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_certificate_audit_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_NETWORK_ACCESS_LIST_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_network_access_list_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_NETWORK_ACCESS_SET_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_network_access_set_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_NETWORK_ACCESS_REMOVE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_network_access_remove_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_NETWORK_ACCESS_AUDIT_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_network_access_audit_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
 
     static final MethodHandle LOOM_ACL_GRANT = LINKER.downcallHandle(
             LOOKUP.find("loom_acl_grant").orElseThrow(),
@@ -402,6 +497,216 @@ public final class Loom {
             LOOKUP.find("loom_exec_cbor").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_APPLY_CBOR = LINKER.downcallHandle(
+            LOOKUP.find("loom_apply_cbor").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_LIFECYCLE_DEFINE_STANDARD_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_lifecycle_define_standard_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_LIFECYCLE_DEFINE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_lifecycle_define_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_LIFECYCLE_INSTANTIATE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_lifecycle_instantiate_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_LIFECYCLE_TRANSITION_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_lifecycle_transition_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_REFS_RECONCILE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_refs_reconcile_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_STUDIO_REINDEX_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_studio_reindex_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_STUDIO_REVISIONS_REBUILD_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_studio_revisions_rebuild_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_STORE_BUNDLE_IMPORT = LINKER.downcallHandle(
+            LOOKUP.find("loom_store_bundle_import").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_AUDIT_COMPACT = LINKER.downcallHandle(
+            LOOKUP.find("loom_audit_compact").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_STORE_MAINTENANCE_STATUS = LINKER.downcallHandle(
+            LOOKUP.find("loom_store_maintenance_status").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_STORE_MAINTENANCE_POLICY_SET = LINKER.downcallHandle(
+            LOOKUP.find("loom_store_maintenance_policy_set").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_STORE_MAINTENANCE_RUN = LINKER.downcallHandle(
+            LOOKUP.find("loom_store_maintenance_run").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IMPORT_TABLE_CSV = LINKER.downcallHandle(
+            LOOKUP.find("loom_import_table_csv").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IMPORT_REDMINE = LINKER.downcallHandle(
+            LOOKUP.find("loom_import_redmine").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IMPORT_ASANA = LINKER.downcallHandle(
+            LOOKUP.find("loom_import_asana").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IMPORT_JIRA = LINKER.downcallHandle(
+            LOOKUP.find("loom_import_jira").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IMPORT_CONFLUENCE = LINKER.downcallHandle(
+            LOOKUP.find("loom_import_confluence").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IMPORT_SLACK = LINKER.downcallHandle(
+            LOOKUP.find("loom_import_slack").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IMPORT_DRIVE = LINKER.downcallHandle(
+            LOOKUP.find("loom_import_drive").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IMPORT_MARKDOWN = LINKER.downcallHandle(
+            LOOKUP.find("loom_import_markdown").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_IMPORT_NOTION = LINKER.downcallHandle(
+            LOOKUP.find("loom_import_notion").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_COLUMNAR_IMPORT_ARROW = LINKER.downcallHandle(
+            LOOKUP.find("loom_columnar_import_arrow").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                    ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_COLUMNAR_IMPORT_PARQUET = LINKER.downcallHandle(
+            LOOKUP.find("loom_columnar_import_parquet").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                    ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_VECTOR_TEXT_UPSERT = LINKER.downcallHandle(
+            LOOKUP.find("loom_vector_text_upsert").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_VECTOR_WORKSPACE_CONFIGURE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_vector_workspace_configure_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_SQL_EXEC_RESULT = LINKER.downcallHandle(
+            LOOKUP.find("loom_sql_exec_result").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_INFERENCE_INSTANCE_CREATE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_inference_instance_create_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_INFERENCE_INSTANCE_UPDATE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_inference_instance_update_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_INFERENCE_INSTANCE_DELETE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_inference_instance_delete_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_SERVE_LISTENER_CONFIGURE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_serve_listener_configure_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_SERVE_LISTENER_LIST_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_serve_listener_list_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_SERVE_LISTENER_SET_ENABLED_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_serve_listener_set_enabled_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_SERVE_LISTENER_REMOVE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_serve_listener_remove_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_SERVE_WEB_ROUTE_LIST_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_serve_web_route_list_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_SERVE_WEB_ROUTE_SET_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_serve_web_route_set_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+
+    static final MethodHandle LOOM_SERVE_WEB_ROUTE_REMOVE_JSON = LINKER.downcallHandle(
+            LOOKUP.find("loom_serve_web_route_remove_json").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
 
     static final MethodHandle LOOM_CAS_PUT = LINKER.downcallHandle(
             LOOKUP.find("loom_cas_put").orElseThrow(),
@@ -1511,27 +1816,35 @@ public final class Loom {
         return execCbor(path, request, null, null);
     }
 
-    public static byte[] execCbor(String path, byte[] request, String passphrase) {
+    public static byte[] applyCbor(String path, byte[] request, String passphrase) {
         byte[] pass = passphrase != null
                 ? passphrase.getBytes(java.nio.charset.StandardCharsets.UTF_8)
                 : null;
-        return execCbor(path, request, pass, null);
+        return applyCbor(path, request, pass, null);
     }
 
-    public static byte[] execCbor(String path, byte[] request, byte[] passphrase, byte[] kek) {
-        return onHandle(path, passphrase, kek, "loom_exec_cbor", (arena, handle) -> {
+    public static byte[] applyCbor(String path, byte[] request, byte[] passphrase, byte[] kek) {
+        return onHandle(path, passphrase, kek, "loom_apply_cbor", (arena, handle) -> {
             MemorySegment req = arena.allocate(Math.max(request.length, 1));
             MemorySegment.copy(request, 0, req, ValueLayout.JAVA_BYTE, 0, request.length);
             MemorySegment outPtr = arena.allocate(ValueLayout.ADDRESS);
             MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
-            int status = (int) LOOM_EXEC_CBOR.invokeExact(
+            int status = (int) LOOM_APPLY_CBOR.invokeExact(
                     handle, req, (long) request.length, outPtr, outLen);
             if (status != 0) {
-                throw lastError("loom_exec_cbor");
+                throw lastError("loom_apply_cbor");
             }
             return takeOwnedBytes(outPtr.get(ValueLayout.ADDRESS, 0),
                     outLen.get(ValueLayout.JAVA_LONG, 0));
         });
+    }
+
+    public static byte[] execCbor(String path, byte[] request, String passphrase) {
+        return applyCbor(path, request, passphrase);
+    }
+
+    public static byte[] execCbor(String path, byte[] request, byte[] passphrase, byte[] kek) {
+        return applyCbor(path, request, passphrase, kek);
     }
 
     public static String daemonStatusJson(String path) {
@@ -1908,6 +2221,24 @@ public final class Loom {
         return out.get(ValueLayout.ADDRESS, 0);
     }
 
+    static MemorySegment openAuthenticatedHandle(Arena arena, String path, byte[] passphrase, byte[] kek,
+            String authPrincipal, String authPassphrase) throws Throwable {
+        MemorySegment handle = openHandle(arena, path, passphrase, kek);
+        if (authPrincipal != null) {
+            byte[] authPass = authPassphrase != null
+                    ? authPassphrase.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                    : null;
+            int status = (int) LOOM_AUTHENTICATE_PASSPHRASE.invokeExact(
+                    handle, arena.allocateFrom(authPrincipal), bytesOrNull(arena, authPass),
+                    (long) (authPass != null ? authPass.length : 0));
+            if (status != 0) {
+                LOOM_CLOSE.invokeExact(handle);
+                throw lastError("loom_authenticate_passphrase");
+            }
+        }
+        return handle;
+    }
+
 
     /** Copy an owned (ptr, len) result buffer into a byte[] and free the native buffer. */
     static byte[] takeOwnedBytes(MemorySegment ptr, long len) throws Throwable {
@@ -1949,6 +2280,209 @@ public final class Loom {
         } catch (Throwable t) {
             throw new RuntimeException(op + " failed", t);
         }
+    }
+
+    static <T> T onAuthenticatedHandle(String path, byte[] passphrase, byte[] kek,
+            String authPrincipal, String authPassphrase, String op, HandleOp<T> body) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment handle = openAuthenticatedHandle(arena, path, passphrase, kek,
+                    authPrincipal, authPassphrase);
+            try {
+                return body.run(arena, handle);
+            } finally {
+                LOOM_CLOSE.invokeExact(handle);
+            }
+        } catch (LoomException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new RuntimeException(op + " failed", t);
+        }
+    }
+
+    public static String auditConfigShowJson(String path, byte[] passphrase, byte[] kek,
+            String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_audit_config_show_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_AUDIT_CONFIG_SHOW_JSON.invokeExact(handle, out);
+                    if (status != 0) throw lastError("loom_audit_config_show_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String auditConfigSetJson(String path, Integer retentionDays, Boolean legalHold,
+            byte[] passphrase, byte[] kek, String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_audit_config_set_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_AUDIT_CONFIG_SET_JSON.invokeExact(
+                            handle,
+                            retentionDays != null ? retentionDays.intValue() : 0,
+                            retentionDays != null ? 1 : 0,
+                            legalHold != null && legalHold.booleanValue() ? 1 : 0,
+                            legalHold != null ? 1 : 0,
+                            out);
+                    if (status != 0) throw lastError("loom_audit_config_set_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String auditListJson(String path, byte[] passphrase, byte[] kek,
+            String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_audit_list_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_AUDIT_LIST_JSON.invokeExact(handle, out);
+                    if (status != 0) throw lastError("loom_audit_list_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String auditViewJson(String path, String record, byte[] passphrase, byte[] kek,
+            String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_audit_view_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_AUDIT_VIEW_JSON.invokeExact(
+                            handle, arena.allocateFrom(record), out);
+                    if (status != 0) throw lastError("loom_audit_view_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String certificateListJson(String path, byte[] passphrase, byte[] kek,
+            String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_certificate_list_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_CERTIFICATE_LIST_JSON.invokeExact(handle, out);
+                    if (status != 0) throw lastError("loom_certificate_list_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String certificateImportJson(String path, String name, byte[] certChainPem,
+            byte[] privateKeyPem, byte[] trustBundlePem, boolean force, byte[] passphrase,
+            byte[] kek, String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_certificate_import_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_CERTIFICATE_IMPORT_JSON.invokeExact(
+                            handle, arena.allocateFrom(name),
+                            bytesOrNull(arena, certChainPem), (long) (certChainPem != null ? certChainPem.length : 0),
+                            bytesOrNull(arena, privateKeyPem), (long) (privateKeyPem != null ? privateKeyPem.length : 0),
+                            bytesOrNull(arena, trustBundlePem), (long) (trustBundlePem != null ? trustBundlePem.length : 0),
+                            force ? 1 : 0, out);
+                    if (status != 0) throw lastError("loom_certificate_import_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static byte[] certificateExport(String path, String name, boolean includeCertChain,
+            boolean includePrivateKey, boolean includeTrustBundle, boolean force, byte[] passphrase,
+            byte[] kek, String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_certificate_export", (arena, handle) -> {
+                    MemorySegment outPtr = arena.allocate(ValueLayout.ADDRESS);
+                    MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+                    int status = (int) LOOM_CERTIFICATE_EXPORT.invokeExact(
+                            handle, arena.allocateFrom(name), includeCertChain ? 1 : 0,
+                            includePrivateKey ? 1 : 0, includeTrustBundle ? 1 : 0, force ? 1 : 0,
+                            outPtr, outLen);
+                    if (status != 0) throw lastError("loom_certificate_export");
+                    return takeOwnedBytes(outPtr.get(ValueLayout.ADDRESS, 0),
+                            outLen.get(ValueLayout.JAVA_LONG, 0));
+                });
+    }
+
+    public static String certificateGenerateSelfSignedJson(String path, String name,
+            String dnsNamesJson, String ipAddressesJson, String cn, int days, String algorithm,
+            boolean force, byte[] passphrase, byte[] kek, String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_certificate_generate_self_signed_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_CERTIFICATE_GENERATE_SELF_SIGNED_JSON.invokeExact(
+                            handle, arena.allocateFrom(name), arena.allocateFrom(dnsNamesJson),
+                            arena.allocateFrom(ipAddressesJson),
+                            cn != null ? arena.allocateFrom(cn) : MemorySegment.NULL,
+                            days, arena.allocateFrom(algorithm), force ? 1 : 0, out);
+                    if (status != 0) throw lastError("loom_certificate_generate_self_signed_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String certificateRemoveJson(String path, String name, byte[] passphrase,
+            byte[] kek, String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_certificate_remove_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_CERTIFICATE_REMOVE_JSON.invokeExact(
+                            handle, arena.allocateFrom(name), out);
+                    if (status != 0) throw lastError("loom_certificate_remove_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String certificateAuditJson(String path, String name, byte[] passphrase,
+            byte[] kek, String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_certificate_audit_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_CERTIFICATE_AUDIT_JSON.invokeExact(
+                            handle, arena.allocateFrom(name), out);
+                    if (status != 0) throw lastError("loom_certificate_audit_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String networkAccessListJson(String path, byte[] passphrase, byte[] kek,
+            String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_network_access_list_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_NETWORK_ACCESS_LIST_JSON.invokeExact(handle, out);
+                    if (status != 0) throw lastError("loom_network_access_list_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String networkAccessSetJson(String path, String name, String description,
+            String defaultAction, String rulesJson, byte[] passphrase, byte[] kek,
+            String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_network_access_set_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_NETWORK_ACCESS_SET_JSON.invokeExact(
+                            handle, arena.allocateFrom(name),
+                            description != null ? arena.allocateFrom(description) : MemorySegment.NULL,
+                            arena.allocateFrom(defaultAction), arena.allocateFrom(rulesJson), out);
+                    if (status != 0) throw lastError("loom_network_access_set_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String networkAccessRemoveJson(String path, String name, byte[] passphrase,
+            byte[] kek, String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_network_access_remove_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_NETWORK_ACCESS_REMOVE_JSON.invokeExact(
+                            handle, arena.allocateFrom(name), out);
+                    if (status != 0) throw lastError("loom_network_access_remove_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
+    }
+
+    public static String networkAccessAuditJson(String path, String name, byte[] passphrase,
+            byte[] kek, String authPrincipal, String authPassphrase) {
+        return onAuthenticatedHandle(path, passphrase, kek, authPrincipal, authPassphrase,
+                "loom_network_access_audit_json", (arena, handle) -> {
+                    MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+                    int status = (int) LOOM_NETWORK_ACCESS_AUDIT_JSON.invokeExact(
+                            handle, arena.allocateFrom(name), out);
+                    if (status != 0) throw lastError("loom_network_access_audit_json");
+                    return takeOwnedString(out.get(ValueLayout.ADDRESS, 0));
+                });
     }
 
     static LoomResult openResult(byte[] bytes) throws Throwable {

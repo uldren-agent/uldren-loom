@@ -200,6 +200,57 @@ pub struct OperationChangeBatch {
     pub next: OperationChangeCursor,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct HostedOperationChangesBatch {
+    pub events: Vec<HostedOperationChangeEvent>,
+    pub next: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostedOperationChangeEvent {
+    Operation {
+        workspace_id: String,
+        app_id: String,
+        scope_id: String,
+        operation_id: String,
+        operation_kind: String,
+        sequence: u64,
+        actor_principal: String,
+        timestamp_ms: u64,
+        root_after: String,
+        payload_digest: String,
+        policy_labels: Vec<String>,
+    },
+}
+
+pub fn hosted_operation_changes_batch(batch: OperationChangeBatch) -> HostedOperationChangesBatch {
+    HostedOperationChangesBatch {
+        events: batch
+            .events
+            .into_iter()
+            .map(hosted_operation_change_event)
+            .collect(),
+        next: batch.next.encode(),
+    }
+}
+
+pub fn hosted_operation_change_event(record: OperationChangeRecord) -> HostedOperationChangeEvent {
+    HostedOperationChangeEvent::Operation {
+        workspace_id: record.workspace_id,
+        app_id: record.app_id,
+        scope_id: record.scope_id,
+        operation_id: record.operation_id,
+        operation_kind: record.operation_kind,
+        sequence: record.sequence,
+        actor_principal: record.actor_principal,
+        timestamp_ms: record.timestamp_ms,
+        root_after: record.root_after.to_string(),
+        payload_digest: record.payload_digest.to_string(),
+        policy_labels: record.policy_labels,
+    }
+}
+
 pub fn operation_log_changes(
     operations: &[SequencedOperation],
     cursor: &OperationChangeCursor,
@@ -312,6 +363,33 @@ mod tests {
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].operation_id, "op-b");
         assert_eq!(batch.next.next_sequence, 3);
+    }
+
+    #[test]
+    fn hosted_operation_changes_batch_uses_existing_hosted_json_shape() {
+        let digest = digest(b"root");
+        let batch = OperationChangeBatch {
+            events: vec![OperationChangeRecord {
+                workspace_id: "studio".to_string(),
+                app_id: "chat".to_string(),
+                scope_id: "chat:studio:general".to_string(),
+                operation_id: "op-1".to_string(),
+                operation_kind: "message.created".to_string(),
+                sequence: 1,
+                actor_principal: "principal".to_string(),
+                timestamp_ms: 10,
+                root_after: digest,
+                target_entity_id: Some("hidden-target".to_string()),
+                payload_digest: digest,
+                policy_labels: vec!["chat".to_string()],
+            }],
+            next: OperationChangeCursor::new("chat:studio:general", 2).unwrap(),
+        };
+        let value = serde_json::to_value(hosted_operation_changes_batch(batch)).unwrap();
+        assert_eq!(value["next"], "oplog:2:chat:studio:general");
+        assert_eq!(value["events"][0]["kind"], "operation");
+        assert_eq!(value["events"][0]["operation_kind"], "message.created");
+        assert!(value["events"][0].get("target_entity_id").is_none());
     }
 
     fn request(base_root: Digest, root_after: Digest, key: &str) -> SequenceRequest {

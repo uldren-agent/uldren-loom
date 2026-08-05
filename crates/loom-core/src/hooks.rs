@@ -1007,6 +1007,46 @@ mod tests {
     }
 
     #[test]
+    fn inference_hook_registration_round_trips_canonical_facet_tag() {
+        let mut hook = registration(1, -10, true);
+        hook.facet = FacetKind::Inference;
+        let bytes = hook_registration_to_cbor(&hook).unwrap();
+        let decoded = hook_registration_from_cbor(&bytes).unwrap();
+
+        assert_eq!(decoded.facet, FacetKind::Inference);
+        assert_eq!(decoded.facet.stable_tag(), 21);
+        assert_eq!(hook_registration_to_cbor(&decoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn hook_registration_rejects_unknown_facet_tag() {
+        let bytes = cbor::encode(&Value::Array(vec![
+            Value::Uint(2),
+            workspace_value(id(1)),
+            Value::Uint(22),
+            Value::Text("on_message_ingested".to_string()),
+            scope_value(&HookScope::Collection {
+                principal: "user@example.com".to_string(),
+                collection: "inbox".to_string(),
+            }),
+            option_text_value(None),
+            digest_text_value(&Digest::blake3(b"program")),
+            Value::Text("main".to_string()),
+            Value::Uint(10_000),
+            exec_mode_value(TriggerExecMode::Gated),
+            trigger_options_value(TriggerOptions::default()),
+            workspace_value(id(90)),
+            Value::int(0),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Uint(4),
+        ]));
+        let err = hook_registration_from_cbor(&bytes).unwrap_err();
+        assert_eq!(err.code, Code::CorruptObject);
+        assert!(err.message.contains("unknown facet tag"));
+    }
+
+    #[test]
     fn pim_event_envelope_round_trips_canonical_cbor() {
         let envelope = PimEventEnvelope {
             workspace: id(7),

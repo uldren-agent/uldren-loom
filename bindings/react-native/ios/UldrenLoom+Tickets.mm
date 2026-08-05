@@ -48,19 +48,25 @@
   } resolve:resolve reject:reject];
 }
 
-- (void)ticketsProjectSettingsGetJson:(NSString *)loomPath workspace:(NSString *)workspace ticketWorkspaceId:(NSString *)ticketWorkspaceId projectId:(NSString *)projectId passphrase:(NSString *)passphrase kek:(NSArray *)kek authPrincipal:(NSString *)authPrincipal authPassphrase:(NSString *)authPassphrase resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+- (void)ticketsProjectSettingsGetJson:(NSString *)loomPath workspace:(NSString *)workspace ticketWorkspaceId:(NSString *)ticketWorkspaceId projectId:(NSString *)projectId includeContracts:(BOOL)includeContracts passphrase:(NSString *)passphrase kek:(NSArray *)kek authPrincipal:(NSString *)authPrincipal authPassphrase:(NSString *)authPassphrase resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
   [self ticketsString:loomPath passphrase:passphrase kek:kek authPrincipal:authPrincipal authPassphrase:authPassphrase call:^int32_t(LoomSession *h, char **out) {
-    return loom_tickets_project_settings_get_json(h, workspace.UTF8String, ticketWorkspaceId.UTF8String, projectId.UTF8String, out);
+    return loom_tickets_project_settings_get_json(h, workspace.UTF8String, ticketWorkspaceId.UTF8String, projectId.UTF8String, includeContracts, out);
   } resolve:resolve reject:reject];
 }
 
-- (void)ticketsProjectSettingsSetJson:(NSString *)loomPath workspace:(NSString *)workspace ticketWorkspaceId:(NSString *)ticketWorkspaceId projectId:(NSString *)projectId defaultProjection:(NSString *)defaultProjection enableProjectionsJson:(NSString *)enableProjectionsJson disableProjectionsJson:(NSString *)disableProjectionsJson actorEnforcement:(NSString *)actorEnforcement projectOwnerPrincipal:(NSString *)projectOwnerPrincipal clearProjectOwnerPrincipal:(BOOL)clearProjectOwnerPrincipal acceptanceAuthoritiesJson:(NSString *)acceptanceAuthoritiesJson expectedRoot:(NSString *)expectedRoot passphrase:(NSString *)passphrase kek:(NSArray *)kek authPrincipal:(NSString *)authPrincipal authPassphrase:(NSString *)authPassphrase resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+- (void)ticketsProjectSettingsSetJson:(NSString *)loomPath workspace:(NSString *)workspace ticketWorkspaceId:(NSString *)ticketWorkspaceId projectId:(NSString *)projectId defaultProjection:(NSString *)defaultProjection enableProjectionsJson:(NSString *)enableProjectionsJson disableProjectionsJson:(NSString *)disableProjectionsJson actorEnforcement:(NSString *)actorEnforcement projectOwnerPrincipal:(NSString *)projectOwnerPrincipal clearProjectOwnerPrincipal:(BOOL)clearProjectOwnerPrincipal acceptanceAuthoritiesJson:(NSString *)acceptanceAuthoritiesJson acceptanceEvidenceEnforcement:(BOOL)acceptanceEvidenceEnforcement hasAcceptanceEvidenceEnforcement:(BOOL)hasAcceptanceEvidenceEnforcement requiredAcceptanceEvidenceKeysJson:(NSString *)requiredAcceptanceEvidenceKeysJson requiredAcceptanceReviewsJson:(NSString *)requiredAcceptanceReviewsJson ownerContractSummary:(NSString *)ownerContractSummary ownerContractDetails:(NSString *)ownerContractDetails workerContractSummary:(NSString *)workerContractSummary workerContractDetails:(NSString *)workerContractDetails expectedRoot:(NSString *)expectedRoot passphrase:(NSString *)passphrase kek:(NSArray *)kek authPrincipal:(NSString *)authPrincipal authPassphrase:(NSString *)authPassphrase resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
   [self ticketsString:loomPath passphrase:passphrase kek:kek authPrincipal:authPrincipal authPassphrase:authPassphrase call:^int32_t(LoomSession *h, char **out) {
     const char *default_projection = defaultProjection.length > 0 ? defaultProjection.UTF8String : NULL;
     const char *actor = actorEnforcement.length > 0 ? actorEnforcement.UTF8String : NULL;
     const char *owner = projectOwnerPrincipal.length > 0 ? projectOwnerPrincipal.UTF8String : NULL;
     const char *authorities = acceptanceAuthoritiesJson.length > 0 ? acceptanceAuthoritiesJson.UTF8String : NULL;
-    return loom_tickets_project_settings_set_json(h, workspace.UTF8String, ticketWorkspaceId.UTF8String, projectId.UTF8String, default_projection, enableProjectionsJson.UTF8String, disableProjectionsJson.UTF8String, actor, owner, clearProjectOwnerPrincipal, authorities, expectedRoot.UTF8String, out);
+    const char *required_keys = requiredAcceptanceEvidenceKeysJson.length > 0 ? requiredAcceptanceEvidenceKeysJson.UTF8String : NULL;
+    const char *required_reviews = requiredAcceptanceReviewsJson.length > 0 ? requiredAcceptanceReviewsJson.UTF8String : NULL;
+    const char *owner_summary = ownerContractSummary.length > 0 ? ownerContractSummary.UTF8String : NULL;
+    const char *owner_details = ownerContractDetails.length > 0 ? ownerContractDetails.UTF8String : NULL;
+    const char *worker_summary = workerContractSummary.length > 0 ? workerContractSummary.UTF8String : NULL;
+    const char *worker_details = workerContractDetails.length > 0 ? workerContractDetails.UTF8String : NULL;
+    return loom_tickets_project_settings_set_json(h, workspace.UTF8String, ticketWorkspaceId.UTF8String, projectId.UTF8String, default_projection, enableProjectionsJson.UTF8String, disableProjectionsJson.UTF8String, actor, owner, clearProjectOwnerPrincipal, authorities, acceptanceEvidenceEnforcement, hasAcceptanceEvidenceEnforcement, required_keys, required_reviews, owner_summary, owner_details, worker_summary, worker_details, expectedRoot.UTF8String, out);
   } resolve:resolve reject:reject];
 }
 

@@ -8,8 +8,7 @@ if ! [[ "$iterations" =~ ^[0-9]+$ ]] || [[ "$iterations" -lt 4 ]]; then
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
-loom_bin="${LOOM_BIN:-$repo_root/target/debug/loom}"
+loom_bin="${LOOM_BIN:-$script_dir/loop/loom}"
 store="${LOOP_STORE:-speed.loom}"
 workspace="${LOOP_WORKSPACE:-speed}"
 project_id="speed"
@@ -22,6 +21,7 @@ lane_id="speed-lane"
 
 if [[ ! -x "$loom_bin" ]]; then
   echo "loom binary is not executable: $loom_bin" >&2
+  echo "copy the Loom binary to $script_dir/loop/loom or set LOOM_BIN=/path/to/loom" >&2
   exit 1
 fi
 
@@ -50,7 +50,10 @@ measure() {
   local started
   local finished
   started="$(date +%s)"
-  /usr/bin/time -p -o "$timing" "$@" >/dev/null
+  if ! /usr/bin/time -p -o "$timing" "$@" >/dev/null; then
+    echo "operation failed: $operation (iteration $iteration)" >&2
+    return 1
+  fi
   finished="$(date +%s)"
   local elapsed_ms
   elapsed_ms="$(awk '$1 == "real" { printf "%.0f", $2 * 1000 }' "$timing")"
@@ -63,17 +66,37 @@ if [[ ! -f "$store" ]]; then
   echo "initializing $store"
   "$loom_bin" store init "$store" >/dev/null
   "$loom_bin" workspace create "$store" "$workspace" --facet document >/dev/null
+else
+  echo "using existing $store"
+fi
+
+project_json="$("$loom_bin" tickets project-settings-get "$store" "$workspace" "$project_id" --format json 2>/dev/null || true)"
+if [[ -z "$project_json" || "$project_json" == "null" ]]; then
   "$loom_bin" tickets project-create "$store" "$workspace" "$project_id" SPD "Speed Probe" --format text >/dev/null
+fi
+ticket_json="$("$loom_bin" tickets get "$store" "$workspace" "$ticket_id" --format json 2>/dev/null || true)"
+if [[ -z "$ticket_json" || "$ticket_json" == "null" ]]; then
   "$loom_bin" tickets create "$store" "$workspace" task \
     --project-id "$project_id" \
     --title "Speed probe ticket" \
     --description "Initial speed probe ticket." \
     --priority P1 \
     --format text >/dev/null
+fi
+space_json="$("$loom_bin" pages space-get "$store" "$workspace" "$space_id" --format json 2>/dev/null || true)"
+if [[ -z "$space_json" || "$space_json" == "null" ]]; then
   "$loom_bin" pages space-create "$store" "$workspace" "$space_id" "Speed Probe Space" --format text >/dev/null
+fi
+page_json="$("$loom_bin" pages get "$store" "$workspace" "$page_id" --format json 2>/dev/null || true)"
+if [[ -z "$page_json" || "$page_json" == "null" ]]; then
   "$loom_bin" pages create "$store" "$workspace" "$page_id" "$space_id" "Speed Probe Page" --format text >/dev/null
+fi
+if ! "$loom_bin" document get-text "$store" "$workspace" "$document_collection" "$document_id" >/dev/null 2>&1; then
   printf '%s\n' "initial speed document" > "$tmpdir/document.txt"
   "$loom_bin" document put-text "$store" "$workspace" "$document_collection" "$document_id" "$tmpdir/document.txt" >/dev/null
+fi
+lane_json="$("$loom_bin" lanes get "$store" "$workspace" "$lane_id" --format json 2>/dev/null || true)"
+if [[ -z "$lane_json" || "$lane_json" == "null" ]]; then
   "$loom_bin" lanes create "$store" "$workspace" "$lane_id" "$lane_id" \
     --kind assignment \
     --owner-principal "speed:agent" \
@@ -85,8 +108,6 @@ if [[ ! -f "$store" ]]; then
     --ticket "$ticket_id" \
     --updated-by "speed:agent" \
     --format text >/dev/null
-else
-  echo "using existing $store"
 fi
 
 daemon_status="$("$loom_bin" daemon status "$store" --json 2>/dev/null || true)"
@@ -183,5 +204,9 @@ output_prefix="${LOOP_OUTPUT_PREFIX:-${store}.speed}"
 cp "$tmpdir/operations.csv" "${output_prefix}.operations.csv"
 cp "$tmpdir/iterations.csv" "${output_prefix}.iterations.csv"
 echo "artifacts=${output_prefix}.operations.csv,${output_prefix}.iterations.csv"
+if [[ "$daemon_started" -eq 1 ]]; then
+  "$loom_bin" daemon stop "$store"
+  daemon_started=0
+fi
 "$loom_bin" store stat "$store"
 "$loom_bin" store attribution "$store" "$workspace" --max-objects 0 --examples 0 --format text

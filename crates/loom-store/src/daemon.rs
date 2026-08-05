@@ -248,6 +248,8 @@ pub struct DaemonPaths {
 #[derive(Debug, Clone)]
 pub struct DaemonStatus {
     pub transport: DaemonTransport,
+    pub startup_mode: DaemonStartupMode,
+    pub startup_initiator: DaemonStartupInitiator,
     pub pid: String,
     pub store: String,
     pub store_id: String,
@@ -256,6 +258,226 @@ pub struct DaemonStatus {
     pub permanent_pins: u64,
     pub leased_pins: u64,
     pub pin_details: Vec<DaemonPinStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DaemonPriorRuntimeStatus {
+    pub transport: DaemonTransport,
+    pub pid: String,
+    pub store: String,
+    pub store_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DaemonRuntimeLockMetadata {
+    pub pid: String,
+    pub store: String,
+    pub store_id: String,
+    pub phase: Option<DaemonRuntimeLockPhase>,
+    pub startup_mode: Option<String>,
+    pub startup_initiator: Option<String>,
+    pub startup_stage: Option<DaemonStartupStage>,
+    pub startup_started_ms: Option<u64>,
+    pub stage_started_ms: Option<u64>,
+    pub heartbeat_ms: Option<u64>,
+    pub progress_ms: Option<u64>,
+    pub progress_seq: Option<u64>,
+    pub progress_completed: Option<u64>,
+    pub progress_total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStartupStage {
+    Spawned,
+    StoreBacking,
+    StoreJournalRecovery,
+    StoreRegionTable,
+    StoreRootCatalog,
+    StoreFreeMap,
+    StoreIndex,
+    StoreMutableOverlayIndex,
+    StoreMutableOverlayRecords,
+    StoreMutableOverlayImport,
+    EngineRoot,
+    EngineSections,
+    EngineContent,
+    EngineStagedMap,
+    EngineImport,
+    Unlock,
+    RuntimePolicy,
+    MutableOverlayExport,
+    MutableOverlayImport,
+    GeneratedRuntimeReady,
+    LocalAuth,
+    Coordinator,
+    KvRuntime,
+    ListenerBind,
+    HostedListeners,
+    RuntimeArtifacts,
+}
+
+impl DaemonStartupStage {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Spawned => "spawned",
+            Self::StoreBacking => "store.backing",
+            Self::StoreJournalRecovery => "store.journal_recovery",
+            Self::StoreRegionTable => "store.region_table",
+            Self::StoreRootCatalog => "store.root_catalog",
+            Self::StoreFreeMap => "store.free_map",
+            Self::StoreIndex => "store.index",
+            Self::StoreMutableOverlayIndex => "store.mutable_overlay_index",
+            Self::StoreMutableOverlayRecords => "store.mutable_overlay_records",
+            Self::StoreMutableOverlayImport => "store.mutable_overlay_import",
+            Self::EngineRoot => "engine.root",
+            Self::EngineSections => "engine.sections",
+            Self::EngineContent => "engine.content",
+            Self::EngineStagedMap => "engine.staged_map",
+            Self::EngineImport => "engine.import",
+            Self::Unlock => "loom.unlock",
+            Self::RuntimePolicy => "loom.runtime_policy",
+            Self::MutableOverlayExport => "loom.mutable_overlay_export",
+            Self::MutableOverlayImport => "loom.mutable_overlay_import",
+            Self::GeneratedRuntimeReady => "generated_runtime.ready",
+            Self::LocalAuth => "generated_runtime.local_auth",
+            Self::Coordinator => "coordinator",
+            Self::KvRuntime => "kv_runtime",
+            Self::ListenerBind => "listener_bind",
+            Self::HostedListeners => "hosted_listeners",
+            Self::RuntimeArtifacts => "runtime_artifacts",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "spawned" => Ok(Self::Spawned),
+            "store.backing" => Ok(Self::StoreBacking),
+            "store.journal_recovery" => Ok(Self::StoreJournalRecovery),
+            "store.region_table" => Ok(Self::StoreRegionTable),
+            "store.root_catalog" => Ok(Self::StoreRootCatalog),
+            "store.free_map" => Ok(Self::StoreFreeMap),
+            "store.index" => Ok(Self::StoreIndex),
+            "store.mutable_overlay_index" => Ok(Self::StoreMutableOverlayIndex),
+            "store.mutable_overlay_records" => Ok(Self::StoreMutableOverlayRecords),
+            "store.mutable_overlay_import" => Ok(Self::StoreMutableOverlayImport),
+            "engine.root" => Ok(Self::EngineRoot),
+            "engine.sections" => Ok(Self::EngineSections),
+            "engine.content" => Ok(Self::EngineContent),
+            "engine.staged_map" => Ok(Self::EngineStagedMap),
+            "engine.import" => Ok(Self::EngineImport),
+            "loom.unlock" => Ok(Self::Unlock),
+            "loom.runtime_policy" => Ok(Self::RuntimePolicy),
+            "loom.mutable_overlay_export" => Ok(Self::MutableOverlayExport),
+            "loom.mutable_overlay_import" => Ok(Self::MutableOverlayImport),
+            "generated_runtime.ready" => Ok(Self::GeneratedRuntimeReady),
+            "generated_runtime.local_auth" => Ok(Self::LocalAuth),
+            "coordinator" => Ok(Self::Coordinator),
+            "kv_runtime" => Ok(Self::KvRuntime),
+            "listener_bind" => Ok(Self::ListenerBind),
+            "hosted_listeners" => Ok(Self::HostedListeners),
+            "runtime_artifacts" => Ok(Self::RuntimeArtifacts),
+            _ => Err(LoomError::invalid(format!(
+                "unsupported daemon startup stage {value:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonRuntimeLockPhase {
+    Starting,
+    Running,
+}
+
+impl DaemonRuntimeLockPhase {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "starting" => Ok(Self::Starting),
+            "running" => Ok(Self::Running),
+            _ => Err(LoomError::invalid(format!(
+                "unsupported daemon runtime lock phase {value:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DaemonUnresponsiveRuntime {
+    pub metadata: DaemonRuntimeLockMetadata,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum DaemonRuntimeCompatibility {
+    Current(DaemonStatus),
+    Prior(DaemonPriorRuntimeStatus),
+    Unresponsive(DaemonUnresponsiveRuntime),
+    Starting(Option<DaemonRuntimeLockMetadata>),
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStartupMode {
+    Persistent,
+    Managed,
+}
+
+impl DaemonStartupMode {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Persistent => "persistent",
+            Self::Managed => "managed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "persistent" => Ok(Self::Persistent),
+            "managed" => Ok(Self::Managed),
+            _ => Err(LoomError::invalid(format!(
+                "unsupported daemon startup mode {value:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStartupInitiator {
+    CliDaemonStart,
+    CliDaemonRestart,
+    CliMcpLocal,
+    CliLockLocal,
+}
+
+impl DaemonStartupInitiator {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::CliDaemonStart => "cli.daemon.start",
+            Self::CliDaemonRestart => "cli.daemon.restart",
+            Self::CliMcpLocal => "cli.mcp.local",
+            Self::CliLockLocal => "cli.lock.local",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "cli.daemon.start" => Ok(Self::CliDaemonStart),
+            "cli.daemon.restart" => Ok(Self::CliDaemonRestart),
+            "cli.mcp.local" => Ok(Self::CliMcpLocal),
+            "cli.lock.local" => Ok(Self::CliLockLocal),
+            _ => Err(LoomError::invalid(format!(
+                "unsupported daemon startup initiator {value:?}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1158,8 +1380,18 @@ fn generated_binary_request(magic: &[u8], body: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn parse_generated_binary_response(response: &[u8], magic: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if let Some(error) = response.strip_prefix(b"error\t") {
+        let error = std::str::from_utf8(error)
+            .map_err(|_| LoomError::corrupt("daemon generated error response is not UTF-8"))?;
+        return Err(parse_daemon_error(error));
+    }
     let rest = response.strip_prefix(magic).ok_or_else(|| {
-        LoomError::corrupt("daemon generated response has an unexpected frame prefix")
+        let preview_len = response.len().min(32);
+        LoomError::corrupt(format!(
+            "daemon generated response has an unexpected frame prefix: bytes={} prefix_hex={}",
+            response.len(),
+            hex_encode(&response[..preview_len])
+        ))
     })?;
     let count_bytes: [u8; 4] = rest
         .get(..4)
@@ -1191,10 +1423,20 @@ fn parse_generated_binary_response(response: &[u8], magic: &[u8]) -> Result<Vec<
 }
 
 fn parse_generated_stream_response(response: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if let Some(error) = response.strip_prefix(b"error\t") {
+        let error = std::str::from_utf8(error)
+            .map_err(|_| LoomError::corrupt("daemon generated error response is not UTF-8"))?;
+        return Err(parse_daemon_error(error));
+    }
     let mut rest = response
         .strip_prefix(DAEMON_GENERATED_STREAM_RESPONSE_MAGIC)
         .ok_or_else(|| {
-            LoomError::corrupt("daemon generated stream response has an unexpected frame prefix")
+            let preview_len = response.len().min(32);
+            LoomError::corrupt(format!(
+                "daemon generated stream response has an unexpected frame prefix: bytes={} prefix_hex={}",
+                response.len(),
+                hex_encode(&response[..preview_len])
+            ))
         })?;
     let mut bodies = Vec::new();
     while !rest.is_empty() {
@@ -1388,6 +1630,13 @@ pub fn session_check_auth(paths: &DaemonPaths, session: &str, auth: &DaemonAuth)
     )
 }
 
+pub fn lease_renew_auth(paths: &DaemonPaths, session: &str, auth: &DaemonAuth) -> Result<String> {
+    request_checked(
+        paths,
+        &format!("lease-renew\t{}{}\n", field(session)?, auth_fields(auth)?),
+    )
+}
+
 pub fn pin_add(paths: &DaemonPaths, pin: &str) -> Result<String> {
     pin_add_auth(paths, pin, &DaemonAuth::default())
 }
@@ -1562,6 +1811,8 @@ pub fn parse_response_expected(
     let mut leased_pins = None;
     let mut pin_details = Vec::new();
     let mut store_id = None;
+    let mut startup_mode = None;
+    let mut startup_initiator = None;
     for part in parts {
         if let Some(value) = part.strip_prefix("sessions=") {
             sessions = value
@@ -1583,6 +1834,10 @@ pub fn parse_response_expected(
             pin_details.push(parse_pin_status(value)?);
         } else if let Some(value) = part.strip_prefix("identity=") {
             store_id = Some(value.to_string());
+        } else if let Some(value) = part.strip_prefix("startup_mode=") {
+            startup_mode = Some(DaemonStartupMode::parse(value)?);
+        } else if let Some(value) = part.strip_prefix("startup_initiator=") {
+            startup_initiator = Some(DaemonStartupInitiator::parse(value)?);
         }
     }
     let derived_permanent = pin_details
@@ -1596,6 +1851,10 @@ pub fn parse_response_expected(
     let permanent_pins = permanent_pins.unwrap_or(derived_permanent);
     let leased_pins = leased_pins.unwrap_or(derived_leased);
     let store_id = store_id.unwrap_or_else(|| store.to_string());
+    let startup_mode =
+        startup_mode.ok_or_else(|| LoomError::invalid("missing daemon startup mode"))?;
+    let startup_initiator =
+        startup_initiator.ok_or_else(|| LoomError::invalid("missing daemon startup initiator"))?;
     if store_id != expected_store_id {
         return Err(LoomError::invalid(format!(
             "daemon identity is {store_id}, not expected identity {expected_store_id}"
@@ -1608,6 +1867,8 @@ pub fn parse_response_expected(
     }
     Ok(DaemonStatus {
         transport,
+        startup_mode,
+        startup_initiator,
         pid: pid.to_string(),
         store: store.to_string(),
         store_id,
@@ -1617,6 +1878,154 @@ pub fn parse_response_expected(
         leased_pins,
         pin_details,
     })
+}
+
+fn parse_prior_response_expected(
+    paths: &DaemonPaths,
+    response: &str,
+    current_error: &LoomError,
+) -> std::result::Result<DaemonPriorRuntimeStatus, String> {
+    let mut parts = response.trim_end().split('\t');
+    let state = parts
+        .next()
+        .ok_or_else(|| "prior daemon status response is empty".to_string())?;
+    let protocol = parts
+        .next()
+        .ok_or_else(|| "prior daemon status response is missing protocol".to_string())?;
+    let transport = parts
+        .next()
+        .ok_or_else(|| "prior daemon status response is missing transport".to_string())?;
+    let pid = parts
+        .next()
+        .ok_or_else(|| "prior daemon status response is missing pid".to_string())?;
+    let store = parts
+        .next()
+        .ok_or_else(|| "prior daemon status response is missing store".to_string())?;
+    if state != "running" {
+        return Err(format!("prior daemon state is {state:?}"));
+    }
+    if protocol != "protocol=1" {
+        return Err(format!("unsupported prior daemon {protocol}"));
+    }
+    let transport = parse_daemon_status_transport(transport).map_err(|e| e.to_string())?;
+    let mut store_id = None;
+    let mut has_startup_mode = false;
+    let mut has_startup_initiator = false;
+    for part in parts {
+        if let Some(value) = part.strip_prefix("identity=") {
+            store_id = Some(value.to_string());
+        } else if part.starts_with("startup_mode=") {
+            has_startup_mode = true;
+        } else if part.starts_with("startup_initiator=") {
+            has_startup_initiator = true;
+        }
+    }
+    if has_startup_mode || has_startup_initiator {
+        return Err(format!(
+            "daemon status has incomplete current runtime metadata: {current_error}"
+        ));
+    }
+    let store_id = store_id.unwrap_or_else(|| store.to_string());
+    if store_id != paths.store_id {
+        return Err(format!(
+            "prior daemon identity is {store_id}, not expected identity {}",
+            paths.store_id
+        ));
+    }
+    if store_id == store && store != paths.store {
+        return Err(format!(
+            "prior daemon is for {store}, not expected store {}",
+            paths.store
+        ));
+    }
+    Ok(DaemonPriorRuntimeStatus {
+        transport,
+        pid: pid.to_string(),
+        store: store.to_string(),
+        store_id,
+        reason: current_error.to_string(),
+    })
+}
+
+fn busy_runtime_lock_metadata(paths: &DaemonPaths) -> Option<DaemonRuntimeLockMetadata> {
+    if !runtime_lock_busy(paths) {
+        return None;
+    }
+    let metadata = read_runtime_lock_metadata(paths)?;
+    if metadata.store != paths.store || metadata.store_id != paths.store_id {
+        return None;
+    }
+    Some(metadata)
+}
+
+fn read_runtime_lock_metadata(paths: &DaemonPaths) -> Option<DaemonRuntimeLockMetadata> {
+    let text = std::fs::read_to_string(&paths.lock_file).ok()?;
+    let mut store = None;
+    let mut store_id = None;
+    let mut pid = None;
+    let mut phase = None;
+    let mut startup_mode = None;
+    let mut startup_initiator = None;
+    let mut startup_stage = None;
+    let mut startup_started_ms = None;
+    let mut stage_started_ms = None;
+    let mut heartbeat_ms = None;
+    let mut progress_ms = None;
+    let mut progress_seq = None;
+    let mut progress_completed = None;
+    let mut progress_total = None;
+    for line in text.lines() {
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "store" => store = Some(value.to_string()),
+            "identity" => store_id = Some(value.to_string()),
+            "pid" => pid = Some(value.to_string()),
+            "phase" => phase = Some(DaemonRuntimeLockPhase::parse(value).ok()?),
+            "startup_mode" => startup_mode = Some(value.to_string()),
+            "startup_initiator" => startup_initiator = Some(value.to_string()),
+            "startup_stage" => startup_stage = Some(DaemonStartupStage::parse(value).ok()?),
+            "startup_started_ms" => startup_started_ms = Some(value.parse().ok()?),
+            "stage_started_ms" => stage_started_ms = Some(value.parse().ok()?),
+            "heartbeat_ms" => heartbeat_ms = Some(value.parse().ok()?),
+            "progress_ms" => progress_ms = Some(value.parse().ok()?),
+            "progress_seq" => progress_seq = Some(value.parse().ok()?),
+            "progress_completed" => progress_completed = Some(value.parse().ok()?),
+            "progress_total" => progress_total = Some(value.parse().ok()?),
+            _ => {}
+        }
+    }
+    Some(DaemonRuntimeLockMetadata {
+        pid: pid?,
+        store: store?,
+        store_id: store_id?,
+        phase,
+        startup_mode,
+        startup_initiator,
+        startup_stage,
+        startup_started_ms,
+        stage_started_ms,
+        heartbeat_ms,
+        progress_ms,
+        progress_seq,
+        progress_completed,
+        progress_total,
+    })
+}
+
+fn runtime_lock_busy(paths: &DaemonPaths) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&paths.lock_file)
+    else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => false,
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
 }
 
 fn parse_daemon_status_transport(field: &str) -> Result<DaemonTransport> {
@@ -1668,6 +2077,79 @@ pub fn status_response(paths: &DaemonPaths) -> Result<DaemonStatus> {
     parse_response_expected(&response, &paths.store, &paths.store_id)
 }
 
+pub fn runtime_compatibility(paths: &DaemonPaths) -> DaemonRuntimeCompatibility {
+    match status_response(paths) {
+        Ok(status) => return DaemonRuntimeCompatibility::Current(status),
+        Err(current_error) => match request_checked(paths, "status\n") {
+            Ok(response) => {
+                return match parse_prior_response_expected(paths, &response, &current_error) {
+                    Ok(status) => DaemonRuntimeCompatibility::Prior(status),
+                    Err(error) => match busy_runtime_lock_metadata(paths) {
+                        Some(metadata) => {
+                            runtime_compatibility_from_lock_metadata(paths, metadata, error)
+                        }
+                        None => DaemonRuntimeCompatibility::Stopped,
+                    },
+                };
+            }
+            Err(request_error) => match busy_runtime_lock_metadata(paths) {
+                Some(metadata) => {
+                    return runtime_compatibility_from_lock_metadata(
+                        paths,
+                        metadata,
+                        format!(
+                            "daemon status is unavailable under the runtime contract: {request_error}"
+                        ),
+                    );
+                }
+                None => {
+                    if runtime_lock_busy(paths) {
+                        return DaemonRuntimeCompatibility::Starting(read_runtime_lock_metadata(
+                            paths,
+                        ));
+                    }
+                }
+            },
+        },
+    }
+    DaemonRuntimeCompatibility::Stopped
+}
+
+fn runtime_compatibility_from_lock_metadata(
+    paths: &DaemonPaths,
+    metadata: DaemonRuntimeLockMetadata,
+    reason: String,
+) -> DaemonRuntimeCompatibility {
+    match metadata.phase {
+        Some(DaemonRuntimeLockPhase::Starting) => {
+            DaemonRuntimeCompatibility::Starting(Some(metadata))
+        }
+        Some(DaemonRuntimeLockPhase::Running) => {
+            DaemonRuntimeCompatibility::Unresponsive(DaemonUnresponsiveRuntime { metadata, reason })
+        }
+        None if runtime_pid_file_matches(paths, &metadata.pid) => {
+            DaemonRuntimeCompatibility::Unresponsive(DaemonUnresponsiveRuntime { metadata, reason })
+        }
+        None => DaemonRuntimeCompatibility::Starting(Some(metadata)),
+    }
+}
+
+pub fn starting_runtime_metadata(paths: &DaemonPaths) -> Option<DaemonRuntimeLockMetadata> {
+    if runtime_lock_busy(paths) {
+        read_runtime_lock_metadata(paths)
+    } else {
+        None
+    }
+}
+
+pub fn runtime_lock_metadata(paths: &DaemonPaths) -> Option<DaemonRuntimeLockMetadata> {
+    read_runtime_lock_metadata(paths)
+}
+
+fn runtime_pid_file_matches(paths: &DaemonPaths, pid: &str) -> bool {
+    std::fs::read_to_string(&paths.pid_file).is_ok_and(|value| value.trim() == pid)
+}
+
 pub fn is_running(paths: &DaemonPaths) -> bool {
     status_response(paths).is_ok()
 }
@@ -1691,10 +2173,12 @@ fn json_escape(s: &str) -> String {
 pub fn status_json(paths: &DaemonPaths) -> String {
     match status_response(paths) {
         Ok(status) => format!(
-            "{{\"state\":\"RUNNING\",\"protocol\":{},\"transport\":\"{}\",\"security\":\"{}\",\"pid\":\"{}\",\"store\":\"{}\",\"identity\":\"{}\",\"sessions\":{},\"pins\":{},\"permanent_pins\":{},\"leased_pins\":{},\"pin_details\":[{}]}}",
+            "{{\"state\":\"RUNNING\",\"protocol\":{},\"transport\":\"{}\",\"security\":\"{}\",\"startup_mode\":\"{}\",\"startup_initiator\":\"{}\",\"pid\":\"{}\",\"store\":\"{}\",\"identity\":\"{}\",\"sessions\":{},\"pins\":{},\"permanent_pins\":{},\"leased_pins\":{},\"pin_details\":[{}]}}",
             PROTOCOL,
             json_escape(status.transport.wire_name()),
             json_escape(status.transport.security().wire_name()),
+            json_escape(status.startup_mode.wire_name()),
+            json_escape(status.startup_initiator.wire_name()),
             json_escape(&status.pid),
             json_escape(&status.store),
             json_escape(&status.store_id),
@@ -1704,16 +2188,54 @@ pub fn status_json(paths: &DaemonPaths) -> String {
             status.leased_pins,
             pin_details_json(&status.pin_details)
         ),
-        Err(e) => format!(
-            "{{\"state\":\"STOPPED\",\"protocol\":{},\"transport\":\"{}\",\"security\":\"{}\",\"pid\":null,\"store\":\"{}\",\"identity\":\"{}\",\"sessions\":0,\"pins\":0,\"permanent_pins\":0,\"leased_pins\":0,\"pin_details\":[],\"reason\":\"{}\"}}",
-            PROTOCOL,
-            json_escape(TRANSPORT),
-            json_escape(DaemonTransport::TcpLoopback.security().wire_name()),
-            json_escape(&paths.store),
-            json_escape(&paths.store_id),
-            json_escape(&e.to_string())
-        ),
+        Err(e) => {
+            if runtime_lock_busy(paths)
+                && let Some(metadata) = read_runtime_lock_metadata(paths)
+            {
+                return format!(
+                    "{{\"state\":\"STARTING\",\"protocol\":{},\"transport\":\"{}\",\"security\":\"{}\",\"startup_mode\":{},\"startup_initiator\":{},\"pid\":\"{}\",\"store\":\"{}\",\"identity\":\"{}\",\"startup_stage\":{},\"startup_started_ms\":{},\"stage_started_ms\":{},\"heartbeat_ms\":{},\"progress_ms\":{},\"progress_seq\":{},\"progress_completed\":{},\"progress_total\":{},\"sessions\":0,\"pins\":0,\"permanent_pins\":0,\"leased_pins\":0,\"pin_details\":[],\"reason\":\"{}\"}}",
+                    PROTOCOL,
+                    json_escape(TRANSPORT),
+                    json_escape(DaemonTransport::TcpLoopback.security().wire_name()),
+                    json_option(metadata.startup_mode.as_deref()),
+                    json_option(metadata.startup_initiator.as_deref()),
+                    json_escape(&metadata.pid),
+                    json_escape(&metadata.store),
+                    json_escape(&metadata.store_id),
+                    json_option(metadata.startup_stage.map(DaemonStartupStage::wire_name)),
+                    json_u64_option(metadata.startup_started_ms),
+                    json_u64_option(metadata.stage_started_ms),
+                    json_u64_option(metadata.heartbeat_ms),
+                    json_u64_option(metadata.progress_ms),
+                    json_u64_option(metadata.progress_seq),
+                    json_u64_option(metadata.progress_completed),
+                    json_u64_option(metadata.progress_total),
+                    json_escape(&e.to_string())
+                );
+            }
+            format!(
+                "{{\"state\":\"STOPPED\",\"protocol\":{},\"transport\":\"{}\",\"security\":\"{}\",\"startup_mode\":null,\"startup_initiator\":null,\"pid\":null,\"store\":\"{}\",\"identity\":\"{}\",\"sessions\":0,\"pins\":0,\"permanent_pins\":0,\"leased_pins\":0,\"pin_details\":[],\"reason\":\"{}\"}}",
+                PROTOCOL,
+                json_escape(TRANSPORT),
+                json_escape(DaemonTransport::TcpLoopback.security().wire_name()),
+                json_escape(&paths.store),
+                json_escape(&paths.store_id),
+                json_escape(&e.to_string())
+            )
+        }
     }
+}
+
+fn json_option(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn json_u64_option(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn pin_details_json(pins: &[DaemonPinStatus]) -> String {
@@ -2328,19 +2850,15 @@ mod tests {
     fn daemon_response_is_bound_to_protocol_and_store() {
         let response =
             "running\tprotocol=1\ttransport=tcp\t123\t/private/tmp/a.loom\tsessions=0\tpins=0\n";
-        let status = parse_response(response, "/private/tmp/a.loom").unwrap();
-        assert_eq!(status.pid, "123");
-        assert_eq!(status.store, "/private/tmp/a.loom");
-        assert_eq!(status.store_id, "/private/tmp/a.loom");
-        assert_eq!(status.sessions, 0);
-        assert_eq!(status.pins, 0);
-        assert_eq!(status.permanent_pins, 0);
-        assert_eq!(status.leased_pins, 0);
-        assert!(status.pin_details.is_empty());
-        assert!(parse_response(response, "/private/tmp/b.loom").is_err());
-        let response = "running\tprotocol=1\ttransport=tcp\t123\t/private/tmp/a.loom\tidentity=unix:1:2\tsessions=1\tpins=2\tpermanent_pins=1\tleased_pins=1\tpin=permanent:6d616e75616c\tpin=leased:600:6d6f756e74\n";
+        assert!(parse_response(response, "/private/tmp/a.loom").is_err());
+        let response = "running\tprotocol=1\ttransport=tcp\t123\t/private/tmp/a.loom\tidentity=unix:1:2\tstartup_mode=managed\tstartup_initiator=cli.mcp.local\tsessions=1\tpins=2\tpermanent_pins=1\tleased_pins=1\tpin=permanent:6d616e75616c\tpin=leased:600:6d6f756e74\n";
         let status = parse_response_expected(response, "/private/tmp/b.loom", "unix:1:2").unwrap();
         assert_eq!(status.pid, "123");
+        assert_eq!(status.startup_mode, DaemonStartupMode::Managed);
+        assert_eq!(
+            status.startup_initiator,
+            DaemonStartupInitiator::CliMcpLocal
+        );
         assert_eq!(status.store, "/private/tmp/a.loom");
         assert_eq!(status.store_id, "unix:1:2");
         assert_eq!(status.sessions, 1);
@@ -2375,6 +2893,112 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn daemon_startup_contract_rejects_unknown_and_delimited_values() {
+        assert_eq!(
+            DaemonStartupMode::parse("persistent").unwrap(),
+            DaemonStartupMode::Persistent
+        );
+        assert_eq!(
+            DaemonStartupMode::parse("managed").unwrap(),
+            DaemonStartupMode::Managed
+        );
+        assert!(DaemonStartupMode::parse("manual").is_err());
+        assert!(DaemonStartupMode::parse("managed\tpins=0").is_err());
+        assert!(DaemonStartupMode::parse("managed\n").is_err());
+
+        assert_eq!(
+            DaemonStartupInitiator::parse("cli.daemon.start").unwrap(),
+            DaemonStartupInitiator::CliDaemonStart
+        );
+        assert_eq!(
+            DaemonStartupInitiator::parse("cli.daemon.restart").unwrap(),
+            DaemonStartupInitiator::CliDaemonRestart
+        );
+        assert_eq!(
+            DaemonStartupInitiator::parse("cli.mcp.local").unwrap(),
+            DaemonStartupInitiator::CliMcpLocal
+        );
+        assert!(DaemonStartupInitiator::parse("mcp").is_err());
+        assert!(DaemonStartupInitiator::parse("cli.mcp.local\tpins=0").is_err());
+        assert!(DaemonStartupInitiator::parse("cli.mcp.local\n").is_err());
+
+        let unknown_mode =
+            "running\tprotocol=1\ttransport=tcp\t123\t/private/tmp/a.loom\tstartup_mode=manual\n";
+        assert!(parse_response(unknown_mode, "/private/tmp/a.loom").is_err());
+        let unknown_initiator =
+            "running\tprotocol=1\ttransport=tcp\t123\t/private/tmp/a.loom\tstartup_initiator=mcp\n";
+        assert!(parse_response(unknown_initiator, "/private/tmp/a.loom").is_err());
+        let missing_initiator =
+            "running\tprotocol=1\ttransport=tcp\t123\t/private/tmp/a.loom\tstartup_mode=managed\n";
+        assert!(parse_response(missing_initiator, "/private/tmp/a.loom").is_err());
+        let missing_mode = "running\tprotocol=1\ttransport=tcp\t123\t/private/tmp/a.loom\tstartup_initiator=cli.mcp.local\n";
+        assert!(parse_response(missing_mode, "/private/tmp/a.loom").is_err());
+        let obsolete_surface = "running\tprotocol=1\ttransport=tcp\t123\t/private/tmp/a.loom\tstartup_mode=managed\tinitiating_surface=cli.mcp.local\n";
+        assert!(parse_response(obsolete_surface, "/private/tmp/a.loom").is_err());
+    }
+
+    #[test]
+    fn mu15d_s_runtime_lock_metadata_parses_startup_progress() {
+        let path = std::env::temp_dir().join(format!(
+            "loom-daemon-mu15d-s-{}-{}.loom",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"test").unwrap();
+        let paths = paths(path.to_string_lossy().as_ref()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&paths.lock_file)
+            .unwrap();
+        lock.lock().unwrap();
+        std::fs::write(
+            &paths.lock_file,
+            format!(
+                "store={}\nidentity={}\npid=42\nphase=starting\nstartup_mode=persistent\nstartup_initiator=cli.daemon.start\nstartup_stage=engine.sections\nstartup_started_ms=100\nstage_started_ms=150\nheartbeat_ms=175\nprogress_ms=150\nprogress_seq=2\nprogress_completed=4\nprogress_total=10\n",
+                paths.store, paths.store_id
+            ),
+        )
+        .unwrap();
+
+        let metadata = starting_runtime_metadata(&paths).unwrap();
+        assert_eq!(metadata.pid, "42");
+        assert_eq!(metadata.phase, Some(DaemonRuntimeLockPhase::Starting));
+        assert_eq!(
+            metadata.startup_stage,
+            Some(DaemonStartupStage::EngineSections)
+        );
+        assert_eq!(metadata.startup_started_ms, Some(100));
+        assert_eq!(metadata.stage_started_ms, Some(150));
+        assert_eq!(metadata.heartbeat_ms, Some(175));
+        assert_eq!(metadata.progress_ms, Some(150));
+        assert_eq!(metadata.progress_seq, Some(2));
+        assert_eq!(metadata.progress_completed, Some(4));
+        assert_eq!(metadata.progress_total, Some(10));
+        let json = status_json(&paths);
+        assert!(json.contains("\"state\":\"STARTING\""), "{json}");
+        assert!(
+            json.contains("\"startup_stage\":\"engine.sections\""),
+            "{json}"
+        );
+        assert!(json.contains("\"progress_completed\":4"), "{json}");
+        assert!(json.contains("\"progress_total\":10"), "{json}");
+        assert!(json.contains("\"heartbeat_ms\":175"), "{json}");
+        assert!(json.contains("\"progress_ms\":150"), "{json}");
+        assert!(json.contains("\"progress_seq\":2"), "{json}");
+
+        drop(lock);
+        let _ = std::fs::remove_file(&paths.lock_file);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2758,6 +3382,19 @@ mod tests {
         let err = parse_daemon_error("legacy daemon error\n");
         assert_eq!(err.code, Code::InvalidArgument);
         assert_eq!(err.message, "legacy daemon error");
+    }
+
+    #[test]
+    fn generated_response_parsers_preserve_daemon_errors() {
+        let response = b"error\tRESOURCE_EXHAUSTED: daemon active connection limit reached\n";
+        let unary =
+            parse_generated_binary_response(response, DAEMON_GENERATED_RESPONSE_MAGIC).unwrap_err();
+        assert_eq!(unary.code, Code::ResourceExhausted);
+        assert_eq!(unary.message, "daemon active connection limit reached");
+
+        let stream = parse_generated_stream_response(response).unwrap_err();
+        assert_eq!(stream.code, Code::ResourceExhausted);
+        assert_eq!(stream.message, "daemon active connection limit reached");
     }
 
     #[cfg(feature = "integration-tests")]

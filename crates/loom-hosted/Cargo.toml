@@ -61,6 +61,7 @@ loom-hosted-core.workspace = true
 loom-hosted-pim.workspace = true
 loom-interchange.workspace = true
 loom-interchange-io.workspace = true
+loom-client.workspace = true
 loom-inference = { workspace = true, optional = true }
 loom-lanes.workspace = true
 loom-lifecycle.workspace = true

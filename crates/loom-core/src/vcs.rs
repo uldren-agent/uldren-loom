@@ -205,7 +205,7 @@ impl EngineStateInstrumentation {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineStateDelta {
     workspace: WorkspaceId,
     work: BTreeMap<String, Option<StagedEntry>>,
@@ -217,6 +217,45 @@ pub type PreparedEngineObjects = Vec<(Digest, Vec<u8>)>;
 pub type BoundedEnginePlanOutput = (EngineStateDelta, PreparedEngineObjects);
 
 impl EngineStateDelta {
+    pub fn empty(workspace: WorkspaceId) -> Self {
+        Self {
+            workspace,
+            work: BTreeMap::new(),
+            directories: BTreeMap::new(),
+            content: BTreeMap::new(),
+        }
+    }
+
+    pub fn summary(
+        workspace: WorkspaceId,
+        changed_paths: impl IntoIterator<Item = String>,
+        changed_content_count: usize,
+    ) -> Self {
+        let work = changed_paths
+            .into_iter()
+            .map(|path| (path, None))
+            .collect::<BTreeMap<_, _>>();
+        let content = (0..changed_content_count)
+            .map(|index| {
+                let address =
+                    Digest::blake3(format!("engine-state-delta-address-{index}").as_bytes());
+                let object =
+                    Digest::blake3(format!("engine-state-delta-object-{index}").as_bytes());
+                (address, object)
+            })
+            .collect();
+        Self {
+            workspace,
+            work,
+            directories: BTreeMap::new(),
+            content,
+        }
+    }
+
+    pub fn workspace(&self) -> WorkspaceId {
+        self.workspace
+    }
+
     pub fn changed_paths(&self) -> Vec<String> {
         self.work.keys().cloned().collect()
     }
@@ -879,10 +918,13 @@ pub use objects::{LiveRootClassDiagnostics, LiveRootDiagnostics, LiveRootExample
 mod protected_refs;
 mod replay;
 mod state;
+pub use state::{EngineStateLoadProgress, EngineStateLoadStage};
 mod streams;
 mod timeseries;
 
-pub use objects::{ReachabilityMarkState, ReachabilityMarkStep, ReachabilityProllyCursor};
+pub use objects::{
+    ReachabilityMarkState, ReachabilityMarkStep, ReachabilityProllyCursor, ReachabilityStreamRoot,
+};
 
 // ---- engine-state codec helpers (for export_state/import_state) ---------------------------------
 

@@ -53,6 +53,66 @@ export function columnarAppend(
   );
 }
 
+export async function columnarImportArrow(
+  loomPath: string,
+  workspace: string,
+  name: string,
+  payload: Uint8Array | number[],
+  targetSegmentRows: number | string | bigint,
+  replace: boolean,
+  dryRun = false,
+  loomKey?: LoomKey,
+  auth?: LoomAuth
+): Promise<Uint8Array> {
+  const [passphrase, kek] = keyArgs(loomKey);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return Uint8Array.from(
+    await UldrenLoom.columnarImportArrow(
+      loomPath,
+      workspace,
+      name,
+      Array.from(payload),
+      targetSegmentRows.toString(),
+      replace,
+      dryRun,
+      passphrase,
+      kek,
+      authPrincipal,
+      authPassphrase
+    )
+  );
+}
+
+export async function columnarImportParquet(
+  loomPath: string,
+  workspace: string,
+  name: string,
+  payload: Uint8Array | number[],
+  targetSegmentRows: number | string | bigint,
+  replace: boolean,
+  dryRun = false,
+  loomKey?: LoomKey,
+  auth?: LoomAuth
+): Promise<Uint8Array> {
+  const [passphrase, kek] = keyArgs(loomKey);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return Uint8Array.from(
+    await UldrenLoom.columnarImportParquet(
+      loomPath,
+      workspace,
+      name,
+      Array.from(payload),
+      targetSegmentRows.toString(),
+      replace,
+      dryRun,
+      passphrase,
+      kek,
+      authPrincipal,
+      authPassphrase
+    )
+  );
+}
+
 /** All rows of dataset `name` in append order as raw Loom Canonical CBOR (an array of cell arrays). */
 export async function columnarScanCbor(
   loomPath: string,

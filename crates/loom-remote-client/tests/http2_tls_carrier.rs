@@ -16,7 +16,7 @@ use loom_locator::{ContextResolver, Layer};
 use loom_remote_client::carrier::Http2TlsTransport;
 use loom_remote_client::{RemoteConnection, RemoteLoomClient};
 use loom_remote_protocol::discovery::{DiscoveryMode, DiscoveryRoutes};
-use loom_remote_protocol::generated_api::{Kv, Queue, Sql, Store, Tasks, Workspaces};
+use loom_remote_protocol::generated_api::{Kv, Locks, Queue, Sql, Store, Tasks, Workspaces};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -315,6 +315,124 @@ async fn client_opens_a_session_over_the_carrier_route() {
             .expect("kv get"),
         Some(b"v".to_vec())
     );
+
+    server.shutdown();
+    runtime.shutdown();
+    std::fs::remove_dir_all(&path).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logical_lock_session_resumes_over_a_new_hosted_connection() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let path = temp_store();
+    let runtime = Arc::new(RemoteRuntime::start(&path, config()).expect("start"));
+    let service = Arc::new(RemoteHttpService::new(runtime.clone(), CALL_PATH));
+    let (server_tls, cert_der) = tls_material();
+    let server = RemoteHttpServer::bind("127.0.0.1:0".parse().unwrap(), server_tls, service)
+        .await
+        .expect("bind server");
+    let addr = server.local_addr();
+    let auth = loom_remote_protocol::session::SessionAuth::Unauthenticated;
+
+    let first_transport = Http2TlsTransport::new(
+        addr,
+        "localhost",
+        CALL_PATH,
+        client_config(cert_der.clone()),
+    );
+    let first_connection =
+        RemoteConnection::connect(first_transport, "prod", &resolver(), DiscoveryMode::Default)
+            .await
+            .expect("connect first attachment");
+    let first = RemoteLoomClient::new(first_connection);
+    let logical = first
+        .create_logical_session(auth.clone())
+        .await
+        .expect("create logical session");
+    let first_handle = Store::open(&first).await.expect("open first handle");
+    let first_token = Locks::lock_acquire(
+        &first,
+        first_handle,
+        "hosted-key".to_string(),
+        vec![0],
+        1,
+        1,
+        60_000,
+        0,
+    )
+    .await
+    .expect("acquire through first attachment");
+    drop(first);
+
+    let resumed_transport = Http2TlsTransport::new(
+        addr,
+        "localhost",
+        CALL_PATH,
+        client_config(cert_der.clone()),
+    );
+    let resumed_connection = RemoteConnection::connect(
+        resumed_transport,
+        "prod",
+        &resolver(),
+        DiscoveryMode::Default,
+    )
+    .await
+    .expect("connect replacement attachment");
+    let resumed = RemoteLoomClient::new(resumed_connection);
+    let rotated = resumed
+        .resume_logical_session(auth.clone(), &logical.credential)
+        .await
+        .expect("resume logical session");
+    assert_eq!(rotated.session_id, logical.session_id);
+    let resumed_handle = Store::open(&resumed).await.expect("open resumed handle");
+    let refreshed = Locks::lock_refresh(&resumed, resumed_handle, first_token.clone(), 60_000)
+        .await
+        .expect("refresh through replacement attachment");
+
+    let foreign_transport =
+        Http2TlsTransport::new(addr, "localhost", CALL_PATH, client_config(cert_der));
+    let foreign_connection = RemoteConnection::connect(
+        foreign_transport,
+        "prod",
+        &resolver(),
+        DiscoveryMode::Default,
+    )
+    .await
+    .expect("connect foreign attachment");
+    let foreign = RemoteLoomClient::new(foreign_connection);
+    foreign
+        .create_logical_session(auth.clone())
+        .await
+        .expect("create foreign logical session");
+    let foreign_handle = Store::open(&foreign).await.expect("open foreign handle");
+    assert_eq!(
+        Locks::lock_release(&foreign, foreign_handle.clone(), refreshed)
+            .await
+            .expect_err("foreign session must not release token")
+            .code,
+        loom_core::Code::PermissionDenied
+    );
+
+    resumed
+        .close_logical_session(auth, &rotated.credential)
+        .await
+        .expect("close resumed logical session");
+    let next = Locks::lock_acquire(
+        &foreign,
+        foreign_handle,
+        "hosted-key".to_string(),
+        vec![0],
+        1,
+        1,
+        60_000,
+        0,
+    )
+    .await
+    .expect("close released hosted lock");
+    let first = loom_wire::lock::lock_token_from_cbor(&first_token).unwrap();
+    let next = loom_wire::lock::lock_token_from_cbor(&next).unwrap();
+    assert!(next.fence > first.fence);
 
     server.shutdown();
     runtime.shutdown();

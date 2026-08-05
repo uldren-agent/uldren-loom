@@ -22,6 +22,7 @@
 pub mod lookup_cbor;
 pub mod result_cbor;
 mod value_map;
+pub use value_map::value_from_tabular;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -1044,7 +1045,7 @@ fn payload_cbor(p: &gluesql_core::prelude::Payload) -> Result<loom_codec::Value>
                         .map(|(name, dt)| {
                             Map(vec![
                                 (cbor_text("name"), cbor_text(name.clone())),
-                                (cbor_text("type"), cbor_text(format!("{dt:?}"))),
+                                (cbor_text("type"), cbor_text(result_data_type_label(dt))),
                             ])
                         })
                         .collect(),
@@ -1064,6 +1065,74 @@ fn payload_cbor(p: &gluesql_core::prelude::Payload) -> Result<loom_codec::Value>
         Payload::Commit => payload_kind("Commit"),
         Payload::Rollback => payload_kind("Rollback"),
         Payload::ShowVariable(var) => show_variable(var),
+    })
+}
+
+fn result_data_type_label(dt: &gluesql_core::ast::DataType) -> String {
+    use gluesql_core::ast::DataType;
+    match dt {
+        DataType::Boolean => "Boolean",
+        DataType::Int8 => "Int8",
+        DataType::Int16 => "Int16",
+        DataType::Int32 => "Int32",
+        DataType::Int => "Int",
+        DataType::Int128 => "Int128",
+        DataType::Uint8 => "Uint8",
+        DataType::Uint16 => "Uint16",
+        DataType::Uint32 => "Uint32",
+        DataType::Uint64 => "Uint64",
+        DataType::Uint128 => "Uint128",
+        DataType::Float32 => "Float32",
+        DataType::Float => "Float",
+        DataType::Text => "Text",
+        DataType::Bytea => "Bytea",
+        DataType::Inet => "Inet",
+        DataType::Date => "Date",
+        DataType::Timestamp => "Timestamp",
+        DataType::Time => "Time",
+        DataType::Interval => "Interval",
+        DataType::Uuid => "Uuid",
+        DataType::Map => "Map",
+        DataType::List => "List",
+        DataType::Decimal => "Decimal",
+        DataType::Point => "Point",
+    }
+    .to_string()
+}
+
+pub fn data_type_from_result_label(label: &str) -> Result<gluesql_core::ast::DataType> {
+    use gluesql_core::ast::DataType;
+    Ok(match label {
+        "Boolean" => DataType::Boolean,
+        "Int8" => DataType::Int8,
+        "Int16" => DataType::Int16,
+        "Int32" => DataType::Int32,
+        "Int" => DataType::Int,
+        "Int128" => DataType::Int128,
+        "Uint8" => DataType::Uint8,
+        "Uint16" => DataType::Uint16,
+        "Uint32" => DataType::Uint32,
+        "Uint64" => DataType::Uint64,
+        "Uint128" => DataType::Uint128,
+        "Float32" => DataType::Float32,
+        "Float" => DataType::Float,
+        "Text" => DataType::Text,
+        "Bytea" => DataType::Bytea,
+        "Inet" => DataType::Inet,
+        "Date" => DataType::Date,
+        "Timestamp" => DataType::Timestamp,
+        "Time" => DataType::Time,
+        "Interval" => DataType::Interval,
+        "Uuid" => DataType::Uuid,
+        "Map" => DataType::Map,
+        "List" => DataType::List,
+        "Decimal" => DataType::Decimal,
+        "Point" => DataType::Point,
+        other => {
+            return Err(LoomError::corrupt(format!(
+                "unknown SQL DataType label {other:?}"
+            )));
+        }
     })
 }
 

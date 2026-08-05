@@ -5,6 +5,42 @@
 
 namespace uldren::loom {
 
+enum class LaneTicketPlacement : std::int32_t {
+    First = LOOM_LANE_TICKET_PLACEMENT_FIRST,
+    Last = LOOM_LANE_TICKET_PLACEMENT_LAST,
+    Before = LOOM_LANE_TICKET_PLACEMENT_BEFORE,
+    After = LOOM_LANE_TICKET_PLACEMENT_AFTER,
+};
+
+enum class TicketReviewType {
+    DesignReview,
+    CodeReview,
+};
+
+inline const char *ticket_review_type_name(TicketReviewType value) {
+    switch (value) {
+    case TicketReviewType::DesignReview:
+        return "design_review";
+    case TicketReviewType::CodeReview:
+        return "code_review";
+    }
+    return "";
+}
+
+inline std::string ticket_review_types_json(const std::vector<TicketReviewType> &values) {
+    std::string out = "[";
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            out += ",";
+        }
+        out += "\"";
+        out += ticket_review_type_name(values[i]);
+        out += "\"";
+    }
+    out += "]";
+    return out;
+}
+
 class batch;
 class sql;
 
@@ -116,13 +152,875 @@ public:
 
     batch sql_batch(const std::string &ns, const std::string &db) const;
 
-    /// Execute a canonical `loom.exec.request.v1` request; returns `loom.exec.result.v1` bytes.
-    std::vector<std::uint8_t> exec_cbor(const std::vector<std::uint8_t> &request) {
+    std::string lifecycle_define_standard_json(const std::string &workspace,
+                                               const std::string &kind,
+                                               const std::string &version,
+                                               const std::string &completion_predicate_digest) {
+        char *out = nullptr;
+        detail::check(::loom_lifecycle_define_standard_json(
+            handle_, workspace.c_str(), kind.c_str(), version.c_str(),
+            completion_predicate_digest.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string lifecycle_define_json(const std::string &workspace,
+                                      const std::vector<std::uint8_t> &definition) {
+        char *out = nullptr;
+        detail::check(::loom_lifecycle_define_json(handle_, workspace.c_str(), definition.data(),
+                                                   definition.size(), &out));
+        return detail::take_string(out);
+    }
+    std::string lifecycle_instantiate_json(const std::string &workspace,
+                                           const std::string &instance_id,
+                                           const std::string &definition_id,
+                                           const std::string &subject_refs_json) {
+        char *out = nullptr;
+        detail::check(::loom_lifecycle_instantiate_json(handle_, workspace.c_str(),
+                                                        instance_id.c_str(), definition_id.c_str(),
+                                                        subject_refs_json.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string lifecycle_transition_json(
+        const std::string &workspace, const std::string &instance_id,
+        const std::string &transition_id, const std::string &to_stage_id,
+        const std::optional<std::string> &actor_principal_id,
+        const std::string &gate_evaluations_json,
+        const std::optional<std::string> &snapshot_digest = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_lifecycle_transition_json(
+            handle_, workspace.c_str(), instance_id.c_str(), transition_id.c_str(),
+            to_stage_id.c_str(), actor_principal_id ? actor_principal_id->c_str() : nullptr,
+            gate_evaluations_json.c_str(), snapshot_digest ? snapshot_digest->c_str() : nullptr,
+            &out));
+        return detail::take_string(out);
+    }
+    std::string refs_reconcile_json(const std::string &workspace, std::uint64_t max) {
+        char *out = nullptr;
+        detail::check(::loom_refs_reconcile_json(handle_, workspace.c_str(), max, &out));
+        return detail::take_string(out);
+    }
+    std::vector<std::uint8_t> import_table_csv(
+        const std::string &workspace, const std::string &source_scope,
+        const std::vector<std::uint8_t> &csv_payload, const std::string &database,
+        const std::string &table, const std::string &schema, const std::string &primary_key,
+        const std::string &mode, bool commit, const std::optional<std::string> &author,
+        const std::optional<std::string> &message, bool dry_run = false) {
         std::uint8_t *ptr = nullptr;
         std::uintptr_t len = 0;
-        detail::check(::loom_exec_cbor(handle_, request.data(), request.size(), &ptr, &len));
+        detail::check(::loom_import_table_csv(
+            handle_, workspace.c_str(), source_scope.c_str(), csv_payload.data(),
+            csv_payload.size(), database.c_str(), table.c_str(), schema.c_str(),
+            primary_key.c_str(), mode.c_str(), commit ? 1 : 0,
+            author ? author->c_str() : nullptr, message ? message->c_str() : nullptr,
+            dry_run ? 1 : 0, &ptr, &len));
         return detail::take_result_bytes(ptr, len);
     }
+    std::vector<std::uint8_t> import_redmine(
+        const std::string &workspace, const std::string &profile,
+        const std::string &source_scope, const std::vector<std::uint8_t> &snapshot_payload,
+        const std::string &field_policy, bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_import_redmine(
+            handle_, workspace.c_str(), profile.c_str(), source_scope.c_str(),
+            snapshot_payload.data(), snapshot_payload.size(), field_policy.c_str(),
+            dry_run ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> import_asana(
+        const std::string &workspace, const std::string &profile,
+        const std::string &source_scope, const std::vector<std::uint8_t> &snapshot_payload,
+        const std::string &field_policy, bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_import_asana(
+            handle_, workspace.c_str(), profile.c_str(), source_scope.c_str(),
+            snapshot_payload.data(), snapshot_payload.size(), field_policy.c_str(),
+            dry_run ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> import_jira(
+        const std::string &workspace, const std::string &profile,
+        const std::string &source_scope, const std::vector<std::uint8_t> &snapshot_payload,
+        const std::string &field_policy, bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_import_jira(
+            handle_, workspace.c_str(), profile.c_str(), source_scope.c_str(),
+            snapshot_payload.data(), snapshot_payload.size(), field_policy.c_str(),
+            dry_run ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> import_confluence(
+        const std::string &workspace, const std::string &profile,
+        const std::string &source_scope, const std::vector<std::uint8_t> &snapshot_payload,
+        const std::string &default_space, bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_import_confluence(
+            handle_, workspace.c_str(), profile.c_str(), source_scope.c_str(),
+            snapshot_payload.data(), snapshot_payload.size(), default_space.c_str(),
+            dry_run ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> import_slack(
+        const std::string &workspace, const std::string &profile,
+        const std::string &source_scope, const std::vector<std::uint8_t> &snapshot_payload,
+        bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_import_slack(handle_, workspace.c_str(), profile.c_str(),
+                                          source_scope.c_str(), snapshot_payload.data(),
+                                          snapshot_payload.size(), dry_run ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> import_drive(
+        const std::string &workspace, const std::string &profile,
+        const std::string &source_scope, const std::vector<std::uint8_t> &archive_payload,
+        bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_import_drive(handle_, workspace.c_str(), profile.c_str(),
+                                          source_scope.c_str(), archive_payload.data(),
+                                          archive_payload.size(), dry_run ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> import_markdown(
+        const std::string &workspace, const std::string &profile,
+        const std::string &source_scope, const std::vector<std::uint8_t> &archive_payload,
+        const std::string &space, bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_import_markdown(
+            handle_, workspace.c_str(), profile.c_str(), source_scope.c_str(),
+            archive_payload.data(), archive_payload.size(), space.c_str(), dry_run ? 1 : 0,
+            &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> import_notion(
+        const std::string &workspace, const std::string &profile,
+        const std::string &source_scope, const std::vector<std::uint8_t> &snapshot_payload,
+        const std::string &default_space, bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_import_notion(
+            handle_, workspace.c_str(), profile.c_str(), source_scope.c_str(),
+            snapshot_payload.data(), snapshot_payload.size(), default_space.c_str(),
+            dry_run ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> columnar_import_arrow(
+        const std::string &workspace, const std::string &name,
+        const std::vector<std::uint8_t> &payload, std::uint64_t target_segment_rows,
+        bool replace, bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_columnar_import_arrow(
+            handle_, workspace.c_str(), name.c_str(), payload.data(), payload.size(),
+            target_segment_rows, replace ? 1 : 0, dry_run ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> columnar_import_parquet(
+        const std::string &workspace, const std::string &name,
+        const std::vector<std::uint8_t> &payload, std::uint64_t target_segment_rows,
+        bool replace, bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_columnar_import_parquet(
+            handle_, workspace.c_str(), name.c_str(), payload.data(), payload.size(),
+            target_segment_rows, replace ? 1 : 0, dry_run ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> vector_text_upsert(
+        const std::vector<std::uint8_t> &request) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_vector_text_upsert(
+            handle_, request.data(), request.size(), &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::string vector_workspace_configure_json(const std::string &workspace,
+                                                const std::string &request_json) {
+        char *out = nullptr;
+        detail::check(::loom_vector_workspace_configure_json(
+            handle_, workspace.c_str(), request_json.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string studio_reindex_json(const std::string &workspace, const std::string &profile) {
+        char *out = nullptr;
+        detail::check(::loom_studio_reindex_json(handle_, workspace.c_str(), profile.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string studio_revisions_rebuild_json(const std::string &workspace,
+                                              const std::string &profile,
+                                              bool dry_run = false) {
+        char *out = nullptr;
+        detail::check(::loom_studio_revisions_rebuild_json(
+            handle_, workspace.c_str(), profile.c_str(), dry_run ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+    std::vector<std::uint8_t> store_bundle_import(const std::vector<std::uint8_t> &bundle,
+                                                  bool dry_run = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_store_bundle_import(handle_, bundle.data(), bundle.size(),
+                                                 dry_run ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> audit_compact(std::uint64_t through_seq) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_audit_compact(handle_, through_seq, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> store_maintenance_status(
+        const std::vector<std::uint8_t> &request) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_store_maintenance_status(
+            handle_, request.data(), request.size(), &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> store_maintenance_policy_set(
+        const std::vector<std::uint8_t> &update) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_store_maintenance_policy_set(
+            handle_, update.data(), update.size(), &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::vector<std::uint8_t> store_maintenance_run(
+        const std::vector<std::uint8_t> &request) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_store_maintenance_run(
+            handle_, request.data(), request.size(), &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::string inference_instance_create_json(
+        const std::string &workspace, const std::string &name, const std::string &model,
+        const std::string &kind, const std::string &runtime,
+        const std::optional<std::string> &preset = std::nullopt,
+        const std::optional<std::string> &settings_json = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_inference_instance_create_json(
+            handle_, workspace.c_str(), name.c_str(), model.c_str(), kind.c_str(),
+            runtime.c_str(), preset ? preset->c_str() : nullptr,
+            settings_json ? settings_json->c_str() : nullptr, &out));
+        return detail::take_string(out);
+    }
+    std::string inference_instance_update_json(
+        const std::string &workspace, const std::string &name,
+        const std::optional<std::string> &preset = std::nullopt,
+        const std::optional<std::string> &settings_json = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_inference_instance_update_json(
+            handle_, workspace.c_str(), name.c_str(), preset ? preset->c_str() : nullptr,
+            settings_json ? settings_json->c_str() : nullptr, &out));
+        return detail::take_string(out);
+    }
+    std::string inference_instance_delete_json(const std::string &workspace,
+                                               const std::string &name) {
+        char *out = nullptr;
+        detail::check(::loom_inference_instance_delete_json(handle_, workspace.c_str(),
+                                                            name.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string serve_listener_configure_json(const std::string &request_json) {
+        char *out = nullptr;
+        detail::check(::loom_serve_listener_configure_json(handle_, request_json.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string serve_listener_list_json() {
+        char *out = nullptr;
+        detail::check(::loom_serve_listener_list_json(handle_, &out));
+        return detail::take_string(out);
+    }
+    std::string serve_listener_set_enabled_json(const std::string &listener_id, bool enabled) {
+        char *out = nullptr;
+        detail::check(::loom_serve_listener_set_enabled_json(handle_, listener_id.c_str(),
+                                                             enabled ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+    std::string serve_listener_remove_json(const std::string &listener_id) {
+        char *out = nullptr;
+        detail::check(::loom_serve_listener_remove_json(handle_, listener_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string serve_web_route_list_json(const std::string &listener_id) {
+        char *out = nullptr;
+        detail::check(::loom_serve_web_route_list_json(handle_, listener_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string serve_web_route_set_json(const std::string &request_json) {
+        char *out = nullptr;
+        detail::check(::loom_serve_web_route_set_json(handle_, request_json.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string serve_web_route_remove_json(const std::string &listener_id,
+                                            const std::string &route_id) {
+        char *out = nullptr;
+        detail::check(::loom_serve_web_route_remove_json(handle_, listener_id.c_str(),
+                                                         route_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::vector<std::uint8_t> apply_cbor(const std::vector<std::uint8_t> &request) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_apply_cbor(handle_, request.data(), request.size(), &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::string meetings_import_snapshot(const std::string &ns, const std::string &input_profile,
+                                         const std::vector<std::uint8_t> &snapshot,
+                                         bool dry_run = false) {
+        char *out = nullptr;
+        detail::check(::loom_meetings_import_snapshot(handle_, ns.c_str(), input_profile.c_str(),
+                                                      snapshot.data(), snapshot.size(),
+                                                      dry_run ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+    std::string drive_list_json(const std::string &ns, const std::string &workspace_id,
+                                const std::string &folder_id) {
+        char *out = nullptr;
+        detail::check(::loom_drive_list_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                             folder_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_stat_json(const std::string &ns, const std::string &workspace_id,
+                                const std::string &folder_id, const std::string &name) {
+        char *out = nullptr;
+        detail::check(::loom_drive_stat_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                             folder_id.c_str(), name.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::vector<std::uint8_t> drive_read_file(const std::string &ns,
+                                              const std::string &workspace_id,
+                                              const std::string &file_id) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_drive_read(handle_, ns.c_str(), workspace_id.c_str(),
+                                        file_id.c_str(), &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+    std::string drive_list_versions_json(const std::string &ns,
+                                         const std::string &workspace_id,
+                                         const std::string &file_id) {
+        char *out = nullptr;
+        detail::check(::loom_drive_list_versions_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                      file_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_list_conflicts_json(const std::string &ns,
+                                          const std::string &workspace_id) {
+        char *out = nullptr;
+        detail::check(
+            ::loom_drive_list_conflicts_json(handle_, ns.c_str(), workspace_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_list_shares_json(const std::string &ns,
+                                       const std::string &workspace_id) {
+        char *out = nullptr;
+        detail::check(
+            ::loom_drive_list_shares_json(handle_, ns.c_str(), workspace_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_list_retention_json(const std::string &ns,
+                                          const std::string &workspace_id) {
+        char *out = nullptr;
+        detail::check(
+            ::loom_drive_list_retention_json(handle_, ns.c_str(), workspace_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_create_folder_json(const std::string &ns,
+                                         const std::string &workspace_id,
+                                         const std::string &parent_folder_id,
+                                         const std::string &folder_id, const std::string &name,
+                                         const std::string &expected_root) {
+        char *out = nullptr;
+        detail::check(::loom_drive_create_folder_json(
+            handle_, ns.c_str(), workspace_id.c_str(), parent_folder_id.c_str(),
+            folder_id.c_str(), name.c_str(), expected_root.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_create_upload_json(const std::string &ns,
+                                         const std::string &workspace_id,
+                                         const std::string &upload_id,
+                                         const std::string &parent_folder_id,
+                                         const std::string &name, const std::string &file_id,
+                                         const std::string &expected_root,
+                                         std::uint64_t created_at_ms, bool replace_file) {
+        char *out = nullptr;
+        detail::check(::loom_drive_create_upload_json(
+            handle_, ns.c_str(), workspace_id.c_str(), upload_id.c_str(),
+            parent_folder_id.c_str(), name.c_str(), file_id.c_str(), expected_root.c_str(),
+            created_at_ms, replace_file ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+    std::string drive_upload_chunk_json(const std::string &ns,
+                                        const std::string &workspace_id,
+                                        const std::string &upload_id,
+                                        const std::vector<std::uint8_t> &chunk) {
+        char *out = nullptr;
+        detail::check(::loom_drive_upload_chunk_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                     upload_id.c_str(), chunk.data(),
+                                                     chunk.size(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_commit_upload_json(const std::string &ns,
+                                         const std::string &workspace_id,
+                                         const std::string &upload_id) {
+        char *out = nullptr;
+        detail::check(::loom_drive_commit_upload_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                      upload_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_rename_json(const std::string &ns, const std::string &workspace_id,
+                                  const std::string &folder_id, const std::string &node_id,
+                                  const std::string &new_name,
+                                  const std::string &expected_root) {
+        char *out = nullptr;
+        detail::check(::loom_drive_rename_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                               folder_id.c_str(), node_id.c_str(),
+                                               new_name.c_str(), expected_root.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_move_json(const std::string &ns, const std::string &workspace_id,
+                                const std::string &source_folder_id,
+                                const std::string &target_folder_id,
+                                const std::string &node_id, const std::string &expected_root) {
+        char *out = nullptr;
+        detail::check(::loom_drive_move_json(
+            handle_, ns.c_str(), workspace_id.c_str(), source_folder_id.c_str(),
+            target_folder_id.c_str(), node_id.c_str(), expected_root.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_delete_json(const std::string &ns, const std::string &workspace_id,
+                                  const std::string &folder_id, const std::string &node_id,
+                                  const std::string &expected_root) {
+        char *out = nullptr;
+        detail::check(::loom_drive_delete_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                               folder_id.c_str(), node_id.c_str(),
+                                               expected_root.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_resolve_conflict_json(const std::string &ns,
+                                            const std::string &workspace_id,
+                                            const std::string &conflict_id,
+                                            const std::string &resolution) {
+        char *out = nullptr;
+        detail::check(::loom_drive_resolve_conflict_json(
+            handle_, ns.c_str(), workspace_id.c_str(), conflict_id.c_str(), resolution.c_str(),
+            &out));
+        return detail::take_string(out);
+    }
+    std::string drive_grant_share_json(const std::string &ns, const std::string &workspace_id,
+                                       const std::string &grant_id,
+                                       const std::string &target_kind,
+                                       const std::string &target_id,
+                                       const std::string &principal, const std::string &role,
+                                       std::uint64_t granted_at_ms,
+                                       std::optional<std::uint64_t> expires_at_ms = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_drive_grant_share_json(
+            handle_, ns.c_str(), workspace_id.c_str(), grant_id.c_str(), target_kind.c_str(),
+            target_id.c_str(), principal.c_str(), role.c_str(), granted_at_ms,
+            expires_at_ms.value_or(0), expires_at_ms ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+    std::string drive_revoke_share_json(const std::string &ns,
+                                        const std::string &workspace_id,
+                                        const std::string &grant_id) {
+        char *out = nullptr;
+        detail::check(::loom_drive_revoke_share_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                     grant_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string drive_apply_share_expiry_json(const std::string &ns,
+                                              const std::string &workspace_id,
+                                              std::uint64_t now_ms) {
+        char *out = nullptr;
+        detail::check(::loom_drive_apply_share_expiry_json(handle_, ns.c_str(),
+                                                           workspace_id.c_str(), now_ms, &out));
+        return detail::take_string(out);
+    }
+    std::string drive_pin_retention_json(
+        const std::string &ns, const std::string &workspace_id, const std::string &pin_id,
+        const std::string &kind, const std::string &root,
+        const std::optional<std::string> &target_entity_id, std::uint64_t added_at_ms,
+        std::optional<std::uint64_t> expires_at_ms = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_drive_pin_retention_json(
+            handle_, ns.c_str(), workspace_id.c_str(), pin_id.c_str(), kind.c_str(),
+            root.c_str(), target_entity_id ? target_entity_id->c_str() : nullptr,
+            added_at_ms, expires_at_ms.value_or(0), expires_at_ms ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+    std::string drive_unpin_retention_json(const std::string &ns,
+                                           const std::string &workspace_id,
+                                           const std::string &pin_id) {
+        char *out = nullptr;
+        detail::check(::loom_drive_unpin_retention_json(handle_, ns.c_str(),
+                                                        workspace_id.c_str(), pin_id.c_str(),
+                                                        &out));
+        return detail::take_string(out);
+    }
+    std::string drive_apply_retention_json(const std::string &ns,
+                                           const std::string &workspace_id,
+                                           std::uint64_t now_ms) {
+        char *out = nullptr;
+        detail::check(::loom_drive_apply_retention_json(handle_, ns.c_str(),
+                                                        workspace_id.c_str(), now_ms, &out));
+        return detail::take_string(out);
+    }
+    std::string chat_create_channel_json(const std::string &ns, const std::string &workspace_id,
+                                         const std::string &channel_id,
+                                         const std::string &channel_handle,
+                                         const std::string &name,
+                                         const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_create_channel_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                      channel_id.c_str(), channel_handle.c_str(),
+                                                      name.c_str(),
+                                                      expected_entity_tag ? expected_entity_tag->c_str() : nullptr,
+                                                      &out));
+        return detail::take_string(out);
+    }
+    std::string chat_rename_channel_json(const std::string &ns, const std::string &workspace_id,
+                                         const std::string &selector,
+                                         const std::string &channel_handle,
+                                         const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_rename_channel_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                      selector.c_str(), channel_handle.c_str(),
+                                                      expected_entity_tag ? expected_entity_tag->c_str() : nullptr,
+                                                      &out));
+        return detail::take_string(out);
+    }
+    std::string chat_list_channels_json(const std::string &ns,
+                                        const std::string &workspace_id) {
+        char *out = nullptr;
+        detail::check(::loom_chat_list_channels_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                     &out));
+        return detail::take_string(out);
+    }
+    std::string chat_post_message_json(
+        const std::string &ns, const std::string &workspace_id,
+        const std::string &channel_id, const std::string &message_id,
+        const std::optional<std::string> &thread_id, const std::string &body_text,
+        const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_post_message_json(
+            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), message_id.c_str(),
+            thread_id ? thread_id->c_str() : nullptr, body_text.c_str(),
+            expected_entity_tag ? expected_entity_tag->c_str() : nullptr, &out));
+        return detail::take_string(out);
+    }
+    std::string chat_post_message_bytes_json(
+        const std::string &ns, const std::string &workspace_id,
+        const std::string &channel_id, const std::string &message_id,
+        const std::optional<std::string> &thread_id, const std::vector<std::uint8_t> &body,
+        const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_post_message_bytes_json(
+            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), message_id.c_str(),
+            thread_id ? thread_id->c_str() : nullptr, body.data(), body.size(),
+            expected_entity_tag ? expected_entity_tag->c_str() : nullptr, &out));
+        return detail::take_string(out);
+    }
+    std::string chat_edit_message_json(const std::string &ns,
+                                       const std::string &workspace_id,
+                                       const std::string &channel_id,
+                                       const std::string &message_id,
+                                       const std::string &body_text,
+                                       const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_edit_message_json(
+            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), message_id.c_str(),
+            body_text.c_str(), expected_entity_tag ? expected_entity_tag->c_str() : nullptr, &out));
+        return detail::take_string(out);
+    }
+    std::string chat_edit_message_bytes_json(const std::string &ns,
+                                             const std::string &workspace_id,
+                                             const std::string &channel_id,
+                                             const std::string &message_id,
+                                             const std::vector<std::uint8_t> &body,
+                                             const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_edit_message_bytes_json(
+            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), message_id.c_str(),
+            body.data(), body.size(), expected_entity_tag ? expected_entity_tag->c_str() : nullptr,
+            &out));
+        return detail::take_string(out);
+    }
+    std::string chat_redact_message_json(const std::string &ns,
+                                         const std::string &workspace_id,
+                                         const std::string &channel_id,
+                                         const std::string &message_id,
+                                         const std::optional<std::string> &reason,
+                                         const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_redact_message_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                      channel_id.c_str(), message_id.c_str(),
+                                                      reason ? reason->c_str() : nullptr,
+                                                      expected_entity_tag ? expected_entity_tag->c_str() : nullptr,
+                                                      &out));
+        return detail::take_string(out);
+    }
+    std::string chat_create_thread_json(const std::string &ns,
+                                        const std::string &workspace_id,
+                                        const std::string &channel_id,
+                                        const std::string &thread_id,
+                                        const std::string &parent_message_id,
+                                        const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_create_thread_json(
+            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), thread_id.c_str(),
+            parent_message_id.c_str(), expected_entity_tag ? expected_entity_tag->c_str() : nullptr,
+            &out));
+        return detail::take_string(out);
+    }
+    std::string chat_create_task_json(const std::string &ns, const std::string &workspace_id,
+                                      const std::string &channel_id,
+                                      const std::string &task_id,
+                                      const std::string &message_id,
+                                      const std::string &title,
+                                      const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_create_task_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                   channel_id.c_str(), task_id.c_str(),
+                                                   message_id.c_str(), title.c_str(),
+                                                   expected_entity_tag ? expected_entity_tag->c_str() : nullptr,
+                                                   &out));
+        return detail::take_string(out);
+    }
+    std::string chat_claim_task_json(const std::string &ns,
+                                     const std::string &workspace_id,
+                                     const std::string &channel_id,
+                                     const std::string &task_id,
+                                     const std::string &claim_id,
+                                     const std::optional<std::string> &lease_token,
+                                     const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_claim_task_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                  channel_id.c_str(), task_id.c_str(),
+                                                  claim_id.c_str(),
+                                                  lease_token ? lease_token->c_str() : nullptr,
+                                                  expected_entity_tag ? expected_entity_tag->c_str() : nullptr,
+                                                  &out));
+        return detail::take_string(out);
+    }
+    std::string chat_complete_task_json(const std::string &ns,
+                                        const std::string &workspace_id,
+                                        const std::string &channel_id,
+                                        const std::string &task_id,
+                                        const std::string &claim_id,
+                                        const std::optional<std::string> &result_message_id,
+                                        const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_complete_task_json(
+            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), task_id.c_str(),
+            claim_id.c_str(), result_message_id ? result_message_id->c_str() : nullptr,
+            expected_entity_tag ? expected_entity_tag->c_str() : nullptr, &out));
+        return detail::take_string(out);
+    }
+    std::string chat_invoke_agent_json(
+        const std::string &ns, const std::string &workspace_id,
+        const std::string &channel_id, const std::string &invocation_id,
+        const std::string &agent_principal, const std::string &source_message_ids_json,
+        const std::string &prompt_text,
+        const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_invoke_agent_json(
+            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), invocation_id.c_str(),
+            agent_principal.c_str(), source_message_ids_json.c_str(), prompt_text.c_str(),
+            expected_entity_tag ? expected_entity_tag->c_str() : nullptr, &out));
+        return detail::take_string(out);
+    }
+    std::string chat_invoke_agent_bytes_json(
+        const std::string &ns, const std::string &workspace_id,
+        const std::string &channel_id, const std::string &invocation_id,
+        const std::string &agent_principal, const std::string &source_message_ids_json,
+        const std::vector<std::uint8_t> &prompt,
+        const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_invoke_agent_bytes_json(
+            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), invocation_id.c_str(),
+            agent_principal.c_str(), source_message_ids_json.c_str(), prompt.data(), prompt.size(),
+            expected_entity_tag ? expected_entity_tag->c_str() : nullptr, &out));
+        return detail::take_string(out);
+    }
+    std::string chat_agent_reply_json(const std::string &ns,
+                                      const std::string &workspace_id,
+                                      const std::string &channel_id,
+                                      const std::string &invocation_id,
+                                      const std::string &message_id,
+                                      const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_agent_reply_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                   channel_id.c_str(), invocation_id.c_str(),
+                                                   message_id.c_str(),
+                                                   expected_entity_tag ? expected_entity_tag->c_str() : nullptr,
+                                                   &out));
+        return detail::take_string(out);
+    }
+    std::string chat_request_handoff_json(
+        const std::string &ns, const std::string &workspace_id,
+        const std::string &channel_id, const std::string &handoff_id,
+        const std::string &from_agent_principal, const std::optional<std::string> &to_principal,
+        const std::optional<std::string> &reason,
+        const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_request_handoff_json(
+            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), handoff_id.c_str(),
+            from_agent_principal.c_str(), to_principal ? to_principal->c_str() : nullptr,
+            reason ? reason->c_str() : nullptr,
+            expected_entity_tag ? expected_entity_tag->c_str() : nullptr, &out));
+        return detail::take_string(out);
+    }
+    std::string chat_add_reaction_json(const std::string &ns,
+                                       const std::string &workspace_id,
+                                       const std::string &channel_id,
+                                       const std::string &message_id,
+                                       const std::string &kind,
+                                       const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_add_reaction_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                    channel_id.c_str(), message_id.c_str(),
+                                                    kind.c_str(),
+                                                    expected_entity_tag ? expected_entity_tag->c_str()
+                                                                        : nullptr,
+                                                    &out));
+        return detail::take_string(out);
+    }
+    std::string chat_remove_reaction_json(const std::string &ns,
+                                          const std::string &workspace_id,
+                                          const std::string &channel_id,
+                                          const std::string &message_id,
+                                          const std::string &kind,
+                                          const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_remove_reaction_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                       channel_id.c_str(), message_id.c_str(),
+                                                       kind.c_str(),
+                                                       expected_entity_tag
+                                                           ? expected_entity_tag->c_str()
+                                                           : nullptr,
+                                                       &out));
+        return detail::take_string(out);
+    }
+    std::string chat_emoji_list_json(const std::string &ns,
+                                     const std::string &workspace_id) {
+        char *out = nullptr;
+        detail::check(::loom_chat_emoji_list_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                  &out));
+        return detail::take_string(out);
+    }
+    std::string chat_emoji_register_json(const std::string &ns,
+                                         const std::string &workspace_id,
+                                         const std::string &kind,
+                                         const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_emoji_register_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                      kind.c_str(),
+                                                      expected_entity_tag ? expected_entity_tag->c_str()
+                                                                          : nullptr,
+                                                      &out));
+        return detail::take_string(out);
+    }
+    std::string chat_emoji_unregister_json(const std::string &ns,
+                                           const std::string &workspace_id,
+                                           const std::string &kind,
+                                           const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_emoji_unregister_json(handle_, ns.c_str(),
+                                                        workspace_id.c_str(), kind.c_str(),
+                                                        expected_entity_tag
+                                                            ? expected_entity_tag->c_str()
+                                                            : nullptr,
+                                                        &out));
+        return detail::take_string(out);
+    }
+    std::string chat_messages_json(const std::string &ns, const std::string &workspace_id,
+                                   const std::string &channel_id) {
+        char *out = nullptr;
+        detail::check(::loom_chat_messages_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                channel_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string chat_cursor_json(const std::string &ns, const std::string &workspace_id,
+                                 const std::string &channel_id) {
+        char *out = nullptr;
+        detail::check(::loom_chat_cursor_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                              channel_id.c_str(), &out));
+        return detail::take_string(out);
+    }
+    std::string chat_update_cursor_json(const std::string &ns,
+                                        const std::string &workspace_id,
+                                        const std::string &channel_id,
+                                        std::uint64_t next_sequence,
+                                        const std::optional<std::string> &expected_entity_tag = std::nullopt) {
+        char *out = nullptr;
+        detail::check(::loom_chat_update_cursor_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                     channel_id.c_str(), next_sequence,
+                                                     expected_entity_tag ? expected_entity_tag->c_str()
+                                                                         : nullptr,
+                                                     &out));
+        return detail::take_string(out);
+    }
+    std::string chat_fetch_events_json(const std::string &ns,
+                                       const std::string &workspace_id,
+                                       const std::string &channel_id,
+                                       std::uint64_t from_sequence, std::uint64_t max) {
+        char *out = nullptr;
+        detail::check(::loom_chat_fetch_events_json(handle_, ns.c_str(), workspace_id.c_str(),
+                                                    channel_id.c_str(), from_sequence, max, &out));
+        return detail::take_string(out);
+    }
+    std::vector<std::uint8_t> sql_exec_result(const std::string &workspace,
+                                              const std::string &db,
+                                              const std::string &sql) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_sql_exec_result(
+            handle_, workspace.c_str(), db.c_str(), sql.c_str(), &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+
+
+
+
+
+
+    /// Execute a canonical `loom.exec.request.v1` request; returns `loom.exec.result.v1` bytes.
+    std::vector<std::uint8_t> exec_cbor(const std::vector<std::uint8_t> &request) {
+        return apply_cbor(request);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     std::vector<std::uint8_t> lanes_create(const std::string &workspace,
                                            const std::vector<std::uint8_t> &lane) {
@@ -173,13 +1071,13 @@ public:
 
     std::vector<std::uint8_t> lanes_ticket_add(
         const std::string &workspace, const std::string &lane_id, const std::string &ticket_id,
-        const std::string &updated_by, const std::string &placement = "append",
+        const std::string &updated_by, LaneTicketPlacement placement = LaneTicketPlacement::Last,
         const std::optional<std::string> &anchor = std::nullopt) {
         std::uint8_t *ptr = nullptr;
         std::uintptr_t len = 0;
         detail::check(::loom_lanes_ticket_add_cbor(handle_, workspace.c_str(), lane_id.c_str(),
                                                    ticket_id.c_str(), updated_by.c_str(),
-                                                   placement.c_str(),
+                                                   static_cast<std::int32_t>(placement),
                                                    anchor ? anchor->c_str() : nullptr, &ptr, &len));
         return detail::take_result_bytes(ptr, len);
     }
@@ -524,10 +1422,14 @@ public:
     }
 
     std::vector<std::uint8_t> fs_import(const std::string &ns, const std::string &src_path,
+                                        const std::optional<std::string> &author = std::nullopt,
+                                        const std::optional<std::string> &message = std::nullopt,
                                         bool commit = false, bool dry_run = false) {
         std::uint8_t *ptr = nullptr;
         std::uintptr_t len = 0;
-        detail::check(::loom_fs_import(handle_, ns.c_str(), src_path.c_str(), commit ? 1 : 0,
+        detail::check(::loom_fs_import(handle_, ns.c_str(), src_path.c_str(),
+                                       author ? author->c_str() : nullptr,
+                                       message ? message->c_str() : nullptr, commit ? 1 : 0,
                                        dry_run ? 1 : 0, &ptr, &len));
         return detail::take_result_bytes(ptr, len);
     }
@@ -544,11 +1446,20 @@ public:
     }
 
     std::vector<std::uint8_t> archive_import(const std::string &ns, const std::string &src_path,
-                                             const std::string &kind, bool dry_run = false) {
+                                             const std::string &kind,
+                                             const std::optional<std::string> &gzip_output_path =
+                                                 std::nullopt,
+                                             bool commit = false,
+                                             const std::optional<std::string> &author = std::nullopt,
+                                             const std::optional<std::string> &message = std::nullopt,
+                                             bool dry_run = false) {
         std::uint8_t *ptr = nullptr;
         std::uintptr_t len = 0;
         detail::check(::loom_archive_import(handle_, ns.c_str(), src_path.c_str(), kind.c_str(),
-                                            dry_run ? 1 : 0, &ptr, &len));
+                                            gzip_output_path ? gzip_output_path->c_str() : nullptr,
+                                            commit ? 1 : 0, author ? author->c_str() : nullptr,
+                                            message ? message->c_str() : nullptr, dry_run ? 1 : 0,
+                                            &ptr, &len));
         return detail::take_result_bytes(ptr, len);
     }
 
@@ -579,6 +1490,116 @@ public:
         detail::check(::loom_car_export(handle_, ns.c_str(), dst_path.c_str(), dry_run ? 1 : 0,
                                         &ptr, &len));
         return detail::take_result_bytes(ptr, len);
+    }
+
+    std::string audit_config_show_json() {
+        char *out = nullptr;
+        detail::check(::loom_audit_config_show_json(handle_, &out));
+        return detail::take_string(out);
+    }
+
+    std::string audit_config_set_json(const std::optional<std::uint32_t> &retention_days,
+                                      const std::optional<bool> &legal_hold) {
+        char *out = nullptr;
+        detail::check(::loom_audit_config_set_json(
+            handle_, retention_days.value_or(0), retention_days ? 1 : 0,
+            legal_hold.value_or(false) ? 1 : 0, legal_hold ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+
+    std::string audit_list_json() {
+        char *out = nullptr;
+        detail::check(::loom_audit_list_json(handle_, &out));
+        return detail::take_string(out);
+    }
+
+    std::string audit_view_json(const std::string &record) {
+        char *out = nullptr;
+        detail::check(::loom_audit_view_json(handle_, record.c_str(), &out));
+        return detail::take_string(out);
+    }
+
+    std::string certificate_list_json() {
+        char *out = nullptr;
+        detail::check(::loom_certificate_list_json(handle_, &out));
+        return detail::take_string(out);
+    }
+
+    std::string certificate_import_json(const std::string &name,
+                                        const std::vector<std::uint8_t> &cert_chain_pem,
+                                        const std::vector<std::uint8_t> &private_key_pem,
+                                        const std::vector<std::uint8_t> &trust_bundle_pem = {},
+                                        bool force = false) {
+        char *out = nullptr;
+        detail::check(::loom_certificate_import_json(
+            handle_, name.c_str(), cert_chain_pem.data(), cert_chain_pem.size(),
+            private_key_pem.data(), private_key_pem.size(),
+            trust_bundle_pem.empty() ? nullptr : trust_bundle_pem.data(), trust_bundle_pem.size(),
+            force ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+
+    std::vector<std::uint8_t> certificate_export(const std::string &name, bool include_cert_chain,
+                                                 bool include_private_key,
+                                                 bool include_trust_bundle, bool force = false) {
+        std::uint8_t *ptr = nullptr;
+        std::uintptr_t len = 0;
+        detail::check(::loom_certificate_export(
+            handle_, name.c_str(), include_cert_chain ? 1 : 0, include_private_key ? 1 : 0,
+            include_trust_bundle ? 1 : 0, force ? 1 : 0, &ptr, &len));
+        return detail::take_result_bytes(ptr, len);
+    }
+
+    std::string certificate_generate_self_signed_json(
+        const std::string &name, const std::string &dns_names_json,
+        const std::string &ip_addresses_json, const std::optional<std::string> &cn,
+        std::uint32_t days, const std::string &algorithm, bool force = false) {
+        char *out = nullptr;
+        detail::check(::loom_certificate_generate_self_signed_json(
+            handle_, name.c_str(), dns_names_json.c_str(), ip_addresses_json.c_str(),
+            cn ? cn->c_str() : nullptr, days, algorithm.c_str(), force ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+
+    std::string certificate_remove_json(const std::string &name) {
+        char *out = nullptr;
+        detail::check(::loom_certificate_remove_json(handle_, name.c_str(), &out));
+        return detail::take_string(out);
+    }
+
+    std::string certificate_audit_json(const std::string &name) {
+        char *out = nullptr;
+        detail::check(::loom_certificate_audit_json(handle_, name.c_str(), &out));
+        return detail::take_string(out);
+    }
+
+    std::string network_access_list_json() {
+        char *out = nullptr;
+        detail::check(::loom_network_access_list_json(handle_, &out));
+        return detail::take_string(out);
+    }
+
+    std::string network_access_set_json(const std::string &name,
+                                        const std::optional<std::string> &description,
+                                        const std::string &default_action,
+                                        const std::string &rules_json) {
+        char *out = nullptr;
+        detail::check(::loom_network_access_set_json(
+            handle_, name.c_str(), description ? description->c_str() : nullptr,
+            default_action.c_str(), rules_json.c_str(), &out));
+        return detail::take_string(out);
+    }
+
+    std::string network_access_remove_json(const std::string &name) {
+        char *out = nullptr;
+        detail::check(::loom_network_access_remove_json(handle_, name.c_str(), &out));
+        return detail::take_string(out);
+    }
+
+    std::string network_access_audit_json(const std::string &name) {
+        char *out = nullptr;
+        detail::check(::loom_network_access_audit_json(handle_, name.c_str(), &out));
+        return detail::take_string(out);
     }
 
     std::string identity_list_json() const {
@@ -653,6 +1674,46 @@ public:
 
     void identity_revoke_public_key(const std::string &key) {
         detail::check(::loom_identity_revoke_public_key(handle_, key.c_str()));
+    }
+
+    std::string identity_force_detach_authority_json(const std::string &principal,
+                                                     std::uint64_t generation,
+                                                     const std::string &reason) {
+        char *out = nullptr;
+        detail::check(::loom_identity_force_detach_authority_json(
+            handle_, principal.c_str(), generation, reason.c_str(), &out));
+        return detail::take_string(out);
+    }
+
+    std::string identity_replicate_authority_json(const std::string &source,
+                                                  bool become_authority) {
+        char *out = nullptr;
+        detail::check(::loom_identity_replicate_authority_json(
+            handle_, source.c_str(), become_authority ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+
+    std::string identity_configure_authority_replication_json(
+        const std::string &id,
+        const std::string &source,
+        bool disabled,
+        bool pull_on_start,
+        const std::optional<std::uint64_t> &interval_ms,
+        std::uint64_t jitter_ms,
+        std::uint64_t backoff_ms,
+        bool publish_witness) {
+        char *out = nullptr;
+        detail::check(::loom_identity_configure_authority_replication_json(
+            handle_, id.c_str(), source.c_str(), disabled ? 1 : 0, pull_on_start ? 1 : 0,
+            interval_ms.value_or(0), interval_ms.has_value() ? 1 : 0, jitter_ms, backoff_ms,
+            publish_witness ? 1 : 0, &out));
+        return detail::take_string(out);
+    }
+
+    std::string identity_remove_authority_replication_json(const std::string &id) {
+        char *out = nullptr;
+        detail::check(::loom_identity_remove_authority_replication_json(handle_, id.c_str(), &out));
+        return detail::take_string(out);
     }
 
     std::string acl_list_json() const {
@@ -837,15 +1898,6 @@ public:
         return detail::take_string(out);
     }
 
-    std::string meetings_import_snapshot(const std::string &ns, const std::string &input_profile,
-                                         const std::vector<std::uint8_t> &snapshot,
-                                         bool dry_run = false) {
-        char *out = nullptr;
-        detail::check(::loom_meetings_import_snapshot(handle_, ns.c_str(), input_profile.c_str(),
-                                                      snapshot.data(), snapshot.size(),
-                                                      dry_run ? 1 : 0, &out));
-        return detail::take_string(out);
-    }
 
     std::vector<std::uint8_t> meetings_source_read(const std::string &ns,
                                                    const std::string &source_id,
@@ -857,219 +1909,26 @@ public:
         return detail::take_result_bytes(ptr, len);
     }
 
-    std::string drive_list_json(const std::string &ns, const std::string &workspace_id,
-                                const std::string &folder_id) {
-        char *out = nullptr;
-        detail::check(::loom_drive_list_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                             folder_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_stat_json(const std::string &ns, const std::string &workspace_id,
-                                const std::string &folder_id, const std::string &name) {
-        char *out = nullptr;
-        detail::check(::loom_drive_stat_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                             folder_id.c_str(), name.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::vector<std::uint8_t> drive_read_file(const std::string &ns,
-                                              const std::string &workspace_id,
-                                              const std::string &file_id) {
-        std::uint8_t *ptr = nullptr;
-        std::uintptr_t len = 0;
-        detail::check(::loom_drive_read(handle_, ns.c_str(), workspace_id.c_str(),
-                                        file_id.c_str(), &ptr, &len));
-        return detail::take_result_bytes(ptr, len);
-    }
 
-    std::string drive_list_versions_json(const std::string &ns,
-                                         const std::string &workspace_id,
-                                         const std::string &file_id) {
-        char *out = nullptr;
-        detail::check(::loom_drive_list_versions_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                      file_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_list_conflicts_json(const std::string &ns,
-                                          const std::string &workspace_id) {
-        char *out = nullptr;
-        detail::check(
-            ::loom_drive_list_conflicts_json(handle_, ns.c_str(), workspace_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_list_shares_json(const std::string &ns,
-                                       const std::string &workspace_id) {
-        char *out = nullptr;
-        detail::check(
-            ::loom_drive_list_shares_json(handle_, ns.c_str(), workspace_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_list_retention_json(const std::string &ns,
-                                          const std::string &workspace_id) {
-        char *out = nullptr;
-        detail::check(
-            ::loom_drive_list_retention_json(handle_, ns.c_str(), workspace_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_create_folder_json(const std::string &ns,
-                                         const std::string &workspace_id,
-                                         const std::string &parent_folder_id,
-                                         const std::string &folder_id, const std::string &name,
-                                         const std::string &expected_root) {
-        char *out = nullptr;
-        detail::check(::loom_drive_create_folder_json(
-            handle_, ns.c_str(), workspace_id.c_str(), parent_folder_id.c_str(),
-            folder_id.c_str(), name.c_str(), expected_root.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_create_upload_json(const std::string &ns,
-                                         const std::string &workspace_id,
-                                         const std::string &upload_id,
-                                         const std::string &parent_folder_id,
-                                         const std::string &name, const std::string &file_id,
-                                         const std::string &expected_root,
-                                         std::uint64_t created_at_ms, bool replace_file) {
-        char *out = nullptr;
-        detail::check(::loom_drive_create_upload_json(
-            handle_, ns.c_str(), workspace_id.c_str(), upload_id.c_str(),
-            parent_folder_id.c_str(), name.c_str(), file_id.c_str(), expected_root.c_str(),
-            created_at_ms, replace_file ? 1 : 0, &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_upload_chunk_json(const std::string &ns,
-                                        const std::string &workspace_id,
-                                        const std::string &upload_id,
-                                        const std::vector<std::uint8_t> &chunk) {
-        char *out = nullptr;
-        detail::check(::loom_drive_upload_chunk_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                     upload_id.c_str(), chunk.data(),
-                                                     chunk.size(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_commit_upload_json(const std::string &ns,
-                                         const std::string &workspace_id,
-                                         const std::string &upload_id) {
-        char *out = nullptr;
-        detail::check(::loom_drive_commit_upload_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                      upload_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_rename_json(const std::string &ns, const std::string &workspace_id,
-                                  const std::string &folder_id, const std::string &node_id,
-                                  const std::string &new_name,
-                                  const std::string &expected_root) {
-        char *out = nullptr;
-        detail::check(::loom_drive_rename_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                               folder_id.c_str(), node_id.c_str(),
-                                               new_name.c_str(), expected_root.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_move_json(const std::string &ns, const std::string &workspace_id,
-                                const std::string &source_folder_id,
-                                const std::string &target_folder_id,
-                                const std::string &node_id, const std::string &expected_root) {
-        char *out = nullptr;
-        detail::check(::loom_drive_move_json(
-            handle_, ns.c_str(), workspace_id.c_str(), source_folder_id.c_str(),
-            target_folder_id.c_str(), node_id.c_str(), expected_root.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_delete_json(const std::string &ns, const std::string &workspace_id,
-                                  const std::string &folder_id, const std::string &node_id,
-                                  const std::string &expected_root) {
-        char *out = nullptr;
-        detail::check(::loom_drive_delete_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                               folder_id.c_str(), node_id.c_str(),
-                                               expected_root.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_resolve_conflict_json(const std::string &ns,
-                                            const std::string &workspace_id,
-                                            const std::string &conflict_id,
-                                            const std::string &resolution) {
-        char *out = nullptr;
-        detail::check(::loom_drive_resolve_conflict_json(
-            handle_, ns.c_str(), workspace_id.c_str(), conflict_id.c_str(), resolution.c_str(),
-            &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_grant_share_json(const std::string &ns, const std::string &workspace_id,
-                                       const std::string &grant_id,
-                                       const std::string &target_kind,
-                                       const std::string &target_id,
-                                       const std::string &principal, const std::string &role,
-                                       std::uint64_t granted_at_ms,
-                                       std::optional<std::uint64_t> expires_at_ms = std::nullopt) {
-        char *out = nullptr;
-        detail::check(::loom_drive_grant_share_json(
-            handle_, ns.c_str(), workspace_id.c_str(), grant_id.c_str(), target_kind.c_str(),
-            target_id.c_str(), principal.c_str(), role.c_str(), granted_at_ms,
-            expires_at_ms.value_or(0), expires_at_ms ? 1 : 0, &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_revoke_share_json(const std::string &ns,
-                                        const std::string &workspace_id,
-                                        const std::string &grant_id) {
-        char *out = nullptr;
-        detail::check(::loom_drive_revoke_share_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                     grant_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_apply_share_expiry_json(const std::string &ns,
-                                              const std::string &workspace_id,
-                                              std::uint64_t now_ms) {
-        char *out = nullptr;
-        detail::check(::loom_drive_apply_share_expiry_json(handle_, ns.c_str(),
-                                                           workspace_id.c_str(), now_ms, &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_pin_retention_json(
-        const std::string &ns, const std::string &workspace_id, const std::string &pin_id,
-        const std::string &kind, const std::string &root,
-        const std::optional<std::string> &target_entity_id, std::uint64_t added_at_ms,
-        std::optional<std::uint64_t> expires_at_ms = std::nullopt) {
-        char *out = nullptr;
-        detail::check(::loom_drive_pin_retention_json(
-            handle_, ns.c_str(), workspace_id.c_str(), pin_id.c_str(), kind.c_str(),
-            root.c_str(), target_entity_id ? target_entity_id->c_str() : nullptr,
-            added_at_ms, expires_at_ms.value_or(0), expires_at_ms ? 1 : 0, &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_unpin_retention_json(const std::string &ns,
-                                           const std::string &workspace_id,
-                                           const std::string &pin_id) {
-        char *out = nullptr;
-        detail::check(::loom_drive_unpin_retention_json(handle_, ns.c_str(),
-                                                        workspace_id.c_str(), pin_id.c_str(),
-                                                        &out));
-        return detail::take_string(out);
-    }
 
-    std::string drive_apply_retention_json(const std::string &ns,
-                                           const std::string &workspace_id,
-                                           std::uint64_t now_ms) {
-        char *out = nullptr;
-        detail::check(::loom_drive_apply_retention_json(handle_, ns.c_str(),
-                                                        workspace_id.c_str(), now_ms, &out));
-        return detail::take_string(out);
-    }
 
     std::string tickets_project_create_json(
         const std::string &ns, const std::string &workspace_id,
@@ -1095,10 +1954,11 @@ public:
 
     std::string tickets_project_settings_get_json(
         const std::string &ns, const std::string &workspace_id,
-        const std::string &project_id) {
+        const std::string &project_id, bool include_contracts = false) {
         char *out = nullptr;
         detail::check(::loom_tickets_project_settings_get_json(
-            handle_, ns.c_str(), workspace_id.c_str(), project_id.c_str(), &out));
+            handle_, ns.c_str(), workspace_id.c_str(), project_id.c_str(), include_contracts,
+            &out));
         return detail::take_string(out);
     }
 
@@ -1111,14 +1971,28 @@ public:
         const std::string &project_owner_principal,
         bool clear_project_owner_principal,
         const std::string &acceptance_authorities_json,
-        const std::string &expected_root) {
+        const std::string &expected_root,
+        bool acceptance_evidence_enforcement = false,
+        bool has_acceptance_evidence_enforcement = false,
+        const std::string &required_acceptance_evidence_keys_json = "",
+        const std::vector<TicketReviewType> &required_acceptance_reviews = {},
+        const std::string &owner_contract_summary = "",
+        const std::string &owner_contract_details = "",
+        const std::string &worker_contract_summary = "",
+        const std::string &worker_contract_details = "") {
         char *out = nullptr;
+        std::string required_acceptance_reviews_json =
+            ticket_review_types_json(required_acceptance_reviews);
         detail::check(::loom_tickets_project_settings_set_json(
             handle_, ns.c_str(), workspace_id.c_str(), project_id.c_str(),
             default_projection.c_str(), enable_projections_json.c_str(),
             disable_projections_json.c_str(), actor_enforcement.c_str(),
             project_owner_principal.c_str(), clear_project_owner_principal,
-            acceptance_authorities_json.c_str(), expected_root.c_str(), &out));
+            acceptance_authorities_json.c_str(), acceptance_evidence_enforcement,
+            has_acceptance_evidence_enforcement, required_acceptance_evidence_keys_json.c_str(),
+            required_acceptance_reviews_json.c_str(), owner_contract_summary.c_str(),
+            owner_contract_details.c_str(), worker_contract_summary.c_str(),
+            worker_contract_details.c_str(), expected_root.c_str(), &out));
         return detail::take_string(out);
     }
 
@@ -1324,242 +2198,30 @@ public:
         return detail::take_string(out);
     }
 
-    std::string chat_create_channel_json(const std::string &ns, const std::string &workspace_id,
-                                         const std::string &channel_id,
-                                         const std::string &channel_handle,
-                                         const std::string &name) {
-        char *out = nullptr;
-        detail::check(::loom_chat_create_channel_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                      channel_id.c_str(), channel_handle.c_str(),
-                                                      name.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_rename_channel_json(const std::string &ns, const std::string &workspace_id,
-                                         const std::string &selector,
-                                         const std::string &channel_handle) {
-        char *out = nullptr;
-        detail::check(::loom_chat_rename_channel_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                      selector.c_str(), channel_handle.c_str(),
-                                                      &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_list_channels_json(const std::string &ns,
-                                        const std::string &workspace_id) {
-        char *out = nullptr;
-        detail::check(::loom_chat_list_channels_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                     &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_post_message_json(
-        const std::string &ns, const std::string &workspace_id,
-        const std::string &channel_id, const std::string &message_id,
-        const std::string &thread_id, const std::string &body_text) {
-        char *out = nullptr;
-        detail::check(::loom_chat_post_message_json(
-            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), message_id.c_str(),
-            thread_id.c_str(), body_text.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_edit_message_json(const std::string &ns,
-                                       const std::string &workspace_id,
-                                       const std::string &channel_id,
-                                       const std::string &message_id,
-                                       const std::string &body_text) {
-        char *out = nullptr;
-        detail::check(::loom_chat_edit_message_json(
-            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), message_id.c_str(),
-            body_text.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_redact_message_json(const std::string &ns,
-                                         const std::string &workspace_id,
-                                         const std::string &channel_id,
-                                         const std::string &message_id,
-                                         const std::string &reason) {
-        char *out = nullptr;
-        detail::check(::loom_chat_redact_message_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                      channel_id.c_str(), message_id.c_str(),
-                                                      reason.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_create_thread_json(const std::string &ns,
-                                        const std::string &workspace_id,
-                                        const std::string &channel_id,
-                                        const std::string &thread_id,
-                                        const std::string &parent_message_id) {
-        char *out = nullptr;
-        detail::check(::loom_chat_create_thread_json(
-            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), thread_id.c_str(),
-            parent_message_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_create_task_json(const std::string &ns, const std::string &workspace_id,
-                                      const std::string &channel_id,
-                                      const std::string &task_id,
-                                      const std::string &message_id,
-                                      const std::string &title) {
-        char *out = nullptr;
-        detail::check(::loom_chat_create_task_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                   channel_id.c_str(), task_id.c_str(),
-                                                   message_id.c_str(), title.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_claim_task_json(const std::string &ns,
-                                     const std::string &workspace_id,
-                                     const std::string &channel_id,
-                                     const std::string &task_id,
-                                     const std::string &claim_id,
-                                     const std::string &lease_token) {
-        char *out = nullptr;
-        detail::check(::loom_chat_claim_task_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                  channel_id.c_str(), task_id.c_str(),
-                                                  claim_id.c_str(), lease_token.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_complete_task_json(const std::string &ns,
-                                        const std::string &workspace_id,
-                                        const std::string &channel_id,
-                                        const std::string &task_id,
-                                        const std::string &claim_id,
-                                        const std::string &result_message_id) {
-        char *out = nullptr;
-        detail::check(::loom_chat_complete_task_json(
-            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), task_id.c_str(),
-            claim_id.c_str(), result_message_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_invoke_agent_json(
-        const std::string &ns, const std::string &workspace_id,
-        const std::string &channel_id, const std::string &invocation_id,
-        const std::string &agent_principal, const std::string &source_message_ids_json,
-        const std::string &prompt_text) {
-        char *out = nullptr;
-        detail::check(::loom_chat_invoke_agent_json(
-            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), invocation_id.c_str(),
-            agent_principal.c_str(), source_message_ids_json.c_str(), prompt_text.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_agent_reply_json(const std::string &ns,
-                                      const std::string &workspace_id,
-                                      const std::string &channel_id,
-                                      const std::string &invocation_id,
-                                      const std::string &message_id) {
-        char *out = nullptr;
-        detail::check(::loom_chat_agent_reply_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                   channel_id.c_str(), invocation_id.c_str(),
-                                                   message_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_request_handoff_json(
-        const std::string &ns, const std::string &workspace_id,
-        const std::string &channel_id, const std::string &handoff_id,
-        const std::string &from_agent_principal, const std::string &to_principal,
-        const std::string &reason) {
-        char *out = nullptr;
-        detail::check(::loom_chat_request_handoff_json(
-            handle_, ns.c_str(), workspace_id.c_str(), channel_id.c_str(), handoff_id.c_str(),
-            from_agent_principal.c_str(), to_principal.c_str(), reason.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_add_reaction_json(const std::string &ns,
-                                       const std::string &workspace_id,
-                                       const std::string &channel_id,
-                                       const std::string &message_id,
-                                       const std::string &kind) {
-        char *out = nullptr;
-        detail::check(::loom_chat_add_reaction_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                    channel_id.c_str(), message_id.c_str(),
-                                                    kind.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_remove_reaction_json(const std::string &ns,
-                                          const std::string &workspace_id,
-                                          const std::string &channel_id,
-                                          const std::string &message_id,
-                                          const std::string &kind) {
-        char *out = nullptr;
-        detail::check(::loom_chat_remove_reaction_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                       channel_id.c_str(), message_id.c_str(),
-                                                       kind.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_emoji_list_json(const std::string &ns,
-                                     const std::string &workspace_id) {
-        char *out = nullptr;
-        detail::check(::loom_chat_emoji_list_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                  &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_emoji_register_json(const std::string &ns,
-                                         const std::string &workspace_id,
-                                         const std::string &kind) {
-        char *out = nullptr;
-        detail::check(::loom_chat_emoji_register_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                      kind.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_emoji_unregister_json(const std::string &ns,
-                                           const std::string &workspace_id,
-                                           const std::string &kind) {
-        char *out = nullptr;
-        detail::check(::loom_chat_emoji_unregister_json(handle_, ns.c_str(),
-                                                        workspace_id.c_str(), kind.c_str(),
-                                                        &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_messages_json(const std::string &ns, const std::string &workspace_id,
-                                   const std::string &channel_id) {
-        char *out = nullptr;
-        detail::check(::loom_chat_messages_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                channel_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_cursor_json(const std::string &ns, const std::string &workspace_id,
-                                 const std::string &channel_id) {
-        char *out = nullptr;
-        detail::check(::loom_chat_cursor_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                              channel_id.c_str(), &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_update_cursor_json(const std::string &ns,
-                                        const std::string &workspace_id,
-                                        const std::string &channel_id,
-                                        std::uint64_t next_sequence) {
-        char *out = nullptr;
-        detail::check(::loom_chat_update_cursor_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                     channel_id.c_str(), next_sequence, &out));
-        return detail::take_string(out);
-    }
 
-    std::string chat_fetch_events_json(const std::string &ns,
-                                       const std::string &workspace_id,
-                                       const std::string &channel_id,
-                                       std::uint64_t from_sequence, std::uintptr_t max) {
-        char *out = nullptr;
-        detail::check(::loom_chat_fetch_events_json(handle_, ns.c_str(), workspace_id.c_str(),
-                                                    channel_id.c_str(), from_sequence, max, &out));
-        return detail::take_string(out);
-    }
+
+
+
 
     /// Put `value` at the typed `key` (Loom Canonical CBOR cell) in map `collection` of workspace `ns` (by
     /// UUID or name, created with the `kv` facet if absent). A later put at the same key replaces it.

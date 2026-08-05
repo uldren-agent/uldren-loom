@@ -131,17 +131,277 @@ public final class Loom {
         return LoomResult(view: view)
     }
 
-    /// Execute canonical `loom.exec.request.v1` bytes and return canonical `loom.exec.result.v1`.
-    public func execCbor(_ request: [UInt8]) throws -> [UInt8] {
+    public func lifecycleDefineStandardJson(workspace: String, kind: String, version: String,
+                                            completionPredicateDigest: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_lifecycle_define_standard_json(session, workspace, kind, version,
+                                                         completionPredicateDigest, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func lifecycleDefineJson(workspace: String, definition: [UInt8]) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = definition.withUnsafeBufferPointer { buf in
+            loom_lifecycle_define_json(session, workspace, buf.baseAddress, UInt(buf.count), &out)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func lifecycleInstantiateJson(workspace: String, instanceId: String, definitionId: String,
+                                         subjectRefsJson: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_lifecycle_instantiate_json(session, workspace, instanceId, definitionId,
+                                                     subjectRefsJson, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func lifecycleTransitionJson(workspace: String, instanceId: String, transitionId: String,
+                                        toStageId: String, actorPrincipalId: String? = nil,
+                                        gateEvaluationsJson: String,
+                                        snapshotDigest: String? = nil) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_lifecycle_transition_json(session, workspace, instanceId, transitionId,
+                                                    toStageId, actorPrincipalId,
+                                                    gateEvaluationsJson, snapshotDigest, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func refsReconcileJson(workspace: String, max: UInt64) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_refs_reconcile_json(session, workspace, max, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func importTableCsv(workspace: String, sourceScope: String, csvPayload: [UInt8],
+                               database: String, table: String, schema: String,
+                               primaryKey: String, mode: String, commit: Bool,
+                               author: String? = nil, message: String? = nil,
+                               dryRun: Bool = false) throws -> [UInt8] {
         var ptr: UnsafeMutablePointer<UInt8>?
         var len: UInt = 0
-        let status = request.withUnsafeBufferPointer { buf in
-            loom_exec_cbor(session, buf.baseAddress, UInt(buf.count), &ptr, &len)
+        let status = csvPayload.withUnsafeBufferPointer { buf in
+            loom_import_table_csv(session, workspace, sourceScope, buf.baseAddress,
+                                  UInt(buf.count), database, table, schema, primaryKey, mode,
+                                  commit ? 1 : 0, author, message, dryRun ? 1 : 0,
+                                  &ptr, &len)
         }
         guard status == 0 else { throw LoomSql.lastError() }
         return Loom.takeBytes(ptr, len)
     }
-
+    public func importRedmine(workspace: String, profile: String, sourceScope: String,
+                              snapshotPayload: [UInt8], fieldPolicy: String,
+                              dryRun: Bool = false) throws -> [UInt8] {
+        try importTicketProfile(loom_import_redmine, workspace, profile, sourceScope,
+                                snapshotPayload, fieldPolicy, dryRun)
+    }
+    public func importAsana(workspace: String, profile: String, sourceScope: String,
+                            snapshotPayload: [UInt8], fieldPolicy: String,
+                            dryRun: Bool = false) throws -> [UInt8] {
+        try importTicketProfile(loom_import_asana, workspace, profile, sourceScope,
+                                snapshotPayload, fieldPolicy, dryRun)
+    }
+    public func importJira(workspace: String, profile: String, sourceScope: String,
+                           snapshotPayload: [UInt8], fieldPolicy: String,
+                           dryRun: Bool = false) throws -> [UInt8] {
+        try importTicketProfile(loom_import_jira, workspace, profile, sourceScope,
+                                snapshotPayload, fieldPolicy, dryRun)
+    }
+    public func importConfluence(workspace: String, profile: String, sourceScope: String,
+                                 snapshotPayload: [UInt8], defaultSpace: String,
+                                 dryRun: Bool = false) throws -> [UInt8] {
+        try importStringProfile(loom_import_confluence, workspace, profile, sourceScope,
+                                snapshotPayload, defaultSpace, dryRun)
+    }
+    public func importSlack(workspace: String, profile: String, sourceScope: String,
+                            snapshotPayload: [UInt8], dryRun: Bool = false) throws -> [UInt8] {
+        try importSimpleProfile(loom_import_slack, workspace, profile, sourceScope,
+                                snapshotPayload, dryRun)
+    }
+    public func importDrive(workspace: String, profile: String, sourceScope: String,
+                            archivePayload: [UInt8], dryRun: Bool = false) throws -> [UInt8] {
+        try importSimpleProfile(loom_import_drive, workspace, profile, sourceScope,
+                                archivePayload, dryRun)
+    }
+    public func importMarkdown(workspace: String, profile: String, sourceScope: String,
+                               archivePayload: [UInt8], space: String,
+                               dryRun: Bool = false) throws -> [UInt8] {
+        try importStringProfile(loom_import_markdown, workspace, profile, sourceScope,
+                                archivePayload, space, dryRun)
+    }
+    public func importNotion(workspace: String, profile: String, sourceScope: String,
+                             snapshotPayload: [UInt8], defaultSpace: String,
+                             dryRun: Bool = false) throws -> [UInt8] {
+        try importStringProfile(loom_import_notion, workspace, profile, sourceScope,
+                                snapshotPayload, defaultSpace, dryRun)
+    }
+    public func studioReindexJson(workspace: String, profile: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_studio_reindex_json(session, workspace, profile, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func studioRevisionsRebuildJson(workspace: String, profile: String,
+                                           dryRun: Bool = false) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_studio_revisions_rebuild_json(session, workspace, profile,
+                                                        dryRun ? 1 : 0, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func storeBundleImport(_ bundle: [UInt8], dryRun: Bool = false) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = bundle.withUnsafeBufferPointer { buf in
+            loom_store_bundle_import(session, buf.baseAddress, UInt(buf.count), dryRun ? 1 : 0,
+                                     &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
+    public func auditCompact(throughSeq: UInt64) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = loom_audit_compact(session, throughSeq, &ptr, &len)
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
+    public func storeMaintenanceStatus(_ request: [UInt8]) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = request.withUnsafeBufferPointer { buf in
+            loom_store_maintenance_status(session, buf.baseAddress, UInt(buf.count), &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
+    public func storeMaintenancePolicySet(_ update: [UInt8]) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = update.withUnsafeBufferPointer { buf in
+            loom_store_maintenance_policy_set(session, buf.baseAddress, UInt(buf.count), &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
+    public func storeMaintenanceRun(_ request: [UInt8]) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = request.withUnsafeBufferPointer { buf in
+            loom_store_maintenance_run(session, buf.baseAddress, UInt(buf.count), &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
+    public func inferenceInstanceCreateJson(workspace: String, name: String, model: String,
+                                            kind: String, runtime: String,
+                                            preset: String? = nil,
+                                            settingsJson: String? = nil) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_inference_instance_create_json(session, workspace, name, model, kind,
+                                                         runtime, preset, settingsJson, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func inferenceInstanceUpdateJson(workspace: String, name: String,
+                                            preset: String? = nil,
+                                            settingsJson: String? = nil) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_inference_instance_update_json(session, workspace, name, preset,
+                                                         settingsJson, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func inferenceInstanceDeleteJson(workspace: String, name: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_inference_instance_delete_json(session, workspace, name, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func serveListenerConfigureJson(_ requestJson: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_serve_listener_configure_json(session, requestJson, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func serveListenerListJson() throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_serve_listener_list_json(session, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func serveListenerSetEnabledJson(listenerId: String, enabled: Bool) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_serve_listener_set_enabled_json(session, listenerId, enabled ? 1 : 0, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func serveListenerRemoveJson(listenerId: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_serve_listener_remove_json(session, listenerId, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func serveWebRouteListJson(listenerId: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_serve_web_route_list_json(session, listenerId, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func serveWebRouteSetJson(_ requestJson: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_serve_web_route_set_json(session, requestJson, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func serveWebRouteRemoveJson(listenerId: String, routeId: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_serve_web_route_remove_json(session, listenerId, routeId, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+    public func applyCbor(_ request: [UInt8]) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = request.withUnsafeBufferPointer { buf in
+            loom_apply_cbor(session, buf.baseAddress, UInt(buf.count), &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
     public func meetingsImportSnapshot(workspace: String, inputProfile: String,
                                        snapshot: [UInt8], dryRun: Bool = false) throws -> String {
         var out: UnsafeMutablePointer<CChar>?
@@ -154,6 +414,101 @@ public final class Loom {
         guard let out else { return "" }
         return String(cString: out)
     }
+    public func sqlExecResult(workspace: String, db: String, sql: String) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = loom_sql_exec_result(session, workspace, db, sql, &ptr, &len)
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
+
+
+
+
+
+
+    /// Execute canonical `loom.exec.request.v1` bytes and return canonical `loom.exec.result.v1`.
+    public func execCbor(_ request: [UInt8]) throws -> [UInt8] {
+        try applyCbor(request)
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    private func importTicketProfile(
+        _ call: (OpaquePointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?,
+                 UnsafePointer<CChar>?, UnsafePointer<UInt8>?, UInt,
+                 UnsafePointer<CChar>?, Int32, UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?,
+                 UnsafeMutablePointer<UInt>?) -> Int32,
+        _ workspace: String, _ profile: String, _ sourceScope: String, _ payload: [UInt8],
+        _ fieldPolicy: String, _ dryRun: Bool
+    ) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = payload.withUnsafeBufferPointer { buf in
+            call(session, workspace, profile, sourceScope, buf.baseAddress, UInt(buf.count),
+                 fieldPolicy, dryRun ? 1 : 0, &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
+
+    private func importStringProfile(
+        _ call: (OpaquePointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?,
+                 UnsafePointer<CChar>?, UnsafePointer<UInt8>?, UInt,
+                 UnsafePointer<CChar>?, Int32, UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?,
+                 UnsafeMutablePointer<UInt>?) -> Int32,
+        _ workspace: String, _ profile: String, _ sourceScope: String, _ payload: [UInt8],
+        _ value: String, _ dryRun: Bool
+    ) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = payload.withUnsafeBufferPointer { buf in
+            call(session, workspace, profile, sourceScope, buf.baseAddress, UInt(buf.count),
+                 value, dryRun ? 1 : 0, &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
+
+    private func importSimpleProfile(
+        _ call: (OpaquePointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?,
+                 UnsafePointer<CChar>?, UnsafePointer<UInt8>?, UInt, Int32,
+                 UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?,
+                 UnsafeMutablePointer<UInt>?) -> Int32,
+        _ workspace: String, _ profile: String, _ sourceScope: String, _ payload: [UInt8],
+        _ dryRun: Bool
+    ) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = payload.withUnsafeBufferPointer { buf in
+            call(session, workspace, profile, sourceScope, buf.baseAddress, UInt(buf.count),
+                 dryRun ? 1 : 0, &ptr, &len)
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
+
+
+
+
+
+
+
+
+
+
 
     public func meetingsSourceRead(workspace: String, sourceId: String, leaf: String) throws -> [UInt8] {
         var ptr: UnsafeMutablePointer<UInt8>?
@@ -164,10 +519,11 @@ public final class Loom {
     }
 
     public func fsImport(workspace: String, srcPath: String,
+                         author: String? = nil, message: String? = nil,
                          commit: Bool = false, dryRun: Bool = false) throws -> [UInt8] {
         var ptr: UnsafeMutablePointer<UInt8>?
         var len: UInt = 0
-        let status = loom_fs_import(session, workspace, srcPath, commit ? 1 : 0,
+        let status = loom_fs_import(session, workspace, srcPath, author, message, commit ? 1 : 0,
                                     dryRun ? 1 : 0, &ptr, &len)
         guard status == 0 else { throw LoomSql.lastError() }
         return Loom.takeBytes(ptr, len)
@@ -190,11 +546,14 @@ public final class Loom {
     }
 
     public func archiveImport(workspace: String, srcPath: String, kind: String,
+                              gzipOutputPath: String? = nil, commit: Bool = false,
+                              author: String? = nil, message: String? = nil,
                               dryRun: Bool = false) throws -> [UInt8] {
         var ptr: UnsafeMutablePointer<UInt8>?
         var len: UInt = 0
-        let status = loom_archive_import(session, workspace, srcPath, kind, dryRun ? 1 : 0,
-                                         &ptr, &len)
+        let status = loom_archive_import(session, workspace, srcPath, kind, gzipOutputPath,
+                                         commit ? 1 : 0, author, message, dryRun ? 1 : 0, &ptr,
+                                         &len)
         guard status == 0 else { throw LoomSql.lastError() }
         return Loom.takeBytes(ptr, len)
     }
@@ -231,14 +590,165 @@ public final class Loom {
         return Loom.takeBytes(ptr, len)
     }
 
+    public func auditConfigShowJson() throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_audit_config_show_json(session, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func auditConfigSetJson(retentionDays: UInt32? = nil, legalHold: Bool? = nil) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_audit_config_set_json(session, retentionDays ?? 0,
+                                                retentionDays == nil ? 0 : 1,
+                                                legalHold == true ? 1 : 0,
+                                                legalHold == nil ? 0 : 1, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func auditListJson() throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_audit_list_json(session, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func auditViewJson(record: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_audit_view_json(session, record, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func certificateListJson() throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_certificate_list_json(session, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func certificateImportJson(name: String, certChainPem: [UInt8], privateKeyPem: [UInt8],
+                                      trustBundlePem: [UInt8]? = nil, force: Bool = false) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let trust = trustBundlePem ?? []
+        let status = certChainPem.withUnsafeBufferPointer { cert in
+            privateKeyPem.withUnsafeBufferPointer { key in
+                trust.withUnsafeBufferPointer { trustBuf in
+                    loom_certificate_import_json(session, name, cert.baseAddress, UInt(cert.count),
+                                                 key.baseAddress, UInt(key.count),
+                                                 trustBundlePem == nil ? nil : trustBuf.baseAddress,
+                                                 UInt(trust.count), force ? 1 : 0, &out)
+                }
+            }
+        }
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func certificateExport(name: String, includeCertChain: Bool, includePrivateKey: Bool,
+                                  includeTrustBundle: Bool, force: Bool = false) throws -> [UInt8] {
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let status = loom_certificate_export(session, name, includeCertChain ? 1 : 0,
+                                             includePrivateKey ? 1 : 0,
+                                             includeTrustBundle ? 1 : 0, force ? 1 : 0,
+                                             &ptr, &len)
+        guard status == 0 else { throw LoomSql.lastError() }
+        return Loom.takeBytes(ptr, len)
+    }
+
+    public func certificateGenerateSelfSignedJson(name: String, dnsNamesJson: String,
+                                                  ipAddressesJson: String, cn: String? = nil,
+                                                  days: UInt32, algorithm: String,
+                                                  force: Bool = false) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_certificate_generate_self_signed_json(session, name, dnsNamesJson,
+                                                                ipAddressesJson, cn, days,
+                                                                algorithm, force ? 1 : 0, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func certificateRemoveJson(name: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_certificate_remove_json(session, name, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func certificateAuditJson(name: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_certificate_audit_json(session, name, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func networkAccessListJson() throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_network_access_list_json(session, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func networkAccessSetJson(name: String, description: String? = nil,
+                                     defaultAction: String, rulesJson: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_network_access_set_json(session, name, description, defaultAction,
+                                                  rulesJson, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func networkAccessRemoveJson(name: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_network_access_remove_json(session, name, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
+    public func networkAccessAuditJson(name: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_network_access_audit_json(session, name, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        guard let out else { return "" }
+        return String(cString: out)
+    }
+
     public func fsImportAsync(workspace: String, srcPath: String,
+                              author: String? = nil, message: String? = nil,
                               commit: Bool = false, dryRun: Bool = false) async throws -> [UInt8] {
         let session = SendableSession(ptr: self.session)
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[UInt8], Error>) in
             DispatchQueue.global().async {
                 var task: OpaquePointer?
-                if loom_fs_import_async(session.ptr, workspace, srcPath, commit ? 1 : 0,
-                                        dryRun ? 1 : 0, &task) != 0 {
+                if loom_fs_import_async(session.ptr, workspace, srcPath, author, message,
+                                        commit ? 1 : 0, dryRun ? 1 : 0, &task) != 0 {
                     cont.resume(throwing: LoomSql.lastError())
                     return
                 }
@@ -271,12 +781,15 @@ public final class Loom {
     }
 
     public func archiveImportAsync(workspace: String, srcPath: String, kind: String,
+                                   gzipOutputPath: String? = nil, commit: Bool = false,
+                                   author: String? = nil, message: String? = nil,
                                    dryRun: Bool = false) async throws -> [UInt8] {
         let session = SendableSession(ptr: self.session)
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[UInt8], Error>) in
             DispatchQueue.global().async {
                 var task: OpaquePointer?
                 if loom_archive_import_async(session.ptr, workspace, srcPath, kind,
+                                             gzipOutputPath, commit ? 1 : 0, author, message,
                                              dryRun ? 1 : 0, &task) != 0 {
                     cont.resume(throwing: LoomSql.lastError())
                     return

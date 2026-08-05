@@ -2,10 +2,7 @@
 
 use super::*;
 
-use loom_drive::{
-    HostedDriveConflictResolution, HostedDriveCreateUpload, HostedDriveGrantShare,
-    HostedDrivePinRetention,
-};
+use loom_client::generated_api::Drive;
 
 unsafe fn optional_str_arg<'a>(value: *const c_char, what: &str) -> LoomResult<Option<&'a str>> {
     if value.is_null() {
@@ -14,52 +11,7 @@ unsafe fn optional_str_arg<'a>(value: *const c_char, what: &str) -> LoomResult<O
     let value = unsafe { CStr::from_ptr(value) }
         .to_str()
         .map_err(|_| LoomError::invalid(format!("{what}: invalid UTF-8")))?;
-    Ok((!value.is_empty()).then_some(value))
-}
-
-fn json_string<T: serde::Serialize>(value: &T) -> LoomResult<String> {
-    serde_json::to_string(value).map_err(|err| LoomError::invalid(err.to_string()))
-}
-
-fn parse_conflict_resolution(value: &str) -> LoomResult<HostedDriveConflictResolution> {
-    match value {
-        "current" | "keep-current" | "keep_current" => {
-            Ok(HostedDriveConflictResolution::KeepCurrent)
-        }
-        "conflict" | "keep-conflict" | "keep_conflict" => {
-            Ok(HostedDriveConflictResolution::KeepConflict)
-        }
-        "both" | "keep-both" | "keep_both" => Ok(HostedDriveConflictResolution::KeepBoth),
-        _ => Err(LoomError::invalid(
-            "drive conflict resolution must be current, conflict, or both",
-        )),
-    }
-}
-
-fn drive_read_loom<T>(
-    h: &LoomSession,
-    workspace: &str,
-    f: impl FnOnce(&Loom<FileStore>, WorkspaceId) -> LoomResult<T>,
-) -> LoomResult<T> {
-    let loom = open_h_read(h)?;
-    let ns = resolve_workspace_arg(&loom, workspace)?;
-    f(&loom, ns)
-}
-
-fn drive_write_loom<T>(
-    h: &LoomSession,
-    workspace: &str,
-    f: impl FnOnce(&mut Loom<FileStore>, WorkspaceId) -> LoomResult<T>,
-) -> LoomResult<T> {
-    let mut loom = open_h_write(h)?;
-    let ns = resolve_workspace_arg(&loom, workspace)?;
-    let result = f(&mut loom, ns)?;
-    save_loom(&mut loom)?;
-    Ok(result)
-}
-
-fn json_result<T: serde::Serialize>(result: LoomResult<T>) -> LoomResult<String> {
-    json_string(&result?)
+    Ok(Some(value))
 }
 
 macro_rules! out_json {
@@ -69,6 +21,31 @@ macro_rules! out_json {
             Err(e) => fail(e),
         }
     };
+}
+
+macro_rules! require_json_out {
+    ($out:ident, $what:literal) => {
+        if $out.is_null() {
+            return fail_arg(concat!($what, ": null out"));
+        }
+    };
+}
+
+fn drive_generated_string(
+    h: &LoomSession,
+    f: impl FnOnce(&loom_client::LocalLoomClient, loom_client::types::LoomSession) -> LoomResult<String>,
+) -> LoomResult<String> {
+    with_generated_client(h, f)
+}
+
+fn drive_generated_bytes(
+    h: &LoomSession,
+    f: impl FnOnce(
+        &loom_client::LocalLoomClient,
+        loom_client::types::LoomSession,
+    ) -> LoomResult<Vec<u8>>,
+) -> LoomResult<Vec<u8>> {
+    with_generated_client(h, f)
 }
 
 /// List a Drive folder as JSON.
@@ -90,8 +67,14 @@ pub unsafe extern "C" fn loom_drive_list_json(
     let folder_id = arg_str!(folder_id, "loom_drive_list_json");
     out_json!(
         out,
-        drive_read_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::list_folder(loom, ns, workspace_id, folder_id))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_list_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                folder_id.to_string(),
+            ))
         })
     )
 }
@@ -117,13 +100,14 @@ pub unsafe extern "C" fn loom_drive_stat_json(
     let name = arg_str!(name, "loom_drive_stat_json");
     out_json!(
         out,
-        drive_read_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::stat_node(
-                loom,
-                ns,
-                workspace_id,
-                folder_id,
-                name,
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_stat_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                folder_id.to_string(),
+                name.to_string(),
             ))
         })
     )
@@ -147,8 +131,14 @@ pub unsafe extern "C" fn loom_drive_read(
     let workspace = arg_str!(workspace, "loom_drive_read");
     let workspace_id = arg_str!(workspace_id, "loom_drive_read");
     let file_id = arg_str!(file_id, "loom_drive_read");
-    match drive_read_loom(h, workspace, |loom, ns| {
-        loom_drive::read_file(loom, ns, workspace_id, file_id)
+    match drive_generated_bytes(h, |client, session| {
+        crate::generated_local::block_generated(Drive::drive_read_file(
+            client,
+            session,
+            workspace.to_string(),
+            workspace_id.to_string(),
+            file_id.to_string(),
+        ))
     }) {
         // SAFETY: output pointers are writable per fn docs.
         Ok(bytes) => unsafe { ok_bytes(out_ptr, out_len, bytes) },
@@ -175,8 +165,14 @@ pub unsafe extern "C" fn loom_drive_list_versions_json(
     let file_id = arg_str!(file_id, "loom_drive_list_versions_json");
     out_json!(
         out,
-        drive_read_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::list_versions(loom, ns, workspace_id, file_id))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_list_versions_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                file_id.to_string(),
+            ))
         })
     )
 }
@@ -198,8 +194,13 @@ pub unsafe extern "C" fn loom_drive_list_conflicts_json(
     let workspace_id = arg_str!(workspace_id, "loom_drive_list_conflicts_json");
     out_json!(
         out,
-        drive_read_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::list_conflicts(loom, ns, workspace_id))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_list_conflicts_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+            ))
         })
     )
 }
@@ -221,8 +222,13 @@ pub unsafe extern "C" fn loom_drive_list_shares_json(
     let workspace_id = arg_str!(workspace_id, "loom_drive_list_shares_json");
     out_json!(
         out,
-        drive_read_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::list_shares(loom, ns, workspace_id))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_list_shares_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+            ))
         })
     )
 }
@@ -244,8 +250,13 @@ pub unsafe extern "C" fn loom_drive_list_retention_json(
     let workspace_id = arg_str!(workspace_id, "loom_drive_list_retention_json");
     out_json!(
         out,
-        drive_read_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::list_retention(loom, ns, workspace_id))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_list_retention_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+            ))
         })
     )
 }
@@ -275,15 +286,16 @@ pub unsafe extern "C" fn loom_drive_create_folder_json(
     let expected_root = arg_str!(expected_root, "loom_drive_create_folder_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::create_folder(
-                loom,
-                ns,
-                workspace_id,
-                parent_folder_id,
-                folder_id,
-                name,
-                expected_root,
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_create_folder_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                parent_folder_id.to_string(),
+                folder_id.to_string(),
+                name.to_string(),
+                expected_root.to_string(),
             ))
         })
     )
@@ -308,22 +320,31 @@ pub unsafe extern "C" fn loom_drive_create_upload_json(
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
+    require_json_out!(out, "loom_drive_create_upload_json");
     let h = handle_ref!(handle, "loom_drive_create_upload_json");
     let workspace = arg_str!(workspace, "loom_drive_create_upload_json");
-    let request = HostedDriveCreateUpload {
-        workspace_id: arg_str!(workspace_id, "loom_drive_create_upload_json"),
-        upload_id: arg_str!(upload_id, "loom_drive_create_upload_json"),
-        parent_folder_id: arg_str!(parent_folder_id, "loom_drive_create_upload_json"),
-        name: arg_str!(name, "loom_drive_create_upload_json"),
-        file_id: arg_str!(file_id, "loom_drive_create_upload_json"),
-        expected_root: arg_str!(expected_root, "loom_drive_create_upload_json"),
-        created_at_ms,
-        replace_file: replace_file != 0,
-    };
+    let workspace_id = arg_str!(workspace_id, "loom_drive_create_upload_json");
+    let upload_id = arg_str!(upload_id, "loom_drive_create_upload_json");
+    let parent_folder_id = arg_str!(parent_folder_id, "loom_drive_create_upload_json");
+    let name = arg_str!(name, "loom_drive_create_upload_json");
+    let file_id = arg_str!(file_id, "loom_drive_create_upload_json");
+    let expected_root = arg_str!(expected_root, "loom_drive_create_upload_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::create_upload(loom, ns, request))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_create_upload_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                upload_id.to_string(),
+                parent_folder_id.to_string(),
+                name.to_string(),
+                file_id.to_string(),
+                expected_root.to_string(),
+                created_at_ms,
+                replace_file != 0,
+            ))
         })
     )
 }
@@ -344,6 +365,7 @@ pub unsafe extern "C" fn loom_drive_upload_chunk_json(
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
+    require_json_out!(out, "loom_drive_upload_chunk_json");
     let h = handle_ref!(handle, "loom_drive_upload_chunk_json");
     let workspace = arg_str!(workspace, "loom_drive_upload_chunk_json");
     let workspace_id = arg_str!(workspace_id, "loom_drive_upload_chunk_json");
@@ -352,13 +374,14 @@ pub unsafe extern "C" fn loom_drive_upload_chunk_json(
     let chunk = unsafe { byte_slice(chunk, chunk_len) };
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::upload_chunk(
-                loom,
-                ns,
-                workspace_id,
-                upload_id,
-                chunk,
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_upload_chunk_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                upload_id.to_string(),
+                chunk.to_vec(),
             ))
         })
     )
@@ -377,14 +400,21 @@ pub unsafe extern "C" fn loom_drive_commit_upload_json(
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
+    require_json_out!(out, "loom_drive_commit_upload_json");
     let h = handle_ref!(handle, "loom_drive_commit_upload_json");
     let workspace = arg_str!(workspace, "loom_drive_commit_upload_json");
     let workspace_id = arg_str!(workspace_id, "loom_drive_commit_upload_json");
     let upload_id = arg_str!(upload_id, "loom_drive_commit_upload_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::commit_upload(loom, ns, workspace_id, upload_id))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_commit_upload_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                upload_id.to_string(),
+            ))
         })
     )
 }
@@ -414,15 +444,16 @@ pub unsafe extern "C" fn loom_drive_rename_json(
     let expected_root = arg_str!(expected_root, "loom_drive_rename_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::rename_node(
-                loom,
-                ns,
-                workspace_id,
-                folder_id,
-                node_id,
-                new_name,
-                expected_root,
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_rename_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                folder_id.to_string(),
+                node_id.to_string(),
+                new_name.to_string(),
+                expected_root.to_string(),
             ))
         })
     )
@@ -453,15 +484,16 @@ pub unsafe extern "C" fn loom_drive_move_json(
     let expected_root = arg_str!(expected_root, "loom_drive_move_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::move_node(
-                loom,
-                ns,
-                workspace_id,
-                source_folder_id,
-                target_folder_id,
-                node_id,
-                expected_root,
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_move_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                source_folder_id.to_string(),
+                target_folder_id.to_string(),
+                node_id.to_string(),
+                expected_root.to_string(),
             ))
         })
     )
@@ -490,14 +522,15 @@ pub unsafe extern "C" fn loom_drive_delete_json(
     let expected_root = arg_str!(expected_root, "loom_drive_delete_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::delete_node(
-                loom,
-                ns,
-                workspace_id,
-                folder_id,
-                node_id,
-                expected_root,
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_delete_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                folder_id.to_string(),
+                node_id.to_string(),
+                expected_root.to_string(),
             ))
         })
     )
@@ -517,24 +550,22 @@ pub unsafe extern "C" fn loom_drive_resolve_conflict_json(
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
+    require_json_out!(out, "loom_drive_resolve_conflict_json");
     let h = handle_ref!(handle, "loom_drive_resolve_conflict_json");
     let workspace = arg_str!(workspace, "loom_drive_resolve_conflict_json");
     let workspace_id = arg_str!(workspace_id, "loom_drive_resolve_conflict_json");
     let conflict_id = arg_str!(conflict_id, "loom_drive_resolve_conflict_json");
-    let resolution =
-        match parse_conflict_resolution(arg_str!(resolution, "loom_drive_resolve_conflict_json")) {
-            Ok(resolution) => resolution,
-            Err(e) => return fail(e),
-        };
+    let resolution = arg_str!(resolution, "loom_drive_resolve_conflict_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::resolve_conflict(
-                loom,
-                ns,
-                workspace_id,
-                conflict_id,
-                resolution,
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_resolve_conflict_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                conflict_id.to_string(),
+                resolution.to_string(),
             ))
         })
     )
@@ -560,22 +591,31 @@ pub unsafe extern "C" fn loom_drive_grant_share_json(
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
+    require_json_out!(out, "loom_drive_grant_share_json");
     let h = handle_ref!(handle, "loom_drive_grant_share_json");
     let workspace = arg_str!(workspace, "loom_drive_grant_share_json");
-    let request = HostedDriveGrantShare {
-        workspace_id: arg_str!(workspace_id, "loom_drive_grant_share_json"),
-        grant_id: arg_str!(grant_id, "loom_drive_grant_share_json"),
-        target_kind: arg_str!(target_kind, "loom_drive_grant_share_json"),
-        target_id: arg_str!(target_id, "loom_drive_grant_share_json"),
-        principal: arg_str!(principal, "loom_drive_grant_share_json"),
-        role: arg_str!(role, "loom_drive_grant_share_json"),
-        granted_at_ms,
-        expires_at_ms: (has_expires_at_ms != 0).then_some(expires_at_ms),
-    };
+    let workspace_id = arg_str!(workspace_id, "loom_drive_grant_share_json");
+    let grant_id = arg_str!(grant_id, "loom_drive_grant_share_json");
+    let target_kind = arg_str!(target_kind, "loom_drive_grant_share_json");
+    let target_id = arg_str!(target_id, "loom_drive_grant_share_json");
+    let principal = arg_str!(principal, "loom_drive_grant_share_json");
+    let role = arg_str!(role, "loom_drive_grant_share_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::grant_share(loom, ns, request))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_grant_share_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                grant_id.to_string(),
+                target_kind.to_string(),
+                target_id.to_string(),
+                principal.to_string(),
+                role.to_string(),
+                granted_at_ms,
+                (has_expires_at_ms != 0).then_some(expires_at_ms),
+            ))
         })
     )
 }
@@ -593,14 +633,21 @@ pub unsafe extern "C" fn loom_drive_revoke_share_json(
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
+    require_json_out!(out, "loom_drive_revoke_share_json");
     let h = handle_ref!(handle, "loom_drive_revoke_share_json");
     let workspace = arg_str!(workspace, "loom_drive_revoke_share_json");
     let workspace_id = arg_str!(workspace_id, "loom_drive_revoke_share_json");
     let grant_id = arg_str!(grant_id, "loom_drive_revoke_share_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::revoke_share(loom, ns, workspace_id, grant_id))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_revoke_share_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                grant_id.to_string(),
+            ))
         })
     )
 }
@@ -618,16 +665,18 @@ pub unsafe extern "C" fn loom_drive_apply_share_expiry_json(
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
+    require_json_out!(out, "loom_drive_apply_share_expiry_json");
     let h = handle_ref!(handle, "loom_drive_apply_share_expiry_json");
     let workspace = arg_str!(workspace, "loom_drive_apply_share_expiry_json");
     let workspace_id = arg_str!(workspace_id, "loom_drive_apply_share_expiry_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::apply_share_expiry(
-                loom,
-                ns,
-                workspace_id,
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_apply_share_expiry_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
                 now_ms,
             ))
         })
@@ -654,27 +703,33 @@ pub unsafe extern "C" fn loom_drive_pin_retention_json(
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
+    require_json_out!(out, "loom_drive_pin_retention_json");
     let h = handle_ref!(handle, "loom_drive_pin_retention_json");
     let workspace = arg_str!(workspace, "loom_drive_pin_retention_json");
-    let request = HostedDrivePinRetention {
-        workspace_id: arg_str!(workspace_id, "loom_drive_pin_retention_json"),
-        pin_id: arg_str!(pin_id, "loom_drive_pin_retention_json"),
-        kind: arg_str!(kind, "loom_drive_pin_retention_json"),
-        root: arg_str!(root, "loom_drive_pin_retention_json"),
-        // SAFETY: `target_entity_id` is optional and must be null or a valid C string per fn docs.
-        target_entity_id: match unsafe {
-            optional_str_arg(target_entity_id, "loom_drive_pin_retention_json")
-        } {
+    let workspace_id = arg_str!(workspace_id, "loom_drive_pin_retention_json");
+    let pin_id = arg_str!(pin_id, "loom_drive_pin_retention_json");
+    let kind = arg_str!(kind, "loom_drive_pin_retention_json");
+    let root = arg_str!(root, "loom_drive_pin_retention_json");
+    let target_entity_id =
+        match unsafe { optional_str_arg(target_entity_id, "loom_drive_pin_retention_json") } {
             Ok(value) => value,
             Err(e) => return fail(e),
-        },
-        added_at_ms,
-        expires_at_ms: (has_expires_at_ms != 0).then_some(expires_at_ms),
-    };
+        };
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::pin_retention(loom, ns, request))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_pin_retention_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                pin_id.to_string(),
+                kind.to_string(),
+                root.to_string(),
+                target_entity_id.map(str::to_string),
+                added_at_ms,
+                (has_expires_at_ms != 0).then_some(expires_at_ms),
+            ))
         })
     )
 }
@@ -692,14 +747,21 @@ pub unsafe extern "C" fn loom_drive_unpin_retention_json(
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
+    require_json_out!(out, "loom_drive_unpin_retention_json");
     let h = handle_ref!(handle, "loom_drive_unpin_retention_json");
     let workspace = arg_str!(workspace, "loom_drive_unpin_retention_json");
     let workspace_id = arg_str!(workspace_id, "loom_drive_unpin_retention_json");
     let pin_id = arg_str!(pin_id, "loom_drive_unpin_retention_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::unpin_retention(loom, ns, workspace_id, pin_id))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_unpin_retention_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                pin_id.to_string(),
+            ))
         })
     )
 }
@@ -717,13 +779,20 @@ pub unsafe extern "C" fn loom_drive_apply_retention_json(
     out: *mut *mut c_char,
 ) -> i32 {
     clear_error();
+    require_json_out!(out, "loom_drive_apply_retention_json");
     let h = handle_ref!(handle, "loom_drive_apply_retention_json");
     let workspace = arg_str!(workspace, "loom_drive_apply_retention_json");
     let workspace_id = arg_str!(workspace_id, "loom_drive_apply_retention_json");
     out_json!(
         out,
-        drive_write_loom(h, workspace, |loom, ns| {
-            json_result(loom_drive::apply_retention(loom, ns, workspace_id, now_ms))
+        drive_generated_string(h, |client, session| {
+            crate::generated_local::block_generated(Drive::drive_apply_retention_json(
+                client,
+                session,
+                workspace.to_string(),
+                workspace_id.to_string(),
+                now_ms,
+            ))
         })
     )
 }

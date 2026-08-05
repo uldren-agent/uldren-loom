@@ -7,41 +7,56 @@ import java.lang.invoke.MethodHandle;
 
 public final class ChatOps {
     private static final MethodHandle CREATE_CHANNEL_JSON = down("loom_chat_create_channel_json",
-            descriptor(6));
+            descriptor(7));
     private static final MethodHandle RENAME_CHANNEL_JSON = down("loom_chat_rename_channel_json",
-            descriptor(5));
+            descriptor(6));
     private static final MethodHandle LIST_CHANNELS_JSON = down("loom_chat_list_channels_json",
             descriptor(3));
     private static final MethodHandle POST_MESSAGE_JSON = down("loom_chat_post_message_json",
-            descriptor(7));
-    private static final MethodHandle EDIT_MESSAGE_JSON = down("loom_chat_edit_message_json",
-            descriptor(6));
-    private static final MethodHandle REDACT_MESSAGE_JSON = down("loom_chat_redact_message_json",
-            descriptor(6));
-    private static final MethodHandle CREATE_THREAD_JSON = down("loom_chat_create_thread_json",
-            descriptor(6));
-    private static final MethodHandle CREATE_TASK_JSON = down("loom_chat_create_task_json",
-            descriptor(7));
-    private static final MethodHandle CLAIM_TASK_JSON = down("loom_chat_claim_task_json",
-            descriptor(7));
-    private static final MethodHandle COMPLETE_TASK_JSON = down("loom_chat_complete_task_json",
-            descriptor(7));
-    private static final MethodHandle INVOKE_AGENT_JSON = down("loom_chat_invoke_agent_json",
             descriptor(8));
+    private static final MethodHandle POST_MESSAGE_BYTES_JSON = down("loom_chat_post_message_bytes_json",
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+    private static final MethodHandle EDIT_MESSAGE_JSON = down("loom_chat_edit_message_json",
+            descriptor(7));
+    private static final MethodHandle EDIT_MESSAGE_BYTES_JSON = down("loom_chat_edit_message_bytes_json",
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS));
+    private static final MethodHandle REDACT_MESSAGE_JSON = down("loom_chat_redact_message_json",
+            descriptor(7));
+    private static final MethodHandle CREATE_THREAD_JSON = down("loom_chat_create_thread_json",
+            descriptor(7));
+    private static final MethodHandle CREATE_TASK_JSON = down("loom_chat_create_task_json",
+            descriptor(8));
+    private static final MethodHandle CLAIM_TASK_JSON = down("loom_chat_claim_task_json",
+            descriptor(8));
+    private static final MethodHandle COMPLETE_TASK_JSON = down("loom_chat_complete_task_json",
+            descriptor(8));
+    private static final MethodHandle INVOKE_AGENT_JSON = down("loom_chat_invoke_agent_json",
+            descriptor(9));
+    private static final MethodHandle INVOKE_AGENT_BYTES_JSON = down("loom_chat_invoke_agent_bytes_json",
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
     private static final MethodHandle AGENT_REPLY_JSON = down("loom_chat_agent_reply_json",
-            descriptor(6));
+            descriptor(7));
     private static final MethodHandle REQUEST_HANDOFF_JSON = down("loom_chat_request_handoff_json",
             descriptor(9));
     private static final MethodHandle ADD_REACTION_JSON = down("loom_chat_add_reaction_json",
-            descriptor(6));
+            descriptor(7));
     private static final MethodHandle REMOVE_REACTION_JSON = down("loom_chat_remove_reaction_json",
-            descriptor(6));
+            descriptor(7));
     private static final MethodHandle EMOJI_LIST_JSON = down("loom_chat_emoji_list_json",
             descriptor(3));
     private static final MethodHandle EMOJI_REGISTER_JSON = down("loom_chat_emoji_register_json",
-            descriptor(4));
+            descriptor(5));
     private static final MethodHandle EMOJI_UNREGISTER_JSON = down("loom_chat_emoji_unregister_json",
-            descriptor(4));
+            descriptor(5));
     private static final MethodHandle MESSAGES_JSON = down("loom_chat_messages_json",
             descriptor(4));
     private static final MethodHandle CURSOR_JSON = down("loom_chat_cursor_json",
@@ -49,7 +64,7 @@ public final class ChatOps {
     private static final MethodHandle UPDATE_CURSOR_JSON = down("loom_chat_update_cursor_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
-                    ValueLayout.ADDRESS));
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
     private static final MethodHandle FETCH_EVENTS_JSON = down("loom_chat_fetch_events_json",
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
@@ -75,15 +90,15 @@ public final class ChatOps {
     }
 
     public String createChannelJson(String workspace, String chatWorkspaceId, String channelId,
-            String channelHandle, String name) {
-        return string5("loom_chat_create_channel_json", CREATE_CHANNEL_JSON, workspace,
-                chatWorkspaceId, channelId, channelHandle, name);
+            String channelHandle, String name, String expectedEntityTag) {
+        return string6("loom_chat_create_channel_json", CREATE_CHANNEL_JSON, workspace,
+                chatWorkspaceId, channelId, channelHandle, name, nullableString(expectedEntityTag));
     }
 
     public String renameChannelJson(String workspace, String chatWorkspaceId, String selector,
-            String channelHandle) {
-        return string4("loom_chat_rename_channel_json", RENAME_CHANNEL_JSON, workspace,
-                chatWorkspaceId, selector, channelHandle);
+            String channelHandle, String expectedEntityTag) {
+        return string5("loom_chat_rename_channel_json", RENAME_CHANNEL_JSON, workspace,
+                chatWorkspaceId, selector, channelHandle, nullableString(expectedEntityTag));
     }
 
     public String listChannelsJson(String workspace, String chatWorkspaceId) {
@@ -92,96 +107,192 @@ public final class ChatOps {
     }
 
     public String postMessageJson(String workspace, String chatWorkspaceId, String channelId,
-            String messageId, String threadId, String bodyText) {
+            String messageId, String threadId, String bodyText, String expectedEntityTag) {
         return session.onHandle("loom_chat_post_message_json", (arena, handle) -> {
             MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
             int status = (int) POST_MESSAGE_JSON.invokeExact(handle,
                     arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
                     arena.allocateFrom(channelId), arena.allocateFrom(messageId),
-                    nullable(arena, threadId), arena.allocateFrom(bodyText), out);
+                    nullable(arena, threadId), arena.allocateFrom(bodyText),
+                    nullable(arena, expectedEntityTag), out);
             return takeString("loom_chat_post_message_json", status, out);
         });
     }
 
+    public String postMessageBytesJson(String workspace, String chatWorkspaceId, String channelId,
+            String messageId, String threadId, byte[] body, String expectedEntityTag) {
+        return session.onHandle("loom_chat_post_message_bytes_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) POST_MESSAGE_BYTES_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(messageId),
+                    nullable(arena, threadId), Loom.bytesOrNull(arena, body),
+                    (long) (body != null ? body.length : 0), nullable(arena, expectedEntityTag),
+                    out);
+            return takeString("loom_chat_post_message_bytes_json", status, out);
+        });
+    }
+
     public String editMessageJson(String workspace, String chatWorkspaceId, String channelId,
-            String messageId, String bodyText) {
+            String messageId, String bodyText, String expectedEntityTag) {
         return session.onHandle("loom_chat_edit_message_json", (arena, handle) -> {
             MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
             int status = (int) EDIT_MESSAGE_JSON.invokeExact(handle,
                     arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
                     arena.allocateFrom(channelId), arena.allocateFrom(messageId),
-                    arena.allocateFrom(bodyText), out);
+                    arena.allocateFrom(bodyText), nullable(arena, expectedEntityTag), out);
             return takeString("loom_chat_edit_message_json", status, out);
         });
     }
 
+    public String editMessageBytesJson(String workspace, String chatWorkspaceId, String channelId,
+            String messageId, byte[] body, String expectedEntityTag) {
+        return session.onHandle("loom_chat_edit_message_bytes_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) EDIT_MESSAGE_BYTES_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(messageId),
+                    Loom.bytesOrNull(arena, body), (long) (body != null ? body.length : 0),
+                    nullable(arena, expectedEntityTag), out);
+            return takeString("loom_chat_edit_message_bytes_json", status, out);
+        });
+    }
+
     public String redactMessageJson(String workspace, String chatWorkspaceId, String channelId,
-            String messageId, String reason) {
-        return string5("loom_chat_redact_message_json", REDACT_MESSAGE_JSON, workspace,
-                chatWorkspaceId, channelId, messageId, nullableString(reason));
+            String messageId, String reason, String expectedEntityTag) {
+        return session.onHandle("loom_chat_redact_message_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) REDACT_MESSAGE_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(messageId),
+                    nullable(arena, reason), nullable(arena, expectedEntityTag), out);
+            return takeString("loom_chat_redact_message_json", status, out);
+        });
     }
 
     public String createThreadJson(String workspace, String chatWorkspaceId, String channelId,
-            String threadId, String parentMessageId) {
-        return string5("loom_chat_create_thread_json", CREATE_THREAD_JSON, workspace,
-                chatWorkspaceId, channelId, threadId, parentMessageId);
+            String threadId, String parentMessageId, String expectedEntityTag) {
+        return string6("loom_chat_create_thread_json", CREATE_THREAD_JSON, workspace,
+                chatWorkspaceId, channelId, threadId, parentMessageId,
+                nullableString(expectedEntityTag));
     }
 
     public String createTaskJson(String workspace, String chatWorkspaceId, String channelId,
-            String taskId, String messageId, String title) {
-        return string6("loom_chat_create_task_json", CREATE_TASK_JSON, workspace,
-                chatWorkspaceId, channelId, taskId, messageId, title);
+            String taskId, String messageId, String title, String expectedEntityTag) {
+        return session.onHandle("loom_chat_create_task_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) CREATE_TASK_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(taskId),
+                    arena.allocateFrom(messageId), arena.allocateFrom(title),
+                    nullablePresent(arena, expectedEntityTag), out);
+            return takeString("loom_chat_create_task_json", status, out);
+        });
     }
 
     public String claimTaskJson(String workspace, String chatWorkspaceId, String channelId,
-            String taskId, String claimId, String leaseToken) {
-        return string6("loom_chat_claim_task_json", CLAIM_TASK_JSON, workspace, chatWorkspaceId,
-                channelId, taskId, claimId, nullableString(leaseToken));
+            String taskId, String claimId, String leaseToken, String expectedEntityTag) {
+        return session.onHandle("loom_chat_claim_task_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) CLAIM_TASK_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(taskId),
+                    arena.allocateFrom(claimId), nullablePresent(arena, leaseToken),
+                    nullablePresent(arena, expectedEntityTag), out);
+            return takeString("loom_chat_claim_task_json", status, out);
+        });
     }
 
     public String completeTaskJson(String workspace, String chatWorkspaceId, String channelId,
-            String taskId, String claimId, String resultMessageId) {
-        return string6("loom_chat_complete_task_json", COMPLETE_TASK_JSON, workspace,
-                chatWorkspaceId, channelId, taskId, claimId, nullableString(resultMessageId));
+            String taskId, String claimId, String resultMessageId, String expectedEntityTag) {
+        return session.onHandle("loom_chat_complete_task_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) COMPLETE_TASK_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(taskId),
+                    arena.allocateFrom(claimId), nullablePresent(arena, resultMessageId),
+                    nullablePresent(arena, expectedEntityTag), out);
+            return takeString("loom_chat_complete_task_json", status, out);
+        });
     }
 
     public String invokeAgentJson(String workspace, String chatWorkspaceId, String channelId,
             String invocationId, String agentPrincipal, String sourceMessageIdsJson,
-            String promptText) {
+            String promptText, String expectedEntityTag) {
         return session.onHandle("loom_chat_invoke_agent_json", (arena, handle) -> {
             MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
             int status = (int) INVOKE_AGENT_JSON.invokeExact(handle,
                     arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
                     arena.allocateFrom(channelId), arena.allocateFrom(invocationId),
                     arena.allocateFrom(agentPrincipal), arena.allocateFrom(sourceMessageIdsJson),
-                    arena.allocateFrom(promptText), out);
+                    arena.allocateFrom(promptText), nullablePresent(arena, expectedEntityTag), out);
             return takeString("loom_chat_invoke_agent_json", status, out);
         });
     }
 
+    public String invokeAgentBytesJson(String workspace, String chatWorkspaceId, String channelId,
+            String invocationId, String agentPrincipal, String sourceMessageIdsJson, byte[] prompt,
+            String expectedEntityTag) {
+        return session.onHandle("loom_chat_invoke_agent_bytes_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) INVOKE_AGENT_BYTES_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(invocationId),
+                    arena.allocateFrom(agentPrincipal), arena.allocateFrom(sourceMessageIdsJson),
+                    Loom.bytesOrNull(arena, prompt), (long) (prompt != null ? prompt.length : 0),
+                    nullablePresent(arena, expectedEntityTag), out);
+            return takeString("loom_chat_invoke_agent_bytes_json", status, out);
+        });
+    }
+
     public String agentReplyJson(String workspace, String chatWorkspaceId, String channelId,
-            String invocationId, String messageId) {
-        return string5("loom_chat_agent_reply_json", AGENT_REPLY_JSON, workspace,
-                chatWorkspaceId, channelId, invocationId, messageId);
+            String invocationId, String messageId, String expectedEntityTag) {
+        return session.onHandle("loom_chat_agent_reply_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) AGENT_REPLY_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(invocationId),
+                    arena.allocateFrom(messageId), nullablePresent(arena, expectedEntityTag), out);
+            return takeString("loom_chat_agent_reply_json", status, out);
+        });
     }
 
     public String requestHandoffJson(String workspace, String chatWorkspaceId, String channelId,
-            String handoffId, String fromAgentPrincipal, String toPrincipal, String reason) {
-        return string7("loom_chat_request_handoff_json", REQUEST_HANDOFF_JSON, workspace,
-                chatWorkspaceId, channelId, handoffId, fromAgentPrincipal,
-                nullableString(toPrincipal), nullableString(reason));
+            String handoffId, String fromAgentPrincipal, String toPrincipal, String reason,
+            String expectedEntityTag) {
+        return session.onHandle("loom_chat_request_handoff_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) REQUEST_HANDOFF_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(handoffId),
+                    arena.allocateFrom(fromAgentPrincipal), nullablePresent(arena, toPrincipal),
+                    nullablePresent(arena, reason), nullablePresent(arena, expectedEntityTag), out);
+            return takeString("loom_chat_request_handoff_json", status, out);
+        });
     }
 
     public String addReactionJson(String workspace, String chatWorkspaceId, String channelId,
-            String messageId, String kind) {
-        return string5("loom_chat_add_reaction_json", ADD_REACTION_JSON, workspace,
-                chatWorkspaceId, channelId, messageId, kind);
+            String messageId, String kind, String expectedEntityTag) {
+        return session.onHandle("loom_chat_add_reaction_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) ADD_REACTION_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(messageId),
+                    arena.allocateFrom(kind), nullablePresent(arena, expectedEntityTag), out);
+            return takeString("loom_chat_add_reaction_json", status, out);
+        });
     }
 
     public String removeReactionJson(String workspace, String chatWorkspaceId, String channelId,
-            String messageId, String kind) {
-        return string5("loom_chat_remove_reaction_json", REMOVE_REACTION_JSON, workspace,
-                chatWorkspaceId, channelId, messageId, kind);
+            String messageId, String kind, String expectedEntityTag) {
+        return session.onHandle("loom_chat_remove_reaction_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) REMOVE_REACTION_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(channelId), arena.allocateFrom(messageId),
+                    arena.allocateFrom(kind), nullablePresent(arena, expectedEntityTag), out);
+            return takeString("loom_chat_remove_reaction_json", status, out);
+        });
     }
 
     public String emojiListJson(String workspace, String chatWorkspaceId) {
@@ -189,14 +300,26 @@ public final class ChatOps {
                 chatWorkspaceId);
     }
 
-    public String emojiRegisterJson(String workspace, String chatWorkspaceId, String kind) {
-        return string3("loom_chat_emoji_register_json", EMOJI_REGISTER_JSON, workspace,
-                chatWorkspaceId, kind);
+    public String emojiRegisterJson(String workspace, String chatWorkspaceId, String kind,
+            String expectedEntityTag) {
+        return session.onHandle("loom_chat_emoji_register_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) EMOJI_REGISTER_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(kind), nullablePresent(arena, expectedEntityTag), out);
+            return takeString("loom_chat_emoji_register_json", status, out);
+        });
     }
 
-    public String emojiUnregisterJson(String workspace, String chatWorkspaceId, String kind) {
-        return string3("loom_chat_emoji_unregister_json", EMOJI_UNREGISTER_JSON, workspace,
-                chatWorkspaceId, kind);
+    public String emojiUnregisterJson(String workspace, String chatWorkspaceId, String kind,
+            String expectedEntityTag) {
+        return session.onHandle("loom_chat_emoji_unregister_json", (arena, handle) -> {
+            MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+            int status = (int) EMOJI_UNREGISTER_JSON.invokeExact(handle,
+                    arena.allocateFrom(workspace), arena.allocateFrom(chatWorkspaceId),
+                    arena.allocateFrom(kind), nullablePresent(arena, expectedEntityTag), out);
+            return takeString("loom_chat_emoji_unregister_json", status, out);
+        });
     }
 
     public String messagesJson(String workspace, String chatWorkspaceId, String channelId) {
@@ -210,12 +333,12 @@ public final class ChatOps {
     }
 
     public String updateCursorJson(String workspace, String chatWorkspaceId, String channelId,
-            long nextSequence) {
+            long nextSequence, String expectedEntityTag) {
         return session.onHandle("loom_chat_update_cursor_json", (arena, handle) -> {
             MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
             int status = (int) UPDATE_CURSOR_JSON.invokeExact(handle, arena.allocateFrom(workspace),
                     arena.allocateFrom(chatWorkspaceId), arena.allocateFrom(channelId),
-                    nextSequence, out);
+                    nextSequence, nullablePresent(arena, expectedEntityTag), out);
             return takeString("loom_chat_update_cursor_json", status, out);
         });
     }
@@ -294,6 +417,10 @@ public final class ChatOps {
 
     private static MemorySegment nullable(java.lang.foreign.Arena arena, String value) {
         return value != null && !value.isEmpty() ? arena.allocateFrom(value) : MemorySegment.NULL;
+    }
+
+    private static MemorySegment nullablePresent(java.lang.foreign.Arena arena, String value) {
+        return value != null ? arena.allocateFrom(value) : MemorySegment.NULL;
     }
 
     private static String nullableString(String value) {

@@ -26,6 +26,7 @@ ed25519-dalek.workspace = true
 hex.workspace = true
 loom-codec.workspace = true
 loom-compute = { workspace = true, features = ["sql-state-access"] }
+loom-client.workspace = true
 loom-core.workspace = true
 loom-chat.workspace = true
 loom-delivery.workspace = true

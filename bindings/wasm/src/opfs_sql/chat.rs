@@ -83,6 +83,7 @@ impl LoomStore {
             channel_id,
             &channel_handle,
             &name,
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -102,6 +103,7 @@ impl LoomStore {
             &chat_workspace_id,
             &selector,
             &channel_handle,
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -113,11 +115,7 @@ impl LoomStore {
         chat_workspace_id: String,
     ) -> Result<String, JsError> {
         let ns = resolve_workspace_arg(&self.loom, &workspace)?;
-        to_json(loom_chat::list_channels(
-            &self.loom,
-            ns,
-            &chat_workspace_id,
-        ))
+        to_json(loom_chat::list_channels(&self.loom, ns, &chat_workspace_id))
     }
 
     pub fn chat_post_message_json(
@@ -138,6 +136,7 @@ impl LoomStore {
             &message_id,
             thread_id.as_deref(),
             body_text.into_bytes(),
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -159,6 +158,7 @@ impl LoomStore {
             &channel_id,
             &message_id,
             body_text.into_bytes(),
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -180,6 +180,7 @@ impl LoomStore {
             &channel_id,
             &message_id,
             reason_text.as_deref(),
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -201,6 +202,7 @@ impl LoomStore {
             &channel_id,
             &thread_id,
             &parent_message_id,
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -224,6 +226,7 @@ impl LoomStore {
             &task_id,
             message_id.as_deref(),
             &title,
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -247,6 +250,7 @@ impl LoomStore {
             &task_id,
             &claim_id,
             lease_token.as_deref(),
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -270,6 +274,7 @@ impl LoomStore {
             &task_id,
             &claim_id,
             result_message_id.as_deref(),
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -297,6 +302,7 @@ impl LoomStore {
             agent_principal,
             source_message_ids,
             prompt_text.into_bytes(),
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -318,6 +324,7 @@ impl LoomStore {
             &channel_id,
             &invocation_id,
             &message_id,
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -348,6 +355,7 @@ impl LoomStore {
             from_agent_principal,
             to_principal,
             reason_text.as_deref(),
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -369,6 +377,7 @@ impl LoomStore {
             &channel_id,
             &message_id,
             &kind,
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -390,6 +399,7 @@ impl LoomStore {
             &channel_id,
             &message_id,
             &kind,
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -420,6 +430,7 @@ impl LoomStore {
             ns,
             &chat_workspace_id,
             &kind,
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -437,6 +448,7 @@ impl LoomStore {
             ns,
             &chat_workspace_id,
             &kind,
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)
@@ -486,6 +498,7 @@ impl LoomStore {
             &chat_workspace_id,
             &channel_id,
             next_sequence,
+            None,
         ))?;
         save_loom(&mut self.loom).map_err(le)?;
         Ok(out)

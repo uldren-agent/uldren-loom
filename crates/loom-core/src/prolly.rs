@@ -664,6 +664,8 @@ pub struct ProllyReach {
     pub nodes: Vec<Digest>,
     /// Values from the visited leaves, in encounter order.
     pub leaf_values: Vec<Vec<u8>>,
+    /// Key/value entries from the visited leaves, in encounter order.
+    pub leaf_entries: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -687,6 +689,7 @@ impl ProllyReachCursor {
 pub struct ProllyReachStep {
     pub nodes: Vec<Digest>,
     pub leaf_values: Vec<Vec<u8>>,
+    pub leaf_entries: Vec<(Vec<u8>, Vec<u8>)>,
     pub visited: usize,
     pub completed: bool,
 }
@@ -712,11 +715,13 @@ pub fn reachable_with_leaves_until<S: ObjectStore>(
     let mut out = ProllyReach {
         nodes: Vec::new(),
         leaf_values: Vec::new(),
+        leaf_entries: Vec::new(),
     };
     while !cursor.completed() {
         let step = step_reachable_with_leaves(store, &mut cursor, have, usize::MAX, deadline)?;
         out.nodes.extend(step.nodes);
         out.leaf_values.extend(step.leaf_values);
+        out.leaf_entries.extend(step.leaf_entries);
     }
     Ok(out)
 }
@@ -730,6 +735,7 @@ pub fn step_reachable_with_leaves<S: ObjectStore>(
 ) -> Result<ProllyReachStep> {
     let mut nodes = Vec::new();
     let mut leaf_values = Vec::new();
+    let mut leaf_entries = Vec::new();
     let mut visited = 0usize;
     while visited < budget {
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
@@ -748,8 +754,9 @@ pub fn step_reachable_with_leaves<S: ObjectStore>(
         visited += 1;
         match read_node(store, &d)? {
             Node::Leaf(entries) => {
-                for (_, v) in entries {
-                    leaf_values.push(v);
+                for (k, v) in entries {
+                    leaf_values.push(v.clone());
+                    leaf_entries.push((k, v));
                 }
             }
             Node::Internal(children) => {
@@ -762,6 +769,7 @@ pub fn step_reachable_with_leaves<S: ObjectStore>(
     Ok(ProllyReachStep {
         nodes,
         leaf_values,
+        leaf_entries,
         visited,
         completed: cursor.completed(),
     })

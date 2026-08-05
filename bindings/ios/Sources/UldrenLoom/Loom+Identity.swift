@@ -126,4 +126,64 @@ extension Loom {
             throw LoomSql.lastError()
         }
     }
+
+    public func identityForceDetachAuthorityJson(
+        principal: String,
+        generation: UInt64,
+        reason: String
+    ) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_identity_force_detach_authority_json(session, principal, generation, reason, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        return out.map { String(cString: $0) } ?? ""
+    }
+
+    public func identityReplicateAuthorityJson(
+        source: String,
+        becomeAuthority: Bool
+    ) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_identity_replicate_authority_json(session, source, becomeAuthority ? 1 : 0, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        return out.map { String(cString: $0) } ?? ""
+    }
+
+    public func identityConfigureAuthorityReplicationJson(
+        id: String,
+        source: String,
+        disabled: Bool,
+        pullOnStart: Bool,
+        intervalMs: UInt64?,
+        jitterMs: UInt64,
+        backoffMs: UInt64,
+        publishWitness: Bool
+    ) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_identity_configure_authority_replication_json(
+            session,
+            id,
+            source,
+            disabled ? 1 : 0,
+            pullOnStart ? 1 : 0,
+            intervalMs ?? 0,
+            intervalMs == nil ? 0 : 1,
+            jitterMs,
+            backoffMs,
+            publishWitness ? 1 : 0,
+            &out
+        )
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        return out.map { String(cString: $0) } ?? ""
+    }
+
+    public func identityRemoveAuthorityReplicationJson(id: String) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        let status = loom_identity_remove_authority_replication_json(session, id, &out)
+        guard status == 0 else { throw LoomSql.lastError() }
+        defer { loom_string_free(out) }
+        return out.map { String(cString: $0) } ?? ""
+    }
 }

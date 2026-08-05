@@ -19,6 +19,7 @@ chrono.workspace = true
 loom-codec.workspace = true
 loom-core.workspace = true
 loom-types.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 unicode-normalization.workspace = true
 

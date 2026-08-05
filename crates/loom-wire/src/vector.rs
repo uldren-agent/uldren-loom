@@ -11,6 +11,29 @@ use loom_core::{AcceleratorPolicy, EmbeddingModel, Hit};
 use loom_types::LoomError;
 use std::collections::BTreeMap;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextUpsertRequest {
+    pub workspace: String,
+    pub name: String,
+    pub id: String,
+    pub vector: Vec<u8>,
+    pub metadata: Vec<u8>,
+    pub source_text: Vec<u8>,
+    pub model_id: Option<String>,
+    pub weights_digest: Option<String>,
+    pub create: bool,
+    pub metric: i32,
+    pub expected_token: Option<Vec<u8>>,
+    pub expect_absent: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextUpsertReport {
+    pub id: String,
+    pub collection: String,
+    pub current_token: Vec<u8>,
+}
+
 /// Decode a distance-metric tag (1 cosine, 2 L2, 3 dot).
 pub fn metric_from_int(metric: i32) -> Result<Metric, LoomError> {
     match metric {
@@ -235,6 +258,186 @@ pub fn embedding_model_cbor(model: &EmbeddingModel) -> Vec<u8> {
         CborValue::Text(model.weights_digest.clone().unwrap_or_default()),
     ]))
     .unwrap_or_default()
+}
+
+pub fn text_upsert_report_to_cbor(id: &str, collection: &str) -> Vec<u8> {
+    text_upsert_report_with_token_to_cbor(id, collection, &[])
+}
+
+pub fn text_upsert_report_with_token_to_cbor(
+    id: &str,
+    collection: &str,
+    current_token: &[u8],
+) -> Vec<u8> {
+    encode(&CborValue::Array(vec![
+        CborValue::Text(id.to_string()),
+        CborValue::Text(collection.to_string()),
+        CborValue::Bytes(current_token.to_vec()),
+    ]))
+    .unwrap_or_default()
+}
+
+pub fn text_upsert_report_from_cbor(bytes: &[u8]) -> Result<TextUpsertReport, LoomError> {
+    let value = decode(bytes).map_err(|e| LoomError::corrupt(format!("cbor: {e}")))?;
+    let CborValue::Array(items) = value else {
+        return Err(LoomError::invalid(
+            "vector text upsert report must be an array",
+        ));
+    };
+    if items.len() != 3 {
+        return Err(LoomError::invalid(
+            "vector text upsert report must have three fields",
+        ));
+    }
+    let mut items = items.into_iter();
+    let Some(CborValue::Text(id)) = items.next() else {
+        return Err(LoomError::invalid(
+            "vector text upsert report id must be text",
+        ));
+    };
+    let Some(CborValue::Text(collection)) = items.next() else {
+        return Err(LoomError::invalid(
+            "vector text upsert report collection must be text",
+        ));
+    };
+    let Some(CborValue::Bytes(current_token)) = items.next() else {
+        return Err(LoomError::invalid(
+            "vector text upsert report current token must be bytes",
+        ));
+    };
+    Ok(TextUpsertReport {
+        id,
+        collection,
+        current_token,
+    })
+}
+
+pub fn text_upsert_request_to_cbor(request: &TextUpsertRequest) -> Vec<u8> {
+    encode(&CborValue::Array(vec![
+        CborValue::Uint(1),
+        CborValue::Text(request.workspace.clone()),
+        CborValue::Text(request.name.clone()),
+        CborValue::Text(request.id.clone()),
+        CborValue::Bytes(request.vector.clone()),
+        CborValue::Bytes(request.metadata.clone()),
+        CborValue::Bytes(request.source_text.clone()),
+        optional_text_value(request.model_id.as_deref()),
+        optional_text_value(request.weights_digest.as_deref()),
+        CborValue::Bool(request.create),
+        CborValue::Uint(request.metric as u64),
+        optional_bytes_value(request.expected_token.as_deref()),
+        CborValue::Bool(request.expect_absent),
+    ]))
+    .unwrap_or_default()
+}
+
+pub fn text_upsert_request_from_cbor(bytes: &[u8]) -> Result<TextUpsertRequest, LoomError> {
+    let value = decode(bytes).map_err(|e| LoomError::corrupt(format!("cbor: {e}")))?;
+    let CborValue::Array(items) = value else {
+        return Err(LoomError::invalid(
+            "vector text upsert request must be an array",
+        ));
+    };
+    if items.len() != 13 {
+        return Err(LoomError::invalid(
+            "vector text upsert request must have thirteen fields",
+        ));
+    }
+    let mut items = items.into_iter();
+    expect_version(items.next(), "vector text upsert request", 1)?;
+    Ok(TextUpsertRequest {
+        workspace: text_field(items.next(), "workspace")?,
+        name: text_field(items.next(), "name")?,
+        id: text_field(items.next(), "id")?,
+        vector: bytes_field(items.next(), "vector")?,
+        metadata: bytes_field(items.next(), "metadata")?,
+        source_text: bytes_field(items.next(), "source_text")?,
+        model_id: optional_text_field(items.next(), "model_id")?,
+        weights_digest: optional_text_field(items.next(), "weights_digest")?,
+        create: bool_field(items.next(), "create")?,
+        metric: i32::try_from(uint_field(items.next(), "metric")?)
+            .map_err(|_| LoomError::invalid("vector text upsert metric out of range"))?,
+        expected_token: optional_bytes_field(items.next(), "expected_token")?,
+        expect_absent: bool_field(items.next(), "expect_absent")?,
+    })
+}
+
+fn expect_version(value: Option<CborValue>, name: &str, expected: u64) -> Result<(), LoomError> {
+    let actual = uint_field(value, "version")?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(LoomError::invalid(format!(
+            "{name} version must be {expected}, got {actual}"
+        )))
+    }
+}
+
+fn optional_text_value(value: Option<&str>) -> CborValue {
+    value.map_or(CborValue::Null, |value| CborValue::Text(value.to_string()))
+}
+
+fn optional_bytes_value(value: Option<&[u8]>) -> CborValue {
+    value.map_or(CborValue::Null, |value| CborValue::Bytes(value.to_vec()))
+}
+
+fn uint_field(value: Option<CborValue>, name: &str) -> Result<u64, LoomError> {
+    match value {
+        Some(CborValue::Uint(value)) => Ok(value),
+        _ => Err(LoomError::invalid(format!(
+            "vector text upsert request {name} must be uint"
+        ))),
+    }
+}
+
+fn text_field(value: Option<CborValue>, name: &str) -> Result<String, LoomError> {
+    match value {
+        Some(CborValue::Text(value)) => Ok(value),
+        _ => Err(LoomError::invalid(format!(
+            "vector text upsert request {name} must be text"
+        ))),
+    }
+}
+
+fn bytes_field(value: Option<CborValue>, name: &str) -> Result<Vec<u8>, LoomError> {
+    match value {
+        Some(CborValue::Bytes(value)) => Ok(value),
+        _ => Err(LoomError::invalid(format!(
+            "vector text upsert request {name} must be bytes"
+        ))),
+    }
+}
+
+fn bool_field(value: Option<CborValue>, name: &str) -> Result<bool, LoomError> {
+    match value {
+        Some(CborValue::Bool(value)) => Ok(value),
+        _ => Err(LoomError::invalid(format!(
+            "vector text upsert request {name} must be bool"
+        ))),
+    }
+}
+
+fn optional_text_field(value: Option<CborValue>, name: &str) -> Result<Option<String>, LoomError> {
+    match value {
+        Some(CborValue::Null) => Ok(None),
+        Some(CborValue::Text(value)) => Ok(Some(value)),
+        _ => Err(LoomError::invalid(format!(
+            "vector text upsert request {name} must be text or null"
+        ))),
+    }
+}
+
+fn optional_bytes_field(
+    value: Option<CborValue>,
+    name: &str,
+) -> Result<Option<Vec<u8>>, LoomError> {
+    match value {
+        Some(CborValue::Null) => Ok(None),
+        Some(CborValue::Bytes(value)) => Ok(Some(value)),
+        _ => Err(LoomError::invalid(format!(
+            "vector text upsert request {name} must be bytes or null"
+        ))),
+    }
 }
 
 /// Encode a fetched entry as `[vector_bytes, metadata]`.

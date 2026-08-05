@@ -254,11 +254,13 @@ impl JsonRpcAdapter<'_> {
         auth: &HostedAuth,
         workspace: WorkspaceId,
         src_path: &str,
+        author: Option<&str>,
+        message: Option<&str>,
         commit: bool,
         dry_run: bool,
     ) -> JsonRpcResult<Vec<u8>> {
         jsonrpc_result(self.kernel.write(auth, |loom| {
-            crate::archive::fs_import(loom, workspace, src_path, commit, dry_run)
+            crate::archive::fs_import(loom, workspace, src_path, author, message, commit, dry_run)
         }))
     }
 
@@ -275,16 +277,34 @@ impl JsonRpcAdapter<'_> {
         }))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the generated Archive IDL signature"
+    )]
     pub fn archive_import(
         &self,
         auth: &HostedAuth,
         workspace: WorkspaceId,
         src_path: &str,
         kind: &str,
+        gzip_output_path: Option<&str>,
+        commit: bool,
+        author: Option<&str>,
+        message: Option<&str>,
         dry_run: bool,
     ) -> JsonRpcResult<Vec<u8>> {
         jsonrpc_result(self.kernel.write(auth, |loom| {
-            crate::archive::archive_import(loom, workspace, src_path, kind, dry_run)
+            crate::archive::archive_import(
+                loom,
+                workspace,
+                src_path,
+                kind,
+                gzip_output_path,
+                commit,
+                author,
+                message,
+                dry_run,
+            )
         }))
     }
 
@@ -353,9 +373,16 @@ impl JsonRpcAdapter<'_> {
         workspace: WorkspaceId,
         workspace_id: &str,
         project_id: &str,
+        include_contracts: bool,
     ) -> JsonRpcResult<Option<TicketProjectSummary>> {
         jsonrpc_result(self.kernel.read(auth, |loom| {
-            crate::tickets::project_settings_get(loom, workspace, workspace_id, project_id)
+            crate::tickets::project_settings_get(
+                loom,
+                workspace,
+                workspace_id,
+                project_id,
+                include_contracts,
+            )
         }))
     }
 
@@ -1545,6 +1572,7 @@ impl JsonRpcAdapter<'_> {
                 message_id,
                 thread_id,
                 body,
+                None,
             )
         }))
     }
@@ -1559,7 +1587,15 @@ impl JsonRpcAdapter<'_> {
         body: Vec<u8>,
     ) -> JsonRpcResult<HostedChatWrite> {
         jsonrpc_result(self.kernel.write(auth, |loom| {
-            crate::chat::edit_message(loom, workspace, workspace_id, channel_id, message_id, body)
+            crate::chat::edit_message(
+                loom,
+                workspace,
+                workspace_id,
+                channel_id,
+                message_id,
+                body,
+                None,
+            )
         }))
     }
 
@@ -1580,6 +1616,7 @@ impl JsonRpcAdapter<'_> {
                 channel_id,
                 message_id,
                 reason,
+                None,
             )
         }))
     }
@@ -1601,6 +1638,7 @@ impl JsonRpcAdapter<'_> {
                 channel_id,
                 thread_id,
                 parent_message_id,
+                None,
             )
         }))
     }
@@ -1624,6 +1662,7 @@ impl JsonRpcAdapter<'_> {
                 task_id,
                 message_id,
                 title,
+                None,
             )
         }))
     }
@@ -1647,6 +1686,7 @@ impl JsonRpcAdapter<'_> {
                 task_id,
                 claim_id,
                 lease_token,
+                None,
             )
         }))
     }
@@ -1670,6 +1710,7 @@ impl JsonRpcAdapter<'_> {
                 task_id,
                 claim_id,
                 result_message_id,
+                None,
             )
         }))
     }
@@ -1695,6 +1736,7 @@ impl JsonRpcAdapter<'_> {
                 agent_principal,
                 source_message_ids,
                 prompt,
+                None,
             )
         }))
     }
@@ -1716,6 +1758,7 @@ impl JsonRpcAdapter<'_> {
                 channel_id,
                 invocation_id,
                 message_id,
+                None,
             )
         }))
     }
@@ -1741,6 +1784,7 @@ impl JsonRpcAdapter<'_> {
                 from_agent_principal,
                 to_principal,
                 reason,
+                None,
             )
         }))
     }
@@ -1755,7 +1799,15 @@ impl JsonRpcAdapter<'_> {
         kind: &str,
     ) -> JsonRpcResult<HostedChatWrite> {
         jsonrpc_result(self.kernel.write(auth, |loom| {
-            crate::chat::add_reaction(loom, workspace, workspace_id, channel_id, message_id, kind)
+            crate::chat::add_reaction(
+                loom,
+                workspace,
+                workspace_id,
+                channel_id,
+                message_id,
+                kind,
+                None,
+            )
         }))
     }
 
@@ -1776,6 +1828,7 @@ impl JsonRpcAdapter<'_> {
                 channel_id,
                 message_id,
                 kind,
+                None,
             )
         }))
     }
@@ -1799,7 +1852,7 @@ impl JsonRpcAdapter<'_> {
         kind: &str,
     ) -> JsonRpcResult<HostedChatEmojiRegistry> {
         jsonrpc_result(self.kernel.write(auth, |loom| {
-            crate::chat::register_emoji(loom, workspace, workspace_id, kind)
+            crate::chat::register_emoji(loom, workspace, workspace_id, kind, None)
         }))
     }
 
@@ -1811,7 +1864,7 @@ impl JsonRpcAdapter<'_> {
         kind: &str,
     ) -> JsonRpcResult<HostedChatEmojiRegistry> {
         jsonrpc_result(self.kernel.write(auth, |loom| {
-            crate::chat::unregister_emoji(loom, workspace, workspace_id, kind)
+            crate::chat::unregister_emoji(loom, workspace, workspace_id, kind, None)
         }))
     }
 
@@ -1848,7 +1901,14 @@ impl JsonRpcAdapter<'_> {
         next_sequence: u64,
     ) -> JsonRpcResult<HostedChatCursor> {
         jsonrpc_result(self.kernel.write(auth, |loom| {
-            crate::chat::update_cursor(loom, workspace, workspace_id, channel_id, next_sequence)
+            crate::chat::update_cursor(
+                loom,
+                workspace,
+                workspace_id,
+                channel_id,
+                next_sequence,
+                None,
+            )
         }))
     }
 
@@ -1924,13 +1984,10 @@ impl JsonRpcAdapter<'_> {
                 from_sequence,
                 max,
             )?;
+            let batch = loom_substrate::changes::hosted_operation_changes_batch(batch);
             Ok(HostedSubstrateChangesBatch {
-                events: batch
-                    .events
-                    .into_iter()
-                    .map(crate::substrate_changes::operation_event)
-                    .collect(),
-                next: batch.next.encode(),
+                events: batch.events.into_iter().map(Into::into).collect(),
+                next: batch.next,
             })
         }))
     }
@@ -2247,6 +2304,7 @@ fn validate_stream_max(max: u32) -> loom_core::Result<()> {
 mod tests {
     use std::fs;
 
+    use loom_client::{LocalLoomClient, generated_api::Chat};
     use loom_core::{Code, Digest, WorkspaceId};
     use loom_interchange::{ExportReport, ImportReport};
     use loom_substrate::versioning::{RevisionIndex, load_current_revision_index};
@@ -2273,6 +2331,21 @@ mod tests {
                 load_current_revision_index(loom, workspace, scope_id)
             })
             .unwrap()
+    }
+
+    fn block<T>(
+        fut: impl ::core::future::Future<Output = Result<T, loom_core::LoomError>>,
+    ) -> Result<T, loom_core::LoomError> {
+        let mut fut = ::std::pin::pin!(fut);
+        match fut.as_mut().poll(&mut ::core::task::Context::from_waker(
+            ::std::task::Waker::noop(),
+        )) {
+            ::core::task::Poll::Ready(output) => output,
+            ::core::task::Poll::Pending => Err(loom_core::LoomError::new(
+                Code::Internal,
+                "in-process future returned Pending",
+            )),
+        }
     }
 
     #[test]
@@ -2446,7 +2519,15 @@ mod tests {
         fs::create_dir_all(fs_import_dir.join("docs")).unwrap();
         fs::write(fs_import_dir.join("docs").join("fs.txt"), b"fs alpha").unwrap();
         let fs_import = jsonrpc
-            .fs_import(&auth, ns, fs_import_dir.to_str().unwrap(), false, false)
+            .fs_import(
+                &auth,
+                ns,
+                fs_import_dir.to_str().unwrap(),
+                None,
+                None,
+                false,
+                false,
+            )
             .unwrap();
         let fs_import_report = ImportReport::decode(&fs_import.result).unwrap();
         assert_eq!(fs_import_report.profile, "fs");
@@ -2491,10 +2572,18 @@ mod tests {
                 imported_ns,
                 archive_path.to_str().unwrap(),
                 "tar",
+                None,
+                false,
+                None,
+                None,
                 false,
             )
             .unwrap();
-        let import_report = ImportReport::decode(&imported.result).unwrap();
+        let import_values = match loom_codec::decode(&imported.result).unwrap() {
+            loom_codec::Value::Array(values) => values,
+            other => panic!("archive import result not an array: {other:?}"),
+        };
+        let import_report = ImportReport::from_value(import_values[1].clone()).unwrap();
         assert_eq!(import_report.profile, "archive");
         assert!(import_report.bytes_in > 0);
         assert!(import_report.bytes_stored >= 5);
@@ -3501,6 +3590,61 @@ mod tests {
             panic!("expected chat operation event");
         };
         assert_eq!(operation_kind, "message.created");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn jsonrpc_generated_chat_fetch_events_matches_existing_hosted_json() {
+        let path = temp_path("jsonrpc-chat-generated-event-parity");
+        let (ns, channel_id) = chat_snapshot(&path);
+        let kernel = HostedKernel::new(&path);
+        let jsonrpc = kernel.jsonrpc();
+        let auth = HostedAuth::passphrase(nid(1), "root-pass", "jsonrpc-chat-generated-root");
+
+        jsonrpc
+            .chat_post_message(
+                &auth,
+                ns,
+                "studio",
+                "general",
+                "m1",
+                None,
+                b"hello".to_vec(),
+            )
+            .unwrap();
+        jsonrpc
+            .chat_create_thread(&auth, ns, "studio", "general", "t1", "m1")
+            .unwrap();
+
+        let hosted = jsonrpc
+            .chat_fetch_events(&auth, ns, "studio", "general", 1, 1)
+            .unwrap()
+            .result;
+        let hosted_json = serde_json::to_string(&hosted).unwrap();
+
+        let client = LocalLoomClient::new(path.to_path_buf());
+        let session = client.open().unwrap();
+        client
+            .authenticate_passphrase(&session, nid(1), b"root-pass")
+            .unwrap();
+        let generated_json = block(<LocalLoomClient as Chat>::chat_fetch_events_json(
+            &client,
+            session.clone(),
+            "main".to_string(),
+            "studio".to_string(),
+            "general".to_string(),
+            1,
+            1,
+        ))
+        .unwrap();
+        client.close(&session);
+
+        assert_eq!(generated_json, hosted_json);
+        let value: serde_json::Value = serde_json::from_str(&generated_json).unwrap();
+        assert_eq!(value["next"], format!("oplog:2:chat:studio:{channel_id}"));
+        assert_eq!(value["events"][0]["kind"], "operation");
+        assert!(value["events"][0].get("target_entity_id").is_none());
+        assert_eq!(value["events"][0]["operation_kind"], "message.created");
         fs::remove_file(path).unwrap();
     }
 

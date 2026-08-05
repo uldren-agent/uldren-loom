@@ -1,19 +1,199 @@
 //! Generic durable delivery over structured append-log streams.
 
 use crate::AclRight;
-use crate::cas::{cas_get_unchecked, cas_put_unchecked};
 use crate::change_set::{ChangeCursor, ChangeGapState, ChangeItem, ChangeSet};
 use crate::error::{Code, LoomError, Result};
 use crate::log;
-use crate::provider::ObjectStore;
+use crate::object::content_address_with;
+use crate::provider::{ObjectStore, PlanningObjectStore};
 use crate::vcs::Loom;
 use crate::workspace::{FacetKind, WorkspaceId};
+use crate::{
+    AtomicityBoundary, EnginePathSelector, EnginePlanningScope, EngineStateDelta,
+    OverlayDurabilityPolicy, PreparedDeliveryIntent, WorkflowOwnerState, WorkflowPlanningSnapshot,
+    WorkflowReferenceUpdate, WorkflowTransaction,
+};
 pub use loom_delivery::{
     DeliveryEnvelope, DeliveryMessage, DeliveryProduceRequest, DeliveryReplay, decode_envelope,
     encode_envelope,
 };
 
+pub struct PlannedDeliveryProduce {
+    pub envelope: DeliveryEnvelope,
+    pub payload_digest: crate::Digest,
+    pub payload_object_write: (crate::Digest, Vec<u8>),
+    pub encoded_envelope: Vec<u8>,
+    pub queue_log_write_records: Vec<Vec<u8>>,
+    pub retained_history_controls: Vec<crate::WorkflowControlWrite>,
+    pub prepared_intent: PreparedDeliveryIntent,
+    pub owner_state: WorkflowOwnerState,
+    candidate_state: Vec<u8>,
+    candidate_objects: Vec<(crate::Digest, Vec<u8>)>,
+    live_state: Option<EngineStateDelta>,
+}
+
 pub fn delivery_produce<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    ns: WorkspaceId,
+    request: DeliveryProduceRequest<'_>,
+) -> Result<DeliveryEnvelope> {
+    let planned = plan_delivery_produce(loom, ns, request)?;
+    publish_planned_delivery(loom, ns, planned)
+}
+
+pub fn plan_delivery_produce<S: ObjectStore>(
+    loom: &Loom<S>,
+    ns: WorkspaceId,
+    request: DeliveryProduceRequest<'_>,
+) -> Result<PlannedDeliveryProduce> {
+    let payload_digest = content_address_with(loom.store().digest_algo(), request.payload);
+    let payload_object = crate::Object::Blob(request.payload.to_vec()).canonical();
+    let payload_object_write = (
+        crate::Object::Blob(request.payload.to_vec()).digest_with(loom.store().digest_algo()),
+        payload_object,
+    );
+    let snapshot = match WorkflowPlanningSnapshot::open(loom.store(), Some("delivery.produce.plan")) {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) if error.code == Code::Unsupported => None,
+        Err(error) => return Err(error),
+    };
+    let (envelope, reference_root, objects, candidate_state, live_state) =
+        if let Some(base_root) = snapshot
+            .as_ref()
+            .and_then(WorkflowPlanningSnapshot::immutable_base_root)
+        {
+            let scope = EnginePlanningScope::new(
+                ns,
+                [EnginePathSelector::Prefix(crate::workspace::facet_root(
+                    FacetKind::Queue,
+                ))],
+            )?;
+            let mut planner =
+                loom.bounded_engine_planner(
+                    scope,
+                    base_root,
+                    snapshot.as_ref().expect("snapshot selected").fork_overlay(),
+                )?;
+            let envelope = stage_delivery_produce(planner.engine_mut(), ns, request)?;
+            let (live_state, planned_objects) = planner.finish()?;
+            let (reference_root, objects) =
+                loom.prepare_engine_state_delta_reference(&live_state, base_root, planned_objects)?;
+            (envelope, reference_root, objects, Vec::new(), Some(live_state))
+        } else {
+            let planning_store = PlanningObjectStore::new(loom.store());
+            let mut candidate = loom.fork_state_into(planning_store)?;
+            let envelope = stage_delivery_produce(&mut candidate, ns, request)?;
+            let (reference_root, mut objects) = candidate.save_state_objects()?;
+            objects.extend(candidate.store().objects()?);
+            let candidate_state = candidate.export_state();
+            (envelope, reference_root, objects, candidate_state, None)
+        };
+    if let Some(snapshot) = snapshot {
+        snapshot.release()?;
+    }
+    let encoded_envelope = encode_envelope(&envelope)?;
+    let prepared_intent = PreparedDeliveryIntent {
+        stream_id: envelope.stream_id.clone(),
+        sequence: envelope.seq,
+        envelope_id: envelope.id.to_string(),
+        payload_digest: envelope.payload_digest,
+    };
+    Ok(PlannedDeliveryProduce {
+        envelope,
+        payload_digest,
+        payload_object_write,
+        encoded_envelope: encoded_envelope.clone(),
+        queue_log_write_records: vec![encoded_envelope],
+        retained_history_controls: Vec::new(),
+        prepared_intent,
+        owner_state: WorkflowOwnerState {
+            objects: objects.clone(),
+            reference: WorkflowReferenceUpdate::Set(Some(reference_root)),
+            controls: Vec::new(),
+            audits: Vec::new(),
+        },
+        candidate_state,
+        candidate_objects: objects,
+        live_state,
+    })
+}
+
+pub fn publish_planned_delivery<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    ns: WorkspaceId,
+    planned: PlannedDeliveryProduce,
+) -> Result<DeliveryEnvelope> {
+    let expected_generation = if loom.store().uses_mutable_overlay_current_records() {
+        loom.store().mutable_overlay_generation()?
+    } else {
+        loom.mutable_overlay_snapshot().generation()
+    };
+    let commit = loom
+        .store()
+        .commit_workflow_transaction(WorkflowTransaction {
+            workspace: ns,
+            actor: loom.effective_principal()?.unwrap_or(ns),
+            expected_generation: Some(expected_generation),
+            writes: Vec::new(),
+            prepared_operations: Vec::new(),
+            revision_metadata: Vec::new(),
+            delivery_intents: vec![planned.prepared_intent.clone()],
+            durability: OverlayDurabilityPolicy::Normal,
+            boundary: AtomicityBoundary::Single,
+            idempotency: None,
+            owner_state: planned.owner_state.clone(),
+            post_commit_delta: planned.live_state.clone().or_else(|| {
+                Some(crate::EngineStateDelta::summary(
+                    ns,
+                    [crate::workspace::facet_root(FacetKind::Queue)],
+                    0,
+                ))
+            }),
+        });
+    let published = match commit {
+        Ok(_) => true,
+        Err(error) if error.code == Code::Unsupported => false,
+        Err(error) => return Err(error),
+    };
+    if published {
+        import_planned_delivery_candidate(loom, &planned)?;
+    } else {
+        apply_planned_delivery_candidate(loom, &planned)?;
+    }
+    Ok(planned.envelope)
+}
+
+pub fn import_planned_delivery_candidate<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    planned: &PlannedDeliveryProduce,
+) -> Result<()> {
+    match &planned.live_state {
+        Some(delta) => loom.apply_engine_state_delta(delta.clone()),
+        None => loom.import_state(&planned.candidate_state),
+    }
+}
+
+pub fn import_planned_delivery_candidate_preserving_mutable_overlay<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    planned: &PlannedDeliveryProduce,
+) -> Result<()> {
+    match &planned.live_state {
+        Some(delta) => loom.apply_engine_state_delta(delta.clone()),
+        None => loom.import_engine_state_preserving_mutable_overlay(&planned.candidate_state),
+    }
+}
+
+pub fn apply_planned_delivery_candidate<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    planned: &PlannedDeliveryProduce,
+) -> Result<()> {
+    for (_, canonical) in &planned.candidate_objects {
+        loom.store().put(&canonical)?;
+    }
+    import_planned_delivery_candidate(loom, planned)
+}
+
+fn stage_delivery_produce<S: ObjectStore>(
     loom: &mut Loom<S>,
     ns: WorkspaceId,
     request: DeliveryProduceRequest<'_>,
@@ -33,7 +213,7 @@ pub fn delivery_produce<S: ObjectStore>(
         Err(err) if err.code == Code::NotFound => 0,
         Err(err) => return Err(err),
     };
-    let payload_digest = cas_put_unchecked(loom, ns, payload)?;
+    let payload_digest = loom.store_content(ns, payload)?;
     let payload_len = payload.len() as u64;
     let envelope = DeliveryEnvelope::new(
         loom.store().digest_algo(),
@@ -115,12 +295,15 @@ pub fn delivery_replay<S: ObjectStore>(
                 "delivery envelope does not match stream",
             ));
         }
-        let payload = cas_get_unchecked(loom, ns, &envelope.payload_digest)?.ok_or_else(|| {
-            LoomError::corrupt("delivery payload digest is not present in content storage")
-        })?;
+        let payload = loom.load_content(envelope.payload_digest)?;
         if payload.len() as u64 != envelope.payload_len {
             return Err(LoomError::integrity_failure(
                 "delivery payload length does not match envelope",
+            ));
+        }
+        if content_address_with(loom.store().digest_algo(), &payload) != envelope.payload_digest {
+            return Err(LoomError::integrity_failure(
+                "delivery payload content digest does not match envelope",
             ));
         }
         messages.push(DeliveryMessage { envelope, payload });
@@ -194,9 +377,10 @@ pub fn delivery_change_scope(ns: WorkspaceId, stream_id: &str, subscriber_id: &s
 mod tests {
     use super::*;
     use crate::{
-        AclRight, AclSubject, FacetKind, IdentityStore, MemoryStore, PrincipalKind,
-        ROLE_SERVICE_ID, WorkspaceId,
+        AclRight, AclSubject, Digest, FacetKind, IdentityStore, MemoryStore, PrincipalKind,
+        ROLE_SERVICE_ID, WorkspaceId, cas::cas_has, object::Object,
     };
+    use std::collections::BTreeSet;
 
     fn nid(seed: u8) -> WorkspaceId {
         WorkspaceId::from_bytes([seed; 16])
@@ -206,6 +390,27 @@ mod tests {
         loom.registry_mut()
             .create(FacetKind::Queue, None, nid(7))
             .unwrap()
+    }
+
+    fn payload_object_digest(loom: &Loom<MemoryStore>, payload: &[u8]) -> Digest {
+        Digest::hash(
+            loom.store().digest_algo(),
+            &Object::Blob(payload.to_vec()).canonical(),
+        )
+    }
+
+    fn live_objects(loom: &Loom<MemoryStore>) -> BTreeSet<Digest> {
+        let mut state = loom.begin_live_object_mark([]).unwrap();
+        while !state.completed {
+            loom.step_live_object_mark(&mut state, 64).unwrap();
+        }
+        state.marked
+    }
+
+    fn reopened(loom: &Loom<MemoryStore>) -> Loom<MemoryStore> {
+        let mut reopened = Loom::new(loom.store().clone());
+        reopened.import_state(&loom.export_state()).unwrap();
+        reopened
     }
 
     #[test]
@@ -384,5 +589,100 @@ mod tests {
                 .code,
             Code::PermissionDenied
         );
+    }
+
+    #[test]
+    fn delivery_payload_liveness_follows_retained_envelopes() {
+        let mut loom = Loom::new(MemoryStore::new());
+        let ns = queue_ns(&mut loom);
+        let payload = b"shared-payload";
+        let payload_object = payload_object_digest(&loom, payload);
+        let first = delivery_produce(
+            &mut loom,
+            ns,
+            DeliveryProduceRequest {
+                stream_id: "apps",
+                producer: "watch",
+                subject: "client",
+                payload,
+                created_at_ms: 10,
+                expires_at_ms: None,
+                source_cursor: Some(b"cursor-1"),
+            },
+        )
+        .unwrap();
+        let second = delivery_produce(
+            &mut loom,
+            ns,
+            DeliveryProduceRequest {
+                stream_id: "apps",
+                producer: "watch",
+                subject: "client",
+                payload,
+                created_at_ms: 11,
+                expires_at_ms: None,
+                source_cursor: Some(b"cursor-2"),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first.payload_digest, second.payload_digest);
+        assert!(!cas_has(&loom, ns, &first.payload_digest).unwrap());
+        assert!(live_objects(&loom).contains(&payload_object));
+
+        delivery_ack(&mut loom, ns, "apps", "client", first.seq).unwrap();
+        assert!(live_objects(&loom).contains(&payload_object));
+
+        delivery_set_retained_low_water_mark(&mut loom, ns, "apps", 1).unwrap();
+        assert!(live_objects(&loom).contains(&payload_object));
+        let replay = delivery_replay(&loom, ns, "apps", "client", Some(1), false, 10).unwrap();
+        assert_eq!(replay.messages.len(), 1);
+        assert_eq!(replay.messages[0].payload, payload);
+        assert_eq!(replay.messages[0].envelope.id, second.id);
+
+        let reopened = reopened(&loom);
+        assert_eq!(
+            delivery_replay(&reopened, ns, "apps", "client", Some(1), false, 10).unwrap(),
+            replay
+        );
+        assert!(live_objects(&reopened).contains(&payload_object));
+
+        delivery_set_retained_low_water_mark(&mut loom, ns, "apps", 2).unwrap();
+        assert!(!live_objects(&loom).contains(&payload_object));
+        assert_eq!(
+            delivery_replay(&loom, ns, "apps", "client", Some(1), false, 10)
+                .unwrap_err()
+                .code,
+            Code::RetainedGap
+        );
+    }
+
+    #[test]
+    fn delivery_payload_liveness_ends_when_stream_owner_is_deleted() {
+        let mut loom = Loom::new(MemoryStore::new());
+        let ns = queue_ns(&mut loom);
+        let payload = b"stream-owned-payload";
+        let payload_object = payload_object_digest(&loom, payload);
+        delivery_produce(
+            &mut loom,
+            ns,
+            DeliveryProduceRequest {
+                stream_id: "apps",
+                producer: "watch",
+                subject: "client",
+                payload,
+                created_at_ms: 10,
+                expires_at_ms: None,
+                source_cursor: None,
+            },
+        )
+        .unwrap();
+        assert!(live_objects(&loom).contains(&payload_object));
+
+        loom.remove_file_reserved(ns, &crate::workspace::facet_path(FacetKind::Queue, "apps"))
+            .unwrap();
+        assert!(!live_objects(&loom).contains(&payload_object));
+        let reopened = reopened(&loom);
+        assert!(!live_objects(&reopened).contains(&payload_object));
     }
 }

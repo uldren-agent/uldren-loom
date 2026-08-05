@@ -172,6 +172,26 @@ fn parse_projection_list(
         .collect()
 }
 
+fn parse_acceptance_evidence_key_list(
+    value: &str,
+    what: &str,
+) -> napi::Result<Vec<loom_tickets::TicketAcceptanceEvidenceKey>> {
+    parse_string_list(value, what)?
+        .into_iter()
+        .map(|key| loom_tickets::TicketAcceptanceEvidenceKey::parse(&key).map_err(reason))
+        .collect()
+}
+
+fn parse_review_type_list(
+    value: &str,
+    what: &str,
+) -> napi::Result<Vec<loom_tickets::TicketReviewType>> {
+    parse_string_list(value, what)?
+        .into_iter()
+        .map(|review| loom_tickets::TicketReviewType::parse(&review).map_err(reason))
+        .collect()
+}
+
 fn parse_cardinality(value: &str) -> napi::Result<loom_tickets::TicketFieldCardinality> {
     match value {
         "single" => Ok(loom_tickets::TicketFieldCardinality::Single),
@@ -451,14 +471,16 @@ pub fn tickets_project_settings_get_json(
     workspace: String,
     ticket_workspace_id: String,
     project_id: String,
+    include_contracts: bool,
     passphrase: Option<String>,
 ) -> napi::Result<String> {
     tickets_read(&loom_path, &workspace, passphrase.as_deref(), |loom, ns| {
-        to_json(loom_tickets::get_project(
+        to_json(loom_tickets::get_project_with_contract_details(
             loom,
             ns,
             &ticket_workspace_id,
             &project_id,
+            include_contracts,
         ))
     })
 }
@@ -476,6 +498,13 @@ pub fn tickets_project_settings_set_json(
     project_owner_principal: Option<String>,
     clear_project_owner_principal: bool,
     acceptance_authorities_json: Option<String>,
+    acceptance_evidence_enforcement: Option<bool>,
+    required_acceptance_evidence_keys_json: Option<String>,
+    required_acceptance_reviews_json: Option<String>,
+    owner_contract_summary: Option<String>,
+    owner_contract_details: Option<String>,
+    worker_contract_summary: Option<String>,
+    worker_contract_details: Option<String>,
     expected_root: Option<String>,
     passphrase: Option<String>,
 ) -> napi::Result<String> {
@@ -497,6 +526,19 @@ pub fn tickets_project_settings_set_json(
         .as_deref()
         .map(|value| parse_string_list(value, "ticket acceptance authorities json"))
         .transpose()?;
+    let required_acceptance_evidence_keys = required_acceptance_evidence_keys_json
+        .as_deref()
+        .map(|value| {
+            parse_acceptance_evidence_key_list(
+                value,
+                "ticket required acceptance evidence keys json",
+            )
+        })
+        .transpose()?;
+    let required_acceptance_reviews = required_acceptance_reviews_json
+        .as_deref()
+        .map(|value| parse_review_type_list(value, "ticket required acceptance reviews json"))
+        .transpose()?;
     tickets_write(&loom_path, &workspace, passphrase.as_deref(), |loom, ns| {
         to_json(loom_tickets::set_project_settings(
             loom,
@@ -511,6 +553,13 @@ pub fn tickets_project_settings_set_json(
                 project_owner_principal: project_owner_principal.as_deref(),
                 clear_project_owner_principal,
                 acceptance_authorities: acceptance_authorities.as_deref(),
+                acceptance_evidence_enforcement,
+                required_acceptance_evidence_keys: required_acceptance_evidence_keys.as_deref(),
+                required_acceptance_reviews: required_acceptance_reviews.as_deref(),
+                owner_contract_summary: owner_contract_summary.as_deref(),
+                owner_contract_details: owner_contract_details.as_deref(),
+                worker_contract_summary: worker_contract_summary.as_deref(),
+                worker_contract_details: worker_contract_details.as_deref(),
                 expected_root: expected_root.as_deref(),
             },
         ))
@@ -652,7 +701,6 @@ pub fn tickets_create_json(
             },
         )
         .map_err(reason)?;
-        sync_ticket_references(loom, ns, &ticket)?;
         ticket_mutation_json(
             ticket,
             "ticket.created",
@@ -751,6 +799,7 @@ pub fn tickets_update_json(
             comment_id: comment_id.as_deref(),
             comment_type: comment_type.as_deref(),
             body,
+            evidence: None,
         });
     let comments = comments_input
         .iter()
@@ -758,6 +807,7 @@ pub fn tickets_update_json(
             comment_id: comment.comment_id.as_deref(),
             comment_type: comment.comment_type.as_deref(),
             body: &comment.body,
+            evidence: None,
         })
         .collect::<Vec<_>>();
     let relation_sets = relation_sets_input
@@ -881,6 +931,7 @@ pub fn tickets_comment_add_json(
                 comment_id: comment_id.as_deref(),
                 comment_type: comment_type.as_deref(),
                 body: &body,
+                evidence: None,
                 expected_root: expected_root.as_deref(),
             },
         )
@@ -924,6 +975,7 @@ pub fn tickets_comment_update_json(
                 comment_id: &comment_id,
                 comment_type: comment_type.as_deref(),
                 body: body.as_deref(),
+                evidence: None,
                 expected_root: expected_root.as_deref(),
             },
         )

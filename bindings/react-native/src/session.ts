@@ -54,6 +54,7 @@ import {
   ticketsRelationSetJson,
   ticketsUpdateJson,
 } from './facets/tickets';
+import type { TicketReviewType } from './facets/tickets';
 import {
   pagesCreateJson,
   pagesGetJson,
@@ -79,9 +80,11 @@ import {
   lanesGet,
   lanesList,
   lanesUpdate,
+  LANE_TICKET_PLACEMENT_LAST,
   lanesTicketAdd,
   lanesTicketRemove,
 } from './facets/lanes';
+import type { LaneTicketPlacement } from './facets/lanes';
 import {
   chatAddReactionJson,
   chatAgentReplyJson,
@@ -91,14 +94,17 @@ import {
   chatCreateTaskJson,
   chatCreateThreadJson,
   chatCursorJson,
+  chatEditMessageBytesJson,
   chatEditMessageJson,
   chatEmojiListJson,
   chatEmojiRegisterJson,
   chatEmojiUnregisterJson,
   chatFetchEventsJson,
+  chatInvokeAgentBytesJson,
   chatInvokeAgentJson,
   chatListChannelsJson,
   chatMessagesJson,
+  chatPostMessageBytesJson,
   chatPostMessageJson,
   chatRedactMessageJson,
   chatRemoveReactionJson,
@@ -114,6 +120,22 @@ import {
   fsExport,
   fsImport,
 } from './facets/archive';
+import {
+  auditConfigSetJson,
+  auditConfigShowJson,
+  auditListJson,
+  auditViewJson,
+  certificateAuditJson,
+  certificateExport,
+  certificateGenerateSelfSignedJson,
+  certificateImportJson,
+  certificateListJson,
+  certificateRemoveJson,
+  networkAccessAuditJson,
+  networkAccessListJson,
+  networkAccessRemoveJson,
+  networkAccessSetJson,
+} from './facets/security_admin';
 import {
   workspaceCreate,
   workspaceDelete,
@@ -142,8 +164,10 @@ import {
   vectorSearchCbor,
   vectorSearchPolicyCbor,
   vectorSourceText,
+  vectorTextUpsert,
   vectorUpsert,
   vectorUpsertSource,
+  vectorWorkspaceConfigureJson,
 } from './facets/vector';
 import {
   graphGetEdge,
@@ -164,6 +188,8 @@ import {
   columnarColumnsCbor,
   columnarCompact,
   columnarCreate,
+  columnarImportArrow,
+  columnarImportParquet,
   columnarInspectCbor,
   columnarRows,
   columnarScanCbor,
@@ -200,6 +226,7 @@ import {
   sqlExec,
   sqlExecBytes,
   sqlExecJson,
+  sqlExecResult,
   sqlIndexScanAtCbor,
   sqlIndexScanCbor,
   sqlQueryBytes,
@@ -300,8 +327,43 @@ import {
   ledgerVerify,
 } from './facets/ledger';
 import {
-  execCbor,
+  applyCbor,
 } from './facets/execution';
+import {
+  lifecycleDefineJson,
+  lifecycleDefineStandardJson,
+  lifecycleInstantiateJson,
+  lifecycleTransitionJson,
+  refsReconcileJson,
+} from './facets/lifecycle';
+import {
+  auditCompact,
+  importAsana,
+  importConfluence,
+  importDrive,
+  importJira,
+  importMarkdown,
+  importNotion,
+  importRedmine,
+  importSlack,
+  importTableCsv,
+  inferenceInstanceCreateJson,
+  inferenceInstanceDeleteJson,
+  inferenceInstanceUpdateJson,
+  serveListenerConfigureJson,
+  serveListenerListJson,
+  serveListenerRemoveJson,
+  serveListenerSetEnabledJson,
+  serveWebRouteListJson,
+  serveWebRouteRemoveJson,
+  serveWebRouteSetJson,
+  storeBundleImport,
+  storeMaintenancePolicySet,
+  storeMaintenanceRun,
+  storeMaintenanceStatus,
+  studioReindexJson,
+  studioRevisionsRebuildJson,
+} from './facets/operational';
 import {
   aclGrant,
   aclGrantScoped,
@@ -313,10 +375,14 @@ import {
   authenticatePassphrase,
   identityAddPrincipal,
   identityAssignRole,
+  identityConfigureAuthorityReplicationJson,
   identityCreateExternalCredential,
+  identityForceDetachAuthorityJson,
   identityListJson,
   identityRenamePrincipalHandle,
   identityRemovePrincipal,
+  identityRemoveAuthorityReplicationJson,
+  identityReplicateAuthorityJson,
   identityRevokeExternalCredential,
   identityRevokeRole,
   identitySetPassphrase,
@@ -398,8 +464,143 @@ export class LoomSession {
     return identityRevokeExternalCredential(this.loomPath, credential, this.key, this.auth);
   }
 
+  identityForceDetachAuthorityJson(principal: string, generation: number, reason: string): Promise<string> {
+    return identityForceDetachAuthorityJson(
+      this.loomPath,
+      principal,
+      generation,
+      reason,
+      this.key,
+      this.auth
+    );
+  }
+
+  identityReplicateAuthorityJson(source: string, becomeAuthority: boolean): Promise<string> {
+    return identityReplicateAuthorityJson(this.loomPath, source, becomeAuthority, this.key, this.auth);
+  }
+
+  identityConfigureAuthorityReplicationJson(
+    id: string,
+    source: string,
+    disabled: boolean,
+    pullOnStart: boolean,
+    intervalMs: number | undefined | null,
+    jitterMs: number,
+    backoffMs: number,
+    publishWitness: boolean
+  ): Promise<string> {
+    return identityConfigureAuthorityReplicationJson(
+      this.loomPath,
+      id,
+      source,
+      disabled,
+      pullOnStart,
+      intervalMs,
+      jitterMs,
+      backoffMs,
+      publishWitness,
+      this.key,
+      this.auth
+    );
+  }
+
+  identityRemoveAuthorityReplicationJson(id: string): Promise<string> {
+    return identityRemoveAuthorityReplicationJson(this.loomPath, id, this.key, this.auth);
+  }
+
   aclListJson(): Promise<string> {
     return aclListJson(this.loomPath, this.key, this.auth);
+  }
+
+  auditConfigShowJson(): Promise<string> {
+    return auditConfigShowJson(this.loomPath, this.key, this.auth);
+  }
+
+  auditConfigSetJson(retentionDays?: number | null, legalHold?: boolean | null): Promise<string> {
+    return auditConfigSetJson(this.loomPath, retentionDays, legalHold, this.key, this.auth);
+  }
+
+  auditListJson(): Promise<string> {
+    return auditListJson(this.loomPath, this.key, this.auth);
+  }
+
+  auditViewJson(record: string): Promise<string> {
+    return auditViewJson(this.loomPath, record, this.key, this.auth);
+  }
+
+  certificateListJson(): Promise<string> {
+    return certificateListJson(this.loomPath, this.key, this.auth);
+  }
+
+  certificateImportJson(
+    name: string,
+    certChainPem: Uint8Array | number[],
+    privateKeyPem: Uint8Array | number[],
+    trustBundlePem?: Uint8Array | number[] | null,
+    force = false
+  ): Promise<string> {
+    return certificateImportJson(
+      this.loomPath, name, certChainPem, privateKeyPem, trustBundlePem, force, this.key, this.auth
+    );
+  }
+
+  certificateExport(
+    name: string,
+    includeCertChain: boolean,
+    includePrivateKey: boolean,
+    includeTrustBundle: boolean,
+    force = false
+  ): Promise<Uint8Array> {
+    return certificateExport(
+      this.loomPath, name, includeCertChain, includePrivateKey, includeTrustBundle, force,
+      this.key, this.auth
+    );
+  }
+
+  certificateGenerateSelfSignedJson(
+    name: string,
+    dnsNamesJson: string,
+    ipAddressesJson: string,
+    cn: string | null | undefined,
+    days: number,
+    algorithm: string,
+    force = false
+  ): Promise<string> {
+    return certificateGenerateSelfSignedJson(
+      this.loomPath, name, dnsNamesJson, ipAddressesJson, cn, days, algorithm, force,
+      this.key, this.auth
+    );
+  }
+
+  certificateRemoveJson(name: string): Promise<string> {
+    return certificateRemoveJson(this.loomPath, name, this.key, this.auth);
+  }
+
+  certificateAuditJson(name: string): Promise<string> {
+    return certificateAuditJson(this.loomPath, name, this.key, this.auth);
+  }
+
+  networkAccessListJson(): Promise<string> {
+    return networkAccessListJson(this.loomPath, this.key, this.auth);
+  }
+
+  networkAccessSetJson(
+    name: string,
+    description: string | null | undefined,
+    defaultAction: string,
+    rulesJson: string
+  ): Promise<string> {
+    return networkAccessSetJson(
+      this.loomPath, name, description, defaultAction, rulesJson, this.key, this.auth
+    );
+  }
+
+  networkAccessRemoveJson(name: string): Promise<string> {
+    return networkAccessRemoveJson(this.loomPath, name, this.key, this.auth);
+  }
+
+  networkAccessAuditJson(name: string): Promise<string> {
+    return networkAccessAuditJson(this.loomPath, name, this.key, this.auth);
   }
 
   aclGrant(
@@ -696,12 +897,12 @@ export class LoomSession {
     return ticketsProjectRekeyJson(this.loomPath, workspace, ticketWorkspaceId, projectId, keyPrefix, expectedRoot, this.key, this.auth);
   }
 
-  ticketsProjectSettingsGetJson(workspace: string, ticketWorkspaceId: string, projectId: string): Promise<string> {
-    return ticketsProjectSettingsGetJson(this.loomPath, workspace, ticketWorkspaceId, projectId, this.key, this.auth);
+  ticketsProjectSettingsGetJson(workspace: string, ticketWorkspaceId: string, projectId: string, includeContracts = false): Promise<string> {
+    return ticketsProjectSettingsGetJson(this.loomPath, workspace, ticketWorkspaceId, projectId, includeContracts, this.key, this.auth);
   }
 
-  ticketsProjectSettingsSetJson(workspace: string, ticketWorkspaceId: string, projectId: string, defaultProjection: string | null | undefined, enableProjectionsJson: string, disableProjectionsJson: string, actorEnforcement: string | null | undefined, projectOwnerPrincipal: string | null | undefined, clearProjectOwnerPrincipal: boolean, acceptanceAuthoritiesJson: string | null | undefined, expectedRoot: string): Promise<string> {
-    return ticketsProjectSettingsSetJson(this.loomPath, workspace, ticketWorkspaceId, projectId, defaultProjection, enableProjectionsJson, disableProjectionsJson, actorEnforcement, projectOwnerPrincipal, clearProjectOwnerPrincipal, acceptanceAuthoritiesJson, expectedRoot, this.key, this.auth);
+  ticketsProjectSettingsSetJson(workspace: string, ticketWorkspaceId: string, projectId: string, defaultProjection: string | null | undefined, enableProjectionsJson: string, disableProjectionsJson: string, actorEnforcement: string | null | undefined, projectOwnerPrincipal: string | null | undefined, clearProjectOwnerPrincipal: boolean, acceptanceAuthoritiesJson: string | null | undefined, expectedRoot: string, acceptanceEvidenceEnforcement?: boolean | null, requiredAcceptanceEvidenceKeysJson?: string | null, requiredAcceptanceReviews?: TicketReviewType[] | null, ownerContractSummary?: string | null, ownerContractDetails?: string | null, workerContractSummary?: string | null, workerContractDetails?: string | null): Promise<string> {
+    return ticketsProjectSettingsSetJson(this.loomPath, workspace, ticketWorkspaceId, projectId, defaultProjection, enableProjectionsJson, disableProjectionsJson, actorEnforcement, projectOwnerPrincipal, clearProjectOwnerPrincipal, acceptanceAuthoritiesJson, expectedRoot, this.key, this.auth, acceptanceEvidenceEnforcement, requiredAcceptanceEvidenceKeysJson, requiredAcceptanceReviews, ownerContractSummary, ownerContractDetails, workerContractSummary, workerContractDetails);
   }
 
   ticketsFieldsJson(workspace: string, ticketWorkspaceId: string, projectId: string, projection = 'native', operation = 'create'): Promise<string> {
@@ -852,7 +1053,7 @@ export class LoomSession {
     return lanesUpdate(this.loomPath, workspace, laneId, fields, updatedBy, this.key, this.auth);
   }
 
-  lanesTicketAdd(workspace: string, laneId: string, ticketId: string, updatedBy: string, placement: string = 'append', anchor?: string | null): Promise<Uint8Array> {
+  lanesTicketAdd(workspace: string, laneId: string, ticketId: string, updatedBy: string, placement: LaneTicketPlacement = LANE_TICKET_PLACEMENT_LAST, anchor?: string | null): Promise<Uint8Array> {
     return lanesTicketAdd(this.loomPath, workspace, laneId, ticketId, updatedBy, placement, anchor, this.key, this.auth);
   }
 
@@ -860,76 +1061,88 @@ export class LoomSession {
     return lanesTicketRemove(this.loomPath, workspace, laneId, ticketId, updatedBy, this.key, this.auth);
   }
 
-  chatCreateChannelJson(workspace: string, chatWorkspaceId: string, channelId: string, channelHandle: string, name: string): Promise<string> {
-    return chatCreateChannelJson(this.loomPath, workspace, chatWorkspaceId, channelId, channelHandle, name, this.key, this.auth);
+  chatCreateChannelJson(workspace: string, chatWorkspaceId: string, channelId: string, channelHandle: string, name: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatCreateChannelJson(this.loomPath, workspace, chatWorkspaceId, channelId, channelHandle, name, expectedEntityTag, this.key, this.auth);
   }
 
-  chatRenameChannelJson(workspace: string, chatWorkspaceId: string, selector: string, channelHandle: string): Promise<string> {
-    return chatRenameChannelJson(this.loomPath, workspace, chatWorkspaceId, selector, channelHandle, this.key, this.auth);
+  chatRenameChannelJson(workspace: string, chatWorkspaceId: string, selector: string, channelHandle: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatRenameChannelJson(this.loomPath, workspace, chatWorkspaceId, selector, channelHandle, expectedEntityTag, this.key, this.auth);
   }
 
   chatListChannelsJson(workspace: string, chatWorkspaceId: string): Promise<string> {
     return chatListChannelsJson(this.loomPath, workspace, chatWorkspaceId, this.key, this.auth);
   }
 
-  chatPostMessageJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, threadId: string | null | undefined, bodyText: string): Promise<string> {
-    return chatPostMessageJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, threadId, bodyText, this.key, this.auth);
+  chatPostMessageJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, threadId: string | null | undefined, bodyText: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatPostMessageJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, threadId, bodyText, expectedEntityTag, this.key, this.auth);
   }
 
-  chatEditMessageJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, bodyText: string): Promise<string> {
-    return chatEditMessageJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, bodyText, this.key, this.auth);
+  chatPostMessageBytesJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, threadId: string | null | undefined, body: Uint8Array | number[], expectedEntityTag?: string | null): Promise<string> {
+    return chatPostMessageBytesJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, threadId, body, expectedEntityTag, this.key, this.auth);
   }
 
-  chatRedactMessageJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, reason?: string | null): Promise<string> {
-    return chatRedactMessageJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, reason, this.key, this.auth);
+  chatEditMessageJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, bodyText: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatEditMessageJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, bodyText, expectedEntityTag, this.key, this.auth);
   }
 
-  chatCreateThreadJson(workspace: string, chatWorkspaceId: string, channelId: string, threadId: string, parentMessageId: string): Promise<string> {
-    return chatCreateThreadJson(this.loomPath, workspace, chatWorkspaceId, channelId, threadId, parentMessageId, this.key, this.auth);
+  chatEditMessageBytesJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, body: Uint8Array | number[], expectedEntityTag?: string | null): Promise<string> {
+    return chatEditMessageBytesJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, body, expectedEntityTag, this.key, this.auth);
   }
 
-  chatCreateTaskJson(workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, messageId: string, title: string): Promise<string> {
-    return chatCreateTaskJson(this.loomPath, workspace, chatWorkspaceId, channelId, taskId, messageId, title, this.key, this.auth);
+  chatRedactMessageJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, reason?: string | null, expectedEntityTag?: string | null): Promise<string> {
+    return chatRedactMessageJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, reason, expectedEntityTag, this.key, this.auth);
   }
 
-  chatClaimTaskJson(workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, leaseToken?: string | null): Promise<string> {
-    return chatClaimTaskJson(this.loomPath, workspace, chatWorkspaceId, channelId, taskId, claimId, leaseToken, this.key, this.auth);
+  chatCreateThreadJson(workspace: string, chatWorkspaceId: string, channelId: string, threadId: string, parentMessageId: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatCreateThreadJson(this.loomPath, workspace, chatWorkspaceId, channelId, threadId, parentMessageId, expectedEntityTag, this.key, this.auth);
   }
 
-  chatCompleteTaskJson(workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, resultMessageId?: string | null): Promise<string> {
-    return chatCompleteTaskJson(this.loomPath, workspace, chatWorkspaceId, channelId, taskId, claimId, resultMessageId, this.key, this.auth);
+  chatCreateTaskJson(workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, messageId: string, title: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatCreateTaskJson(this.loomPath, workspace, chatWorkspaceId, channelId, taskId, messageId, title, expectedEntityTag, this.key, this.auth);
   }
 
-  chatInvokeAgentJson(workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, agentPrincipal: string, sourceMessageIdsJson: string, promptText: string): Promise<string> {
-    return chatInvokeAgentJson(this.loomPath, workspace, chatWorkspaceId, channelId, invocationId, agentPrincipal, sourceMessageIdsJson, promptText, this.key, this.auth);
+  chatClaimTaskJson(workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, leaseToken?: string | null, expectedEntityTag?: string | null): Promise<string> {
+    return chatClaimTaskJson(this.loomPath, workspace, chatWorkspaceId, channelId, taskId, claimId, leaseToken, expectedEntityTag, this.key, this.auth);
   }
 
-  chatAgentReplyJson(workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, messageId: string): Promise<string> {
-    return chatAgentReplyJson(this.loomPath, workspace, chatWorkspaceId, channelId, invocationId, messageId, this.key, this.auth);
+  chatCompleteTaskJson(workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, resultMessageId?: string | null, expectedEntityTag?: string | null): Promise<string> {
+    return chatCompleteTaskJson(this.loomPath, workspace, chatWorkspaceId, channelId, taskId, claimId, resultMessageId, expectedEntityTag, this.key, this.auth);
   }
 
-  chatRequestHandoffJson(workspace: string, chatWorkspaceId: string, channelId: string, handoffId: string, fromAgentPrincipal: string, toPrincipal?: string | null, reason?: string | null): Promise<string> {
-    return chatRequestHandoffJson(this.loomPath, workspace, chatWorkspaceId, channelId, handoffId, fromAgentPrincipal, toPrincipal, reason, this.key, this.auth);
+  chatInvokeAgentJson(workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, agentPrincipal: string, sourceMessageIdsJson: string, promptText: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatInvokeAgentJson(this.loomPath, workspace, chatWorkspaceId, channelId, invocationId, agentPrincipal, sourceMessageIdsJson, promptText, expectedEntityTag, this.key, this.auth);
   }
 
-  chatAddReactionJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string): Promise<string> {
-    return chatAddReactionJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, kind, this.key, this.auth);
+  chatInvokeAgentBytesJson(workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, agentPrincipal: string, sourceMessageIdsJson: string, prompt: Uint8Array | number[], expectedEntityTag?: string | null): Promise<string> {
+    return chatInvokeAgentBytesJson(this.loomPath, workspace, chatWorkspaceId, channelId, invocationId, agentPrincipal, sourceMessageIdsJson, prompt, expectedEntityTag, this.key, this.auth);
   }
 
-  chatRemoveReactionJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string): Promise<string> {
-    return chatRemoveReactionJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, kind, this.key, this.auth);
+  chatAgentReplyJson(workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, messageId: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatAgentReplyJson(this.loomPath, workspace, chatWorkspaceId, channelId, invocationId, messageId, expectedEntityTag, this.key, this.auth);
+  }
+
+  chatRequestHandoffJson(workspace: string, chatWorkspaceId: string, channelId: string, handoffId: string, fromAgentPrincipal: string, toPrincipal?: string | null, reason?: string | null, expectedEntityTag?: string | null): Promise<string> {
+    return chatRequestHandoffJson(this.loomPath, workspace, chatWorkspaceId, channelId, handoffId, fromAgentPrincipal, toPrincipal, reason, expectedEntityTag, this.key, this.auth);
+  }
+
+  chatAddReactionJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatAddReactionJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, kind, expectedEntityTag, this.key, this.auth);
+  }
+
+  chatRemoveReactionJson(workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatRemoveReactionJson(this.loomPath, workspace, chatWorkspaceId, channelId, messageId, kind, expectedEntityTag, this.key, this.auth);
   }
 
   chatEmojiListJson(workspace: string, chatWorkspaceId: string): Promise<string> {
     return chatEmojiListJson(this.loomPath, workspace, chatWorkspaceId, this.key, this.auth);
   }
 
-  chatEmojiRegisterJson(workspace: string, chatWorkspaceId: string, kind: string): Promise<string> {
-    return chatEmojiRegisterJson(this.loomPath, workspace, chatWorkspaceId, kind, this.key, this.auth);
+  chatEmojiRegisterJson(workspace: string, chatWorkspaceId: string, kind: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatEmojiRegisterJson(this.loomPath, workspace, chatWorkspaceId, kind, expectedEntityTag, this.key, this.auth);
   }
 
-  chatEmojiUnregisterJson(workspace: string, chatWorkspaceId: string, kind: string): Promise<string> {
-    return chatEmojiUnregisterJson(this.loomPath, workspace, chatWorkspaceId, kind, this.key, this.auth);
+  chatEmojiUnregisterJson(workspace: string, chatWorkspaceId: string, kind: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatEmojiUnregisterJson(this.loomPath, workspace, chatWorkspaceId, kind, expectedEntityTag, this.key, this.auth);
   }
 
   chatMessagesJson(workspace: string, chatWorkspaceId: string, channelId: string): Promise<string> {
@@ -940,16 +1153,23 @@ export class LoomSession {
     return chatCursorJson(this.loomPath, workspace, chatWorkspaceId, channelId, this.key, this.auth);
   }
 
-  chatUpdateCursorJson(workspace: string, chatWorkspaceId: string, channelId: string, nextSequence: string): Promise<string> {
-    return chatUpdateCursorJson(this.loomPath, workspace, chatWorkspaceId, channelId, nextSequence, this.key, this.auth);
+  chatUpdateCursorJson(workspace: string, chatWorkspaceId: string, channelId: string, nextSequence: string, expectedEntityTag?: string | null): Promise<string> {
+    return chatUpdateCursorJson(this.loomPath, workspace, chatWorkspaceId, channelId, nextSequence, expectedEntityTag, this.key, this.auth);
   }
 
   chatFetchEventsJson(workspace: string, chatWorkspaceId: string, channelId: string, fromSequence: string, max: string): Promise<string> {
     return chatFetchEventsJson(this.loomPath, workspace, chatWorkspaceId, channelId, fromSequence, max, this.key, this.auth);
   }
 
-  fsImport(workspace: string, srcPath: string, commit = false, dryRun = false): Promise<Uint8Array> {
-    return fsImport(this.loomPath, workspace, srcPath, commit, dryRun, this.key, this.auth);
+  fsImport(
+    workspace: string,
+    srcPath: string,
+    author?: string | null,
+    message?: string | null,
+    commit = false,
+    dryRun = false
+  ): Promise<Uint8Array> {
+    return fsImport(this.loomPath, workspace, srcPath, author, message, commit, dryRun, this.key, this.auth);
   }
 
   fsExport(
@@ -961,8 +1181,20 @@ export class LoomSession {
     return fsExport(this.loomPath, workspace, dstPath, revision, dryRun, this.key, this.auth);
   }
 
-  archiveImport(workspace: string, srcPath: string, kind: string, dryRun = false): Promise<Uint8Array> {
-    return archiveImport(this.loomPath, workspace, srcPath, kind, dryRun, this.key, this.auth);
+  archiveImport(
+    workspace: string,
+    srcPath: string,
+    kind: string,
+    gzipOutputPath?: string | null,
+    commit = false,
+    author?: string | null,
+    message?: string | null,
+    dryRun = false
+  ): Promise<Uint8Array> {
+    return archiveImport(
+      this.loomPath, workspace, srcPath, kind, gzipOutputPath, commit, author, message, dryRun,
+      this.key, this.auth
+    );
   }
 
   archiveExport(
@@ -1265,8 +1497,238 @@ export class LoomSession {
     return ledgerVerify(this.loomPath, workspace, collection, this.key, this.auth);
   }
 
-  execCbor(request: Uint8Array | number[]): Promise<Uint8Array> {
-    return execCbor(this.loomPath, request, this.key, this.auth);
+  applyCbor(request: Uint8Array | number[]): Promise<Uint8Array> {
+    return applyCbor(this.loomPath, request, this.key, this.auth);
+  }
+
+  lifecycleDefineStandardJson(
+    workspace: string,
+    kind: string,
+    version: string,
+    completionPredicateDigest: string
+  ): Promise<string> {
+    return lifecycleDefineStandardJson(
+      this.loomPath,
+      workspace,
+      kind,
+      version,
+      completionPredicateDigest,
+      this.key,
+      this.auth
+    );
+  }
+
+  lifecycleDefineJson(workspace: string, definition: Uint8Array | number[]): Promise<string> {
+    return lifecycleDefineJson(this.loomPath, workspace, definition, this.key, this.auth);
+  }
+
+  lifecycleInstantiateJson(
+    workspace: string,
+    instanceId: string,
+    definitionId: string,
+    subjectRefsJson: string
+  ): Promise<string> {
+    return lifecycleInstantiateJson(
+      this.loomPath,
+      workspace,
+      instanceId,
+      definitionId,
+      subjectRefsJson,
+      this.key,
+      this.auth
+    );
+  }
+
+  lifecycleTransitionJson(
+    workspace: string,
+    instanceId: string,
+    transitionId: string,
+    toStageId: string,
+    actorPrincipalId: string | null | undefined,
+    gateEvaluationsJson: string,
+    snapshotDigest?: string | null
+  ): Promise<string> {
+    return lifecycleTransitionJson(
+      this.loomPath,
+      workspace,
+      instanceId,
+      transitionId,
+      toStageId,
+      actorPrincipalId,
+      gateEvaluationsJson,
+      snapshotDigest,
+      this.key,
+      this.auth
+    );
+  }
+
+  refsReconcileJson(workspace: string, max: string): Promise<string> {
+    return refsReconcileJson(this.loomPath, workspace, max, this.key, this.auth);
+  }
+
+  studioReindexJson(workspace: string, profile: string): Promise<string> {
+    return studioReindexJson(this.loomPath, workspace, profile, this.key, this.auth);
+  }
+
+  studioRevisionsRebuildJson(workspace: string, profile: string, dryRun = false): Promise<string> {
+    return studioRevisionsRebuildJson(this.loomPath, workspace, profile, dryRun, this.key, this.auth);
+  }
+
+  storeBundleImport(bundle: Uint8Array | number[], dryRun = false): Promise<Uint8Array> {
+    return storeBundleImport(this.loomPath, bundle, dryRun, this.key, this.auth);
+  }
+
+  auditCompact(throughSeq: number): Promise<Uint8Array> {
+    return auditCompact(this.loomPath, throughSeq, this.key, this.auth);
+  }
+
+  storeMaintenanceStatus(request: Uint8Array | number[]): Promise<Uint8Array> {
+    return storeMaintenanceStatus(this.loomPath, request, this.key, this.auth);
+  }
+
+  storeMaintenancePolicySet(update: Uint8Array | number[]): Promise<Uint8Array> {
+    return storeMaintenancePolicySet(this.loomPath, update, this.key, this.auth);
+  }
+
+  storeMaintenanceRun(request: Uint8Array | number[]): Promise<Uint8Array> {
+    return storeMaintenanceRun(this.loomPath, request, this.key, this.auth);
+  }
+
+  importTableCsv(
+    workspace: string,
+    sourceScope: string,
+    csvPayload: Uint8Array | number[],
+    database: string,
+    table: string,
+    schema: string,
+    primaryKey: string,
+    mode: string,
+    commit: boolean,
+    author?: string,
+    message?: string,
+    dryRun = false
+  ): Promise<Uint8Array> {
+    return importTableCsv(
+      this.loomPath,
+      workspace,
+      sourceScope,
+      csvPayload,
+      database,
+      table,
+      schema,
+      primaryKey,
+      mode,
+      commit,
+      author,
+      message,
+      dryRun,
+      this.key,
+      this.auth
+    );
+  }
+
+  importRedmine(workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array | number[], fieldPolicy: string, dryRun = false): Promise<Uint8Array> {
+    return importRedmine(this.loomPath, workspace, profile, sourceScope, snapshotPayload, fieldPolicy, dryRun, this.key, this.auth);
+  }
+
+  importAsana(workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array | number[], fieldPolicy: string, dryRun = false): Promise<Uint8Array> {
+    return importAsana(this.loomPath, workspace, profile, sourceScope, snapshotPayload, fieldPolicy, dryRun, this.key, this.auth);
+  }
+
+  importJira(workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array | number[], fieldPolicy: string, dryRun = false): Promise<Uint8Array> {
+    return importJira(this.loomPath, workspace, profile, sourceScope, snapshotPayload, fieldPolicy, dryRun, this.key, this.auth);
+  }
+
+  importConfluence(workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array | number[], defaultSpace: string, dryRun = false): Promise<Uint8Array> {
+    return importConfluence(this.loomPath, workspace, profile, sourceScope, snapshotPayload, defaultSpace, dryRun, this.key, this.auth);
+  }
+
+  importSlack(workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array | number[], dryRun = false): Promise<Uint8Array> {
+    return importSlack(this.loomPath, workspace, profile, sourceScope, snapshotPayload, dryRun, this.key, this.auth);
+  }
+
+  importDrive(workspace: string, profile: string, sourceScope: string, archivePayload: Uint8Array | number[], dryRun = false): Promise<Uint8Array> {
+    return importDrive(this.loomPath, workspace, profile, sourceScope, archivePayload, dryRun, this.key, this.auth);
+  }
+
+  importMarkdown(workspace: string, profile: string, sourceScope: string, archivePayload: Uint8Array | number[], space: string, dryRun = false): Promise<Uint8Array> {
+    return importMarkdown(this.loomPath, workspace, profile, sourceScope, archivePayload, space, dryRun, this.key, this.auth);
+  }
+
+  importNotion(workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array | number[], defaultSpace: string, dryRun = false): Promise<Uint8Array> {
+    return importNotion(this.loomPath, workspace, profile, sourceScope, snapshotPayload, defaultSpace, dryRun, this.key, this.auth);
+  }
+
+  inferenceInstanceCreateJson(
+    workspace: string,
+    name: string,
+    model: string,
+    kind: string,
+    runtime: string,
+    preset?: string,
+    settingsJson?: string
+  ): Promise<string> {
+    return inferenceInstanceCreateJson(
+      this.loomPath,
+      workspace,
+      name,
+      model,
+      kind,
+      runtime,
+      preset,
+      settingsJson,
+      this.key,
+      this.auth
+    );
+  }
+
+  inferenceInstanceUpdateJson(
+    workspace: string,
+    name: string,
+    preset?: string,
+    settingsJson?: string
+  ): Promise<string> {
+    return inferenceInstanceUpdateJson(
+      this.loomPath,
+      workspace,
+      name,
+      preset,
+      settingsJson,
+      this.key,
+      this.auth
+    );
+  }
+
+  inferenceInstanceDeleteJson(workspace: string, name: string): Promise<string> {
+    return inferenceInstanceDeleteJson(this.loomPath, workspace, name, this.key, this.auth);
+  }
+
+  serveListenerConfigureJson(requestJson: string): Promise<string> {
+    return serveListenerConfigureJson(this.loomPath, requestJson, this.key, this.auth);
+  }
+
+  serveListenerListJson(): Promise<string> {
+    return serveListenerListJson(this.loomPath, this.key, this.auth);
+  }
+
+  serveListenerSetEnabledJson(listenerId: string, enabled: boolean): Promise<string> {
+    return serveListenerSetEnabledJson(this.loomPath, listenerId, enabled, this.key, this.auth);
+  }
+
+  serveListenerRemoveJson(listenerId: string): Promise<string> {
+    return serveListenerRemoveJson(this.loomPath, listenerId, this.key, this.auth);
+  }
+
+  serveWebRouteListJson(listenerId: string): Promise<string> {
+    return serveWebRouteListJson(this.loomPath, listenerId, this.key, this.auth);
+  }
+
+  serveWebRouteSetJson(requestJson: string): Promise<string> {
+    return serveWebRouteSetJson(this.loomPath, requestJson, this.key, this.auth);
+  }
+
+  serveWebRouteRemoveJson(listenerId: string, routeId: string): Promise<string> {
+    return serveWebRouteRemoveJson(this.loomPath, listenerId, routeId, this.key, this.auth);
   }
 
   vectorCreate(workspace: string, name: string, dim: number, metric: number): Promise<void> {
@@ -1306,6 +1768,14 @@ export class LoomSession {
       this.key,
       this.auth
     );
+  }
+
+  vectorTextUpsert(request: Uint8Array | number[]): Promise<Uint8Array> {
+    return vectorTextUpsert(this.loomPath, request, this.key, this.auth);
+  }
+
+  vectorWorkspaceConfigureJson(workspace: string, requestJson: string): Promise<string> {
+    return vectorWorkspaceConfigureJson(this.loomPath, workspace, requestJson, this.key, this.auth);
   }
 
   vectorGet(workspace: string, name: string, id: string): Promise<Uint8Array | null> {
@@ -1458,6 +1928,32 @@ export class LoomSession {
     return columnarAppend(this.loomPath, workspace, name, row, this.key, this.auth);
   }
 
+  columnarImportArrow(
+    workspace: string,
+    name: string,
+    payload: Uint8Array | number[],
+    targetSegmentRows: number | string | bigint,
+    replace: boolean,
+    dryRun = false
+  ): Promise<Uint8Array> {
+    return columnarImportArrow(
+      this.loomPath, workspace, name, payload, targetSegmentRows, replace, dryRun, this.key, this.auth
+    );
+  }
+
+  columnarImportParquet(
+    workspace: string,
+    name: string,
+    payload: Uint8Array | number[],
+    targetSegmentRows: number | string | bigint,
+    replace: boolean,
+    dryRun = false
+  ): Promise<Uint8Array> {
+    return columnarImportParquet(
+      this.loomPath, workspace, name, payload, targetSegmentRows, replace, dryRun, this.key, this.auth
+    );
+  }
+
   columnarScanCbor(workspace: string, name: string): Promise<Uint8Array> {
     return columnarScanCbor(this.loomPath, workspace, name, this.key, this.auth);
   }
@@ -1608,6 +2104,10 @@ export class LoomSession {
 
   sqlExecBytes(workspace: string, db: string, sql: string): Promise<Uint8Array> {
     return sqlExecBytes(this.loomPath, workspace, db, sql, this.key, this.auth);
+  }
+
+  sqlExecResult(workspace: string, db: string, sql: string): Promise<Uint8Array> {
+    return sqlExecResult(this.loomPath, workspace, db, sql, this.key, this.auth);
   }
 
   sqlQueryBytes(workspace: string, db: string, sql: string): Promise<Uint8Array[]> {

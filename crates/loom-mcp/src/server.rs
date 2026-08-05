@@ -134,15 +134,6 @@ fn err(e: LoomError) -> ErrorData {
     ErrorData::internal_error(message, details)
 }
 
-/// Build a [`loom_lanes::LaneTicketPlacement`] from the wire placement verb and optional anchor.
-/// Defaults to LAST. BEFORE and AFTER require an anchor; unknown verbs are rejected.
-fn lane_ticket_placement<'a>(
-    placement: Option<&str>,
-    anchor: Option<&'a str>,
-) -> Result<loom_lanes::LaneTicketPlacement<'a>, LoomError> {
-    loom_lanes::LaneTicketPlacement::parse(placement.unwrap_or("LAST"), anchor)
-}
-
 fn board_columns(columns: Vec<PBoardColumn>) -> Result<Vec<BoardColumn>, LoomError> {
     columns
         .into_iter()
@@ -209,6 +200,9 @@ fn write_admission(value: Option<PWriteAdmission>) -> Option<WriteAdmission> {
 }
 
 fn workspace_profile_id(mcp: &LoomMcp, workspace: &str) -> Result<String, LoomError> {
+    if let Some(backend) = mcp.store().remote_backend() {
+        return backend.workspace_id(workspace);
+    }
     mcp.store().read(|loom| {
         let ns = crate::reads::resolve_ns(loom, workspace)?;
         Ok(ns.to_string())
@@ -217,6 +211,12 @@ fn workspace_profile_id(mcp: &LoomMcp, workspace: &str) -> Result<String, LoomEr
 
 fn ser<T: serde::Serialize>(v: T) -> ToolResult {
     serde_json::to_value(v)
+        .map(out_value)
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+}
+
+fn ser_json_string(value: String) -> ToolResult {
+    serde_json::from_str::<Value>(&value)
         .map(out_value)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
 }
@@ -417,6 +417,151 @@ fn maintenance_report_json(
     value
 }
 
+fn live_root_diagnostics_record_json(
+    diagnostics: &loom_wire::store_admin::StoreLiveRootDiagnosticsRecord,
+) -> Value {
+    json!({
+        "sample_limit": diagnostics.sample_limit,
+        "classes": diagnostics.classes.iter().map(|class| {
+            json!({
+                "class": class.class,
+                "count": class.count,
+                "examples": class.examples.iter().map(|example| {
+                    json!({
+                        "id": example.id,
+                        "digest": example.digest,
+                    })
+                }).collect::<Vec<_>>(),
+                "truncated": class.truncated,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn maintenance_report_record_json(
+    result: &loom_wire::store_admin::StoreMaintenanceStatusResult,
+) -> Value {
+    let report = &result.report;
+    let policy = json!({
+        "min_candidate_pages": report.policy.min_candidate_pages,
+        "min_reusable_pages": report.policy.min_reusable_pages,
+        "interval_ms": report.policy.interval_ms,
+        "backoff_ms": report.policy.backoff_ms,
+        "max_segments": report.policy.max_segments,
+        "max_pages": report.policy.max_pages,
+        "full_compaction_enabled": report.policy.full_compaction_enabled,
+        "tail_trim_enabled": report.policy.tail_trim_enabled,
+        "tail_compaction_enabled": report.policy.tail_compaction_enabled,
+        "tail_compaction_max_pages": report.policy.tail_compaction_max_pages,
+        "tail_compaction_max_objects": report.policy.tail_compaction_max_objects,
+        "tail_compaction_max_bytes": report.policy.tail_compaction_max_bytes,
+        "tail_compaction_interval_ms": report.policy.tail_compaction_interval_ms,
+        "tail_compaction_backoff_ms": report.policy.tail_compaction_backoff_ms,
+    });
+    let run_state = json!({
+        "last_run_ms": report.run_state.last_run_ms,
+        "next_eligible_ms": report.run_state.next_eligible_ms,
+        "last_skip_reason": report.run_state.last_skip_reason,
+        "last_error": report.run_state.last_error,
+        "last_tail_trim_attempted": report.run_state.last_tail_trim_attempted,
+        "last_tail_trim_pages": report.run_state.last_tail_trim_pages,
+        "last_tail_trim_bytes": report.run_state.last_tail_trim_bytes,
+        "last_tail_compaction_attempted": report.run_state.last_tail_compaction_attempted,
+        "last_tail_compaction_relocated_objects": report.run_state.last_tail_compaction_relocated_objects,
+        "last_tail_compaction_relocated_pages": report.run_state.last_tail_compaction_relocated_pages,
+        "last_tail_compaction_relocated_bytes": report.run_state.last_tail_compaction_relocated_bytes,
+        "last_tail_compaction_truncated_pages": report.run_state.last_tail_compaction_truncated_pages,
+        "last_tail_compaction_conflicts": report.run_state.last_tail_compaction_conflicts,
+        "last_shrink_skip_reason": report.run_state.last_shrink_skip_reason,
+    });
+    let overlay = json!({
+        "generation": report.overlay_health.current_generation,
+        "current_records": report.overlay_health.current_record_count,
+        "tombstones": report.overlay_health.tombstone_count,
+        "obsolete_records": report.overlay_obsolete_record_count,
+        "live_checkpoint_references": report.overlay_health.live_checkpoint_references,
+        "reclaimable_pages": report.overlay_health.reclaimable_overlay_pages,
+        "obsolete_pages": report.overlay_obsolete_page_count,
+        "blocked_reclamation_reasons": report.overlay_health.blocked_reclamation_reasons,
+        "retained_checkpoint_blockers": report.overlay_health.blocked_reclamation_reasons,
+        "hot_write_count": report.overlay_health.hot_write_count,
+        "active_writer_contention_indicators": report.overlay_health.active_writer_contention_indicators,
+    });
+    let mvcc_pins = report
+        .mvcc_snapshots
+        .pins
+        .iter()
+        .map(|pin| {
+            json!({
+                "pin_id": pin.pin_id,
+                "overlay_generation": pin.identity.overlay_generation,
+                "base_root": pin.identity.immutable_base_root,
+                "owner": pin.owner,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mvcc = json!({
+        "active_snapshots": report.mvcc_snapshots.active_snapshot_count,
+        "oldest_pinned_generation": report.mvcc_snapshots.oldest_pinned_overlay_generation,
+        "pinned_reader_reclaim_pressure": report.mvcc_snapshots.active_snapshot_count > 0
+            && report.overlay_obsolete_record_count > 0,
+        "pins": mvcc_pins,
+    });
+    let group_commit = json!({
+        "group_commit_batches_total": report.status.group_commit.group_commit_batches_total,
+        "group_commit_transactions_total": report.status.group_commit.group_commit_transactions_total,
+        "group_commit_records_total": report.status.group_commit.group_commit_records_total,
+        "fsync_total_micros": report.status.group_commit.fsync_total_micros,
+        "fsync_count": report.status.group_commit.fsync_count,
+        "write_lock_wait_total_micros": report.status.group_commit.write_lock_wait_total_micros,
+        "write_lock_wait_count": report.status.group_commit.write_lock_wait_count,
+        "pending_durable_window_transactions": report.status.group_commit.pending_durable_window_transactions,
+        "pending_durable_window_records": report.status.group_commit.pending_durable_window_records,
+        "pinned_reader_blockers": report.status.group_commit.pinned_reader_blockers,
+    });
+    let mut value = json!({
+        "eligible": report.eligible,
+        "reason": report.reason,
+        "physical_bytes": report.status.physical_bytes,
+        "reusable_free_pages": report.status.reusable_free_pages,
+        "candidate_dead_pages": report.status.candidate_dead_pages,
+        "candidate_reclaimable_bytes": report.candidate_reclaimable_bytes,
+        "reusable_free_bytes": report.reusable_free_bytes,
+        "tail_free_pages": report.tail_free_pages,
+        "tail_free_bytes": report.tail_free_bytes,
+        "tail_trim_eligible": report.tail_trim_eligible,
+        "tail_blocked_by_live_objects": report.tail_blocked_by_live_objects,
+        "tail_compaction_eligible": report.tail_compaction_eligible,
+        "full_compaction_required_for_shrink": report.full_compaction_required_for_shrink,
+        "tail_trim_attempted": report.tail_trim_attempted,
+        "tail_trim_pages": report.tail_trim_pages,
+        "tail_trim_bytes": report.tail_trim_bytes,
+        "tail_compaction_attempted": report.tail_compaction_attempted,
+        "tail_compaction_relocated_objects": report.tail_compaction_relocated_objects,
+        "tail_compaction_relocated_pages": report.tail_compaction_relocated_pages,
+        "tail_compaction_relocated_bytes": report.tail_compaction_relocated_bytes,
+        "tail_compaction_truncated_pages": report.tail_compaction_truncated_pages,
+        "tail_compaction_conflicts": report.tail_compaction_conflicts,
+        "last_shrink_skip_reason": report.last_shrink_skip_reason,
+        "mark_epoch": report.mark_epoch,
+        "mark_completed": report.mark_completed,
+        "marked_live_objects": report.marked_live_objects,
+        "marked_live_bytes": report.marked_live_bytes,
+        "last_validated_mark_epoch": report.status.last_validated_mark_epoch,
+        "retained_control_roots": report.retained_control_roots,
+        "derived_payload_count": report.derived_payload_count,
+        "overlay": overlay,
+        "mvcc": mvcc,
+        "group_commit": group_commit,
+        "policy": policy,
+        "run_state": run_state,
+    });
+    if let Some(diagnostics) = &result.live_root_diagnostics {
+        value["live_root_diagnostics"] = live_root_diagnostics_record_json(diagnostics);
+    }
+    value
+}
+
 fn store_policy_json(policy: loom_store::StorePolicy, audit_seq: Option<u64>) -> Value {
     let mut overrides = serde_json::Map::new();
     for facet in FacetKind::ALL {
@@ -494,16 +639,7 @@ fn run_mcp_store_maintenance_once(
     if !manual && !report.eligible {
         return Ok(json!({"outcome": "skipped", "reason": "not_eligible"}));
     }
-    let mut active = loom.store().active_reachability_mark_epoch()?;
-    if let Some(epoch) = &active
-        && let Err(error) = loom.store().validate_reachability_mark_epoch_current(epoch)
-    {
-        if error.code != Code::Conflict {
-            return Err(error);
-        }
-        loom.store().clear_reachability_mark_epoch()?;
-        active = None;
-    }
+    let active = loom.store().active_reachability_mark_epoch()?;
     let needs_mark = active
         .as_ref()
         .map(|epoch| !epoch.state.completed)
@@ -664,6 +800,7 @@ fn build_ticket_list_query(
         policy_labels: a.policy_labels.clone(),
         ready_only: a.ready,
         include_completed: a.include_completed,
+        lane_id: a.lane.clone(),
         lane_member_ids,
         board_id: a.board.clone(),
         cursor: a.cursor.clone(),
@@ -1562,6 +1699,18 @@ pub fn execute_promoted_tool(
                 a.body_text.into_bytes(),
             )?)
         }
+        "chat_post_message_bytes" => {
+            let a: params::PChatPostMessageBytes = promoted_args(args_json)?;
+            let pid = workspace_profile_id(mcp, &a.workspace)?;
+            promoted_result_bytes(mcp.write_chat_post_message(
+                &a.workspace,
+                &pid,
+                &a.channel_id,
+                &a.message_id,
+                a.thread_id.as_deref(),
+                a.body,
+            )?)
+        }
         "chat_edit_message" => {
             let a: params::PChatEditMessage = promoted_args(args_json)?;
             let pid = workspace_profile_id(mcp, &a.workspace)?;
@@ -1571,6 +1720,17 @@ pub fn execute_promoted_tool(
                 &a.channel_id,
                 &a.message_id,
                 a.body_text.into_bytes(),
+            )?)
+        }
+        "chat_edit_message_bytes" => {
+            let a: params::PChatEditMessageBytes = promoted_args(args_json)?;
+            let pid = workspace_profile_id(mcp, &a.workspace)?;
+            promoted_result_bytes(mcp.write_chat_edit_message(
+                &a.workspace,
+                &pid,
+                &a.channel_id,
+                &a.message_id,
+                a.body,
             )?)
         }
         "chat_redact_message" => {
@@ -1679,6 +1839,19 @@ pub fn execute_promoted_tool(
                 &a.agent_principal,
                 a.source_message_ids,
                 a.prompt_text.into_bytes(),
+            )?)
+        }
+        "chat_invoke_agent_bytes" => {
+            let a: params::PChatInvokeAgentBytes = promoted_args(args_json)?;
+            let pid = workspace_profile_id(mcp, &a.workspace)?;
+            promoted_result_bytes(mcp.write_chat_invoke_agent(
+                &a.workspace,
+                &pid,
+                &a.channel_id,
+                &a.invocation_id,
+                &a.agent_principal,
+                a.source_message_ids,
+                a.prompt,
             )?)
         }
         "chat_agent_reply" => {
@@ -2208,6 +2381,14 @@ pub fn execute_promoted_tool(
                         .collect::<loom_core::Result<Vec<_>>>()
                 })
                 .transpose()?;
+            let required_acceptance_reviews =
+                a.required_acceptance_reviews.as_deref().map(|reviews| {
+                    reviews
+                        .iter()
+                        .copied()
+                        .map(loom_tickets::TicketReviewType::from)
+                        .collect::<Vec<_>>()
+                });
             promoted_result_bytes(mcp.write_tickets_project_settings_set(
                 &a.workspace,
                 loom_tickets::TicketProjectSettingsRequest {
@@ -2222,6 +2403,7 @@ pub fn execute_promoted_tool(
                     acceptance_authorities,
                     acceptance_evidence_enforcement: a.acceptance_evidence_enforcement,
                     required_acceptance_evidence_keys: required_acceptance_evidence_keys.as_deref(),
+                    required_acceptance_reviews: required_acceptance_reviews.as_deref(),
                     owner_contract_summary: a.owner_contract_summary.as_deref(),
                     owner_contract_details: a.owner_contract_details.as_deref(),
                     worker_contract_summary: a.worker_contract_summary.as_deref(),
@@ -2611,7 +2793,7 @@ pub fn execute_promoted_tool(
             let a: params::PTicketsList = promoted_args(args_json)?;
             let pid = workspace_profile_id(mcp, &a.workspace)?;
             let query = build_ticket_list_query(mcp, &a)?;
-            promoted_result_bytes(mcp.read_tickets_page(&a.workspace, &pid, query)?)
+            promoted_result_bytes(mcp.read_tickets_page_value(&a.workspace, &pid, query)?)
         }
         "tickets_board_get" => {
             let a: params::PTicketsBoardGet = promoted_args(args_json)?;
@@ -3089,6 +3271,16 @@ fn open_object_schema() -> Value {
 
 fn string_array_schema() -> Value {
     array_schema(string_schema())
+}
+
+fn ticket_review_type_array_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "string",
+            "enum": ["design_review", "code_review"]
+        }
+    })
 }
 
 fn string_array_map_schema() -> Value {
@@ -3613,13 +3805,14 @@ fn ticket_project_schema() -> Value {
             "acceptance_authorities": string_array_schema(),
             "acceptance_evidence_enforcement": bool_schema(),
             "required_acceptance_evidence_keys": string_array_schema(),
+            "required_acceptance_reviews": ticket_review_type_array_schema(),
             "contracts": contracts_schema,
             "active_workflow_version": nullable(string_schema()),
             "profile_root": digest_string_schema(),
             "operation_id": string_schema(),
             "sequence": integer_schema()
         },
-        "required": ["workspace_id", "project_id", "key_prefix", "name", "next_ticket_number", "default_projection", "enabled_projections", "lifecycle_authorization_policy", "project_owner_principal", "acceptance_authorities", "acceptance_evidence_enforcement", "required_acceptance_evidence_keys", "contracts", "active_workflow_version", "profile_root", "operation_id", "sequence"],
+        "required": ["workspace_id", "project_id", "key_prefix", "name", "next_ticket_number", "default_projection", "enabled_projections", "lifecycle_authorization_policy", "project_owner_principal", "acceptance_authorities", "acceptance_evidence_enforcement", "required_acceptance_evidence_keys", "required_acceptance_reviews", "contracts", "active_workflow_version", "profile_root", "operation_id", "sequence"],
         "additionalProperties": false
     })
 }
@@ -4117,9 +4310,8 @@ fn lane_view_result_schema() -> Value {
     json!({ "anyOf": [lane_compact_view_schema(), lane_view_schema()] })
 }
 
-/// One per-record fail-soft decode failure surfaced by `lanes_list`: the offending lane document id
-/// and a human-readable reason. Malformed coordination records appear here instead of being dropped.
-fn lane_decode_diagnostic_schema() -> Value {
+/// One canonical Lane consistency warning surfaced by `lanes_list`.
+fn lane_diagnostic_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -4150,14 +4342,13 @@ fn lane_cleanup_report_schema() -> Value {
     })
 }
 
-/// `lanes_list` returns the healthy lane views plus one diagnostic per record that failed to decode,
-/// so a single malformed lane never makes the whole coordination surface unreadable.
+/// `lanes_list` returns canonical Lane views and their consistency warnings.
 fn lanes_list_result_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
             "lanes": array_schema(lane_view_result_schema()),
-            "diagnostics": array_schema(lane_decode_diagnostic_schema())
+            "diagnostics": array_schema(lane_diagnostic_schema())
         },
         "required": ["lanes", "diagnostics"],
         "additionalProperties": false
@@ -6208,12 +6399,7 @@ fn output_value_schema(name: &str) -> Option<Value> {
         | "queue_len"
         | "queue_consumer_position" => integer_schema(),
         "store_capabilities"
-        | "store_capabilities_json"
-        | "store_policy_get"
-        | "store_policy_set"
-        | "store_maintenance_status"
-        | "store_maintenance_policy_set"
-        | "store_maintenance_run"
+        | "store_bundle_import"
         | "metrics_query"
         | "logs_query"
         | "traces_trace_spans"
@@ -6228,11 +6414,14 @@ fn output_value_schema(name: &str) -> Option<Value> {
         | "vector_metadata_index_keys"
         | "vector_search"
         | "vector_search_policy"
+        | "vector_text_upsert"
         | "columnar_scan"
         | "columnar_columns"
         | "columnar_inspect"
         | "columnar_select"
         | "columnar_aggregate"
+        | "columnar_import_arrow"
+        | "columnar_import_parquet"
         | "dataframe_collect"
         | "dataframe_preview"
         | "dataframe_source_digests"
@@ -6245,6 +6434,7 @@ fn output_value_schema(name: &str) -> Option<Value> {
         | "timeseries_range"
         | "vcs_diff"
         | "sql_exec"
+        | "sql_exec_result"
         | "sql_query"
         | "sql_read_table"
         | "sql_read_table_at"
@@ -6254,6 +6444,13 @@ fn output_value_schema(name: &str) -> Option<Value> {
         | "sql_table_diff"
         | "sql_blame"
         | "drive_read" => bytes_schema(),
+        "store_capabilities_json"
+        | "store_policy_get"
+        | "store_policy_set"
+        | "store_maintenance_status"
+        | "store_maintenance_policy_set"
+        | "store_maintenance_run"
+        | "vector_workspace_configure_json" => object_schema(),
         "fs_stat" | "fs_list_directory" => bytes_schema(),
         "cas_get"
         | "kv_get"
@@ -6424,7 +6621,9 @@ fn output_value_schema(name: &str) -> Option<Value> {
         "chat_presence" => chat_presence_schema(),
         "chat_create_channel" | "chat_rename_channel" => chat_channel_directory_schema(),
         "chat_post_message"
+        | "chat_post_message_bytes"
         | "chat_edit_message"
+        | "chat_edit_message_bytes"
         | "chat_redact_message"
         | "chat_add_reaction"
         | "chat_remove_reaction"
@@ -6433,6 +6632,7 @@ fn output_value_schema(name: &str) -> Option<Value> {
         | "chat_claim_task"
         | "chat_complete_task"
         | "chat_invoke_agent"
+        | "chat_invoke_agent_bytes"
         | "chat_agent_reply"
         | "chat_request_handoff" => chat_write_schema(),
         "chat_update_cursor" => chat_cursor_schema(),
@@ -7430,6 +7630,40 @@ impl LoomServer {
         Ok(CallToolResult::structured(value))
     }
 
+    fn generated_execution_target(&self, name: &str) -> Option<GeneratedMcpExecutionTarget<'_>> {
+        let tool = crate::tools::tool(name)?;
+        let crate::tools::ExecutionTarget::Generated(operation) = tool.target else {
+            return None;
+        };
+        let projection = tool.generated_projection?;
+        let backend = self.mcp.store().remote_backend()?;
+        Some(GeneratedMcpExecutionTarget {
+            backend: backend.as_ref(),
+            tool,
+            operation,
+            projection,
+        })
+    }
+
+    async fn execute_generated_tool_remote(
+        &self,
+        request: &CallToolRequestParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let target = self
+            .generated_execution_target(request.name.as_ref())
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!(
+                        "MCP tool {} is not a generated remote-forwarded operation",
+                        request.name
+                    ),
+                    None,
+                )
+            })?;
+        let args = request.arguments.clone().unwrap_or_default();
+        target.execute(&args).await.map_err(err)
+    }
+
     /// Fill each `substrate_transact` op's omitted `workspace` (and, for document/graph ops,
     /// `collection`) from the active binding, so the hosted server receives fully explicit ops and runs
     /// the transaction unbound. Ops left without a workspace/collection stay unresolved and are rejected
@@ -7575,11 +7809,36 @@ impl LoomServer {
             .map(|(policy, seq)| out_value(store_policy_json(policy, Some(seq))))
     }
     #[tool(
+        name = "store_bundle_import",
+        description = "Import a canonical store bundle"
+    )]
+    fn store_bundle_import(&self, Parameters(a): Parameters<PStoreBundleImport>) -> ToolResult {
+        self.mcp
+            .write_store_bundle_import(&a.bundle, a.dry_run)
+            .map_err(err)
+            .map(|b| out_value(jbytes(&b)))
+    }
+    #[tool(
         name = "store_maintenance_status",
         description = "Store maintenance policy, status, and last-run counters",
         annotations(read_only_hint = true)
     )]
     fn store_maintenance_status(&self) -> ToolResult {
+        if let Some(backend) = self.mcp.store().remote_backend() {
+            let request = loom_wire::store_admin::store_maintenance_status_request_to_cbor(
+                &loom_wire::store_admin::StoreMaintenanceStatusRequest {
+                    include_live_root_diagnostics: true,
+                },
+            );
+            return backend
+                .store_maintenance_status(&request)
+                .map_err(err)
+                .and_then(|bytes| {
+                    loom_wire::store_admin::store_maintenance_status_result_from_cbor(&bytes)
+                        .map_err(err)
+                })
+                .map(|report| out_value(maintenance_report_record_json(&report)));
+        }
         self.mcp
             .store()
             .read(|loom| {
@@ -7600,6 +7859,33 @@ impl LoomServer {
         &self,
         Parameters(a): Parameters<PStoreMaintenancePolicySet>,
     ) -> ToolResult {
+        if let Some(backend) = self.mcp.store().remote_backend() {
+            let update = loom_wire::store_admin::StoreMaintenancePolicyUpdate {
+                min_candidate_pages: a.min_candidate_pages,
+                min_reusable_pages: a.min_reusable_pages,
+                interval_ms: a.interval_ms,
+                backoff_ms: a.backoff_ms,
+                max_segments: a.max_segments,
+                max_pages: a.max_pages,
+                full_compaction_enabled: a.full_compaction_enabled,
+                tail_trim_enabled: a.tail_trim_enabled,
+                tail_compaction_enabled: a.tail_compaction_enabled,
+                tail_compaction_max_pages: a.tail_compaction_max_pages,
+                tail_compaction_max_objects: a.tail_compaction_max_objects,
+                tail_compaction_max_bytes: a.tail_compaction_max_bytes,
+                tail_compaction_interval_ms: a.tail_compaction_interval_ms,
+                tail_compaction_backoff_ms: a.tail_compaction_backoff_ms,
+            };
+            let update = loom_wire::store_admin::store_maintenance_policy_update_to_cbor(&update);
+            return backend
+                .store_maintenance_policy_set(&update)
+                .map_err(err)
+                .and_then(|bytes| {
+                    loom_wire::store_admin::store_maintenance_status_result_from_cbor(&bytes)
+                        .map_err(err)
+                })
+                .map(|report| out_value(maintenance_report_record_json(&report)));
+        }
         self.mcp
             .store()
             .write(|loom| {
@@ -7661,6 +7947,21 @@ impl LoomServer {
         description = "Run one bounded store maintenance pass"
     )]
     fn store_maintenance_run(&self, Parameters(a): Parameters<PStoreMaintenanceRun>) -> ToolResult {
+        if let Some(backend) = self.mcp.store().remote_backend() {
+            let request = loom_wire::store_admin::StoreMaintenanceRunRequest {
+                max_segments: a.max_segments,
+                max_pages: a.max_pages,
+            };
+            let request = loom_wire::store_admin::store_maintenance_run_request_to_cbor(&request);
+            return backend
+                .store_maintenance_run(&request)
+                .map_err(err)
+                .and_then(|bytes| {
+                    loom_wire::store_admin::store_maintenance_status_result_from_cbor(&bytes)
+                        .map_err(err)
+                })
+                .map(|report| out_value(maintenance_report_record_json(&report)));
+        }
         self.mcp
             .store()
             .write(|loom| {
@@ -8186,6 +8487,37 @@ impl LoomServer {
             .map_err(err)
             .map(|b| out_value(jbytes(&b)))
     }
+    #[tool(
+        name = "vector_text_upsert",
+        description = "Upsert embedded vector text"
+    )]
+    fn vector_text_upsert(&self, Parameters(a): Parameters<PVectorTextUpsert>) -> ToolResult {
+        self.mcp
+            .write_vector_text_upsert(&a.request)
+            .map_err(err)
+            .map(|b| out_value(jbytes(&b)))
+    }
+    #[tool(
+        name = "vector_workspace_configure_json",
+        description = "Configure vector workspace JSON"
+    )]
+    fn vector_workspace_configure_json(
+        &self,
+        Parameters(a): Parameters<PVectorWorkspaceConfigure>,
+    ) -> ToolResult {
+        self.mcp
+            .write_vector_workspace_configure_json(&a.workspace, &a.request_json)
+            .map_err(err)
+            .and_then(|json| {
+                serde_json::from_str::<Value>(&json).map_err(|e| {
+                    err(LoomError::new(
+                        Code::Internal,
+                        format!("decode vector workspace configure JSON: {e}"),
+                    ))
+                })
+            })
+            .map(out_value)
+    }
 
     // ===== columnar =====
     #[tool(name = "columnar_create", description = "Create a columnar dataset")]
@@ -8290,6 +8622,40 @@ impl LoomServer {
     fn columnar_aggregate(&self, Parameters(a): Parameters<PColumnarAggregate>) -> ToolResult {
         self.mcp
             .read_columnar_aggregate(&a.workspace, &a.collection, &a.aggregates, &a.filter)
+            .map_err(err)
+            .map(|b| out_value(jbytes(&b)))
+    }
+    #[tool(
+        name = "columnar_import_arrow",
+        description = "Import Arrow IPC as columnar data"
+    )]
+    fn columnar_import_arrow(&self, Parameters(a): Parameters<PColumnarImport>) -> ToolResult {
+        self.mcp
+            .write_columnar_import_arrow(
+                &a.workspace,
+                &a.collection,
+                &a.payload,
+                a.target_segment_rows,
+                a.replace,
+                a.dry_run,
+            )
+            .map_err(err)
+            .map(|b| out_value(jbytes(&b)))
+    }
+    #[tool(
+        name = "columnar_import_parquet",
+        description = "Import Parquet as columnar data"
+    )]
+    fn columnar_import_parquet(&self, Parameters(a): Parameters<PColumnarImport>) -> ToolResult {
+        self.mcp
+            .write_columnar_import_parquet(
+                &a.workspace,
+                &a.collection,
+                &a.payload,
+                a.target_segment_rows,
+                a.replace,
+                a.dry_run,
+            )
             .map_err(err)
             .map(|b| out_value(jbytes(&b)))
     }
@@ -8953,6 +9319,13 @@ impl LoomServer {
             })
             .transpose()
             .map_err(err)?;
+        let required_acceptance_reviews = a.required_acceptance_reviews.as_deref().map(|reviews| {
+            reviews
+                .iter()
+                .copied()
+                .map(loom_tickets::TicketReviewType::from)
+                .collect::<Vec<_>>()
+        });
         self.mcp
             .write_tickets_project_settings_set(
                 &a.workspace,
@@ -8968,6 +9341,7 @@ impl LoomServer {
                     acceptance_authorities,
                     acceptance_evidence_enforcement: a.acceptance_evidence_enforcement,
                     required_acceptance_evidence_keys: required_acceptance_evidence_keys.as_deref(),
+                    required_acceptance_reviews: required_acceptance_reviews.as_deref(),
                     owner_contract_summary: a.owner_contract_summary.as_deref(),
                     owner_contract_details: a.owner_contract_details.as_deref(),
                     worker_contract_summary: a.worker_contract_summary.as_deref(),
@@ -8987,6 +9361,24 @@ impl LoomServer {
             loom_tickets::parse_ticket_projection(a.projection.as_deref()).map_err(err)?;
         let fields = loom_tickets::normalize_ticket_fields_for_projection(&fields, projection)
             .map_err(err)?;
+        if let Some(backend) = self.mcp.store().remote_backend() {
+            return backend
+                .tickets_create_json(
+                    &a.workspace,
+                    TicketCreateRequest {
+                        workspace_id: &profile_id,
+                        project_id: &a.project_id,
+                        ticket_type: &a.ticket_type,
+                        external_source: a.external_source.as_deref(),
+                        external_id: a.external_id.as_deref(),
+                        fields: &fields,
+                        policy_labels: &a.policy_labels,
+                        expected_root: a.expected_root.as_deref(),
+                    },
+                )
+                .map_err(err)
+                .and_then(ser_json_string);
+        }
         self.mcp
             .write_tickets_create_receipt(
                 &a.workspace,
@@ -9086,6 +9478,30 @@ impl LoomServer {
                 relation_id: &relation.relation_id,
             })
             .collect::<Vec<_>>();
+        if let Some(backend) = self.mcp.store().remote_backend() {
+            return backend
+                .tickets_update_json(
+                    &a.workspace,
+                    TicketUpdateRequest {
+                        workspace_id: &profile_id,
+                        ticket_id: &a.ticket_id,
+                        set_fields: set_fields.as_ref(),
+                        delete_fields: &delete_fields,
+                        action,
+                        target_status: a.target_status.as_deref(),
+                        observed_source_status: a.observed_source_status.as_deref(),
+                        observed_workflow_version: a.observed_workflow_version.as_deref(),
+                        assignee: a.assignee.as_deref(),
+                        expected_root: a.expected_root.as_deref(),
+                        comment,
+                        comments: &comments,
+                        relation_sets: &relation_sets,
+                        relation_removes: &relation_removes,
+                    },
+                )
+                .map_err(err)
+                .and_then(ser_json_string);
+        }
         self.mcp
             .write_tickets_update_receipt(
                 &a.workspace,
@@ -9437,6 +9853,17 @@ impl LoomServer {
     )]
     fn tickets_get(&self, Parameters(a): Parameters<PTicketsGet>) -> ToolResult {
         let profile_id = workspace_profile_id(&self.mcp, &a.workspace).map_err(err)?;
+        if let Some(backend) = self.mcp.store().remote_backend() {
+            return backend
+                .tickets_get_json(
+                    &a.workspace,
+                    &profile_id,
+                    &a.ticket_id,
+                    a.projection.as_deref(),
+                )
+                .map_err(err)
+                .and_then(ser_json_string);
+        }
         if a.detailed {
             self.mcp
                 .read_tickets_get(
@@ -9479,7 +9906,7 @@ impl LoomServer {
         let profile_id = workspace_profile_id(&self.mcp, &a.workspace).map_err(err)?;
         let query = build_ticket_list_query(&self.mcp, &a).map_err(err)?;
         self.mcp
-            .read_tickets_page(&a.workspace, &profile_id, query)
+            .read_tickets_page_value(&a.workspace, &profile_id, query)
             .map_err(err)
             .and_then(ser)
     }
@@ -9661,8 +10088,11 @@ impl LoomServer {
         description = "Add a ticket to Lane membership. Treat tickets as the source of truth and Lane as coordination state."
     )]
     fn lanes_ticket_add(&self, Parameters(a): Parameters<PLanesTicketAdd>) -> ToolResult {
-        let placement =
-            lane_ticket_placement(a.placement.as_deref(), a.anchor.as_deref()).map_err(err)?;
+        let placement = a
+            .placement
+            .unwrap_or(LaneTicketPlacementParam::Last)
+            .into_lane_placement(a.anchor.as_deref())
+            .map_err(err)?;
         self.mcp
             .write_lanes_ticket_add_receipt(
                 &a.workspace,
@@ -10363,6 +10793,28 @@ impl LoomServer {
             .and_then(ser)
     }
 
+    #[tool(
+        name = "chat_post_message_bytes",
+        description = "Append a binary chat message"
+    )]
+    fn chat_post_message_bytes(
+        &self,
+        Parameters(a): Parameters<PChatPostMessageBytes>,
+    ) -> ToolResult {
+        let profile_id = workspace_profile_id(&self.mcp, &a.workspace).map_err(err)?;
+        self.mcp
+            .write_chat_post_message(
+                &a.workspace,
+                &profile_id,
+                &a.channel_id,
+                &a.message_id,
+                a.thread_id.as_deref(),
+                a.body,
+            )
+            .map_err(err)
+            .and_then(ser)
+    }
+
     #[tool(name = "chat_edit_message", description = "Append a chat message edit")]
     fn chat_edit_message(&self, Parameters(a): Parameters<PChatEditMessage>) -> ToolResult {
         let profile_id = workspace_profile_id(&self.mcp, &a.workspace).map_err(err)?;
@@ -10373,6 +10825,27 @@ impl LoomServer {
                 &a.channel_id,
                 &a.message_id,
                 a.body_text.into_bytes(),
+            )
+            .map_err(err)
+            .and_then(ser)
+    }
+
+    #[tool(
+        name = "chat_edit_message_bytes",
+        description = "Append a binary chat message edit"
+    )]
+    fn chat_edit_message_bytes(
+        &self,
+        Parameters(a): Parameters<PChatEditMessageBytes>,
+    ) -> ToolResult {
+        let profile_id = workspace_profile_id(&self.mcp, &a.workspace).map_err(err)?;
+        self.mcp
+            .write_chat_edit_message(
+                &a.workspace,
+                &profile_id,
+                &a.channel_id,
+                &a.message_id,
+                a.body,
             )
             .map_err(err)
             .and_then(ser)
@@ -10544,6 +11017,29 @@ impl LoomServer {
                 &a.agent_principal,
                 a.source_message_ids,
                 a.prompt_text.into_bytes(),
+            )
+            .map_err(err)
+            .and_then(ser)
+    }
+
+    #[tool(
+        name = "chat_invoke_agent_bytes",
+        description = "Invite an agent principal with a binary prompt"
+    )]
+    fn chat_invoke_agent_bytes(
+        &self,
+        Parameters(a): Parameters<PChatInvokeAgentBytes>,
+    ) -> ToolResult {
+        let profile_id = workspace_profile_id(&self.mcp, &a.workspace).map_err(err)?;
+        self.mcp
+            .write_chat_invoke_agent(
+                &a.workspace,
+                &profile_id,
+                &a.channel_id,
+                &a.invocation_id,
+                &a.agent_principal,
+                a.source_message_ids,
+                a.prompt,
             )
             .map_err(err)
             .and_then(ser)
@@ -12652,6 +13148,16 @@ impl LoomServer {
             .map_err(err)
             .map(|b| out_value(jbytes(&b)))
     }
+    #[tool(
+        name = "sql_exec_result",
+        description = "Run SQL statements and return result payload"
+    )]
+    fn sql_exec_result(&self, Parameters(a): Parameters<PSqlExec>) -> ToolResult {
+        self.mcp
+            .write_sql_exec_result(&a.workspace, &a.db, &a.sql)
+            .map_err(err)
+            .map(|b| out_value(jbytes(&b)))
+    }
     #[tool(name = "sql_commit", description = "Record a SQL-workspace commit")]
     fn sql_commit(&self, Parameters(a): Parameters<PSqlCommit>) -> ToolResult {
         self.mcp
@@ -14258,6 +14764,9 @@ impl LoomServer {
         if !self.binding.allow_writes && spec.kind == ToolKind::Write {
             return Ok(false);
         }
+        if self.mcp.store().remote_backend().is_some() {
+            return Ok(true);
+        }
         self.mcp
             .store()
             .read(|loom| {
@@ -14808,13 +15317,11 @@ impl LoomServer {
             Err(e) if e.code == Code::NotFound => json!([]),
             Err(e) => return Err(err(e)),
         };
-        let (lanes, lane_diagnostics) = match self.mcp.read_lanes_list_with_diagnostics(workspace) {
-            Ok((lanes, diagnostics)) => {
+        let (lanes, lane_diagnostics) = match self.mcp.read_lanes_list(workspace) {
+            Ok(lanes) => {
                 let lanes = serde_json::to_value(lanes)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                let diagnostics = serde_json::to_value(diagnostics)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                (lanes, diagnostics)
+                (lanes, json!([]))
             }
             Err(e) if e.code == Code::NotFound => (json!([]), json!([])),
             Err(e) => return Err(err(e)),
@@ -16657,6 +17164,296 @@ impl LoomServer {
     }
 }
 
+struct GeneratedMcpExecutionTarget<'a> {
+    backend: &'a dyn crate::RemoteMcpBackend,
+    tool: &'static ToolSpec,
+    operation: loom_remote_protocol::generated::GeneratedOperationId,
+    projection: crate::tools::GeneratedMcpProjection,
+}
+
+impl GeneratedMcpExecutionTarget<'_> {
+    async fn execute(&self, arguments: &JsonObject) -> Result<CallToolResult, LoomError> {
+        let sig = crate::tools::generated_operation_signature(self.operation).ok_or_else(|| {
+            LoomError::new(
+                Code::NotFound,
+                format!(
+                    "{} references an unknown generated operation",
+                    self.tool.name
+                ),
+            )
+        })?;
+        let args = match self.projection {
+            crate::tools::GeneratedMcpProjection::Canonical => {
+                canonical_generated_args(sig, arguments)?
+            }
+            crate::tools::GeneratedMcpProjection::GraphRemoveEdge => {
+                graph_remove_edge_generated_args(arguments)?
+            }
+        };
+        let value = self
+            .backend
+            .execute_generated_operation(crate::GeneratedMcpCall {
+                operation: self.operation,
+                args_without_handle: args,
+            })
+            .await?;
+        match self.projection {
+            crate::tools::GeneratedMcpProjection::Canonical => {
+                let value = generated_wire_to_json(sig.ret, value)?;
+                Ok(CallToolResult::structured(json!({ "value": value })))
+            }
+            crate::tools::GeneratedMcpProjection::GraphRemoveEdge => {
+                let value = generated_wire_to_json(sig.ret, value)?;
+                Ok(CallToolResult::structured(json!({ "value": value })))
+            }
+        }
+    }
+}
+
+fn canonical_generated_args(
+    sig: &loom_remote_protocol::generated::MethodSig,
+    arguments: &JsonObject,
+) -> Result<Vec<loom_codec::Value>, LoomError> {
+    sig.args_without_handle
+        .iter()
+        .map(|(idl_type, name)| {
+            let value = arguments.get(*name);
+            json_to_generated_wire(idl_type, *name, value)
+        })
+        .collect()
+}
+
+fn graph_remove_edge_generated_args(
+    arguments: &JsonObject,
+) -> Result<Vec<loom_codec::Value>, LoomError> {
+    let workspace = required_generated_string_arg(arguments, "workspace")?;
+    let name = required_generated_string_arg(arguments, "collection")?;
+    let id = required_generated_string_arg(arguments, "id")?;
+    Ok(vec![
+        loom_codec::Value::Text(workspace),
+        loom_codec::Value::Text(name),
+        loom_codec::Value::Text(id),
+    ])
+}
+
+fn json_to_generated_wire(
+    idl_type: &str,
+    name: &str,
+    value: Option<&Value>,
+) -> Result<loom_codec::Value, LoomError> {
+    let idl_type = idl_type.trim();
+    if let Some(inner) = strip_idl_optional(idl_type) {
+        return match value {
+            None | Some(Value::Null) => Ok(loom_codec::Value::Null),
+            Some(value) => json_to_generated_wire(&inner, name, Some(value)),
+        };
+    }
+    let value = value.ok_or_else(|| {
+        LoomError::new(
+            Code::InvalidArgument,
+            format!("missing generated MCP argument {name}"),
+        )
+    })?;
+    match idl_type {
+        "bool" => value
+            .as_bool()
+            .map(loom_codec::Value::Bool)
+            .ok_or_else(|| invalid_generated_arg(name, "boolean")),
+        "string" | "Uuid" | "Digest" => value
+            .as_str()
+            .map(|text| loom_codec::Value::Text(text.to_string()))
+            .ok_or_else(|| invalid_generated_arg(name, "string")),
+        "bytes" => json_bytes_to_wire(name, value),
+        "u8" => json_u64(name, value, 255).map(loom_codec::Value::Uint),
+        "u32" => json_u64(name, value, u32::MAX.into()).map(loom_codec::Value::Uint),
+        "u64" => json_u64(name, value, u64::MAX).map(loom_codec::Value::Uint),
+        "i32" => {
+            json_i64(name, value, i32::MIN.into(), i32::MAX.into()).map(loom_codec::Value::int)
+        }
+        "i64" => json_i64(name, value, i64::MIN, i64::MAX).map(loom_codec::Value::int),
+        "f64" => value
+            .as_f64()
+            .map(loom_codec::Value::Float)
+            .ok_or_else(|| invalid_generated_arg(name, "number")),
+        other => Err(LoomError::new(
+            Code::InvalidArgument,
+            format!(
+                "generated MCP argument {name} uses unsupported JSON adapter type {other}; pass byte-shaped IDL contracts through an owning adapter"
+            ),
+        )),
+    }
+}
+
+fn generated_wire_to_json(idl_type: &str, value: loom_codec::Value) -> Result<Value, LoomError> {
+    let idl_type = idl_type.trim();
+    if strip_idl_optional(idl_type).is_some() && value == loom_codec::Value::Null {
+        return Ok(Value::Null);
+    }
+    if strip_idl_list(idl_type).is_some() {
+        let loom_codec::Value::Array(items) = value else {
+            return Err(invalid_generated_result("array"));
+        };
+        return items
+            .into_iter()
+            .map(|item| generated_wire_value_to_json(item))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array);
+    }
+    generated_wire_value_to_json(value)
+}
+
+fn generated_wire_value_to_json(value: loom_codec::Value) -> Result<Value, LoomError> {
+    match value {
+        loom_codec::Value::Uint(value) => Ok(json!(value)),
+        loom_codec::Value::Nint(value) => {
+            let signed = -1i128 - i128::from(value);
+            Ok(json!(signed))
+        }
+        loom_codec::Value::Bytes(bytes) => {
+            Ok(Value::String(crate::resources::base64_encode(&bytes)))
+        }
+        loom_codec::Value::Text(text) => Ok(Value::String(text)),
+        loom_codec::Value::Array(items) => items
+            .into_iter()
+            .map(generated_wire_value_to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        loom_codec::Value::Map(entries) => entries
+            .into_iter()
+            .map(|(key, value)| {
+                let key = generated_wire_value_to_json(key)?;
+                let key = key
+                    .as_str()
+                    .ok_or_else(|| invalid_generated_result("string map key"))?;
+                Ok((key.to_string(), generated_wire_value_to_json(value)?))
+            })
+            .collect::<Result<JsonObject, _>>()
+            .map(Value::Object),
+        loom_codec::Value::Float(value) => Ok(json!(value)),
+        loom_codec::Value::Bool(value) => Ok(Value::Bool(value)),
+        loom_codec::Value::Null => Ok(Value::Null),
+    }
+}
+
+fn strip_idl_optional(idl_type: &str) -> Option<String> {
+    if let Some(inner) = idl_type.strip_suffix('?') {
+        return Some(inner.trim().to_string());
+    }
+    idl_type
+        .strip_prefix("optional ")
+        .map(str::trim)
+        .map(str::to_string)
+        .or_else(|| {
+            idl_type
+                .strip_prefix("optional<")
+                .and_then(|inner| inner.strip_suffix('>'))
+                .map(str::trim)
+                .map(str::to_string)
+        })
+}
+
+fn strip_idl_list(idl_type: &str) -> Option<String> {
+    idl_type
+        .strip_prefix("list<")
+        .and_then(|inner| inner.strip_suffix('>'))
+        .map(str::trim)
+        .map(str::to_string)
+}
+
+fn json_bytes_to_wire(name: &str, value: &Value) -> Result<loom_codec::Value, LoomError> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| invalid_generated_arg(name, "base64 string"))?;
+    let bytes = base64_decode(text).map_err(|_| invalid_generated_arg(name, "base64 string"))?;
+    Ok(loom_codec::Value::Bytes(bytes))
+}
+
+fn required_generated_string_arg(arguments: &JsonObject, name: &str) -> Result<String, LoomError> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| invalid_generated_arg(name, "string"))
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    if !input.len().is_multiple_of(4) {
+        return Err(());
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
+        if pad > 2 || chunk[..4 - pad].contains(&b'=') {
+            return Err(());
+        }
+        let a = value(chunk[0]).ok_or(())?;
+        let b = value(chunk[1]).ok_or(())?;
+        let c = if pad >= 2 {
+            0
+        } else {
+            value(chunk[2]).ok_or(())?
+        };
+        let d = if pad >= 1 {
+            0
+        } else {
+            value(chunk[3]).ok_or(())?
+        };
+        out.push((a << 2) | (b >> 4));
+        if pad < 2 {
+            out.push((b << 4) | (c >> 2));
+        }
+        if pad < 1 {
+            out.push((c << 6) | d);
+        }
+    }
+    Ok(out)
+}
+
+fn json_u64(name: &str, value: &Value, max: u64) -> Result<u64, LoomError> {
+    let Some(value) = value.as_u64() else {
+        return Err(invalid_generated_arg(name, "unsigned integer"));
+    };
+    if value > max {
+        return Err(invalid_generated_arg(name, "bounded unsigned integer"));
+    }
+    Ok(value)
+}
+
+fn json_i64(name: &str, value: &Value, min: i64, max: i64) -> Result<i64, LoomError> {
+    let Some(value) = value.as_i64() else {
+        return Err(invalid_generated_arg(name, "signed integer"));
+    };
+    if value < min || value > max {
+        return Err(invalid_generated_arg(name, "bounded signed integer"));
+    }
+    Ok(value)
+}
+
+fn invalid_generated_arg(name: &str, expected: &str) -> LoomError {
+    LoomError::new(
+        Code::InvalidArgument,
+        format!("generated MCP argument {name} must be {expected}"),
+    )
+}
+
+fn invalid_generated_result(expected: &str) -> LoomError {
+    LoomError::new(
+        Code::CorruptObject,
+        format!("generated MCP result must be {expected}"),
+    )
+}
+
 impl ServerHandler for LoomServer {
     /// Start this session's resource-subscription poll loop.
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
@@ -16714,7 +17511,9 @@ impl ServerHandler for LoomServer {
                 }
             }
         }
-        let lifecycle_allows =
+        let lifecycle_allows = if self.mcp.store().remote_backend().is_some() {
+            true
+        } else {
             self.mcp
                 .store()
                 .read(|loom| {
@@ -16724,7 +17523,8 @@ impl ServerHandler for LoomServer {
                         active_tools.as_ref(),
                     ))
                 })
-                .map_err(err)?;
+                .map_err(err)?
+        };
         if !lifecycle_allows {
             return Err(ErrorData::invalid_params(
                 format!(
@@ -16758,11 +17558,27 @@ impl ServerHandler for LoomServer {
                 .notify_progress(progress_param(token.clone(), false, &name))
                 .await;
         }
-        let tcc = ToolCallContext::new(self, request, context);
-        let result = tokio::select! {
-            biased;
-            _ = ct.cancelled() => Err(cancelled_error(&name)),
-            r = self.tool_router.call(tcc) => r,
+        let generated_remote = self.mcp.store().remote_backend().is_some()
+            && matches!(
+                crate::tools::remote_tool_route(request.name.as_ref()),
+                crate::tools::RemoteToolRoute::UnaryForward
+            )
+            && self
+                .generated_execution_target(request.name.as_ref())
+                .is_some();
+        let result = if generated_remote {
+            tokio::select! {
+                biased;
+                _ = ct.cancelled() => Err(cancelled_error(&name)),
+                r = self.execute_generated_tool_remote(&request) => r,
+            }
+        } else {
+            let tcc = ToolCallContext::new(self, request, context);
+            tokio::select! {
+                biased;
+                _ = ct.cancelled() => Err(cancelled_error(&name)),
+                r = self.tool_router.call(tcc) => r,
+            }
         };
         let result = match (result, app_tool_call) {
             (Ok(inner), Some(tool)) => {

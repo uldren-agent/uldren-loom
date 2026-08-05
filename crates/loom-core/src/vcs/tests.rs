@@ -118,6 +118,12 @@ impl ObjectStore for OverlayMemoryStore {
             generation,
             root_after: Digest::blake3(&generation.as_u64().to_be_bytes()),
             writes: outcomes,
+            operation_identities: Vec::new(),
+            revision_identities: Vec::new(),
+            audit_sequences: Vec::new(),
+            retained_sequences: Vec::new(),
+            delivery_receipts: Vec::new(),
+            post_commit_delta: None,
             replayed: false,
         })
     }
@@ -672,10 +678,11 @@ fn save_state_uses_independently_rooted_sections() {
     let Object::Tree(entries) = loom.get_object(&root).unwrap() else {
         panic!("engine-state root should be a section tree");
     };
-    assert_eq!(entries.len(), 10);
+    assert_eq!(entries.len(), 11);
     assert_eq!(entries[0].name, "00-registry");
     assert_eq!(entries[1].name, "01-content");
     assert_eq!(entries[9].name, "09-protected-refs");
+    assert_eq!(entries[10].name, "10-stream-low-water");
     for entry in &entries {
         if entry.name == "01-content" || entry.name == "02-work" || entry.name == "07-index" {
             let Object::Tree(section_entries) = loom.get_object(&entry.target).unwrap() else {
@@ -3176,6 +3183,33 @@ fn open_handles_survive_export_import() {
 }
 
 #[test]
+fn engine_state_import_preserves_mutable_overlay() {
+    let mut loom = Loom::new(MemoryStore::new());
+    let ns = new_vcs_ns(&mut loom, 1);
+    let key = OverlayKey::from_segments([
+        b"workspace",
+        ns.as_bytes(),
+        b"lanes",
+        b"lane",
+        b"lane-1",
+        b"v1",
+    ])
+    .unwrap();
+    loom.mutable_overlay_mut()
+        .put_value(key.clone(), None, b"lane state")
+        .unwrap();
+
+    let bytes = loom.export_state();
+    loom.import_state(&bytes).unwrap();
+
+    let current = loom
+        .mutable_overlay()
+        .current_entry(&key)
+        .expect("mutable overlay entry after engine-state import");
+    assert_eq!(current.payload, b"lane state");
+}
+
+#[test]
 fn lightweight_and_annotated_tags_resolve_and_persist() {
     let mut loom = Loom::new(MemoryStore::new());
     let ns = new_vcs_ns(&mut loom, 1);
@@ -3658,7 +3692,10 @@ fn deadline_preserves_pending_stream_root_mark_work() {
         .unwrap();
 
     assert_eq!(step.visited, 0);
-    assert_eq!(state.stream_roots.front().copied(), Some(root));
+    assert_eq!(
+        state.stream_roots.front().map(|stream| stream.root),
+        Some(root)
+    );
     assert!(!state.completed);
 }
 

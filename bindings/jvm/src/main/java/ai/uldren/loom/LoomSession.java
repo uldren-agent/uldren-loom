@@ -40,20 +40,24 @@ public final class LoomSession implements AutoCloseable {
         authPassphrase = null;
     }
 
-    public byte[] execCbor(byte[] request) {
-        return onHandle("loom_exec_cbor", (arena, handle) -> {
+    public byte[] applyCbor(byte[] request) {
+        return onHandle("loom_apply_cbor", (arena, handle) -> {
             MemorySegment req = arena.allocate(Math.max(request.length, 1));
             MemorySegment.copy(request, 0, req, ValueLayout.JAVA_BYTE, 0, request.length);
             MemorySegment outPtr = arena.allocate(ValueLayout.ADDRESS);
             MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
-            int status = (int) Loom.LOOM_EXEC_CBOR.invokeExact(
+            int status = (int) Loom.LOOM_APPLY_CBOR.invokeExact(
                     handle, req, (long) request.length, outPtr, outLen);
             if (status != 0) {
-                throw Loom.lastError("loom_exec_cbor");
+                throw Loom.lastError("loom_apply_cbor");
             }
             return Loom.takeOwnedBytes(outPtr.get(ValueLayout.ADDRESS, 0),
                     outLen.get(ValueLayout.JAVA_LONG, 0));
         });
+    }
+
+    public byte[] execCbor(byte[] request) {
+        return applyCbor(request);
     }
 
     <T> T onHandle(String op, Loom.HandleOp<T> body) {
@@ -111,6 +115,53 @@ public final class LoomSession implements AutoCloseable {
 
     public MeetingsOps meetings() {
         return new MeetingsOps(this);
+    }
+
+    public LifecycleOps lifecycle() {
+        return new LifecycleOps(this);
+    }
+
+    public RefsOps refs() {
+        return new RefsOps(this);
+    }
+
+    public StudioMaintenanceOps studioMaintenance() {
+        return new StudioMaintenanceOps(this);
+    }
+
+    public StoreAdminOps storeAdmin() {
+        return new StoreAdminOps(this);
+    }
+
+    public AuditOps audit() {
+        return new AuditOps(this);
+    }
+
+    public InferenceInstanceOps inferenceInstance() {
+        return new InferenceInstanceOps(this);
+    }
+
+    public ServeConfigOps serveConfig() {
+        return new ServeConfigOps(this);
+    }
+
+    public InterchangeProfilesOps interchangeProfiles() {
+        return new InterchangeProfilesOps(this);
+    }
+
+    public byte[] sqlExecResult(String workspace, String db, String sql) {
+        return onHandle("loom_sql_exec_result", (arena, handle) -> {
+            MemorySegment outPtr = arena.allocate(ValueLayout.ADDRESS);
+            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+            int status = (int) Loom.LOOM_SQL_EXEC_RESULT.invokeExact(
+                    handle, arena.allocateFrom(workspace), arena.allocateFrom(db),
+                    arena.allocateFrom(sql), outPtr, outLen);
+            if (status != 0) {
+                throw Loom.lastError("loom_sql_exec_result");
+            }
+            return Loom.takeOwnedBytes(outPtr.get(ValueLayout.ADDRESS, 0),
+                    outLen.get(ValueLayout.JAVA_LONG, 0));
+        });
     }
 
     public DriveOps drive() {

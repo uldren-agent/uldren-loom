@@ -2,8 +2,8 @@ use loom_codec::Value;
 use loom_core::digest::{Algo, DIGEST_LEN, Digest};
 use loom_core::error::{LoomError, Result};
 use loom_core::{
-    MutableOverlay, OverlayKey, OverlayOwnerToken, OverlayReadSnapshot, SecondaryIndexWrite,
-    SecondaryIndexWriteOp,
+    MutableOverlay, ObjectStore, OverlayEntryKind, OverlayKey, OverlayKeyPrefix, OverlayOwnerToken,
+    OverlayReadSnapshot, SecondaryIndexWrite, SecondaryIndexWriteOp,
 };
 
 const WORKFLOW_CURRENT_SCHEMA: &str = "loom.workflow.current-record.v1";
@@ -183,6 +183,51 @@ pub fn workflow_current_key(
         kind.as_str().as_bytes(),
         record_id.as_bytes(),
     ])
+}
+
+pub fn workflow_current_key_prefix(
+    workspace_id: &str,
+    project_id: &str,
+    kind: WorkflowCurrentRecordKind,
+) -> Result<OverlayKeyPrefix> {
+    validate_segment("workspace_id", workspace_id)?;
+    validate_segment("project_id", project_id)?;
+    OverlayKey::prefix_from_segments(
+        6,
+        [
+            WORKSPACE_SCOPE,
+            workspace_id.as_bytes(),
+            TICKETS_DOMAIN,
+            project_id.as_bytes(),
+            kind.as_str().as_bytes(),
+        ],
+    )
+}
+
+pub fn list_workflow_current_records_by_prefix(
+    store: &impl ObjectStore,
+    workspace_id: &str,
+    project_id: &str,
+    kind: WorkflowCurrentRecordKind,
+) -> Result<Vec<WorkflowCurrentRecord>> {
+    let prefix = workflow_current_key_prefix(workspace_id, project_id, kind)?;
+    let mut records = Vec::new();
+    for entry in store.mutable_overlay_current_entries_with_prefix(&prefix)? {
+        if entry.kind == OverlayEntryKind::Tombstone {
+            continue;
+        }
+        let record = WorkflowCurrentRecord::decode(&entry.payload)?;
+        let key = record.overlay_key()?;
+        if key != entry.key
+            || record.workspace_id != workspace_id
+            || record.project_id != project_id
+            || record.kind != kind
+        {
+            return Err(LoomError::corrupt("workflow current record key mismatch"));
+        }
+        records.push(record);
+    }
+    Ok(records)
 }
 
 pub fn workflow_current_secondary_index_key(

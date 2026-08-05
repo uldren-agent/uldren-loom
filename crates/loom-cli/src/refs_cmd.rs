@@ -1,4 +1,5 @@
 use crate::{KeyOpts, mount_open_auth};
+use loom_remote_protocol::codec::ToValue;
 use uldren_loom_mcp::{LoomMcp, StoreAccess};
 
 use crate::cli::RefsCmd;
@@ -21,11 +22,13 @@ pub(crate) fn run_refs(action: RefsCmd, keys: &KeyOpts) -> Result<(), String> {
             max,
             format,
         } => {
-            let workspace_id = workspace_profile_id(&store, &workspace, keys)?;
-            let status = mcp_for_store(&store, keys)?
-                .write_substrate_reference_reconcile(&workspace, &workspace_id, max)
-                .map_err(|error| error.to_string())?;
-            print_status(&status, &format)
+            let client = crate::remote::open_cli_generated_client(&store, keys)?;
+            let raw = client.generated_json(
+                "Refs",
+                "refs_reconcile_json",
+                vec![workspace.to_value(), (max as u64).to_value()],
+            )?;
+            print_status_json(&raw, &format)
         }
     }
 }
@@ -42,12 +45,10 @@ fn mcp_for_store(store: &str, keys: &KeyOpts) -> Result<LoomMcp, String> {
     Ok(LoomMcp::new(access))
 }
 
-fn workspace_profile_id(store: &str, workspace: &str, keys: &KeyOpts) -> Result<String, String> {
-    let loom = crate::cli_open_loom(store, keys)?;
-    loom.registry()
-        .open(&loom_core::WsSelector::Name(workspace.to_string()))
-        .map(|workspace_id| workspace_id.to_string())
-        .map_err(|_| "reference reconciliation workspace was not found".to_string())
+fn print_status_json(raw: &str, format: &str) -> Result<(), String> {
+    let status: uldren_loom_mcp::reads::ReferenceReconciliationSummary =
+        serde_json::from_str(raw).map_err(|error| error.to_string())?;
+    print_status(&status, format)
 }
 
 fn print_status(

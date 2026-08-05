@@ -4,17 +4,17 @@ use std::collections::BTreeSet;
 
 use loom_codec::Value;
 use loom_core::delivery::{DeliveryEnvelope, DeliveryProduceRequest, delivery_produce};
-use loom_core::document::{doc_delete, doc_list, document_get_text, document_put_text};
 use loom_core::error::{Code, LoomError, Result};
 use loom_core::workspace::{FacetKind, WorkspaceId};
 use loom_core::{
-    AclDomain, AclRight, AtomicityBoundary, AuditIntent, CompareToken, Digest, FacetSideEffects,
-    FacetWrite, FacetWriteOp, Loom, OverlayDurabilityPolicy, SecondaryIndexWrite,
+    AclDomain, AclRight, AtomicityBoundary, AuditIntent, CommitReceipt, CompareToken, Digest,
+    FacetSideEffects, FacetWrite, FacetWriteOp, Loom, OverlayDurabilityPolicy, SecondaryIndexWrite,
     WorkflowTransaction,
 };
 use loom_store::FileStore;
 use loom_tickets::{
-    WorkflowCurrentRecordKind, read_workflow_current_record, workflow_active_assignment_record,
+    WorkflowCurrentRecordKind, list_workflow_current_records_by_prefix,
+    read_workflow_current_record, workflow_active_assignment_record, workflow_current_key,
     workflow_current_secondary_index_delete, workflow_current_secondary_index_put,
     workflow_lane_current_record,
 };
@@ -26,6 +26,12 @@ pub const LANE_COLLECTION: &str = "lanes";
 pub const APP_ID: &str = "loom-lanes";
 
 const PROSE_MAX_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaneMutationMode {
+    Create,
+    Update,
+}
 
 pub fn provided_capabilities() -> &'static [&'static str] {
     &["lanes"]
@@ -117,11 +123,26 @@ pub enum LaneTicketPlacement<'a> {
 
 impl<'a> LaneTicketPlacement<'a> {
     /// Parse a public placement verb and optional anchor ticket id. Empty defaults to Last.
-    /// Before and After require a non-empty anchor. Unknown verbs are rejected.
+    /// First and Last reject anchors. Before and After require a non-empty anchor. Unknown verbs are
+    /// rejected.
     pub fn parse(placement: &str, anchor: Option<&'a str>) -> Result<Self> {
         match placement {
-            "" | "LAST" => Ok(Self::Last),
-            "FIRST" => Ok(Self::First),
+            "" | "LAST" => {
+                if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                    return Err(LoomError::invalid(
+                        "placement 'LAST' rejects an anchor ticket id",
+                    ));
+                }
+                Ok(Self::Last)
+            }
+            "FIRST" => {
+                if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                    return Err(LoomError::invalid(
+                        "placement 'FIRST' rejects an anchor ticket id",
+                    ));
+                }
+                Ok(Self::First)
+            }
             "BEFORE" => anchor
                 .filter(|a| !a.is_empty())
                 .map(Self::Before)
@@ -747,6 +768,7 @@ impl Lane {
         Ok(())
     }
 
+    #[cfg(test)]
     fn from_json(text: &str) -> Result<Self> {
         let lane: Self = serde_json::from_str(text)
             .map_err(|error| LoomError::invalid(format!("lane document is invalid: {error}")))?;
@@ -754,6 +776,7 @@ impl Lane {
         Ok(lane)
     }
 
+    #[cfg(test)]
     fn to_json(&self) -> Result<String> {
         self.validate()?;
         serde_json::to_string(self)
@@ -764,19 +787,15 @@ impl Lane {
 pub fn create_lane(loom: &mut Loom<FileStore>, workspace: WorkspaceId, lane: Lane) -> Result<Lane> {
     loom.authorize_domain(workspace, AclDomain::Tickets, AclRight::Write)?;
     lane.validate()?;
-    if document_get_text(loom, workspace, LANE_COLLECTION, &lane.lane_id)?.is_some() {
-        return Err(LoomError::new(Code::AlreadyExists, "lane already exists"));
-    }
-    put_lane(loom, workspace, lane)
+    validate_assignment_lane_membership(loom, workspace, &lane)?;
+    commit_lane_current_record(loom, workspace, &lane, LaneMutationMode::Create)?;
+    Ok(lane)
 }
 
 pub fn put_lane(loom: &mut Loom<FileStore>, workspace: WorkspaceId, lane: Lane) -> Result<Lane> {
     loom.authorize_domain(workspace, AclDomain::Tickets, AclRight::Write)?;
-    let text = lane.to_json()?;
     validate_assignment_lane_membership(loom, workspace, &lane)?;
-    let prior = get_lane(loom, workspace, &lane.lane_id)?;
-    document_put_text(loom, workspace, LANE_COLLECTION, &lane.lane_id, &text, None)?;
-    put_lane_current_record(loom, workspace, &lane, prior.as_ref())?;
+    commit_lane_current_record(loom, workspace, &lane, LaneMutationMode::Update)?;
     Ok(lane)
 }
 
@@ -786,9 +805,86 @@ pub fn put_lane_current_record(
     lane: &Lane,
     prior_lane: Option<&Lane>,
 ) -> Result<()> {
+    let _ = prior_lane;
+    commit_lane_current_record(loom, workspace, lane, LaneMutationMode::Update)
+}
+
+fn commit_lane_current_record(
+    loom: &mut Loom<FileStore>,
+    workspace: WorkspaceId,
+    lane: &Lane,
+    mode: LaneMutationMode,
+) -> Result<()> {
+    let txn = prepare_lane_current_transaction(loom, workspace, lane, mode)?;
+    let receipt = loom.store().commit_workflow_transaction(txn)?;
+    synchronize_lane_transaction_receipt(loom, &receipt)?;
+    Ok(())
+}
+
+fn prepare_lane_current_transaction(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    lane: &Lane,
+    mode: LaneMutationMode,
+) -> Result<WorkflowTransaction> {
+    lane.validate()?;
     let workspace_id = workspace.to_string();
-    let lane_record = workflow_lane_current_record(
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("lanes.current.plan"))?;
+    let prior_lane = read_lane_from_snapshot(&snapshot, &workspace_id, &lane.lane_id)?;
+    match mode {
+        LaneMutationMode::Create => {
+            let lane_key = workflow_current_key(
+                &workspace_id,
+                LANE_COLLECTION,
+                WorkflowCurrentRecordKind::Lane,
+                &lane.lane_id,
+            )?;
+            if prior_lane.is_some() || snapshot.owner_token(&lane_key)?.is_some() {
+                return Err(LoomError::new(Code::AlreadyExists, "lane already exists"));
+            }
+        }
+        LaneMutationMode::Update => {
+            if prior_lane.is_none() {
+                return Err(LoomError::not_found("lane not found"));
+            }
+        }
+    }
+    let writes = lane_current_writes_from_snapshot(
+        loom,
         &workspace_id,
+        &snapshot,
+        lane,
+        prior_lane.as_ref(),
+        mode,
+    )?;
+    let expected_generation = snapshot.overlay_generation();
+    snapshot.release()?;
+    Ok(WorkflowTransaction {
+        workspace,
+        actor: loom.effective_principal()?.unwrap_or(workspace),
+        expected_generation: Some(expected_generation),
+        writes,
+        prepared_operations: Vec::new(),
+        revision_metadata: Vec::new(),
+        delivery_intents: Vec::new(),
+        durability: OverlayDurabilityPolicy::Normal,
+        boundary: AtomicityBoundary::Single,
+        idempotency: None,
+        owner_state: loom_core::WorkflowOwnerState::default(),
+        post_commit_delta: None,
+    })
+}
+
+fn lane_current_writes_from_snapshot(
+    loom: &Loom<FileStore>,
+    workspace_id: &str,
+    snapshot: &loom_core::OverlayReadSnapshot,
+    lane: &Lane,
+    prior_lane: Option<&Lane>,
+    mode: LaneMutationMode,
+) -> Result<Vec<FacetWrite>> {
+    let lane_record = workflow_lane_current_record(
+        workspace_id,
         &lane.lane_id,
         lane.encode()?,
         loom.store().reference_root(),
@@ -798,30 +894,34 @@ pub fn put_lane_current_record(
         && let Some(active_ticket_id) = &lane.active_ticket_id
     {
         records.push(workflow_active_assignment_record(
-            &workspace_id,
+            workspace_id,
             &lane.lane_id,
             active_ticket_id.as_bytes().to_vec(),
             loom.store().reference_root(),
         )?);
-    } else if let Some(prior) = prior_lane
+    } else if let Some(prior) = prior_lane.as_ref()
         && prior.active_ticket_id.is_some()
     {
         records.push(workflow_active_assignment_record(
-            &workspace_id,
+            workspace_id,
             &lane.lane_id,
             Vec::new(),
             loom.store().reference_root(),
         )?);
     }
-    let snapshot = loom.mutable_overlay_snapshot();
     let mut writes = Vec::with_capacity(records.len());
     for (index, record) in records.iter().enumerate() {
         let key = record.overlay_key()?;
         let mut secondary_indexes = Vec::new();
         if index == 0 {
             secondary_indexes =
-                lane_workflow_secondary_index_updates(&workspace_id, prior_lane, lane)?;
+                lane_workflow_secondary_index_updates(workspace_id, prior_lane, lane)?;
         }
+        let expected = if mode == LaneMutationMode::Create {
+            None
+        } else {
+            snapshot.owner_token(&key)?.map(CompareToken)
+        };
         let op = if index == 1
             && lane.active_ticket_id.is_none()
             && prior_lane
@@ -839,7 +939,7 @@ pub fn put_lane_current_record(
             target: key.clone(),
             op,
             secondary_indexes,
-            expected: snapshot.owner_token(&key)?.map(CompareToken),
+            expected,
             durability: None,
             audit: Some(AuditIntent {
                 operation: "lanes.current.put".to_string(),
@@ -847,19 +947,40 @@ pub fn put_lane_current_record(
             side_effects: FacetSideEffects::default(),
         });
     }
-    loom.store()
-        .commit_workflow_transaction(WorkflowTransaction {
-            workspace,
-            actor: loom.effective_principal()?.unwrap_or(workspace),
-            expected_generation: Some(snapshot.generation()),
-            writes,
-            durability: OverlayDurabilityPolicy::Normal,
-            boundary: AtomicityBoundary::Single,
-            idempotency: None,
-            owner_state: loom_core::WorkflowOwnerState::default(),
-        })?;
-    *loom.mutable_overlay_mut() =
-        loom_core::MutableOverlay::import_entries(&loom.store().mutable_overlay_entries()?)?;
+    Ok(writes)
+}
+
+fn read_lane_from_snapshot(
+    snapshot: &loom_core::OverlayReadSnapshot,
+    workspace_id: &str,
+    lane_id: &str,
+) -> Result<Option<Lane>> {
+    read_workflow_current_record(
+        snapshot,
+        workspace_id,
+        LANE_COLLECTION,
+        WorkflowCurrentRecordKind::Lane,
+        lane_id,
+        |_| Ok(None),
+    )?
+    .map(|record| Lane::decode(&record.payload))
+    .transpose()
+}
+
+fn synchronize_lane_transaction_receipt(
+    loom: &mut Loom<FileStore>,
+    receipt: &CommitReceipt,
+) -> Result<()> {
+    for outcome in &receipt.writes {
+        let current = loom
+            .store()
+            .mutable_overlay_current_entry(&outcome.target)?
+            .ok_or_else(|| {
+                LoomError::corrupt("lane transaction receipt target is absent after commit")
+            })?;
+        loom.mutable_overlay_mut()
+            .synchronize_current_entry(current)?;
+    }
     Ok(())
 }
 
@@ -1098,10 +1219,14 @@ pub fn transfer_assignment_lane_ticket(
     if source_lane_id == target_lane_id {
         return Err(LoomError::invalid("source and target lanes must differ"));
     }
-    let mut source = get_lane(loom, workspace, source_lane_id)?
+    let workspace_id = workspace.to_string();
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("lanes.transfer.plan"))?;
+    let mut source = read_lane_from_snapshot(&snapshot, &workspace_id, source_lane_id)?
         .ok_or_else(|| LoomError::not_found("source lane not found"))?;
-    let mut target = get_lane(loom, workspace, target_lane_id)?
+    let mut target = read_lane_from_snapshot(&snapshot, &workspace_id, target_lane_id)?
         .ok_or_else(|| LoomError::not_found("target lane not found"))?;
+    let prior_source = source.clone();
+    let prior_target = target.clone();
     for lane in [&source, &target] {
         if lane.lane_kind != LaneKind::Assignment.as_str() {
             return Err(LoomError::invalid(
@@ -1127,8 +1252,43 @@ pub fn transfer_assignment_lane_ticket(
     source.updated_by = updated_by.to_string();
     target.updated_at = updated_at;
     target.updated_by = updated_by.to_string();
-    let source = put_lane(loom, workspace, source)?;
-    let target = put_lane(loom, workspace, target)?;
+    source.validate()?;
+    target.validate()?;
+    let mut writes = lane_current_writes_from_snapshot(
+        loom,
+        &workspace_id,
+        &snapshot,
+        &source,
+        Some(&prior_source),
+        LaneMutationMode::Update,
+    )?;
+    writes.extend(lane_current_writes_from_snapshot(
+        loom,
+        &workspace_id,
+        &snapshot,
+        &target,
+        Some(&prior_target),
+        LaneMutationMode::Update,
+    )?);
+    let expected_generation = snapshot.overlay_generation();
+    snapshot.release()?;
+    let receipt = loom
+        .store()
+        .commit_workflow_transaction(WorkflowTransaction {
+            workspace,
+            actor: loom.effective_principal()?.unwrap_or(workspace),
+            expected_generation: Some(expected_generation),
+            writes,
+            prepared_operations: Vec::new(),
+            revision_metadata: Vec::new(),
+            delivery_intents: Vec::new(),
+            durability: OverlayDurabilityPolicy::Normal,
+            boundary: AtomicityBoundary::Single,
+            idempotency: None,
+            owner_state: loom_core::WorkflowOwnerState::default(),
+            post_commit_delta: None,
+        })?;
+    synchronize_lane_transaction_receipt(loom, &receipt)?;
     Ok((source, target))
 }
 
@@ -1140,30 +1300,98 @@ pub fn delete_lane(
     updated_by: &str,
 ) -> Result<Lane> {
     loom.authorize_domain(workspace, AclDomain::Tickets, AclRight::Write)?;
-    let mut lane = get_lane(loom, workspace, lane_id)?
-        .ok_or_else(|| LoomError::not_found("lane not found"))?;
-    if lane.lane_status != LaneStatus::Closed.as_str() {
-        return Err(LoomError::invalid("only closed lanes can be deleted"));
-    }
-    lane.updated_at = updated_at;
-    lane.updated_by = updated_by.to_string();
-    emit_lane_change_notification(
-        loom,
-        workspace,
-        &workspace.to_string(),
-        &lane,
-        "lane.deleted",
-    )?;
-    doc_delete(loom, workspace, LANE_COLLECTION, lane_id)?;
+    let (txn, lane) =
+        prepare_lane_delete_transaction(loom, workspace, lane_id, updated_at, updated_by)?;
+    let receipt = loom.store().commit_workflow_transaction(txn)?;
+    synchronize_lane_transaction_receipt(loom, &receipt)?;
     Ok(lane)
 }
 
-/// A per-record decode failure surfaced by fail-soft lane listing: the offending lane document id
-/// plus a human-readable reason. One malformed record must never make the whole coordination surface
-/// unreadable, so `list_lanes_with_diagnostics` returns the lanes that decode alongside one
-/// of these per record that does not.
+fn prepare_lane_delete_transaction(
+    loom: &Loom<FileStore>,
+    workspace: WorkspaceId,
+    lane_id: &str,
+    updated_at: u64,
+    updated_by: &str,
+) -> Result<(WorkflowTransaction, Lane)> {
+    let workspace_id = workspace.to_string();
+    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("lanes.delete.plan"))?;
+    let Some(prior_lane) = read_lane_from_snapshot(&snapshot, &workspace_id, lane_id)? else {
+        snapshot.release()?;
+        return Err(LoomError::not_found("lane not found"));
+    };
+    if prior_lane.lane_status != LaneStatus::Closed.as_str() {
+        snapshot.release()?;
+        return Err(LoomError::invalid("only closed lanes can be deleted"));
+    }
+    let mut deleted_lane = prior_lane.clone();
+    deleted_lane.updated_at = updated_at;
+    deleted_lane.updated_by = updated_by.to_string();
+    let lane_key = workflow_current_key(
+        &workspace_id,
+        LANE_COLLECTION,
+        WorkflowCurrentRecordKind::Lane,
+        lane_id,
+    )?;
+    let lane_owner_token = snapshot
+        .owner_token(&lane_key)?
+        .ok_or_else(|| LoomError::not_found("lane not found"))?;
+    let mut writes = vec![FacetWrite {
+        facet: FacetKind::Queue,
+        target: lane_key,
+        op: FacetWriteOp::Delete,
+        secondary_indexes: lane_workflow_secondary_index_deletes(&workspace_id, &prior_lane)?,
+        expected: Some(CompareToken(lane_owner_token)),
+        durability: None,
+        audit: Some(AuditIntent {
+            operation: "lanes.current.delete".to_string(),
+        }),
+        side_effects: FacetSideEffects::default(),
+    }];
+    if prior_lane.active_ticket_id.is_some() {
+        let active_key = workflow_current_key(
+            &workspace_id,
+            "assignments",
+            WorkflowCurrentRecordKind::ActiveAssignment,
+            lane_id,
+        )?;
+        writes.push(FacetWrite {
+            facet: FacetKind::Queue,
+            target: active_key.clone(),
+            op: FacetWriteOp::Delete,
+            secondary_indexes: Vec::new(),
+            expected: snapshot.owner_token(&active_key)?.map(CompareToken),
+            durability: None,
+            audit: Some(AuditIntent {
+                operation: "lanes.current.delete".to_string(),
+            }),
+            side_effects: FacetSideEffects::default(),
+        });
+    }
+    let expected_generation = snapshot.overlay_generation();
+    snapshot.release()?;
+    Ok((
+        WorkflowTransaction {
+            workspace,
+            actor: loom.effective_principal()?.unwrap_or(workspace),
+            expected_generation: Some(expected_generation),
+            writes,
+            prepared_operations: Vec::new(),
+            revision_metadata: Vec::new(),
+            delivery_intents: Vec::new(),
+            durability: OverlayDurabilityPolicy::Normal,
+            boundary: AtomicityBoundary::Single,
+            idempotency: None,
+            owner_state: loom_core::WorkflowOwnerState::default(),
+            post_commit_delta: None,
+        },
+        deleted_lane,
+    ))
+}
+
+/// A Lane consistency warning surfaced alongside a successfully decoded canonical Lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LaneDecodeDiagnostic {
+pub struct LaneDiagnostic {
     pub lane_id: String,
     pub error: String,
 }
@@ -1174,10 +1402,6 @@ pub fn get_lane(
     lane_id: &str,
 ) -> Result<Option<Lane>> {
     loom.authorize_domain(workspace, AclDomain::Tickets, AclRight::Read)?;
-    let Some(document) = document_get_text(loom, workspace, LANE_COLLECTION, lane_id)? else {
-        return Ok(None);
-    };
-    let base = Lane::from_json(&document.text)?;
     let snapshot = loom.open_mutable_overlay_read_snapshot(Some("lanes.get"))?;
     let current = read_workflow_current_record(
         &snapshot,
@@ -1185,79 +1409,30 @@ pub fn get_lane(
         "lanes",
         WorkflowCurrentRecordKind::Lane,
         lane_id,
-        |_| Ok(Some(base.encode()?)),
+        |_| Ok(None),
     )?;
     current
         .map(|record| Lane::decode(&record.payload))
         .transpose()
-        .map(|current| current.or(Some(base)))
 }
 
 pub fn list_lanes(loom: &Loom<FileStore>, workspace: WorkspaceId) -> Result<Vec<Lane>> {
-    Ok(list_lanes_with_diagnostics(loom, workspace)?.0)
-}
-
-/// Fail-soft lane listing. Authorization and collection access still fail hard, but a
-/// single malformed lane record no longer poisons the whole list: returns the lanes that decode
-/// plus a diagnostic for each record that does not. Callers that only want the healthy lanes use
-/// [`list_lanes`]; the MCP/CLI/dashboard readers use this to also surface the diagnostics.
-pub fn list_lanes_with_diagnostics(
-    loom: &Loom<FileStore>,
-    workspace: WorkspaceId,
-) -> Result<(Vec<Lane>, Vec<LaneDecodeDiagnostic>)> {
     loom.authorize_domain(workspace, AclDomain::Tickets, AclRight::Read)?;
-    let documents: Vec<(String, Vec<u8>)> = doc_list(loom, workspace, LANE_COLLECTION)?
-        .iter()
-        .map(|(id, bytes)| (id.to_string(), bytes.to_vec()))
-        .collect();
-    let (lanes, diagnostics) = partition_lane_documents(documents);
-    let workspace_id = workspace.to_string();
-    let snapshot = loom.open_mutable_overlay_read_snapshot(Some("lanes.list"))?;
-    let mut lanes = lanes
-        .into_iter()
-        .map(|lane| {
-            let current = read_workflow_current_record(
-                &snapshot,
-                &workspace_id,
-                "lanes",
-                WorkflowCurrentRecordKind::Lane,
-                &lane.lane_id,
-                |_| Ok(Some(lane.encode()?)),
-            )?;
-            current
-                .map(|record| Lane::decode(&record.payload))
-                .transpose()
-                .map(|current| current.unwrap_or(lane))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut lanes = list_workflow_current_records_by_prefix(
+        loom.store(),
+        &workspace.to_string(),
+        LANE_COLLECTION,
+        WorkflowCurrentRecordKind::Lane,
+    )?
+    .into_iter()
+    .map(|record| Lane::decode(&record.payload))
+    .collect::<Result<Vec<_>>>()?;
     lanes.sort_by(|left, right| {
         left.lane_key
             .cmp(&right.lane_key)
             .then_with(|| left.lane_id.cmp(&right.lane_id))
     });
-    Ok((lanes, diagnostics))
-}
-
-/// Decode lane documents into successfully-decoded lanes and per-record diagnostics without ever
-/// returning early on a bad record. Pure over owned documents so it is unit-testable without a store.
-fn partition_lane_documents(
-    documents: Vec<(String, Vec<u8>)>,
-) -> (Vec<Lane>, Vec<LaneDecodeDiagnostic>) {
-    let mut lanes = Vec::new();
-    let mut diagnostics = Vec::new();
-    for (lane_id, bytes) in documents {
-        let decoded = std::str::from_utf8(&bytes)
-            .map_err(|_| LoomError::invalid("lane document is not utf-8"))
-            .and_then(Lane::from_json);
-        match decoded {
-            Ok(lane) => lanes.push(lane),
-            Err(error) => diagnostics.push(LaneDecodeDiagnostic {
-                lane_id,
-                error: error.to_string(),
-            }),
-        }
-    }
-    (lanes, diagnostics)
+    Ok(lanes)
 }
 
 pub fn emit_lane_change_notification(
@@ -1442,6 +1617,53 @@ mod tests {
         .unwrap()
     }
 
+    fn second_lane() -> Lane {
+        Lane::new(LaneInput {
+            lane_id: "review-lane-b",
+            lane_key: "review-lane-b",
+            title: "Review lane B",
+            description: "Durable intention: receive transferred work.",
+            lane_kind: LaneKind::Assignment,
+            owner_principal: Some("user:reviewer-b"),
+            lane_status: LaneStatus::Working,
+            lane_tickets: &[LaneTicket {
+                ticket_id: "DEMO-201".to_string(),
+                order_key: "F".to_string(),
+            }],
+            active_ticket_id: Some("DEMO-201"),
+            status_report: "ready for transfer",
+            reviewer_feedback: "",
+            updated_at: 1,
+            updated_by: "user:reviewer-b",
+        })
+        .unwrap()
+    }
+
+    fn refresh_mutable_overlay(loom: &mut Loom<FileStore>) {
+        let entries = loom.store().mutable_overlay_entries().unwrap();
+        *loom.mutable_overlay_mut() = loom_core::MutableOverlay::import_entries(&entries).unwrap();
+    }
+
+    fn lane_current_key(workspace: WorkspaceId, lane_id: &str) -> loom_core::OverlayKey {
+        workflow_current_key(
+            &workspace.to_string(),
+            LANE_COLLECTION,
+            WorkflowCurrentRecordKind::Lane,
+            lane_id,
+        )
+        .unwrap()
+    }
+
+    fn active_assignment_key(workspace: WorkspaceId, lane_id: &str) -> loom_core::OverlayKey {
+        workflow_current_key(
+            &workspace.to_string(),
+            "assignments",
+            WorkflowCurrentRecordKind::ActiveAssignment,
+            lane_id,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn lane_records_validate_and_round_trip_through_persistence_boundary() {
         let workspace = workspace();
@@ -1472,6 +1694,805 @@ mod tests {
 
         let lanes = list_lanes(&loom, workspace).unwrap();
         assert_eq!(lanes, vec![lane]);
+    }
+
+    #[test]
+    fn canonical_update_of_absent_lane_fails() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = sample_lane();
+
+        let error = put_lane(&mut loom, workspace, lane.clone()).unwrap_err();
+        assert_eq!(error.code, Code::NotFound);
+        let helper_error = put_lane_current_record(&mut loom, workspace, &lane, None).unwrap_err();
+        assert_eq!(helper_error.code, Code::NotFound);
+        assert_eq!(get_lane(&loom, workspace, &lane.lane_id).unwrap(), None);
+    }
+
+    #[test]
+    fn canonical_update_over_tombstone_fails_and_preserves_tombstone() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = create_lane(&mut loom, workspace, sample_lane()).unwrap();
+        let key = lane_current_key(workspace, &lane.lane_id);
+        loom.store()
+            .put_mutable_overlay_tombstone(key.clone())
+            .unwrap();
+        let tombstone = loom
+            .store()
+            .mutable_overlay_current_entry(&key)
+            .unwrap()
+            .unwrap();
+        loom.mutable_overlay_mut()
+            .synchronize_current_entry(tombstone.clone())
+            .unwrap();
+        let generation = loom.store().mutable_overlay_generation().unwrap();
+
+        let mut updated = lane.clone();
+        updated.title = "must not recreate".to_string();
+        let error = put_lane(&mut loom, workspace, updated.clone()).unwrap_err();
+        assert_eq!(error.code, Code::NotFound);
+        let helper_error =
+            put_lane_current_record(&mut loom, workspace, &updated, Some(&lane)).unwrap_err();
+        assert_eq!(helper_error.code, Code::NotFound);
+
+        assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap(),
+            generation
+        );
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_current_entry(&key)
+                .unwrap()
+                .unwrap(),
+            tombstone
+        );
+        assert_eq!(get_lane(&loom, workspace, &lane.lane_id).unwrap(), None);
+    }
+
+    #[test]
+    fn canonical_failed_recreation_leaves_tombstone_and_generation_unchanged() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = create_lane(&mut loom, workspace, sample_lane()).unwrap();
+        let key = lane_current_key(workspace, &lane.lane_id);
+        loom.store()
+            .put_mutable_overlay_tombstone(key.clone())
+            .unwrap();
+        let tombstone = loom
+            .store()
+            .mutable_overlay_current_entry(&key)
+            .unwrap()
+            .unwrap();
+        loom.mutable_overlay_mut()
+            .synchronize_current_entry(tombstone.clone())
+            .unwrap();
+        let generation = loom.store().mutable_overlay_generation().unwrap();
+
+        let create_error = create_lane(&mut loom, workspace, lane.clone()).unwrap_err();
+        assert_eq!(create_error.code, Code::AlreadyExists);
+        let update_error = put_lane(&mut loom, workspace, lane.clone()).unwrap_err();
+        assert_eq!(update_error.code, Code::NotFound);
+
+        assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap(),
+            generation
+        );
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_current_entry(&key)
+                .unwrap()
+                .unwrap(),
+            tombstone
+        );
+    }
+
+    #[test]
+    fn canonical_create_and_update_do_not_fully_enumerate_mutable_overlay() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = sample_lane();
+        let full_enumerations = loom.store().mutable_overlay_enumeration_count();
+
+        create_lane(&mut loom, workspace, lane.clone()).unwrap();
+        assert_eq!(
+            loom.store().mutable_overlay_enumeration_count(),
+            full_enumerations
+        );
+
+        let mut updated = lane;
+        updated.title = "bounded update".to_string();
+        put_lane(&mut loom, workspace, updated).unwrap();
+        assert_eq!(
+            loom.store().mutable_overlay_enumeration_count(),
+            full_enumerations
+        );
+    }
+
+    #[test]
+    fn canonical_bounded_receipt_synchronization_keeps_reads_current() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let mut lane = create_lane(&mut loom, workspace, sample_lane()).unwrap();
+        assert_eq!(
+            get_lane(&loom, workspace, &lane.lane_id).unwrap(),
+            Some(lane.clone())
+        );
+
+        lane.title = "current after bounded sync".to_string();
+        put_lane(&mut loom, workspace, lane.clone()).unwrap();
+
+        assert_eq!(
+            get_lane(&loom, workspace, &lane.lane_id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "current after bounded sync"
+        );
+    }
+
+    #[test]
+    fn canonical_planned_create_conflicts_after_concurrent_create() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = sample_lane();
+        let planned =
+            prepare_lane_current_transaction(&loom, workspace, &lane, LaneMutationMode::Create)
+                .unwrap();
+
+        let mut concurrent = lane.clone();
+        concurrent.title = "concurrent create wins".to_string();
+        create_lane(&mut loom, workspace, concurrent.clone()).unwrap();
+        let generation = loom.store().mutable_overlay_generation().unwrap();
+
+        let error = loom
+            .store()
+            .commit_workflow_transaction(planned)
+            .unwrap_err();
+
+        assert_eq!(error.code, Code::Conflict);
+        assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap(),
+            generation
+        );
+        assert_eq!(
+            get_lane(&loom, workspace, &lane.lane_id).unwrap(),
+            Some(concurrent)
+        );
+    }
+
+    #[test]
+    fn canonical_planned_update_conflicts_after_concurrent_update() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = create_lane(&mut loom, workspace, sample_lane()).unwrap();
+        let mut planned_lane = lane.clone();
+        planned_lane.title = "stale planned update".to_string();
+        let planned = prepare_lane_current_transaction(
+            &loom,
+            workspace,
+            &planned_lane,
+            LaneMutationMode::Update,
+        )
+        .unwrap();
+
+        let mut concurrent = lane.clone();
+        concurrent.title = "concurrent update wins".to_string();
+        put_lane(&mut loom, workspace, concurrent.clone()).unwrap();
+        let generation = loom.store().mutable_overlay_generation().unwrap();
+
+        let error = loom
+            .store()
+            .commit_workflow_transaction(planned)
+            .unwrap_err();
+
+        assert_eq!(error.code, Code::Conflict);
+        assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap(),
+            generation
+        );
+        assert_eq!(
+            get_lane(&loom, workspace, &lane.lane_id).unwrap(),
+            Some(concurrent)
+        );
+    }
+
+    #[test]
+    fn canonical_planned_update_conflicts_after_concurrent_tombstone() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = create_lane(&mut loom, workspace, sample_lane()).unwrap();
+        let mut planned_lane = lane.clone();
+        planned_lane.title = "stale update after tombstone".to_string();
+        let planned = prepare_lane_current_transaction(
+            &loom,
+            workspace,
+            &planned_lane,
+            LaneMutationMode::Update,
+        )
+        .unwrap();
+        let key = lane_current_key(workspace, &lane.lane_id);
+        loom.store()
+            .put_mutable_overlay_tombstone(key.clone())
+            .unwrap();
+        let tombstone = loom
+            .store()
+            .mutable_overlay_current_entry(&key)
+            .unwrap()
+            .unwrap();
+        loom.mutable_overlay_mut()
+            .synchronize_current_entry(tombstone.clone())
+            .unwrap();
+        let generation = loom.store().mutable_overlay_generation().unwrap();
+
+        let error = loom
+            .store()
+            .commit_workflow_transaction(planned)
+            .unwrap_err();
+
+        assert_eq!(error.code, Code::Conflict);
+        assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap(),
+            generation
+        );
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_current_entry(&key)
+                .unwrap()
+                .unwrap(),
+            tombstone
+        );
+        assert_eq!(get_lane(&loom, workspace, &lane.lane_id).unwrap(), None);
+    }
+
+    #[test]
+    fn canonical_single_lane_mutation_publishes_current_active_indexes_and_audit_together() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = sample_lane();
+        let before_generation = loom.store().mutable_overlay_generation().unwrap();
+        let before_fsync = loom.store().group_commit_diagnostics().unwrap().fsync_count;
+
+        create_lane(&mut loom, workspace, lane.clone()).unwrap();
+
+        let after_generation = loom.store().mutable_overlay_generation().unwrap();
+        let after_fsync = loom.store().group_commit_diagnostics().unwrap().fsync_count;
+        assert_eq!(after_generation.as_u64(), before_generation.as_u64() + 1);
+        assert_eq!(after_fsync, before_fsync + 2);
+        assert!(
+            loom.store()
+                .mutable_overlay_current_entry(&lane_current_key(workspace, &lane.lane_id))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            loom.store()
+                .mutable_overlay_current_entry(&active_assignment_key(workspace, &lane.lane_id))
+                .unwrap()
+                .is_some()
+        );
+        let kind_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace.to_string(),
+            LANE_COLLECTION,
+            "lane-kind",
+            LaneKind::Assignment.as_str(),
+            &lane.lane_id,
+        )
+        .unwrap();
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&kind_index)
+                .unwrap()
+                .as_deref(),
+            Some(lane.lane_id.as_bytes())
+        );
+    }
+
+    #[test]
+    fn canonical_lane_compare_token_failure_preserves_existing_lane() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let original = create_lane(&mut loom, workspace, sample_lane()).unwrap();
+        let mut changed = original.clone();
+        changed.title = "stale compare title".to_string();
+        let workspace_id = workspace.to_string();
+        let record = workflow_lane_current_record(
+            &workspace_id,
+            &changed.lane_id,
+            changed.encode().unwrap(),
+            loom.store().reference_root(),
+        )
+        .unwrap();
+        let key = record.overlay_key().unwrap();
+        let generation = loom.store().mutable_overlay_generation().unwrap();
+        let stale = CompareToken(loom_core::OverlayOwnerToken::from_bytes([9; 32]));
+
+        let error = loom
+            .store()
+            .commit_workflow_transaction(WorkflowTransaction {
+                workspace,
+                actor: workspace,
+                expected_generation: Some(generation),
+                writes: vec![FacetWrite {
+                    facet: FacetKind::Queue,
+                    target: key,
+                    op: FacetWriteOp::Put {
+                        payload: record.encode().unwrap(),
+                    },
+                    secondary_indexes: Vec::new(),
+                    expected: Some(stale),
+                    durability: None,
+                    audit: Some(AuditIntent {
+                        operation: "lanes.current.put".to_string(),
+                    }),
+                    side_effects: FacetSideEffects::default(),
+                }],
+                prepared_operations: Vec::new(),
+                revision_metadata: Vec::new(),
+                delivery_intents: Vec::new(),
+                durability: OverlayDurabilityPolicy::Normal,
+                boundary: AtomicityBoundary::Single,
+                idempotency: None,
+                owner_state: loom_core::WorkflowOwnerState::default(),
+                post_commit_delta: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, Code::Conflict);
+        assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap(),
+            generation
+        );
+        assert_eq!(
+            get_lane(&loom, workspace, &original.lane_id).unwrap(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn canonical_lane_transaction_failure_rolls_back_prior_writes() {
+        let workspace = workspace();
+        let loom = loom();
+        let lane = sample_lane();
+        let workspace_id = workspace.to_string();
+        let lane_record = workflow_lane_current_record(
+            &workspace_id,
+            &lane.lane_id,
+            lane.encode().unwrap(),
+            loom.store().reference_root(),
+        )
+        .unwrap();
+        let active_record = workflow_active_assignment_record(
+            &workspace_id,
+            &lane.lane_id,
+            lane.active_ticket_id.as_ref().unwrap().as_bytes().to_vec(),
+            loom.store().reference_root(),
+        )
+        .unwrap();
+        let lane_key = lane_record.overlay_key().unwrap();
+        let active_key = active_record.overlay_key().unwrap();
+        let generation = loom.store().mutable_overlay_generation().unwrap();
+        let stale = CompareToken(loom_core::OverlayOwnerToken::from_bytes([7; 32]));
+        let kind_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace_id,
+            LANE_COLLECTION,
+            "lane-kind",
+            LaneKind::Assignment.as_str(),
+            &lane.lane_id,
+        )
+        .unwrap();
+
+        let error = loom
+            .store()
+            .commit_workflow_transaction(WorkflowTransaction {
+                workspace,
+                actor: workspace,
+                expected_generation: Some(generation),
+                writes: vec![
+                    FacetWrite {
+                        facet: FacetKind::Queue,
+                        target: lane_key.clone(),
+                        op: FacetWriteOp::Put {
+                            payload: lane_record.encode().unwrap(),
+                        },
+                        secondary_indexes: lane_workflow_secondary_index_updates(
+                            &workspace_id,
+                            None,
+                            &lane,
+                        )
+                        .unwrap(),
+                        expected: None,
+                        durability: None,
+                        audit: Some(AuditIntent {
+                            operation: "lanes.current.put".to_string(),
+                        }),
+                        side_effects: FacetSideEffects::default(),
+                    },
+                    FacetWrite {
+                        facet: FacetKind::Queue,
+                        target: active_key.clone(),
+                        op: FacetWriteOp::Put {
+                            payload: active_record.encode().unwrap(),
+                        },
+                        secondary_indexes: Vec::new(),
+                        expected: Some(stale),
+                        durability: None,
+                        audit: Some(AuditIntent {
+                            operation: "lanes.current.put".to_string(),
+                        }),
+                        side_effects: FacetSideEffects::default(),
+                    },
+                ],
+                prepared_operations: Vec::new(),
+                revision_metadata: Vec::new(),
+                delivery_intents: Vec::new(),
+                durability: OverlayDurabilityPolicy::Normal,
+                boundary: AtomicityBoundary::Single,
+                idempotency: None,
+                owner_state: loom_core::WorkflowOwnerState::default(),
+                post_commit_delta: None,
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, Code::Conflict);
+        assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap(),
+            generation
+        );
+        assert!(
+            loom.store()
+                .mutable_overlay_current_entry(&lane_key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            loom.store()
+                .mutable_overlay_current_entry(&active_key)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&kind_index)
+                .unwrap(),
+            None
+        );
+        assert_eq!(get_lane(&loom, workspace, &lane.lane_id).unwrap(), None);
+    }
+
+    #[test]
+    fn canonical_transfer_updates_both_lanes_and_indexes_atomically() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let source = create_lane(&mut loom, workspace, sample_lane()).unwrap();
+        let target = create_lane(&mut loom, workspace, second_lane()).unwrap();
+        let generation = loom.store().mutable_overlay_generation().unwrap();
+        let old_source_ticket_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace.to_string(),
+            LANE_COLLECTION,
+            "lane-ticket",
+            "DEMO-102",
+            &source.lane_id,
+        )
+        .unwrap();
+        let new_target_ticket_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace.to_string(),
+            LANE_COLLECTION,
+            "lane-ticket",
+            "DEMO-102",
+            &target.lane_id,
+        )
+        .unwrap();
+
+        let (source_after, target_after) = transfer_assignment_lane_ticket(
+            &mut loom,
+            workspace,
+            &source.lane_id,
+            &target.lane_id,
+            "DEMO-102",
+            2,
+            "user:mover",
+        )
+        .unwrap();
+
+        assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap().as_u64(),
+            generation.as_u64() + 4
+        );
+        assert!(
+            !source_after
+                .lane_tickets
+                .iter()
+                .any(|ticket| ticket.ticket_id == "DEMO-102")
+        );
+        assert!(
+            target_after
+                .lane_tickets
+                .iter()
+                .any(|ticket| ticket.ticket_id == "DEMO-102")
+        );
+        assert_eq!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&old_source_ticket_index)
+                .unwrap(),
+            None
+        );
+        assert!(
+            loom.store()
+                .mutable_overlay_secondary_index_value(&new_target_ticket_index)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            get_lane(&loom, workspace, &source.lane_id).unwrap(),
+            Some(source_after)
+        );
+        assert_eq!(
+            get_lane(&loom, workspace, &target.lane_id).unwrap(),
+            Some(target_after)
+        );
+    }
+
+    #[test]
+    fn canonical_delete_tombstones_lane_and_removes_discoverability_indexes() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let mut lane = create_lane(&mut loom, workspace, sample_lane()).unwrap();
+        lane.lane_status = LaneStatus::Closed.as_str().to_string();
+        lane = put_lane(&mut loom, workspace, lane).unwrap();
+        let lane_key = lane_current_key(workspace, &lane.lane_id);
+        let active_key = active_assignment_key(workspace, &lane.lane_id);
+        let kind_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace.to_string(),
+            LANE_COLLECTION,
+            "lane-kind",
+            LaneKind::Assignment.as_str(),
+            &lane.lane_id,
+        )
+        .unwrap();
+        let owner_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace.to_string(),
+            LANE_COLLECTION,
+            "owner-principal",
+            lane.owner_principal.as_ref().unwrap(),
+            &lane.lane_id,
+        )
+        .unwrap();
+        let ticket_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace.to_string(),
+            LANE_COLLECTION,
+            "lane-ticket",
+            "DEMO-102",
+            &lane.lane_id,
+        )
+        .unwrap();
+
+        let deleted = delete_lane(&mut loom, workspace, &lane.lane_id, 3, "user:deleter").unwrap();
+
+        assert_eq!(deleted.updated_at, 3);
+        assert_eq!(get_lane(&loom, workspace, &lane.lane_id).unwrap(), None);
+        assert!(matches!(
+            loom.store()
+                .mutable_overlay_current_entry(&lane_key)
+                .unwrap()
+                .unwrap()
+                .kind,
+            loom_core::OverlayEntryKind::Tombstone
+        ));
+        assert!(matches!(
+            loom.store()
+                .mutable_overlay_current_entry(&active_key)
+                .unwrap()
+                .unwrap()
+                .kind,
+            loom_core::OverlayEntryKind::Tombstone
+        ));
+        for index in [kind_index, owner_index, ticket_index] {
+            assert_eq!(
+                loom.store()
+                    .mutable_overlay_secondary_index_value(&index)
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_planned_delete_conflicts_after_concurrent_update() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let mut lane = create_lane(&mut loom, workspace, sample_lane()).unwrap();
+        lane.lane_status = LaneStatus::Closed.as_str().to_string();
+        lane = put_lane(&mut loom, workspace, lane).unwrap();
+        let (planned_delete, _) =
+            prepare_lane_delete_transaction(&loom, workspace, &lane.lane_id, 3, "user:deleter")
+                .unwrap();
+
+        let mut concurrent = lane.clone();
+        concurrent.lane_status = LaneStatus::Working.as_str().to_string();
+        concurrent.owner_principal = Some("user:reviewer-b".to_string());
+        concurrent.updated_at = 4;
+        concurrent.updated_by = "user:updater".to_string();
+        concurrent = put_lane(&mut loom, workspace, concurrent).unwrap();
+        let generation = loom.store().mutable_overlay_generation().unwrap();
+        let lane_key = lane_current_key(workspace, &lane.lane_id);
+        let active_key = active_assignment_key(workspace, &lane.lane_id);
+        let kind_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace.to_string(),
+            LANE_COLLECTION,
+            "lane-kind",
+            LaneKind::Assignment.as_str(),
+            &lane.lane_id,
+        )
+        .unwrap();
+        let new_owner_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace.to_string(),
+            LANE_COLLECTION,
+            "owner-principal",
+            "user:reviewer-b",
+            &lane.lane_id,
+        )
+        .unwrap();
+        let ticket_index = loom_tickets::workflow_current_secondary_index_key(
+            &workspace.to_string(),
+            LANE_COLLECTION,
+            "lane-ticket",
+            "DEMO-102",
+            &lane.lane_id,
+        )
+        .unwrap();
+
+        let error = loom
+            .store()
+            .commit_workflow_transaction(planned_delete)
+            .unwrap_err();
+
+        assert_eq!(error.code, Code::Conflict);
+        assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap(),
+            generation
+        );
+        assert!(matches!(
+            loom.store()
+                .mutable_overlay_current_entry(&lane_key)
+                .unwrap()
+                .unwrap()
+                .kind,
+            loom_core::OverlayEntryKind::Value { .. }
+        ));
+        assert!(matches!(
+            loom.store()
+                .mutable_overlay_current_entry(&active_key)
+                .unwrap()
+                .unwrap()
+                .kind,
+            loom_core::OverlayEntryKind::Value { .. }
+        ));
+        for index in [kind_index, new_owner_index, ticket_index] {
+            assert!(
+                loom.store()
+                    .mutable_overlay_secondary_index_value(&index)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            get_lane(&loom, workspace, &lane.lane_id).unwrap(),
+            Some(concurrent)
+        );
+    }
+
+    #[test]
+    fn canonical_lane_is_visible() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = sample_lane();
+
+        create_lane(&mut loom, workspace, lane.clone()).unwrap();
+
+        assert_eq!(
+            get_lane(&loom, workspace, "review-lane-a").unwrap(),
+            Some(lane.clone())
+        );
+        assert_eq!(list_lanes(&loom, workspace).unwrap(), vec![lane]);
+    }
+
+    #[test]
+    fn document_collection_named_lanes_cannot_affect_canonical_lane_reads() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = sample_lane();
+        create_lane(&mut loom, workspace, lane.clone()).unwrap();
+        loom_core::document::document_put_text(
+            &mut loom,
+            workspace,
+            LANE_COLLECTION,
+            &lane.lane_id,
+            "{ not a lane }",
+            None,
+        )
+        .unwrap();
+        loom_core::document::document_put_text(
+            &mut loom,
+            workspace,
+            LANE_COLLECTION,
+            "document-only-lane",
+            r#"{"lane_id":"document-only-lane"}"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_lane(&loom, workspace, &lane.lane_id).unwrap(),
+            Some(lane.clone())
+        );
+        assert_eq!(
+            get_lane(&loom, workspace, "document-only-lane").unwrap(),
+            None
+        );
+        assert_eq!(list_lanes(&loom, workspace).unwrap(), vec![lane]);
+    }
+
+    #[test]
+    fn canonical_lane_corruption_fails_closed() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = sample_lane();
+        let record = workflow_lane_current_record(
+            &workspace.to_string(),
+            &lane.lane_id,
+            b"not canonical lane cbor".to_vec(),
+            None,
+        )
+        .unwrap();
+        loom.store()
+            .put_mutable_overlay_value(record.overlay_key().unwrap(), record.encode().unwrap())
+            .unwrap();
+        refresh_mutable_overlay(&mut loom);
+
+        assert!(get_lane(&loom, workspace, "review-lane-a").is_err());
+        assert!(list_lanes(&loom, workspace).is_err());
+    }
+
+    #[test]
+    fn lane_list_uses_bounded_workflow_current_prefix_enumeration() {
+        let workspace = workspace();
+        let mut loom = loom();
+        let lane = sample_lane();
+        create_lane(&mut loom, workspace, lane.clone()).unwrap();
+        let workspace_id = workspace.to_string();
+        for index in 0..200 {
+            let record = loom_tickets::WorkflowCurrentRecord::new(
+                &workspace_id,
+                "tickets",
+                WorkflowCurrentRecordKind::Ticket,
+                format!("ticket-{index}"),
+                b"not a lane".to_vec(),
+                None,
+            )
+            .unwrap();
+            loom.store()
+                .put_mutable_overlay_value(record.overlay_key().unwrap(), record.encode().unwrap())
+                .unwrap();
+        }
+        let full_enumerations = loom.store().mutable_overlay_enumeration_count();
+        let prefix_enumerations = loom.store().mutable_overlay_prefix_enumeration_count();
+        let prefix_entries = loom.store().mutable_overlay_prefix_entries_returned_count();
+
+        assert_eq!(list_lanes(&loom, workspace).unwrap(), vec![lane]);
+
+        assert_eq!(
+            loom.store().mutable_overlay_enumeration_count(),
+            full_enumerations
+        );
+        assert_eq!(
+            loom.store().mutable_overlay_prefix_enumeration_count(),
+            prefix_enumerations + 1
+        );
+        assert_eq!(
+            loom.store().mutable_overlay_prefix_entries_returned_count(),
+            prefix_entries + 1
+        );
     }
 
     #[test]
@@ -1559,28 +2580,6 @@ mod tests {
         assert_eq!(Lane::from_json(&json).unwrap(), lane);
         let cbor = lane.encode().unwrap();
         assert_eq!(Lane::decode(&cbor).unwrap(), lane);
-    }
-
-    #[test]
-    fn list_partition_is_fail_soft_with_per_record_diagnostics() {
-        // One valid lane document plus two undecodable ones (malformed JSON and non-UTF-8) must
-        // yield the valid lane and one diagnostic per bad record, never an all-or-nothing failure.
-        let good = sample_lane();
-        let good_json = good.to_json().unwrap();
-        let documents = vec![
-            (good.lane_id.clone(), good_json.into_bytes()),
-            (
-                "lane-broken".to_string(),
-                b"{ this is not valid lane json".to_vec(),
-            ),
-            ("lane-nonutf8".to_string(), vec![0xff, 0xfe, 0xfd]),
-        ];
-        let (lanes, diagnostics) = partition_lane_documents(documents);
-        assert_eq!(lanes.len(), 1);
-        assert_eq!(lanes[0].lane_id, good.lane_id);
-        let bad_ids: Vec<&str> = diagnostics.iter().map(|d| d.lane_id.as_str()).collect();
-        assert_eq!(bad_ids, vec!["lane-broken", "lane-nonutf8"]);
-        assert!(diagnostics.iter().all(|d| !d.error.is_empty()));
     }
 
     #[test]
@@ -1930,6 +2929,18 @@ mod tests {
         assert_eq!(
             LaneTicketPlacement::parse("FIRST", None).unwrap(),
             LaneTicketPlacement::First
+        );
+        assert_eq!(
+            LaneTicketPlacement::parse("FIRST", Some("A"))
+                .unwrap_err()
+                .code,
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            LaneTicketPlacement::parse("LAST", Some("A"))
+                .unwrap_err()
+                .code,
+            Code::InvalidArgument
         );
         assert_eq!(
             LaneTicketPlacement::parse("BEFORE", Some("A")).unwrap(),

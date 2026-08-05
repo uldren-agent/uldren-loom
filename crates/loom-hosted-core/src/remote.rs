@@ -382,6 +382,16 @@ struct SessionEntry {
     /// store write lock is not held between calls and the SQL path family can reopen by path.
     writer: Option<LoomSession>,
     writer_refs: u64,
+    current_resume_secret: [u8; 32],
+    pending_resume_credential: Option<PendingSessionCredential>,
+    credential_principal: Option<[u8; 16]>,
+    lock_owner: loom_core::LockOwner,
+}
+
+#[derive(Clone, Copy)]
+struct PendingSessionCredential {
+    secret: [u8; 32],
+    lease_expires_ms: u64,
 }
 
 struct ConnectionEntry {
@@ -514,6 +524,7 @@ pub trait McpToolExecutor: Send + Sync {
 
 pub struct RemoteRuntime {
     client: LocalLoomClient,
+    locks_authority: Arc<loom_client::locks::InProcessLocksAuthority>,
     config: RemoteServerConfig,
     /// Optional server-side MCP tool executor. When unset, `Mcp.call_tool` requests are rejected with
     /// `Code::Unsupported`.
@@ -534,6 +545,10 @@ pub struct RemoteRuntime {
     /// key)` (the session encodes the endpoint + principal). Bounded per session and dropped on session
     /// close/expiry.
     idempotency: Mutex<HashMap<IdemKey, IdemEntry>>,
+    store_identity: String,
+    coordinator_identity: [u8; 32],
+    credential_signing_key: [u8; 32],
+    authority_epoch: u64,
 }
 
 /// Idempotency dedup key: `(session, interface, method, idempotency_key)`.
@@ -610,11 +625,30 @@ impl RemoteRuntime {
     /// Returns [`LoomError`] for invalid configuration or a store that cannot be opened.
     pub fn start(path: impl Into<PathBuf>, config: RemoteServerConfig) -> Result<Self, LoomError> {
         config.validate()?;
-        let client = LocalLoomClient::new(path);
+        let path = path.into();
+        let locks_authority = Arc::new(loom_client::locks::InProcessLocksAuthority::default());
+        let client_locks: Arc<dyn loom_client::locks::LocksAuthority> = locks_authority.clone();
+        let client = LocalLoomClient::with_locks_authority(&path, client_locks);
         let probe = client.open()?;
         client.close(&probe);
+        let mut coordinator_identity = [0u8; 32];
+        getrandom::fill(&mut coordinator_identity).map_err(|error| {
+            LoomError::new(
+                Code::Internal,
+                format!("coordinator identity randomness: {error}"),
+            )
+        })?;
+        let mut credential_signing_key = [0u8; 32];
+        getrandom::fill(&mut credential_signing_key).map_err(|error| {
+            LoomError::new(
+                Code::Internal,
+                format!("session credential randomness: {error}"),
+            )
+        })?;
+        let store_identity = loom_store::daemon::paths(&path)?.store_id;
         Ok(Self {
             client,
+            locks_authority,
             config,
             mcp_executor: None,
             sessions: Mutex::new(HashMap::new()),
@@ -627,6 +661,10 @@ impl RemoteRuntime {
             write_lock: Mutex::new(()),
             draining: AtomicBool::new(false),
             idempotency: Mutex::new(HashMap::new()),
+            store_identity,
+            coordinator_identity,
+            credential_signing_key,
+            authority_epoch: 1,
         })
     }
 
@@ -733,7 +771,13 @@ impl RemoteRuntime {
 
     /// The number of live protocol sessions.
     pub fn session_count(&self) -> usize {
-        self.sessions.lock().expect("session registry").len()
+        self.prune_expired_sessions(now_ms());
+        self.sessions
+            .lock()
+            .expect("session registry")
+            .values()
+            .filter(|entry| entry.lease_expires_ms > now_ms())
+            .count()
     }
 
     /// Whether the runtime is draining and rejecting new sessions.
@@ -762,6 +806,10 @@ impl RemoteRuntime {
         }
         let mut sessions = self.sessions.lock().expect("session registry");
         for (_, entry) in sessions.drain() {
+            let _ = loom_client::locks::LocksAuthority::close_owner(
+                self.locks_authority.as_ref(),
+                &entry.lock_owner,
+            );
             if let Some(writer) = entry.writer {
                 self.client.close(&writer);
             }
@@ -824,6 +872,7 @@ impl RemoteRuntime {
         connection: u64,
         auth: RemoteAuth,
     ) -> Result<RemoteSession, LoomError> {
+        self.prune_expired_sessions(now_ms());
         if self.is_draining() {
             return Err(LoomError::new(
                 Code::Unsupported,
@@ -855,6 +904,24 @@ impl RemoteRuntime {
         };
         let id = self.mint_id();
         let lease_expires_ms = now_ms().saturating_add(self.config.session_lease_ms);
+        let mut resume_secret = [0u8; 32];
+        getrandom::fill(&mut resume_secret).map_err(|error| {
+            LoomError::new(
+                Code::Internal,
+                format!("session credential randomness: {error}"),
+            )
+        })?;
+        let credential_principal = match &auth {
+            RemoteAuth::Unauthenticated => None,
+            RemoteAuth::Passphrase { principal, .. } => Some(*principal.as_bytes()),
+        };
+        let logical_session = format!("remote-logical-{id}");
+        let lock_owner = loom_core::LockOwner {
+            principal: principal
+                .clone()
+                .unwrap_or_else(|| "unauthenticated-root".to_string()),
+            session: logical_session,
+        };
         self.sessions.lock().expect("session registry").insert(
             id,
             SessionEntry {
@@ -864,12 +931,228 @@ impl RemoteRuntime {
                 lease_expires_ms,
                 writer: None,
                 writer_refs: 0,
+                current_resume_secret: resume_secret,
+                pending_resume_credential: None,
+                credential_principal,
+                lock_owner,
             },
         );
         Ok(RemoteSession {
             id: id.to_be_bytes().to_vec(),
             lease_expires_ms,
         })
+    }
+
+    /// Open a session and issue its resumable coordinator credential.
+    pub fn create_logical_session(
+        &self,
+        connection: u64,
+        auth: RemoteAuth,
+    ) -> Result<(RemoteSession, Vec<u8>), LoomError> {
+        let session = self.open_session(connection, auth)?;
+        let key = session_key(&session.id)?;
+        let sessions = self.sessions.lock().expect("session registry");
+        let entry = sessions
+            .get(&key)
+            .ok_or_else(|| LoomError::new(Code::Internal, "logical session was not registered"))?;
+        let credential = self.seal_session_credential(
+            &session.id,
+            entry.current_resume_secret,
+            entry.credential_principal,
+            entry.lease_expires_ms,
+        )?;
+        Ok((session, credential))
+    }
+
+    /// Resume a logical session and rotate its credential.
+    pub fn resume_logical_session(
+        &self,
+        connection: u64,
+        auth: RemoteAuth,
+        credential: &[u8],
+    ) -> Result<(RemoteSession, Vec<u8>), LoomError> {
+        self.prune_expired_sessions(now_ms());
+        let claims = self.validated_credential(&auth, credential)?;
+        let key = session_key(&claims.session_id)?;
+        let mut sessions = self.sessions.lock().expect("session registry");
+        let entry = sessions
+            .get_mut(&key)
+            .ok_or_else(|| LoomError::new(Code::PermissionDenied, "unknown logical session"))?;
+        if entry.lease_expires_ms <= now_ms() {
+            return Err(LoomError::new(
+                Code::PermissionDenied,
+                "expired logical session",
+            ));
+        }
+        let presented_current = entry.current_resume_secret == claims.resume_secret;
+        let presented_pending = entry
+            .pending_resume_credential
+            .filter(|pending| pending.lease_expires_ms == claims.lease_expires_ms)
+            .is_some_and(|pending| pending.secret == claims.resume_secret);
+        if (!presented_current && !presented_pending)
+            || entry.credential_principal != claims.principal
+        {
+            return Err(LoomError::new(
+                Code::PermissionDenied,
+                "stale session credential",
+            ));
+        }
+        let existing_pending = entry.pending_resume_credential;
+        let pending = if presented_current {
+            match existing_pending {
+                Some(pending) => pending,
+                None => self.mint_pending_session_credential()?,
+            }
+        } else {
+            self.mint_pending_session_credential()?
+        };
+        let rotated = self.seal_session_credential(
+            &claims.session_id,
+            pending.secret,
+            claims.principal,
+            pending.lease_expires_ms,
+        )?;
+        if presented_pending {
+            entry.current_resume_secret = claims.resume_secret;
+            entry.pending_resume_credential = Some(pending);
+            entry.lease_expires_ms = pending.lease_expires_ms;
+        } else if existing_pending.is_none() {
+            entry.pending_resume_credential = Some(pending);
+            entry.lease_expires_ms = pending.lease_expires_ms;
+        }
+        entry.connection = connection;
+        Ok((
+            RemoteSession {
+                id: claims.session_id,
+                lease_expires_ms: pending.lease_expires_ms,
+            },
+            rotated,
+        ))
+    }
+
+    fn mint_pending_session_credential(&self) -> Result<PendingSessionCredential, LoomError> {
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).map_err(|error| {
+            LoomError::new(
+                Code::Internal,
+                format!("session credential randomness: {error}"),
+            )
+        })?;
+        Ok(PendingSessionCredential {
+            secret,
+            lease_expires_ms: now_ms().saturating_add(self.config.session_lease_ms),
+        })
+    }
+
+    /// Authenticate and explicitly close a logical session.
+    pub fn close_logical_session(
+        &self,
+        auth: RemoteAuth,
+        credential: &[u8],
+    ) -> Result<Vec<u8>, LoomError> {
+        self.prune_expired_sessions(now_ms());
+        let claims = self.validated_credential(&auth, credential)?;
+        let key = session_key(&claims.session_id)?;
+        {
+            let sessions = self.sessions.lock().expect("session registry");
+            let entry = sessions
+                .get(&key)
+                .ok_or_else(|| LoomError::new(Code::PermissionDenied, "unknown logical session"))?;
+            if entry.lease_expires_ms <= now_ms() {
+                return Err(LoomError::new(
+                    Code::PermissionDenied,
+                    "expired logical session",
+                ));
+            }
+            if entry.current_resume_secret != claims.resume_secret
+                && !entry
+                    .pending_resume_credential
+                    .filter(|pending| pending.lease_expires_ms == claims.lease_expires_ms)
+                    .is_some_and(|pending| pending.secret == claims.resume_secret)
+            {
+                return Err(LoomError::new(
+                    Code::PermissionDenied,
+                    "stale session credential",
+                ));
+            }
+        }
+        if !self.close_session(&claims.session_id) {
+            return Err(LoomError::new(
+                Code::PermissionDenied,
+                "unknown logical session",
+            ));
+        }
+        Ok(claims.session_id)
+    }
+
+    fn seal_session_credential(
+        &self,
+        session_id: &[u8],
+        resume_secret: [u8; 32],
+        principal: Option<[u8; 16]>,
+        lease_expires_ms: u64,
+    ) -> Result<Vec<u8>, LoomError> {
+        loom_remote_protocol::session::seal_credential(
+            &loom_remote_protocol::session::SessionCredentialClaims {
+                session_id: session_id.to_vec(),
+                resume_secret,
+                principal,
+                store_identity: self.store_identity.clone(),
+                coordinator_identity: self.coordinator_identity,
+                authority_epoch: self.authority_epoch,
+                protocol_profile: loom_remote_protocol::envelope::PROTOCOL_ID.to_string(),
+                lease_expires_ms,
+            },
+            &self.credential_signing_key,
+        )
+        .map_err(|error| LoomError::new(Code::Internal, format!("session credential: {error}")))
+    }
+
+    fn validated_credential(
+        &self,
+        auth: &RemoteAuth,
+        credential: &[u8],
+    ) -> Result<loom_remote_protocol::session::SessionCredentialClaims, LoomError> {
+        let claims = loom_remote_protocol::session::open_credential(
+            credential,
+            &self.credential_signing_key,
+        )
+        .map_err(|_| LoomError::new(Code::PermissionDenied, "invalid session credential"))?;
+        if claims.store_identity != self.store_identity
+            || claims.coordinator_identity != self.coordinator_identity
+            || claims.authority_epoch != self.authority_epoch
+            || claims.protocol_profile != loom_remote_protocol::envelope::PROTOCOL_ID
+            || claims.lease_expires_ms <= now_ms()
+        {
+            return Err(LoomError::new(
+                Code::PermissionDenied,
+                "session credential binding mismatch or expiry",
+            ));
+        }
+        match (auth, claims.principal) {
+            (RemoteAuth::Unauthenticated, None) => {}
+            (
+                RemoteAuth::Passphrase {
+                    principal,
+                    passphrase,
+                },
+                Some(expected),
+            ) if principal.as_bytes() == &expected => {
+                let probe = self.client.open()?;
+                let result = self
+                    .client
+                    .authenticate_passphrase(&probe, *principal, passphrase);
+                self.client.close(&probe);
+                result?;
+            }
+            _ => {
+                return Err(LoomError::new(
+                    Code::PermissionDenied,
+                    "session credential principal mismatch",
+                ));
+            }
+        }
+        Ok(claims)
     }
 
     /// Renew a session lease, returning the new expiry. An expired or unknown session is not renewable.
@@ -879,6 +1162,13 @@ impl RemoteRuntime {
     /// already expired lease.
     pub fn renew_session(&self, session_id: &[u8], at_ms: u64) -> Result<u64, LoomError> {
         let key = session_key(session_id)?;
+        let expired = self.prune_expired_session_keys(at_ms);
+        if expired.contains(&key) {
+            return Err(LoomError::new(
+                Code::LockLeaseExpired,
+                "session lease already expired",
+            ));
+        }
         let mut sessions = self.sessions.lock().expect("session registry");
         let entry = sessions
             .get_mut(&key)
@@ -896,28 +1186,26 @@ impl RemoteRuntime {
     /// Sweep expired sessions at `at_ms`, freeing their handles and closing their engine sessions.
     /// Returns the number expired.
     pub fn expire_sessions(&self, at_ms: u64) -> usize {
-        let expired: Vec<(u64, Option<LoomSession>)> = {
-            let mut sessions = self.sessions.lock().expect("session registry");
-            let keys: Vec<u64> = sessions
+        self.prune_expired_session_keys(at_ms).len()
+    }
+
+    fn prune_expired_sessions(&self, at_ms: u64) {
+        self.prune_expired_session_keys(at_ms);
+    }
+
+    fn prune_expired_session_keys(&self, at_ms: u64) -> Vec<u64> {
+        let expired: Vec<u64> = {
+            let sessions = self.sessions.lock().expect("session registry");
+            sessions
                 .iter()
                 .filter(|(_, s)| s.lease_expires_ms <= at_ms)
                 .map(|(id, _)| *id)
-                .collect();
-            keys.into_iter()
-                .filter_map(|id| sessions.remove(&id).map(|entry| (id, entry.writer)))
                 .collect()
         };
-        for (key, writer) in &expired {
-            // Free registered handles while the engine writer is still open (file handles need it), then
-            // release the writer if one was held.
-            self.close_session_handles(*key);
-            self.close_session_runtime_resources(*key);
-            self.forget_idempotency(*key);
-            if let Some(writer) = writer {
-                self.client.close(writer);
-            }
-        }
-        expired.len()
+        expired
+            .into_iter()
+            .filter(|key| self.close_session(&key.to_be_bytes()))
+            .collect()
     }
 
     /// Close a session explicitly, freeing its registered handles first, returning whether one was open.
@@ -925,10 +1213,21 @@ impl RemoteRuntime {
         let Ok(key) = session_key(session_id) else {
             return false;
         };
-        let entry = {
-            let mut sessions = self.sessions.lock().expect("session registry");
-            sessions.remove(&key)
+        let owner = self
+            .sessions
+            .lock()
+            .expect("session registry")
+            .get(&key)
+            .map(|entry| entry.lock_owner.clone());
+        let Some(owner) = owner else {
+            return false;
         };
+        if loom_client::locks::LocksAuthority::close_owner(self.locks_authority.as_ref(), &owner)
+            .is_err()
+        {
+            return false;
+        }
+        let entry = self.sessions.lock().expect("session registry").remove(&key);
         match entry {
             Some(entry) => {
                 // Free registered handles while the writer is still open (file handles need it), then
@@ -947,21 +1246,25 @@ impl RemoteRuntime {
 
     /// The authenticated principal bound to a session, if any.
     pub fn session_principal(&self, session_id: &[u8]) -> Option<String> {
+        self.prune_expired_sessions(now_ms());
         let key = session_key(session_id).ok()?;
         self.sessions
             .lock()
             .expect("session registry")
             .get(&key)
+            .filter(|entry| entry.lease_expires_ms > now_ms())
             .and_then(|entry| entry.principal.clone())
     }
 
     /// The connection a session was opened on, if it is live.
     pub fn session_connection(&self, session_id: &[u8]) -> Option<u64> {
+        self.prune_expired_sessions(now_ms());
         let key = session_key(session_id).ok()?;
         self.sessions
             .lock()
             .expect("session registry")
             .get(&key)
+            .filter(|entry| entry.lease_expires_ms > now_ms())
             .map(|entry| entry.connection)
     }
 
@@ -998,6 +1301,7 @@ impl RemoteRuntime {
     /// `NOT_FOUND`, and `Daemon` is the only generated interface that answers `UNSUPPORTED`. Engine errors
     /// ride the response error envelope.
     pub fn dispatch(&self, request: &Request) -> Response {
+        self.prune_expired_sessions(now_ms());
         let request_id = request.request_id.clone();
         let session_id = request.session_id.clone();
         let reply_ok = |value: Value| Response::ok(request_id.clone(), session_id.clone(), value);
@@ -1053,10 +1357,7 @@ impl RemoteRuntime {
             Err(err) => return reply_err(&err),
         };
         if !self.session_exists(session_key) {
-            return reply_err(&LoomError::new(
-                Code::NotFound,
-                "unknown or expired session",
-            ));
+            return reply_err(&LoomError::new(Code::NotFound, "unknown session handle"));
         }
         let connection = self.session_connection(session_bytes).unwrap_or_default();
         // Validate consumed sub-handles (SqlSession/SqlBatch/RowIter/Task/File) before the engine call.
@@ -1173,6 +1474,7 @@ impl RemoteRuntime {
     /// is installed or the executor declines the tool; the runtime never reconstructs tool semantics from
     /// low-level primitives.
     fn dispatch_mcp_tool(&self, request: &Request) -> Response {
+        self.prune_expired_sessions(now_ms());
         let request_id = request.request_id.clone();
         let session_id = request.session_id.clone();
         let reply_ok = |value: Value| Response::ok(request_id.clone(), session_id.clone(), value);
@@ -1210,10 +1512,7 @@ impl RemoteRuntime {
             Err(err) => return reply_err(&err),
         };
         if !self.session_exists(session_key) {
-            return reply_err(&LoomError::new(
-                Code::NotFound,
-                "unknown or expired session",
-            ));
+            return reply_err(&LoomError::new(Code::NotFound, "unknown session handle"));
         }
         let Some(executor) = self.mcp_executor.clone() else {
             return reply_err(&LoomError::new(
@@ -1263,10 +1562,12 @@ impl RemoteRuntime {
 
     /// Whether a protocol session is live.
     fn session_exists(&self, session_key: u64) -> bool {
+        self.prune_expired_sessions(now_ms());
         self.sessions
             .lock()
             .expect("session registry")
-            .contains_key(&session_key)
+            .get(&session_key)
+            .is_some_and(|entry| entry.lease_expires_ms > now_ms())
     }
 
     /// Resolve the engine session a `(interface, method)` call runs against, honoring the store's
@@ -1330,23 +1631,29 @@ impl RemoteRuntime {
     /// session must be closed by the caller (via [`RemoteRuntime::release_engine`]). Caller holds
     /// `write_lock`.
     fn open_engine(&self, session_key: u64) -> Result<LoomSession, LoomError> {
-        let auth = {
+        let (auth, logical_session) = {
             let sessions = self.sessions.lock().expect("session registry");
-            sessions
+            let entry = sessions
                 .get(&session_key)
-                .ok_or_else(|| LoomError::new(Code::NotFound, "unknown or expired session"))?
-                .auth
-                .clone()
+                .ok_or_else(|| LoomError::new(Code::NotFound, "unknown session handle"))?;
+            (entry.auth.clone(), entry.lock_owner.session.clone())
         };
         let engine = self.client.open()?;
-        if let RemoteAuth::Passphrase {
-            principal,
-            passphrase,
-        } = &auth
-            && let Err(err) = self
+        let bind = match &auth {
+            RemoteAuth::Passphrase {
+                principal,
+                passphrase,
+            } => self.client.authenticate_passphrase_for_logical_session(
+                &engine,
+                *principal,
+                passphrase,
+                logical_session,
+            ),
+            RemoteAuth::Unauthenticated => self
                 .client
-                .authenticate_passphrase(&engine, *principal, passphrase)
-        {
+                .bind_clear_logical_lock_session(&engine, logical_session),
+        };
+        if let Err(err) = bind {
             self.client.close(&engine);
             return Err(err);
         }
@@ -1369,7 +1676,7 @@ impl RemoteRuntime {
             let mut sessions = self.sessions.lock().expect("session registry");
             let entry = sessions
                 .get_mut(&session_key)
-                .ok_or_else(|| LoomError::new(Code::NotFound, "unknown or expired session"))?;
+                .ok_or_else(|| LoomError::new(Code::NotFound, "unknown session handle"))?;
             entry.writer_refs = entry.writer_refs.saturating_add(1);
             return Ok(entry.writer.clone().expect("writer present"));
         }
@@ -1384,7 +1691,7 @@ impl RemoteRuntime {
             None => {
                 drop(sessions);
                 self.client.close(&engine);
-                Err(LoomError::new(Code::NotFound, "unknown or expired session"))
+                Err(LoomError::new(Code::NotFound, "unknown session handle"))
             }
         }
     }
@@ -1418,13 +1725,8 @@ impl RemoteRuntime {
             .as_ref()
             .ok_or_else(|| LoomError::new(Code::PermissionDenied, "method requires a session"))?;
         let key = session_key(bytes)?;
-        if !self
-            .sessions
-            .lock()
-            .expect("session registry")
-            .contains_key(&key)
-        {
-            return Err(LoomError::new(Code::NotFound, "unknown or expired session"));
+        if !self.session_exists(key) {
+            return Err(LoomError::new(Code::NotFound, "unknown session handle"));
         }
         Ok(LoomSession(HandleId {
             kind: "session".to_string(),
@@ -1555,6 +1857,7 @@ impl RemoteRuntime {
     /// `complete`; an engine or routing failure yields a single terminal `error` frame. Frame encoding
     /// never fails for these frames.
     pub fn dispatch_stream(&self, request: &Request) -> Vec<Vec<u8>> {
+        self.prune_expired_sessions(now_ms());
         let frames = match self.stream_items(request) {
             Ok(items) => {
                 let count = items.len() as u64;
@@ -1601,7 +1904,7 @@ impl RemoteRuntime {
             .ok_or_else(|| LoomError::new(Code::PermissionDenied, "method requires a session"))?;
         let session_key = session_key(session_bytes)?;
         if !self.session_exists(session_key) {
-            return Err(LoomError::new(Code::NotFound, "unknown or expired session"));
+            return Err(LoomError::new(Code::NotFound, "unknown session handle"));
         }
         self.validate_consumed_handles(
             session_key,
@@ -3023,6 +3326,97 @@ mod tests {
     }
 
     #[test]
+    fn generated_dispatch_rejects_path_imports_without_filesystem_access() {
+        let path = temp_store("path-import-reject");
+        let client = LocalLoomClient::new(&path);
+        let engine = client.open().expect("open engine");
+        let source = path.with_extension("source-that-must-not-exist");
+        let source_text = source.to_str().expect("utf8 path").to_string();
+        assert!(!source.exists(), "test source path starts absent");
+
+        let cases = [
+            (
+                "FileSystem",
+                "import_fs",
+                vec![
+                    Value::Null,
+                    Value::Text("app".to_string()),
+                    Value::Text(source_text.clone()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Bool(true),
+                    Value::Bool(false),
+                ],
+            ),
+            (
+                "FileSystem",
+                "import_fs_async",
+                vec![
+                    Value::Null,
+                    Value::Text("app".to_string()),
+                    Value::Text(source_text.clone()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Bool(true),
+                    Value::Bool(false),
+                ],
+            ),
+            (
+                "Archive",
+                "archive_import",
+                vec![
+                    Value::Null,
+                    Value::Text("app".to_string()),
+                    Value::Text(source_text.clone()),
+                    Value::Text("tar".to_string()),
+                    Value::Null,
+                    Value::Bool(true),
+                    Value::Null,
+                    Value::Null,
+                    Value::Bool(false),
+                ],
+            ),
+            (
+                "Archive",
+                "archive_import_async",
+                vec![
+                    Value::Null,
+                    Value::Text("app".to_string()),
+                    Value::Text(source_text.clone()),
+                    Value::Text("tar".to_string()),
+                    Value::Null,
+                    Value::Bool(true),
+                    Value::Null,
+                    Value::Null,
+                    Value::Bool(false),
+                ],
+            ),
+        ];
+
+        for (interface, method, args) in cases {
+            let err = match crate::generated_dispatch::dispatch(
+                &client, &engine, interface, method, &args,
+            ) {
+                Ok(_) => panic!("{interface}.{method} path import dispatch must fail closed"),
+                Err(err) => err,
+            };
+            assert_eq!(err.code, Code::Unsupported, "{interface}.{method}");
+            assert!(
+                err.message.contains("local-only"),
+                "{interface}.{method}: {}",
+                err.message
+            );
+        }
+        assert!(
+            !source.exists(),
+            "dispatch did not create or open the host path"
+        );
+
+        client.close(&engine);
+        std::fs::remove_dir_all(&path).ok();
+    }
+
+    #[test]
     fn generated_dispatch_tracks_file_handle_lifecycle() {
         let path = temp_store("file-handle");
         let rt = RemoteRuntime::start(&path, config()).expect("start");
@@ -3319,15 +3713,14 @@ mod tests {
         )
     }
 
-    fn lock_acquire_request(session: &[u8], principal: &str, owner_session: &str) -> Request {
+    fn lock_acquire_request(session: &[u8]) -> Request {
         request(
             session,
             "Locks",
             "lock_acquire",
             vec![
+                Value::Null,
                 Value::Text("resource".to_string()),
-                Value::Text(principal.to_string()),
-                Value::Text(owner_session.to_string()),
                 Value::Bytes(vec![0]),
                 Value::Uint(1),
                 Value::Uint(1),
@@ -3346,22 +3739,22 @@ mod tests {
             .open_session(conn, RemoteAuth::Unauthenticated)
             .expect("open");
 
-        let first = match rt
-            .dispatch(&lock_acquire_request(&session.id, "alice", "s1"))
-            .payload
-        {
-            ResponsePayload::Ok(Value::Bytes(bytes)) => decode_lock_token(&bytes),
+        let (first_bytes, first) = match rt.dispatch(&lock_acquire_request(&session.id)).payload {
+            ResponsePayload::Ok(Value::Bytes(bytes)) => {
+                let token = decode_lock_token(&bytes);
+                (bytes, token)
+            }
             other => panic!("first lock acquire failed: {other:?}"),
         };
         assert_eq!(first.0, "resource");
-        assert_eq!(first.1, "alice");
-        assert_eq!(first.2, "s1");
+        assert_eq!(first.1, "unauthenticated-root");
+        assert!(first.2.starts_with("remote-logical-"));
         assert_eq!(first.6, 1);
 
-        match rt
-            .dispatch(&lock_acquire_request(&session.id, "bob", "s2"))
-            .payload
-        {
+        let other = rt
+            .open_session(conn, RemoteAuth::Unauthenticated)
+            .expect("other session");
+        match rt.dispatch(&lock_acquire_request(&other.id)).payload {
             ResponsePayload::Err(err) => assert_eq!(err.code, Code::Locked),
             other => panic!("contended lock acquire must fail, got {other:?}"),
         }
@@ -3372,39 +3765,27 @@ mod tests {
                 "Locks",
                 "lock_refresh",
                 vec![
-                    Value::Text(first.0.clone()),
-                    Value::Text(first.1.clone()),
-                    Value::Text(first.2.clone()),
-                    Value::Bytes(first.3.clone()),
-                    Value::Uint(u64::from(first.4)),
-                    Value::Uint(u64::from(first.5)),
-                    Value::Uint(first.6),
-                    Value::Uint(first.7),
+                    Value::Null,
+                    Value::Bytes(first_bytes.clone()),
                     Value::Uint(60_000),
                 ],
             ))
             .payload
         {
-            ResponsePayload::Ok(Value::Bytes(bytes)) => decode_lock_token(&bytes),
+            ResponsePayload::Ok(Value::Bytes(bytes)) => {
+                let token = decode_lock_token(&bytes);
+                (bytes, token)
+            }
             other => panic!("lock refresh failed: {other:?}"),
         };
-        assert_eq!(refreshed.6, first.6);
+        assert_eq!(refreshed.1.6, first.6);
 
         assert!(matches!(
             rt.dispatch(&request(
                 &session.id,
                 "Locks",
                 "lock_release",
-                vec![
-                    Value::Text(refreshed.0.clone()),
-                    Value::Text(refreshed.1.clone()),
-                    Value::Text(refreshed.2.clone()),
-                    Value::Bytes(refreshed.3.clone()),
-                    Value::Uint(u64::from(refreshed.4)),
-                    Value::Uint(u64::from(refreshed.5)),
-                    Value::Uint(refreshed.6),
-                    Value::Uint(refreshed.7),
-                ],
+                vec![Value::Null, Value::Bytes(refreshed.0)],
             ))
             .payload,
             ResponsePayload::Ok(Value::Null)
@@ -3415,16 +3796,7 @@ mod tests {
                 &session.id,
                 "Locks",
                 "lock_release",
-                vec![
-                    Value::Text(first.0),
-                    Value::Text(first.1),
-                    Value::Text(first.2),
-                    Value::Bytes(first.3),
-                    Value::Uint(u64::from(first.4)),
-                    Value::Uint(u64::from(first.5)),
-                    Value::Uint(first.6),
-                    Value::Uint(first.7),
-                ],
+                vec![Value::Null, Value::Bytes(first_bytes)],
             ))
             .payload
         {
@@ -3432,14 +3804,261 @@ mod tests {
             other => panic!("stale lock token must fail, got {other:?}"),
         }
 
-        let next = match rt
-            .dispatch(&lock_acquire_request(&session.id, "bob", "s2"))
-            .payload
-        {
+        let next = match rt.dispatch(&lock_acquire_request(&other.id)).payload {
             ResponsePayload::Ok(Value::Bytes(bytes)) => decode_lock_token(&bytes),
             other => panic!("second lock acquire failed: {other:?}"),
         };
         assert_eq!(next.6, 2);
+        std::fs::remove_dir_all(&path).ok();
+    }
+
+    #[test]
+    fn logical_session_resume_preserves_lock_owner_and_close_releases() {
+        let path = temp_store("logical-lock-resume");
+        let rt = RemoteRuntime::start(&path, config()).expect("start");
+        let first_connection = rt.register_connection("first");
+        let (session, credential) = rt
+            .create_logical_session(first_connection, RemoteAuth::Unauthenticated)
+            .expect("create logical session");
+        let token = match rt.dispatch(&lock_acquire_request(&session.id)).payload {
+            ResponsePayload::Ok(Value::Bytes(bytes)) => bytes,
+            other => panic!("logical lock acquire failed: {other:?}"),
+        };
+        rt.drop_connection(first_connection);
+
+        let second_connection = rt.register_connection("second");
+        let (resumed, rotated) = rt
+            .resume_logical_session(second_connection, RemoteAuth::Unauthenticated, &credential)
+            .expect("resume logical session");
+        assert_eq!(resumed.id, session.id);
+        assert_ne!(rotated, credential);
+        assert!(matches!(
+            rt.dispatch(&request(
+                &resumed.id,
+                "Locks",
+                "lock_refresh",
+                vec![
+                    Value::Null,
+                    Value::Bytes(token.clone()),
+                    Value::Uint(60_000),
+                ],
+            ))
+            .payload,
+            ResponsePayload::Ok(Value::Bytes(_))
+        ));
+
+        let foreign_connection = rt.register_connection("foreign");
+        let (foreign, _) = rt
+            .create_logical_session(foreign_connection, RemoteAuth::Unauthenticated)
+            .expect("create foreign session");
+        match rt
+            .dispatch(&request(
+                &foreign.id,
+                "Locks",
+                "lock_refresh",
+                vec![Value::Null, Value::Bytes(token), Value::Uint(60_000)],
+            ))
+            .payload
+        {
+            ResponsePayload::Err(error) => assert_eq!(error.code, Code::PermissionDenied),
+            other => panic!("foreign logical session refreshed token: {other:?}"),
+        }
+
+        rt.close_logical_session(RemoteAuth::Unauthenticated, &rotated)
+            .expect("close logical session");
+        assert!(matches!(
+            rt.dispatch(&lock_acquire_request(&foreign.id)).payload,
+            ResponsePayload::Ok(Value::Bytes(_))
+        ));
+
+        let expiring = rt
+            .create_logical_session(foreign_connection, RemoteAuth::Unauthenticated)
+            .expect("create expiring session")
+            .0;
+        let mut expiry_request = lock_acquire_request(&expiring.id);
+        expiry_request.args[1] = Value::Text("expiry-key".to_string());
+        assert!(matches!(
+            rt.dispatch(&expiry_request).payload,
+            ResponsePayload::Ok(Value::Bytes(_))
+        ));
+        assert!(rt.expire_sessions(u64::MAX) >= 1);
+        let after_expiry = rt
+            .create_logical_session(foreign_connection, RemoteAuth::Unauthenticated)
+            .expect("create post-expiry session")
+            .0;
+        let mut after_expiry_request = lock_acquire_request(&after_expiry.id);
+        after_expiry_request.args[1] = Value::Text("expiry-key".to_string());
+        assert!(matches!(
+            rt.dispatch(&after_expiry_request).payload,
+            ResponsePayload::Ok(Value::Bytes(_))
+        ));
+
+        let restarted = RemoteRuntime::start(&path, config()).expect("restart runtime");
+        let connection = restarted.register_connection("restart");
+        assert_eq!(
+            restarted
+                .resume_logical_session(connection, RemoteAuth::Unauthenticated, &rotated)
+                .expect_err("credential must fail after coordinator restart")
+                .code,
+            Code::PermissionDenied
+        );
+        std::fs::remove_dir_all(&path).ok();
+    }
+
+    #[test]
+    fn hosted_dispatch_prunes_expired_lock_owner_before_contention() {
+        let path = temp_store("dispatch-expiry-lock-release");
+        let rt = RemoteRuntime::start(&path, config()).expect("start");
+        let first_connection = rt.register_connection("first");
+        let first = rt
+            .open_session(first_connection, RemoteAuth::Unauthenticated)
+            .expect("open first session");
+        let second_connection = rt.register_connection("second");
+        let second = rt
+            .open_session(second_connection, RemoteAuth::Unauthenticated)
+            .expect("open second session");
+
+        let mut first_request = lock_acquire_request(&first.id);
+        first_request.args[5] = Value::Uint(600_000);
+        assert!(matches!(
+            rt.dispatch(&first_request).payload,
+            ResponsePayload::Ok(Value::Bytes(_))
+        ));
+        rt.sessions
+            .lock()
+            .expect("session registry")
+            .get_mut(&session_key(&first.id).expect("first session key"))
+            .expect("first session entry")
+            .lease_expires_ms = now_ms();
+
+        assert!(matches!(
+            rt.dispatch(&lock_acquire_request(&second.id)).payload,
+            ResponsePayload::Ok(Value::Bytes(_))
+        ));
+        assert_eq!(rt.session_principal(&first.id), None);
+        assert_eq!(rt.session_count(), 1);
+        std::fs::remove_dir_all(&path).ok();
+    }
+
+    #[test]
+    fn hosted_logical_session_rotation_is_recoverable_and_bounded() {
+        let path = temp_store("logical-rotation-state");
+        let rt = Arc::new(RemoteRuntime::start(&path, config()).expect("start"));
+        let connection = rt.register_connection("initial");
+        let (session, current) = rt
+            .create_logical_session(connection, RemoteAuth::Unauthenticated)
+            .expect("create logical session");
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for peer in ["resume-a", "resume-b"] {
+            let runtime = Arc::clone(&rt);
+            let barrier = Arc::clone(&barrier);
+            let credential = current.clone();
+            workers.push(std::thread::spawn(move || {
+                let connection = runtime.register_connection(peer);
+                barrier.wait();
+                runtime
+                    .resume_logical_session(connection, RemoteAuth::Unauthenticated, &credential)
+                    .expect("concurrent current-credential resume")
+                    .1
+            }));
+        }
+        barrier.wait();
+        let issued = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("resume worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(issued[0], issued[1]);
+
+        let pending = issued[0].clone();
+        let pending_barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut pending_workers = Vec::new();
+        for peer in ["pending-a", "pending-b"] {
+            let runtime = Arc::clone(&rt);
+            let barrier = Arc::clone(&pending_barrier);
+            let credential = pending.clone();
+            pending_workers.push(std::thread::spawn(move || {
+                let connection = runtime.register_connection(peer);
+                barrier.wait();
+                runtime
+                    .resume_logical_session(connection, RemoteAuth::Unauthenticated, &credential)
+                    .expect("concurrent pending-credential resume")
+                    .1
+            }));
+        }
+        pending_barrier.wait();
+        let successors = pending_workers
+            .into_iter()
+            .map(|worker| worker.join().expect("pending resume worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(successors[0], successors[1]);
+        let successor = successors[0].clone();
+        let successor_claims =
+            loom_remote_protocol::session::open_credential(&successor, &rt.credential_signing_key)
+                .expect("successor claims");
+        let stored_successor = rt
+            .sessions
+            .lock()
+            .expect("session registry")
+            .get(&session_key(&session.id).expect("session key"))
+            .and_then(|entry| entry.pending_resume_credential)
+            .expect("bounded pending credential");
+        assert_eq!(stored_successor.secret, successor_claims.resume_secret);
+        assert_eq!(
+            stored_successor.lease_expires_ms,
+            successor_claims.lease_expires_ms
+        );
+        assert_eq!(
+            rt.resume_logical_session(
+                rt.register_connection("promoted-current-replay"),
+                RemoteAuth::Unauthenticated,
+                &pending,
+            )
+            .expect("promoted predecessor replays its existing successor")
+            .1,
+            successor
+        );
+        assert_eq!(
+            rt.resume_logical_session(
+                rt.register_connection("old-current"),
+                RemoteAuth::Unauthenticated,
+                &current,
+            )
+            .expect_err("older current credential must fail after promotion")
+            .code,
+            Code::PermissionDenied
+        );
+
+        let restarted = RemoteRuntime::start(&path, config()).expect("restart runtime");
+        assert_eq!(
+            restarted
+                .resume_logical_session(
+                    restarted.register_connection("restart"),
+                    RemoteAuth::Unauthenticated,
+                    &successor,
+                )
+                .expect_err("credential must fail after coordinator restart")
+                .code,
+            Code::PermissionDenied
+        );
+
+        rt.sessions
+            .lock()
+            .expect("session registry")
+            .get_mut(&session_key(&session.id).expect("session key"))
+            .expect("session entry")
+            .lease_expires_ms = now_ms();
+        assert_eq!(
+            rt.resume_logical_session(
+                rt.register_connection("expired"),
+                RemoteAuth::Unauthenticated,
+                &successor,
+            )
+            .expect_err("expired session must fail closed")
+            .code,
+            Code::PermissionDenied
+        );
         std::fs::remove_dir_all(&path).ok();
     }
 
@@ -3526,6 +4145,73 @@ mod tests {
         }
 
         rt.shutdown();
+        std::fs::remove_dir_all(&path).ok();
+    }
+
+    #[test]
+    fn mu_6h_l_b_generated_dispatch_runs_sql_exec_result() {
+        let path = temp_store("sql-exec-result");
+        let rt = RemoteRuntime::start(&path, config()).expect("start");
+        let conn = rt.register_connection("peer");
+        let session = rt
+            .open_session(conn, RemoteAuth::Unauthenticated)
+            .expect("open");
+
+        assert!(matches!(
+            rt.dispatch(&request(
+                &session.id,
+                "Workspaces",
+                "workspace_create",
+                vec![Value::Null, Value::Text("repo".to_string()), Value::Null],
+            ))
+            .payload,
+            ResponsePayload::Ok(_)
+        ));
+
+        let mut create = request(
+            &session.id,
+            "Sql",
+            "sql_exec_result",
+            vec![
+                Value::Null,
+                Value::Text("repo".to_string()),
+                Value::Text("db".to_string()),
+                Value::Text(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1)".to_string(),
+                ),
+            ],
+        );
+        create.idempotency_key = Some(b"sql-exec-result-create".to_vec());
+        assert!(matches!(
+            rt.dispatch(&create).payload,
+            ResponsePayload::Ok(Value::Bytes(_))
+        ));
+
+        let mut insert = request(
+            &session.id,
+            "Sql",
+            "sql_exec_result",
+            vec![
+                Value::Null,
+                Value::Text("repo".to_string()),
+                Value::Text("db".to_string()),
+                Value::Text("INSERT INTO t VALUES (2)".to_string()),
+            ],
+        );
+        insert.idempotency_key = Some(b"sql-exec-result-insert".to_vec());
+        assert!(matches!(
+            rt.dispatch(&insert).payload,
+            ResponsePayload::Ok(Value::Bytes(_))
+        ));
+
+        rt.shutdown();
+        let client = LocalLoomClient::new(&path);
+        let reopened = client.open().expect("reopen");
+        let selected = client
+            .sql_query_result(&reopened, "repo", "db", "SELECT id FROM t ORDER BY id")
+            .expect("reopened select");
+        assert!(!selected.is_empty());
+        client.close(&reopened);
         std::fs::remove_dir_all(&path).ok();
     }
 

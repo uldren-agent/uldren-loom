@@ -87,3 +87,15 @@ actual fun Loom.sqlTableDiffCbor(
         authPassphrase: String?,
     ): ByteArray =
         LoomNative.nativeSqlTableDiff(path, workspace, table, fromCommit, toCommit, passphrase?.encodeToByteArray(), kek, authPrincipal, authPassphrase?.encodeToByteArray())
+
+actual fun Loom.sqlExecResult(
+        path: String,
+        workspace: String,
+        db: String,
+        sql: String,
+        passphrase: String?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: String?,
+    ): ByteArray =
+        LoomNative.nativeSqlExecResult(path, workspace, db, sql, passphrase?.encodeToByteArray(), kek, authPrincipal, authPassphrase?.encodeToByteArray())

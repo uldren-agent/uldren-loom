@@ -3,10 +3,11 @@
 use std::io::Write as _;
 
 use ::time::{Duration, OffsetDateTime};
-use rcgen::{
-    CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256,
-    PKCS_ECDSA_P384_SHA384, PKCS_ED25519, SignatureAlgorithm,
-};
+#[cfg(test)]
+use rcgen::{CertificateParams, KeyPair};
+#[cfg(test)]
+use rcgen::{PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519, SignatureAlgorithm};
+#[cfg(test)]
 use rustls::pki_types::pem::PemObject as _;
 use x509_parser::pem::Pem;
 use x509_parser::prelude::*;
@@ -80,28 +81,8 @@ pub(crate) fn run_certificate(action: CertificateCmd, keys: &KeyOpts) -> Result<
 }
 
 fn run_certificate_list(store: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let bundles = loom
-        .store()
-        .certificate_bundles()
-        .map_err(|e| e.to_string())?;
-    let references = certificate_bundle_served_listener_reference_map(loom.store())?;
-    let seq = loom
-        .store()
-        .audit_append(Some(actor), "certificate.bundle.list", Some("certificates"))
-        .map_err(|e| e.to_string())?;
-    let mut out = format!("{{\"seq\":{seq},\"certificates\":[");
-    for (idx, bundle) in bundles.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&certificate_bundle_record_json(
-            bundle,
-            certificate_bundle_references_for(&references, &bundle.name),
-        ));
-    }
-    out.push_str("]}");
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let out = execute_generated_string(&client, "Certificate", "certificate_list_json", vec![])?;
     println!("{out}");
     Ok(())
 }
@@ -122,36 +103,20 @@ fn run_certificate_import(
     let trust_bundle_pem = trust_bundle
         .map(|path| std::fs::read(path).map_err(|e| format!("read --trust-bundle {path}: {e}")))
         .transpose()?;
-    validate_certificate_material(
-        &server_cert_chain_pem,
-        &private_key_pem,
-        trust_bundle_pem.as_deref(),
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let out = execute_generated_string(
+        &client,
+        "Certificate",
+        "certificate_import_json",
+        vec![
+            name.to_value(),
+            loom_codec::Value::Bytes(server_cert_chain_pem),
+            loom_codec::Value::Bytes(private_key_pem),
+            trust_bundle_pem.map_or(loom_codec::Value::Null, loom_codec::Value::Bytes),
+            force.to_value(),
+        ],
     )?;
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let mut record = loom
-        .store()
-        .certificate_bundle_record(
-            name,
-            server_cert_chain_pem,
-            private_key_pem,
-            trust_bundle_pem,
-        )
-        .map_err(|e| e.to_string())?;
-    let action = if force {
-        "certificate.bundle.import.force"
-    } else {
-        "certificate.bundle.import"
-    };
-    let target = certificate_bundle_target(name);
-    let seq = loom
-        .store()
-        .save_certificate_bundle_audited(&record, Some(actor), action, Some(&target), force)
-        .map_err(|e| e.to_string())?;
-    record.created_audit_seq = record.created_audit_seq.or(Some(seq));
-    record.updated_audit_seq = Some(seq);
-    record.unencrypted_private_key_override = !loom.store().is_encrypted() && force;
-    println!("{}", certificate_bundle_json(&record, seq, &[]));
+    println!("{out}");
     Ok(())
 }
 
@@ -172,38 +137,85 @@ fn run_certificate_export(
     if private_key.is_some() && !force {
         return Err("exporting private keys requires --force".to_string());
     }
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let record = loom
-        .store()
-        .certificate_bundle(name)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("certificate bundle {name:?} not found"))?;
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let encoded = execute_generated_bytes(
+        &client,
+        "Certificate",
+        "certificate_export",
+        vec![
+            name.to_value(),
+            cert_chain.is_some().to_value(),
+            private_key.is_some().to_value(),
+            trust_bundle.is_some().to_value(),
+            force.to_value(),
+        ],
+    )?;
+    let export = decode_certificate_export(&encoded)?;
     if let Some(path) = cert_chain {
-        write_output_file(path, &record.server_cert_chain_pem, false, force)?;
+        write_output_file(
+            path,
+            export.cert_chain.as_deref().unwrap_or_default(),
+            false,
+            force,
+        )?;
     }
     if let Some(path) = private_key {
-        write_output_file(path, &record.private_key_pem, true, force)?;
+        write_output_file(
+            path,
+            export.private_key.as_deref().unwrap_or_default(),
+            true,
+            force,
+        )?;
     }
     if let Some(path) = trust_bundle {
-        let pem = record
-            .trust_bundle_pem
-            .as_ref()
-            .ok_or_else(|| format!("certificate bundle {name:?} has no trust bundle"))?;
-        write_output_file(path, pem, false, force)?;
+        write_output_file(
+            path,
+            export.trust_bundle.as_deref().unwrap_or_default(),
+            false,
+            force,
+        )?;
     }
-    let target = certificate_bundle_target(name);
-    let action = if private_key.is_some() {
-        "certificate.bundle.export_private_key"
-    } else {
-        "certificate.bundle.export"
-    };
-    let seq = loom
-        .store()
-        .audit_append(Some(actor), action, Some(&target))
-        .map_err(|e| e.to_string())?;
+    let seq = export.seq;
     println!("{{\"seq\":{seq},\"name\":{}}}", json_string(name));
     Ok(())
+}
+
+struct CertificateExportPayload {
+    seq: u64,
+    cert_chain: Option<Vec<u8>>,
+    private_key: Option<Vec<u8>>,
+    trust_bundle: Option<Vec<u8>>,
+}
+
+fn decode_certificate_export(bytes: &[u8]) -> Result<CertificateExportPayload, String> {
+    let value = loom_codec::decode(bytes).map_err(|e| e.to_string())?;
+    let loom_codec::Value::Array(items) = value else {
+        return Err("certificate export result must be an array".to_string());
+    };
+    if items.len() != 5 {
+        return Err("certificate export result must have five fields".to_string());
+    }
+    let seq = match &items[0] {
+        loom_codec::Value::Uint(value) => *value,
+        _ => return Err("certificate export seq must be a uint".to_string()),
+    };
+    Ok(CertificateExportPayload {
+        seq,
+        cert_chain: certificate_export_bytes(&items[2], "cert_chain")?,
+        private_key: certificate_export_bytes(&items[3], "private_key")?,
+        trust_bundle: certificate_export_bytes(&items[4], "trust_bundle")?,
+    })
+}
+
+fn certificate_export_bytes(
+    value: &loom_codec::Value,
+    field: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    match value {
+        loom_codec::Value::Null => Ok(None),
+        loom_codec::Value::Bytes(bytes) => Ok(Some(bytes.clone())),
+        _ => Err(format!("certificate export {field} must be bytes or null")),
+    }
 }
 
 struct CertificateSelfSignedRequest<'a> {
@@ -221,100 +233,38 @@ fn run_certificate_generate_self_signed(
     request: CertificateSelfSignedRequest<'_>,
     keys: &KeyOpts,
 ) -> Result<(), String> {
-    if request.days == 0 {
-        return Err("--days must be greater than zero".to_string());
-    }
-    let san_names = certificate_san_names(request.dns_names, request.ip_addresses, request.cn)?;
-    let mut params = CertificateParams::new(san_names).map_err(|e| e.to_string())?;
-    if let Some(cn) = request.cn {
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, cn);
-        params.distinguished_name = dn;
-    }
-    let now = OffsetDateTime::now_utc();
-    params.not_before = now;
-    params.not_after = now
-        .checked_add(Duration::days(i64::from(request.days)))
-        .ok_or_else(|| "--days is too large".to_string())?;
-    let key_pair = KeyPair::generate_for(certificate_algorithm(request.algorithm)?)
-        .map_err(|e| format!("generate key pair: {e}"))?;
-    let cert = params
-        .self_signed(&key_pair)
-        .map_err(|e| format!("generate certificate: {e}"))?;
-    save_generated_certificate(
-        store,
-        request.name,
-        cert.pem().into_bytes(),
-        key_pair.serialize_pem().into_bytes(),
-        request.force,
-        keys,
-    )
-}
-
-fn save_generated_certificate(
-    store: &str,
-    name: &str,
-    server_cert_chain_pem: Vec<u8>,
-    private_key_pem: Vec<u8>,
-    force: bool,
-    keys: &KeyOpts,
-) -> Result<(), String> {
-    validate_certificate_material(&server_cert_chain_pem, &private_key_pem, None)?;
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let mut record = loom
-        .store()
-        .certificate_bundle_record(name, server_cert_chain_pem, private_key_pem, None)
-        .map_err(|e| e.to_string())?;
-    let action = if force {
-        "certificate.bundle.generate_self_signed.force"
-    } else {
-        "certificate.bundle.generate_self_signed"
-    };
-    let target = certificate_bundle_target(name);
-    let seq = loom
-        .store()
-        .save_certificate_bundle_audited(&record, Some(actor), action, Some(&target), force)
-        .map_err(|e| e.to_string())?;
-    record.created_audit_seq = record.created_audit_seq.or(Some(seq));
-    record.updated_audit_seq = Some(seq);
-    record.unencrypted_private_key_override = !loom.store().is_encrypted() && force;
-    println!("{}", certificate_bundle_json(&record, seq, &[]));
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let out = execute_generated_string(
+        &client,
+        "Certificate",
+        "certificate_generate_self_signed_json",
+        vec![
+            request.name.to_value(),
+            request.dns_names.to_vec().to_value(),
+            request.ip_addresses.to_vec().to_value(),
+            request.cn.map(str::to_string).to_value(),
+            request.days.to_value(),
+            request.algorithm.to_value(),
+            request.force.to_value(),
+        ],
+    )?;
+    println!("{out}");
     Ok(())
 }
 
 fn run_certificate_remove(store: &str, name: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let references = certificate_bundle_served_listener_references(loom.store(), name)?;
-    let target = certificate_bundle_target(name);
-    if !references.is_empty() {
-        let denied_target = certificate_bundle_denied_remove_target(name, &references);
-        loom.store()
-            .audit_append(
-                Some(actor),
-                "certificate.bundle.remove.denied",
-                Some(&denied_target),
-            )
-            .map_err(|e| e.to_string())?;
-        return Err(format!(
-            "certificate bundle {name:?} is referenced by served listeners: {}",
-            references.join(", ")
-        ));
-    }
-    let seq = loom
-        .store()
-        .remove_certificate_bundle_audited(
-            name,
-            Some(actor),
-            "certificate.bundle.remove",
-            Some(&target),
-        )
-        .map_err(|e| e.to_string())?;
-    println!("{{\"seq\":{seq},\"name\":{}}}", json_string(name));
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let out = execute_generated_string(
+        &client,
+        "Certificate",
+        "certificate_remove_json",
+        vec![name.to_value()],
+    )?;
+    println!("{out}");
     Ok(())
 }
 
+#[cfg(test)]
 fn certificate_bundle_served_listener_references(
     store: &FileStore,
     name: &str,
@@ -346,6 +296,7 @@ fn certificate_bundle_references_for<'a>(
     references.get(name).map(Vec::as_slice).unwrap_or(&[])
 }
 
+#[cfg(test)]
 fn certificate_bundle_denied_remove_target(name: &str, references: &[String]) -> String {
     let mut target = certificate_bundle_target(name);
     target.push_str(";served_listener_count=");
@@ -368,23 +319,14 @@ fn certificate_bundle_denied_remove_target(name: &str, references: &[String]) ->
 }
 
 fn run_certificate_audit(store: &str, name: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let record = loom
-        .store()
-        .certificate_bundle(name)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("certificate bundle {name:?} not found"))?;
-    let references = certificate_bundle_served_listener_references(loom.store(), name)?;
-    let target = certificate_bundle_target(name);
-    let seq = loom
-        .store()
-        .audit_append(Some(actor), "certificate.bundle.audit", Some(&target))
-        .map_err(|e| e.to_string())?;
-    println!(
-        "{}",
-        certificate_bundle_audit_json(&record, seq, &references)
-    );
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let out = execute_generated_string(
+        &client,
+        "Certificate",
+        "certificate_audit_json",
+        vec![name.to_value()],
+    )?;
+    println!("{out}");
     Ok(())
 }
 
@@ -470,6 +412,7 @@ fn doctor_field(value: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn validate_certificate_material(
     server_cert_chain_pem: &[u8],
     private_key_pem: &[u8],
@@ -516,6 +459,7 @@ fn write_output_file(path: &str, bytes: &[u8], secret: bool, force: bool) -> Res
         .map_err(|e| format!("write output file {path}: {e}"))
 }
 
+#[cfg(test)]
 fn certificate_san_names(
     dns_names: &[String],
     ip_addresses: &[String],
@@ -533,6 +477,7 @@ fn certificate_san_names(
     Ok(names)
 }
 
+#[cfg(test)]
 fn certificate_algorithm(name: &str) -> Result<&'static SignatureAlgorithm, String> {
     match name {
         "p256" | "ecdsa-p256" | "ecdsa-p256-sha256" => Ok(&PKCS_ECDSA_P256_SHA256),
@@ -544,10 +489,12 @@ fn certificate_algorithm(name: &str) -> Result<&'static SignatureAlgorithm, Stri
     }
 }
 
+#[cfg(test)]
 fn certificate_bundle_target(name: &str) -> String {
     format!("name={name}")
 }
 
+#[cfg(test)]
 fn certificate_bundle_json(
     record: &loom_store::CertificateBundleRecord,
     seq: u64,
@@ -562,6 +509,7 @@ fn certificate_bundle_json(
     out
 }
 
+#[cfg(test)]
 fn certificate_bundle_record_json(
     record: &loom_store::CertificateBundleRecord,
     references: &[String],
@@ -624,6 +572,7 @@ fn certificate_bundle_record_json(
     out
 }
 
+#[cfg(test)]
 fn certificate_bundle_audit_json(
     record: &loom_store::CertificateBundleRecord,
     seq: u64,
@@ -659,6 +608,7 @@ fn certificate_bundle_audit_json(
     out
 }
 
+#[cfg(test)]
 fn json_string_array(values: &[String]) -> String {
     let mut out = String::new();
     out.push('[');
@@ -672,6 +622,7 @@ fn json_string_array(values: &[String]) -> String {
     out
 }
 
+#[cfg(test)]
 fn push_json_u64(out: &mut String, value: Option<u64>) {
     match value {
         Some(value) => out.push_str(&value.to_string()),
@@ -679,6 +630,7 @@ fn push_json_u64(out: &mut String, value: Option<u64>) {
     }
 }
 
+#[cfg(test)]
 fn certificate_infos_json_result(infos: Result<Vec<CertificateInfo>, String>) -> String {
     match infos {
         Ok(infos) => certificate_infos_json(&infos),
@@ -691,6 +643,7 @@ fn certificate_infos_json_result(infos: Result<Vec<CertificateInfo>, String>) ->
     }
 }
 
+#[cfg(test)]
 fn certificate_infos_json(infos: &[CertificateInfo]) -> String {
     let mut out = String::new();
     out.push('[');
@@ -704,6 +657,7 @@ fn certificate_infos_json(infos: &[CertificateInfo]) -> String {
     out
 }
 
+#[cfg(test)]
 fn certificate_info_json(info: &CertificateInfo) -> String {
     let mut out = String::new();
     out.push('{');
@@ -723,6 +677,7 @@ fn certificate_info_json(info: &CertificateInfo) -> String {
     out
 }
 
+#[cfg(test)]
 fn push_json_string_option(out: &mut String, value: Option<&str>) {
     match value {
         Some(value) => out.push_str(&json_string(value)),
@@ -825,6 +780,7 @@ fn collect_health_reasons(
     }
 }
 
+#[cfg(test)]
 fn health_json(health: &CertificateHealth) -> String {
     let mut out = String::new();
     out.push('{');
@@ -1034,9 +990,9 @@ mod tests {
                 bind: "127.0.0.1:8033".into(),
                 transport: Some("rest".into()),
                 profile: None,
+                mode: None,
                 disabled: true,
                 tls_certificate_bundle: Some("local".into()),
-                tls_mode: None,
                 auth_mode: None,
                 exposure: None,
                 audit_mode: None,

@@ -119,9 +119,21 @@ export declare function aclRevokeScoped(loomPath: string, effect: number, subjec
 /** Append `content` to file `path`, creating it if absent (the parent directory must exist). */
 export declare function appendFile(loomPath: string, facet: string, workspace: string, path: string, content: Uint8Array, passphrase?: string | undefined | null): void
 
+export declare function applyCbor(loomPath: string, request: Uint8Array, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
 export declare function archiveExport(loomPath: string, workspace: string, dstPath: string, kind: string, revision: string | undefined | null, dryRun: boolean, passphrase?: string | undefined | null): Uint8Array
 
-export declare function archiveImport(loomPath: string, workspace: string, srcPath: string, kind: string, dryRun: boolean, passphrase?: string | undefined | null): Uint8Array
+export declare function archiveImport(loomPath: string, workspace: string, srcPath: string, kind: string, gzipOutputPath: string | undefined | null, commit: boolean, author: string | undefined | null, message: string | undefined | null, dryRun: boolean, passphrase?: string | undefined | null): Uint8Array
+
+export declare function auditCompact(loomPath: string, throughSeq: bigint, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function auditConfigSetJson(path: string, retentionDays?: number | undefined | null, legalHold?: boolean | undefined | null, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function auditConfigShowJson(path: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function auditListJson(path: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function auditViewJson(path: string, record: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
 
 export declare function authenticatePassphrase(loomPath: string, principal: string, principalPassphrase: string, passphrase?: string | undefined | null): void
 
@@ -287,6 +299,68 @@ export declare function casListJson(loomPath: string, workspace: string, passphr
  */
 export declare function casPut(loomPath: string, workspace: string, content: Uint8Array, passphrase?: string | undefined | null): string
 
+export declare function certificateAuditJson(path: string, name: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function certificateExport(path: string, name: string, includeCertChain: boolean, includePrivateKey: boolean, includeTrustBundle: boolean, force: boolean, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): Uint8Array
+
+export declare function certificateGenerateSelfSignedJson(path: string, name: string, dnsNames: Array<string>, ipAddresses: Array<string>, cn: string | undefined | null, days: number, algorithm: string, force: boolean, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function certificateImportJson(path: string, name: string, certChainPem: Uint8Array, privateKeyPem: Uint8Array, trustBundlePem: Uint8Array | undefined | null, force: boolean, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function certificateListJson(path: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function certificateRemoveJson(path: string, name: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function chatAddReactionJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string, expectedEntityTag?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatAgentReplyJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, messageId: string, passphrase?: string | undefined | null): string
+
+export declare function chatClaimTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, leaseToken?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatCompleteTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, resultMessageId?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatCreateChannelJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, channelHandle: string, name: string, passphrase?: string | undefined | null): string
+
+export declare function chatCreateTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, messageId: string | undefined | null, title: string, passphrase?: string | undefined | null): string
+
+export declare function chatCreateThreadJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, threadId: string, parentMessageId: string, passphrase?: string | undefined | null): string
+
+export declare function chatCursorJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, passphrase?: string | undefined | null): string
+
+export declare function chatEditMessageBytesJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, body: Uint8Array, expectedEntityTag?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatEditMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, bodyText: string, passphrase?: string | undefined | null): string
+
+export declare function chatEmojiListJson(loomPath: string, workspace: string, chatWorkspaceId: string, passphrase?: string | undefined | null): string
+
+export declare function chatEmojiRegisterJson(loomPath: string, workspace: string, chatWorkspaceId: string, kind: string, expectedEntityTag?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatEmojiUnregisterJson(loomPath: string, workspace: string, chatWorkspaceId: string, kind: string, expectedEntityTag?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatFetchEventsJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, fromSequence: bigint, max: number, passphrase?: string | undefined | null): string
+
+export declare function chatInvokeAgentBytesJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, agentPrincipal: string, sourceMessageIdsJson: string, prompt: Uint8Array, expectedEntityTag?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatInvokeAgentJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, agentPrincipal: string, sourceMessageIdsJson: string, promptText: string, passphrase?: string | undefined | null): string
+
+export declare function chatListChannelsJson(loomPath: string, workspace: string, chatWorkspaceId: string, passphrase?: string | undefined | null): string
+
+export declare function chatMessagesJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, passphrase?: string | undefined | null): string
+
+export declare function chatPostMessageBytesJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, threadId: string | undefined | null, body: Uint8Array, expectedEntityTag?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatPostMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, threadId: string | undefined | null, bodyText: string, passphrase?: string | undefined | null): string
+
+export declare function chatRedactMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, reasonText?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatRemoveReactionJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string, expectedEntityTag?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatRenameChannelJson(loomPath: string, workspace: string, chatWorkspaceId: string, selector: string, channelHandle: string, passphrase?: string | undefined | null): string
+
+export declare function chatRequestHandoffJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, handoffId: string, fromAgentPrincipal: string, toPrincipal?: string | undefined | null, reasonText?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function chatUpdateCursorJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, nextSequence: bigint, expectedEntityTag?: string | undefined | null, passphrase?: string | undefined | null): string
+
 /**
  * Cherry-pick `commits` (digest strings) onto the current branch, preserving each author and message.
  * `dryRun` previews conflicts. Returns the outcome JSON.
@@ -317,6 +391,10 @@ export declare function columnarCompact(loomPath: string, workspace: string, nam
  * the `columnar` facet if absent). `CONFLICT` if the dataset already exists.
  */
 export declare function columnarCreate(loomPath: string, workspace: string, name: string, columns: Uint8Array, targetSegmentRows: bigint, passphrase?: string | undefined | null): void
+
+export declare function columnarImportArrow(loomPath: string, workspace: string, name: string, payload: Uint8Array, targetSegmentRows: bigint, replace: boolean, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function columnarImportParquet(loomPath: string, workspace: string, name: string, payload: Uint8Array, targetSegmentRows: bigint, replace: boolean, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
 
 /** Inspect dataset metadata as CBOR `[columns, rows, segment_count, target_segment_rows, source_digest]`. */
 export declare function columnarInspect(loomPath: string, workspace: string, name: string, passphrase?: string | undefined | null): Uint8Array
@@ -393,6 +471,9 @@ export interface DocBinary {
 /** Remove `id` from collection `collection`; returns whether it was present. */
 export declare function docDelete(loomPath: string, workspace: string, collection: string, id: string, passphrase?: string | undefined | null): boolean
 
+/** Remove collection `collection` and its structured roots; returns whether it was present. */
+export declare function docDeleteCollection(loomPath: string, workspace: string, collection: string, passphrase?: string | undefined | null): boolean
+
 export declare function docFindJson(loomPath: string, workspace: string, collection: string, index: string, valueJson: string, passphrase?: string | undefined | null): string
 
 /** Fetch `id` as binary bytes with its content digest, or `null` if absent. */
@@ -416,13 +497,13 @@ export declare function docIndexStatusJson(loomPath: string, workspace: string, 
 /** List collection `collection` as its canonical binary representation. */
 export declare function docListBinary(loomPath: string, workspace: string, collection: string, passphrase?: string | undefined | null): Uint8Array
 
-/** Remove collection `collection` and its structured roots; returns whether it was present. */
-export declare function docDeleteCollection(loomPath: string, workspace: string, collection: string, passphrase?: string | undefined | null): boolean
-
-export interface DocPutResult { digest: string, entityTag: string }
-
 /** Put binary bytes at string `id` in collection `collection` and return the new document tags. */
 export declare function docPutBinary(loomPath: string, workspace: string, collection: string, id: string, bytes: Uint8Array, expectedEntityTag?: string | undefined | null, passphrase?: string | undefined | null): DocPutResult
+
+export interface DocPutResult {
+  digest: string
+  entityTag: string
+}
 
 /** Put UTF-8 text at string `id` in collection `collection` and return the new document tags. */
 export declare function docPutText(loomPath: string, workspace: string, collection: string, id: string, text: string, expectedEntityTag?: string | undefined | null, passphrase?: string | undefined | null): DocPutResult
@@ -434,6 +515,48 @@ export interface DocText {
   digest: string
   entityTag: string
 }
+
+export declare function driveApplyRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, nowMs: bigint, passphrase?: string | undefined | null): string
+
+export declare function driveApplyShareExpiryJson(loomPath: string, workspace: string, driveWorkspaceId: string, nowMs: bigint, passphrase?: string | undefined | null): string
+
+export declare function driveCommitUploadJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, passphrase?: string | undefined | null): string
+
+export declare function driveCreateFolderJson(loomPath: string, workspace: string, driveWorkspaceId: string, parentFolderId: string, folderId: string, name: string, expectedRoot: string, passphrase?: string | undefined | null): string
+
+export declare function driveCreateUploadJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, parentFolderId: string, name: string, fileId: string, expectedRoot: string, createdAtMs: bigint, replaceFile: boolean, passphrase?: string | undefined | null): string
+
+export declare function driveDeleteJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, nodeId: string, expectedRoot: string, passphrase?: string | undefined | null): string
+
+export declare function driveGrantShareJson(loomPath: string, workspace: string, driveWorkspaceId: string, grantId: string, targetKind: string, targetId: string, principal: string, role: string, grantedAtMs: bigint, expiresAtMs?: bigint | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function driveListConflictsJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase?: string | undefined | null): string
+
+export declare function driveListJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, passphrase?: string | undefined | null): string
+
+export declare function driveListRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase?: string | undefined | null): string
+
+export declare function driveListSharesJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase?: string | undefined | null): string
+
+export declare function driveListVersionsJson(loomPath: string, workspace: string, driveWorkspaceId: string, fileId: string, passphrase?: string | undefined | null): string
+
+export declare function driveMoveJson(loomPath: string, workspace: string, driveWorkspaceId: string, sourceFolderId: string, targetFolderId: string, nodeId: string, expectedRoot: string, passphrase?: string | undefined | null): string
+
+export declare function drivePinRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, pinId: string, kind: string, root: string, targetEntityId: string | undefined | null, addedAtMs: bigint, expiresAtMs?: bigint | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function driveReadFile(loomPath: string, workspace: string, driveWorkspaceId: string, fileId: string, passphrase?: string | undefined | null): Uint8Array
+
+export declare function driveRenameJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, nodeId: string, newName: string, expectedRoot: string, passphrase?: string | undefined | null): string
+
+export declare function driveResolveConflictJson(loomPath: string, workspace: string, driveWorkspaceId: string, conflictId: string, resolution: string, passphrase?: string | undefined | null): string
+
+export declare function driveRevokeShareJson(loomPath: string, workspace: string, driveWorkspaceId: string, grantId: string, passphrase?: string | undefined | null): string
+
+export declare function driveStatJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, name: string, passphrase?: string | undefined | null): string
+
+export declare function driveUnpinRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, pinId: string, passphrase?: string | undefined | null): string
+
+export declare function driveUploadChunkJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, chunk: Uint8Array, passphrase?: string | undefined | null): string
 
 /** Execute a canonical `loom.exec.request.v1` request and return canonical `loom.exec.result.v1`. */
 export declare function execCbor(loomPath: string, request: Uint8Array, passphrase?: string | undefined | null): Uint8Array
@@ -484,7 +607,7 @@ export declare function fileWriteAt(loomPath: string, file: number, offset: numb
 
 export declare function fsExport(loomPath: string, workspace: string, dstPath: string, revision: string | undefined | null, dryRun: boolean, passphrase?: string | undefined | null): Uint8Array
 
-export declare function fsImport(loomPath: string, workspace: string, srcPath: string, commit: boolean, dryRun: boolean, passphrase?: string | undefined | null): Uint8Array
+export declare function fsImport(loomPath: string, workspace: string, srcPath: string, author: string | undefined | null, message: string | undefined | null, commit: boolean, dryRun: boolean, passphrase?: string | undefined | null): Uint8Array
 
 export declare function graphExplainQuery(loomPath: string, workspace: string, name: string, query: string, passphrase?: string | undefined | null): Uint8Array
 
@@ -560,13 +683,21 @@ export declare function identityAddPublicKey(loomPath: string, principal: string
 
 export declare function identityAssignRole(loomPath: string, principal: string, role: string, passphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): void
 
+export declare function identityConfigureAuthorityReplicationJson(path: string, id: string, source: string, disabled: boolean, pullOnStart: boolean, intervalMs: number | undefined | null, jitterMs: number, backoffMs: number, publishWitness: boolean, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
 export declare function identityCreateExternalCredential(loomPath: string, principal: string, kind: string, label: string, issuer: string, subject: string, materialDigest?: string | undefined | null, passphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
 
+export declare function identityForceDetachAuthorityJson(path: string, authorityPrincipal: string, generation: number, detachReason: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
 export declare function identityListJson(loomPath: string, passphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function identityRemoveAuthorityReplicationJson(path: string, id: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
 
 export declare function identityRemovePrincipal(loomPath: string, principal: string, passphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): void
 
 export declare function identityRenamePrincipalHandle(loomPath: string, principal: string, principalHandle: string, passphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): void
+
+export declare function identityReplicateAuthorityJson(path: string, source: string, becomeAuthority: boolean, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
 
 export declare function identityRevokeExternalCredential(loomPath: string, credential: string, passphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): void
 
@@ -575,6 +706,30 @@ export declare function identityRevokePublicKey(loomPath: string, key: string, p
 export declare function identityRevokeRole(loomPath: string, principal: string, role: string, passphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): boolean
 
 export declare function identitySetPassphrase(loomPath: string, principal: string, principalPassphrase: string, passphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): void
+
+export declare function importAsana(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array, fieldPolicy: string, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function importConfluence(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array, defaultSpace: string, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function importDrive(loomPath: string, workspace: string, profile: string, sourceScope: string, archivePayload: Uint8Array, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function importJira(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array, fieldPolicy: string, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function importMarkdown(loomPath: string, workspace: string, profile: string, sourceScope: string, archivePayload: Uint8Array, space: string, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function importNotion(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array, defaultSpace: string, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function importRedmine(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array, fieldPolicy: string, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function importSlack(loomPath: string, workspace: string, profile: string, sourceScope: string, snapshotPayload: Uint8Array, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function importTableCsv(loomPath: string, workspace: string, sourceScope: string, csvPayload: Uint8Array, database: string, table: string, schema: string, primaryKey: string, mode: string, commit: boolean, author: string | undefined | null, message: string | undefined | null, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function inferenceInstanceCreateJson(loomPath: string, workspace: string, name: string, model: string, kind: string, runtime: string, preset: string | undefined | null, settingsJson: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function inferenceInstanceDeleteJson(loomPath: string, workspace: string, name: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function inferenceInstanceUpdateJson(loomPath: string, workspace: string, name: string, preset: string | undefined | null, settingsJson: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
 
 /**
  * Add a passphrase unlock wrap to an encrypted store, unlocking it with the existing `passphrase`.
@@ -620,6 +775,14 @@ export declare function kvPut(loomPath: string, workspace: string, collection: s
  */
 export declare function kvRange(loomPath: string, workspace: string, collection: string, lo: Uint8Array, hi: Uint8Array, passphrase?: string | undefined | null): Uint8Array
 
+export const LANE_TICKET_PLACEMENT_AFTER: number
+
+export const LANE_TICKET_PLACEMENT_BEFORE: number
+
+export const LANE_TICKET_PLACEMENT_FIRST: number
+
+export const LANE_TICKET_PLACEMENT_LAST: number
+
 export declare function lanesCreate(loomPath: string, workspace: string, lane: Uint8Array, passphrase?: string | undefined | null): Uint8Array
 
 export declare function lanesDelete(loomPath: string, workspace: string, laneId: string, updatedBy: string, passphrase?: string | undefined | null): Uint8Array
@@ -628,53 +791,13 @@ export declare function lanesGet(loomPath: string, workspace: string, laneId: st
 
 export declare function lanesList(loomPath: string, workspace: string, passphrase?: string | undefined | null): Uint8Array
 
-export declare function lanesReviewerFeedbackUpdate(loomPath: string, workspace: string, laneId: string, reviewerFeedback: string, updatedBy: string, passphrase?: string | undefined | null): Uint8Array
-
-export declare function lanesStatusReportUpdate(loomPath: string, workspace: string, laneId: string, statusReport: string, updatedBy: string, passphrase?: string | undefined | null): Uint8Array
-
-export declare function lanesDeleteClosed(loomPath: string, workspace: string, laneId: string, updatedBy: string, passphrase?: string | undefined | null): Uint8Array
-
-export declare function lanesTicketAdd(loomPath: string, workspace: string, laneId: string, ticketId: string, updatedBy: string, placement: string, anchor?: string | undefined | null, passphrase?: string | undefined | null): Uint8Array
+export declare function lanesTicketAdd(loomPath: string, workspace: string, laneId: string, ticketId: string, updatedBy: string, placement: number, anchor?: string | undefined | null, passphrase?: string | undefined | null): Uint8Array
 
 export declare function lanesTicketRemove(loomPath: string, workspace: string, laneId: string, ticketId: string, updatedBy: string, passphrase?: string | undefined | null): Uint8Array
 
 export declare function lanesTicketTransfer(loomPath: string, workspace: string, sourceLaneId: string, targetLaneId: string, ticketId: string, updatedBy: string, passphrase?: string | undefined | null): Uint8Array
 
-export declare function spacesCreateJson(loomPath: string, workspace: string, pageWorkspaceId: string, spaceId: string, title: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function spacesListJson(loomPath: string, workspace: string, pageWorkspaceId: string, passphrase?: string | undefined | null): string
-
-export declare function spacesGetJson(loomPath: string, workspace: string, pageWorkspaceId: string, spaceId: string, passphrase?: string | undefined | null): string
-
-export declare function pagesCreateJson(loomPath: string, workspace: string, pageWorkspaceId: string, pageId: string, spaceId: string, parentPageId: string | undefined | null, title: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function pagesUpdateJson(loomPath: string, workspace: string, pageWorkspaceId: string, pageId: string, bodyText: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function pagesPublishJson(loomPath: string, workspace: string, pageWorkspaceId: string, pageId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function pagesGetJson(loomPath: string, workspace: string, pageWorkspaceId: string, pageId: string, passphrase?: string | undefined | null): string
-
-export declare function pagesListJson(loomPath: string, workspace: string, pageWorkspaceId: string, passphrase?: string | undefined | null): string
-
-export declare function pagesHistoryJson(loomPath: string, workspace: string, pageWorkspaceId: string, pageId: string, passphrase?: string | undefined | null): string
-
-export declare function structuresCreateJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, spaceId: string, kind: string, title: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function structuresAddNodeJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, nodeId: string, kind: string, label: string, bodyDigest?: string | undefined | null, entityRef?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function structuresUpdateNodeJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, nodeId: string, kind: string, label: string, bodyDigest?: string | undefined | null, entityRef?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function structuresBindJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, nodeId: string, entityRef?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function structuresMoveNodeJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, nodeId: string, parentNodeId?: string | undefined | null, label?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function structuresLinkNodeJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, edgeId: string, srcNodeId: string, dstNodeId: string, label: string, targetRef?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function structuresDecomposeToTicketsJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, itemsJson: string, passphrase?: string | undefined | null): string
-
-export declare function structuresGetJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, passphrase?: string | undefined | null): string
-
-export declare function structuresListJson(loomPath: string, workspace: string, pageWorkspaceId: string, passphrase?: string | undefined | null): string
+export declare function lanesUpdate(loomPath: string, workspace: string, laneId: string, title: string | undefined | null, description: string | undefined | null, laneStatus: string | undefined | null, statusReport: string | undefined | null, reviewerFeedback: string | undefined | null, updatedBy: string, passphrase?: string | undefined | null): Uint8Array
 
 /**
  * Append `payload` to ledger `collection` of `workspace` (created with the `ledger` facet if absent); returns
@@ -693,6 +816,14 @@ export declare function ledgerLen(loomPath: string, workspace: string, collectio
 
 /** Recompute and verify ledger `collection`'s hash chain; an altered payload or broken link is an error. */
 export declare function ledgerVerify(loomPath: string, workspace: string, collection: string, passphrase?: string | undefined | null): void
+
+export declare function lifecycleDefineJson(loomPath: string, workspace: string, definition: Uint8Array, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function lifecycleDefineStandardJson(loomPath: string, workspace: string, kind: string, version: string, completionPredicateDigest: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function lifecycleInstantiateJson(loomPath: string, workspace: string, instanceId: string, definitionId: string, subjectRefs: Array<string>, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function lifecycleTransitionJson(loomPath: string, workspace: string, instanceId: string, transitionId: string, toStageId: string, actorPrincipalId: string | undefined | null, gateEvaluationsJson: string, snapshotDigest?: string | undefined | null, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
 
 /** Acquire, refresh, or release a daemon-backed lock. Token-returning calls return JSON. */
 export declare function lockAcquireJson(loomPath: string, key: string, principal: string, session: string, mode: string, permits: number, capacity: number, leaseMs: bigint, waitMs?: bigint | undefined | null): string
@@ -775,127 +906,9 @@ export declare function mailSetFlags(loomPath: string, workspace: string, princi
  */
 export declare function mailToEml(loomPath: string, workspace: string, principal: string, mailbox: string, uid: string, passphrase?: string | undefined | null): Uint8Array | null
 
-export declare function meetingsImportSnapshot(loomPath: string, workspace: string, inputProfile: string, snapshot: Uint8Array, dryRun: boolean, passphrase?: string | undefined | null): string
+export declare function meetingsImportSnapshot(loomPath: string, workspace: string, inputProfile: string, snapshot: Uint8Array, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
 
 export declare function meetingsSourceRead(loomPath: string, workspace: string, sourceId: string, leaf: string, passphrase?: string | undefined | null): Uint8Array
-
-export declare function driveListJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, passphrase?: string | undefined | null): string
-
-export declare function driveStatJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, name: string, passphrase?: string | undefined | null): string
-
-export declare function driveReadFile(loomPath: string, workspace: string, driveWorkspaceId: string, fileId: string, passphrase?: string | undefined | null): Uint8Array
-
-export declare function driveListVersionsJson(loomPath: string, workspace: string, driveWorkspaceId: string, fileId: string, passphrase?: string | undefined | null): string
-
-export declare function driveListConflictsJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase?: string | undefined | null): string
-
-export declare function driveListSharesJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase?: string | undefined | null): string
-
-export declare function driveListRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, passphrase?: string | undefined | null): string
-
-export declare function driveCreateFolderJson(loomPath: string, workspace: string, driveWorkspaceId: string, parentFolderId: string, folderId: string, name: string, expectedRoot: string, passphrase?: string | undefined | null): string
-
-export declare function driveCreateUploadJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, parentFolderId: string, name: string, fileId: string, expectedRoot: string, createdAtMs: bigint, replaceFile: boolean, passphrase?: string | undefined | null): string
-
-export declare function driveUploadChunkJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, chunk: Uint8Array, passphrase?: string | undefined | null): string
-
-export declare function driveCommitUploadJson(loomPath: string, workspace: string, driveWorkspaceId: string, uploadId: string, passphrase?: string | undefined | null): string
-
-export declare function driveRenameJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, nodeId: string, newName: string, expectedRoot: string, passphrase?: string | undefined | null): string
-
-export declare function driveMoveJson(loomPath: string, workspace: string, driveWorkspaceId: string, sourceFolderId: string, targetFolderId: string, nodeId: string, expectedRoot: string, passphrase?: string | undefined | null): string
-
-export declare function driveDeleteJson(loomPath: string, workspace: string, driveWorkspaceId: string, folderId: string, nodeId: string, expectedRoot: string, passphrase?: string | undefined | null): string
-
-export declare function driveResolveConflictJson(loomPath: string, workspace: string, driveWorkspaceId: string, conflictId: string, resolution: string, passphrase?: string | undefined | null): string
-
-export declare function driveGrantShareJson(loomPath: string, workspace: string, driveWorkspaceId: string, grantId: string, targetKind: string, targetId: string, principal: string, role: string, grantedAtMs: bigint, expiresAtMs?: bigint | null, passphrase?: string | undefined | null): string
-
-export declare function driveRevokeShareJson(loomPath: string, workspace: string, driveWorkspaceId: string, grantId: string, passphrase?: string | undefined | null): string
-
-export declare function driveApplyShareExpiryJson(loomPath: string, workspace: string, driveWorkspaceId: string, nowMs: bigint, passphrase?: string | undefined | null): string
-
-export declare function drivePinRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, pinId: string, kind: string, root: string, targetEntityId: string | undefined | null, addedAtMs: bigint, expiresAtMs?: bigint | null, passphrase?: string | undefined | null): string
-
-export declare function driveUnpinRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, pinId: string, passphrase?: string | undefined | null): string
-
-export declare function driveApplyRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, nowMs: bigint, passphrase?: string | undefined | null): string
-
-export declare function ticketsProjectCreateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, keyPrefix: string, name: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsProjectRekeyJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, keyPrefix: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsProjectSettingsGetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, passphrase?: string | undefined | null): string
-
-export declare function ticketsProjectSettingsSetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, defaultProjection: string | undefined | null, enableProjectionsJson: string, disableProjectionsJson: string, actorEnforcement: string | undefined | null, projectOwnerPrincipal: string | undefined | null, clearProjectOwnerPrincipal: boolean, acceptanceAuthoritiesJson?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsFieldsJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId?: string | undefined | null, projection?: string | undefined | null, operation?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsFieldPutJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, fieldId: string, key: string, name: string, description: string | undefined | null, fieldType: string, optionSet: string | undefined | null, maxLength: number | undefined | null, required: boolean, searchable: boolean, orderable: boolean, cardinality: string, applicableTypeIdsJson: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsFieldRetireJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, fieldId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsCreateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, ticketType: string, externalSource: string | undefined | null, externalId: string | undefined | null, fieldsJson: string, policyLabelsJson: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsUpdateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, setFieldsJson: string | undefined | null, deleteFieldsJson: string, action?: string | undefined | null, targetStatus?: string | undefined | null, observedSourceStatus?: string | undefined | null, observedWorkflowVersion?: string | undefined | null, assignee?: string | undefined | null, commentId?: string | undefined | null, commentType?: string | undefined | null, commentBody?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsDeleteJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsRelationSetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, relationId: string | undefined | null, kind: string, targetId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsRelationRemoveJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, relationId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsRelationListJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, passphrase?: string | undefined | null): string
-
-export declare function ticketsGetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, projection?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsListJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projection?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function ticketsHistoryJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function chatCreateChannelJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, channelHandle: string, name: string, passphrase?: string | undefined | null): string
-
-export declare function chatRenameChannelJson(loomPath: string, workspace: string, chatWorkspaceId: string, selector: string, channelHandle: string, passphrase?: string | undefined | null): string
-
-export declare function chatListChannelsJson(loomPath: string, workspace: string, chatWorkspaceId: string, passphrase?: string | undefined | null): string
-
-export declare function chatPostMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, threadId: string | undefined | null, bodyText: string, passphrase?: string | undefined | null): string
-
-export declare function chatEditMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, bodyText: string, passphrase?: string | undefined | null): string
-
-export declare function chatRedactMessageJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, reasonText?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function chatCreateThreadJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, threadId: string, parentMessageId: string, passphrase?: string | undefined | null): string
-
-export declare function chatCreateTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, messageId: string | undefined | null, title: string, passphrase?: string | undefined | null): string
-
-export declare function chatClaimTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, leaseToken?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function chatCompleteTaskJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, taskId: string, claimId: string, resultMessageId?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function chatInvokeAgentJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, agentPrincipal: string, sourceMessageIdsJson: string, promptText: string, passphrase?: string | undefined | null): string
-
-export declare function chatAgentReplyJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, invocationId: string, messageId: string, passphrase?: string | undefined | null): string
-
-export declare function chatRequestHandoffJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, handoffId: string, fromAgentPrincipal: string, toPrincipal?: string | undefined | null, reasonText?: string | undefined | null, passphrase?: string | undefined | null): string
-
-export declare function chatAddReactionJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string, passphrase?: string | undefined | null): string
-
-export declare function chatRemoveReactionJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, messageId: string, kind: string, passphrase?: string | undefined | null): string
-
-export declare function chatEmojiListJson(loomPath: string, workspace: string, chatWorkspaceId: string, passphrase?: string | undefined | null): string
-
-export declare function chatEmojiRegisterJson(loomPath: string, workspace: string, chatWorkspaceId: string, kind: string, passphrase?: string | undefined | null): string
-
-export declare function chatEmojiUnregisterJson(loomPath: string, workspace: string, chatWorkspaceId: string, kind: string, passphrase?: string | undefined | null): string
-
-export declare function chatMessagesJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, passphrase?: string | undefined | null): string
-
-export declare function chatCursorJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, passphrase?: string | undefined | null): string
-
-export declare function chatUpdateCursorJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, nextSequence: bigint, passphrase?: string | undefined | null): string
-
-export declare function chatFetchEventsJson(loomPath: string, workspace: string, chatWorkspaceId: string, channelId: string, fromSequence: bigint, max: number, passphrase?: string | undefined | null): string
 
 /**
  * Abandon the in-progress merge, restoring the pre-merge working tree. Throws `INVALID_ARGUMENT` if no
@@ -934,6 +947,26 @@ export declare function metricsPutDescriptor(loomPath: string, workspace: string
 export declare function metricsPutObservation(loomPath: string, workspace: string, descriptorName: string, observation: Uint8Array, passphrase?: string | undefined | null): void
 
 export declare function metricsQuery(loomPath: string, workspace: string, descriptorName: string, fromTimestampMs: bigint, toTimestampMs: bigint, maxSeries: number, maxGroups: number, maxSamples: number, maxOutputBytes: bigint, passphrase?: string | undefined | null): Uint8Array
+
+export declare function networkAccessAuditJson(path: string, name: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function networkAccessListJson(path: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function networkAccessRemoveJson(path: string, name: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function networkAccessSetJson(path: string, name: string, description: string | undefined | null, defaultAction: string, rulesJson: string, storePassphrase?: string | undefined | null, principal?: string | undefined | null, principalPassphrase?: string | undefined | null): string
+
+export declare function pagesCreateJson(loomPath: string, workspace: string, pageWorkspaceId: string, pageId: string, spaceId: string, parentPageId: string | undefined | null, title: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function pagesGetJson(loomPath: string, workspace: string, pageWorkspaceId: string, pageId: string, passphrase?: string | undefined | null): string
+
+export declare function pagesHistoryJson(loomPath: string, workspace: string, pageWorkspaceId: string, pageId: string, passphrase?: string | undefined | null): string
+
+export declare function pagesListJson(loomPath: string, workspace: string, pageWorkspaceId: string, passphrase?: string | undefined | null): string
+
+export declare function pagesPublishJson(loomPath: string, workspace: string, pageWorkspaceId: string, pageId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function pagesUpdateJson(loomPath: string, workspace: string, pageWorkspaceId: string, pageId: string, bodyText: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
 
 export declare function protectedRefGetJson(loomPath: string, workspace: string, refName: string, passphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
 
@@ -988,6 +1021,8 @@ export declare function readLink(loomPath: string, facet: string, workspace: str
  */
 export declare function rebase(loomPath: string, facet: string, workspace: string, onto: string, dryRun: boolean, passphrase?: string | undefined | null): string
 
+export declare function refsReconcileJson(loomPath: string, workspace: string, max: bigint, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
 /** Remove file `path` from the workspace working tree. */
 export declare function removeFile(loomPath: string, facet: string, workspace: string, path: string, passphrase?: string | undefined | null): void
 
@@ -1026,8 +1061,6 @@ export declare function revert(loomPath: string, facet: string, workspace: strin
 
 /** The runtime provider/profile report as canonical CBOR. */
 export declare function runtimeProfile(): Uint8Array
-
-export declare function studioSurfaceCatalogJson(workspace: string, set?: string | undefined | null): string
 
 /**
  * Create search collection `name` with the field `mapping` (CBOR `field -> [type_tag, stored, faceted]`,
@@ -1077,6 +1110,26 @@ export declare function searchQuery(loomPath: string, workspace: string, name: s
  */
 export declare function searchRemap(loomPath: string, workspace: string, name: string, mapping: Uint8Array, passphrase?: string | undefined | null): void
 
+export declare function serveListenerConfigureJson(loomPath: string, requestJson: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function serveListenerListJson(loomPath: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function serveListenerRemoveJson(loomPath: string, listenerId: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function serveListenerSetEnabledJson(loomPath: string, listenerId: string, enabled: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function serveWebRouteListJson(loomPath: string, listenerId: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function serveWebRouteRemoveJson(loomPath: string, listenerId: string, routeId: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function serveWebRouteSetJson(loomPath: string, requestJson: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function spacesCreateJson(loomPath: string, workspace: string, pageWorkspaceId: string, spaceId: string, title: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function spacesGetJson(loomPath: string, workspace: string, pageWorkspaceId: string, spaceId: string, passphrase?: string | undefined | null): string
+
+export declare function spacesListJson(loomPath: string, workspace: string, pageWorkspaceId: string, passphrase?: string | undefined | null): string
+
 /**
  * Blame the rows of `table` on `branch` for workspace `workspace` (selected with `facet`): each current
  * row plus the commit that last set it, as canonical-CBOR
@@ -1090,6 +1143,8 @@ export declare function sqlBlame(loomPath: string, workspace: string, branch: st
  * Mirrors the C ABI `loom_sql_diff`.
  */
 export declare function sqlDiff(loomPath: string, workspace: string, table: string, fromCommit: string, toCommit: string, passphrase?: string | undefined | null): Uint8Array
+
+export declare function sqlExecResult(loomPath: string, workspace: string, db: string, sql: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
 
 /**
  * Scan secondary index `index` on `table` for the lookup `prefix` (a canonical-CBOR cell array, the
@@ -1129,6 +1184,38 @@ export declare function stageAll(loomPath: string, facet: string, workspace: str
 /** The workspace status as a JSON string (`{ staged, unstaged, untracked, conflicts }`). */
 export declare function statusJson(loomPath: string, facet: string, workspace: string, passphrase?: string | undefined | null): string
 
+export declare function storeBundleImport(loomPath: string, bundle: Uint8Array, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function storeMaintenancePolicySet(loomPath: string, update: Uint8Array, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function storeMaintenanceRun(loomPath: string, request: Uint8Array, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function storeMaintenanceStatus(loomPath: string, request: Uint8Array, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
+export declare function structuresAddNodeJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, nodeId: string, kind: string, label: string, bodyDigest?: string | undefined | null, entityRef?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function structuresBindJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, nodeId: string, entityRef?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function structuresCreateJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, spaceId: string, kind: string, title: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function structuresDecomposeToTicketsJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, itemsJson: string, passphrase?: string | undefined | null): string
+
+export declare function structuresGetJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, passphrase?: string | undefined | null): string
+
+export declare function structuresLinkNodeJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, edgeId: string, srcNodeId: string, dstNodeId: string, label: string, targetRef?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function structuresListJson(loomPath: string, workspace: string, pageWorkspaceId: string, passphrase?: string | undefined | null): string
+
+export declare function structuresMoveNodeJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, nodeId: string, parentNodeId?: string | undefined | null, label?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function structuresUpdateNodeJson(loomPath: string, workspace: string, pageWorkspaceId: string, structureId: string, nodeId: string, kind: string, label: string, bodyDigest?: string | undefined | null, entityRef?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function studioReindexJson(loomPath: string, workspace: string, profile: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function studioRevisionsRebuildJson(loomPath: string, workspace: string, profile: string, dryRun: boolean, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
+
+export declare function studioSurfaceCatalogJson(workspace: string, set?: string | undefined | null): string
+
 /**
  * Create a symbolic link at `linkPath` whose target is `target` (opaque; may be dangling). The parent
  * must exist; `linkPath` must be free.
@@ -1153,6 +1240,60 @@ export declare function tagRename(loomPath: string, facet: string, workspace: st
 
 /** The raw ref target digest of tag `name` (commit for lightweight, tag object for annotated), or null. */
 export declare function tagTarget(loomPath: string, facet: string, workspace: string, name: string, passphrase?: string | undefined | null): string | null
+
+export declare function ticketsBoardConfigureColumnsJson(loomPath: string, workspace: string, ticketWorkspaceId: string, boardId: string, requestJson: string, passphrase?: string | undefined | null): string
+
+export declare function ticketsBoardCreateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, requestJson: string, passphrase?: string | undefined | null): string
+
+export declare function ticketsBoardDeleteJson(loomPath: string, workspace: string, ticketWorkspaceId: string, boardId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsBoardGetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, boardId: string, passphrase?: string | undefined | null): string
+
+export declare function ticketsBoardListJson(loomPath: string, workspace: string, ticketWorkspaceId: string, includeDeleted: boolean, passphrase?: string | undefined | null): string
+
+export declare function ticketsBoardMoveCardJson(loomPath: string, workspace: string, ticketWorkspaceId: string, boardId: string, requestJson: string, passphrase?: string | undefined | null): string
+
+export declare function ticketsBoardUpdateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, boardId: string, requestJson: string, passphrase?: string | undefined | null): string
+
+export declare function ticketsCommentAddJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, commentId: string | undefined | null, commentType: string | undefined | null, body: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsCommentDeleteJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, commentId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsCommentsJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, passphrase?: string | undefined | null): string
+
+export declare function ticketsCommentUpdateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, commentId: string, commentType?: string | undefined | null, body?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsCreateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, ticketType: string, externalSource: string | undefined | null, externalId: string | undefined | null, fieldsJson: string, policyLabelsJson: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsDeleteJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsFieldPutJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, fieldId: string, key: string, name: string, description: string | undefined | null, fieldType: string, optionSet: string | undefined | null, maxLength: number | undefined | null, required: boolean, searchable: boolean, orderable: boolean, cardinality: string, applicableTypeIdsJson: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsFieldRetireJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, fieldId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsFieldsJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId?: string | undefined | null, projection?: string | undefined | null, operation?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsGetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, projection?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsHistoryJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsListJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projection?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsProjectCreateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, keyPrefix: string, name: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsProjectRekeyJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, keyPrefix: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsProjectSettingsGetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, includeContracts: boolean, passphrase?: string | undefined | null): string
+
+export declare function ticketsProjectSettingsSetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, projectId: string, defaultProjection: string | undefined | null, enableProjectionsJson: string, disableProjectionsJson: string, actorEnforcement: string | undefined | null, projectOwnerPrincipal: string | undefined | null, clearProjectOwnerPrincipal: boolean, acceptanceAuthoritiesJson?: string | undefined | null, acceptanceEvidenceEnforcement?: boolean | undefined | null, requiredAcceptanceEvidenceKeysJson?: string | undefined | null, requiredAcceptanceReviewsJson?: string | undefined | null, ownerContractSummary?: string | undefined | null, ownerContractDetails?: string | undefined | null, workerContractSummary?: string | undefined | null, workerContractDetails?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsRelationListJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, passphrase?: string | undefined | null): string
+
+export declare function ticketsRelationRemoveJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, relationId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsRelationSetJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, relationId: string | undefined | null, kind: string, targetId: string, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null): string
+
+export declare function ticketsUpdateJson(loomPath: string, workspace: string, ticketWorkspaceId: string, ticketId: string, setFieldsJson: string | undefined | null, deleteFieldsJson: string, action?: string | undefined | null, targetStatus?: string | undefined | null, observedSourceStatus?: string | undefined | null, observedWorkflowVersion?: string | undefined | null, assignee?: string | undefined | null, commentId?: string | undefined | null, commentType?: string | undefined | null, commentBody?: string | undefined | null, expectedRoot?: string | undefined | null, passphrase?: string | undefined | null, commentsJson?: string | undefined | null, relationSetsJson?: string | undefined | null, relationRemovesJson?: string | undefined | null): string
 
 export declare function tracesGetSpan(loomPath: string, workspace: string, traceId: string, spanId: string, passphrase?: string | undefined | null): Uint8Array | null
 
@@ -1258,6 +1399,8 @@ export declare function vectorSearchPolicy(loomPath: string, workspace: string, 
 /** Fetch UTF-8 source text for vector `id`, or `null` if no source text is stored. */
 export declare function vectorSourceText(loomPath: string, workspace: string, name: string, id: string, passphrase?: string | undefined | null): Uint8Array | null
 
+export declare function vectorTextUpsert(loomPath: string, request: Uint8Array, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): Uint8Array
+
 /**
  * Insert or replace the vector at `id` in set `name`: `vector` is bytes of little-endian `f32` (4 per
  * component); `metadata` is a CBOR `text -> cell` map (or empty). `NOT_FOUND` if the set was never
@@ -1270,6 +1413,8 @@ export declare function vectorUpsert(loomPath: string, workspace: string, name: 
  * crosses as `[1, model_id, dimension, weights_digest]`.
  */
 export declare function vectorUpsertSource(loomPath: string, workspace: string, name: string, id: string, vector: Uint8Array, metadata: Uint8Array, sourceText: Uint8Array, modelId?: string | undefined | null, weightsDigest?: string | undefined | null, passphrase?: string | undefined | null): void
+
+export declare function vectorWorkspaceConfigureJson(loomPath: string, workspace: string, requestJson: string, storePassphrase?: string | undefined | null, authPrincipal?: string | undefined | null, authPassphrase?: string | undefined | null): string
 
 /** The library version. */
 export declare function version(): string

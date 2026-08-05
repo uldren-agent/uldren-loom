@@ -81,6 +81,35 @@ export function vectorUpsertSource(
   );
 }
 
+export async function vectorTextUpsert(
+  loomPath: string,
+  request: Uint8Array | number[],
+  loomKey?: LoomKey,
+  auth?: LoomAuth
+): Promise<Uint8Array> {
+  const [passphrase, kek] = keyArgs(loomKey);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return Uint8Array.from(
+    await UldrenLoom.vectorTextUpsert(
+      loomPath, Array.from(request), passphrase, kek, authPrincipal, authPassphrase
+    )
+  );
+}
+
+export function vectorWorkspaceConfigureJson(
+  loomPath: string,
+  workspace: string,
+  requestJson: string,
+  loomKey?: LoomKey,
+  auth?: LoomAuth
+): Promise<string> {
+  const [passphrase, kek] = keyArgs(loomKey);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.vectorWorkspaceConfigureJson(
+    loomPath, workspace, requestJson, passphrase, kek, authPrincipal, authPassphrase
+  );
+}
+
 /** Fetch the embedding + metadata at `id` as raw Loom Canonical CBOR `[vector_bytes, metadata]`, or
  * null if absent. */
 export async function vectorGet(

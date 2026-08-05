@@ -1,4 +1,5 @@
 use js_sys::{Array, BigInt, Object, Reflect, Uint8Array};
+use loom_client::{IdentityAuthorityPolicyService, SecurityAdminService};
 use loom_codec::{Value as CborValue, encode as cbor_encode};
 use loom_core::calendar::{
     self, CalendarEntry, CollectionMeta, Component, DateTime, IcalDate, IcalMonth, IcalTime,
@@ -1078,6 +1079,12 @@ struct OpfsBacking {
     handle: FileSystemSyncAccessHandle,
 }
 
+impl Drop for OpfsBacking {
+    fn drop(&mut self) {
+        let _ = self.handle.close();
+    }
+}
+
 impl BackingIo for OpfsBacking {
     fn pread(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
         let opts = FileSystemReadWriteOptions::new();
@@ -1318,6 +1325,21 @@ impl LoomStore {
         Ok((identity, acl))
     }
 
+    fn prepare_security_admin_context(&mut self) -> Result<(), JsError> {
+        let (identity, acl) = self.load_control_state()?;
+        let mut authorized_identity = identity;
+        if let (Some(principal), Some(passphrase)) = (&self.auth_principal, &self.auth_passphrase) {
+            let principal = WorkspaceId::parse(principal).map_err(le)?;
+            let session = authorized_identity
+                .authenticate_passphrase(principal, passphrase, random_workspace_id()?.to_string())
+                .map_err(le)?;
+            self.loom.set_session(session.id);
+        }
+        self.loom.set_identity_store(authorized_identity);
+        self.loom.set_acl_store(acl);
+        Ok(())
+    }
+
     pub fn authenticate_passphrase(
         &mut self,
         principal: String,
@@ -1338,6 +1360,143 @@ impl LoomStore {
         self.auth_principal = Some(principal.to_string());
         self.auth_passphrase = Some(principal_passphrase);
         Ok(())
+    }
+
+    pub fn audit_config_show_json(&mut self) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::audit_config_show_json(&mut self.loom).map_err(le)
+    }
+
+    pub fn audit_config_set_json(
+        &mut self,
+        retention_days: Option<u32>,
+        legal_hold: Option<bool>,
+    ) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::audit_config_set_json(&mut self.loom, retention_days, legal_hold)
+            .map_err(le)
+    }
+
+    pub fn audit_list_json(&mut self) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::audit_list_json(&mut self.loom).map_err(le)
+    }
+
+    pub fn audit_view_json(&mut self, record: String) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::audit_view_json(&mut self.loom, &record).map_err(le)
+    }
+
+    pub fn certificate_list_json(&mut self) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::certificate_list_json(&mut self.loom).map_err(le)
+    }
+
+    pub fn certificate_import_json(
+        &mut self,
+        name: String,
+        cert_chain_pem: Vec<u8>,
+        private_key_pem: Vec<u8>,
+        trust_bundle_pem: Option<Vec<u8>>,
+        force: bool,
+    ) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::certificate_import_json(
+            &mut self.loom,
+            &name,
+            cert_chain_pem,
+            private_key_pem,
+            trust_bundle_pem,
+            force,
+        )
+        .map_err(le)
+    }
+
+    pub fn certificate_export(
+        &mut self,
+        name: String,
+        include_cert_chain: bool,
+        include_private_key: bool,
+        include_trust_bundle: bool,
+        force: bool,
+    ) -> Result<Vec<u8>, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::certificate_export(
+            &mut self.loom,
+            &name,
+            include_cert_chain,
+            include_private_key,
+            include_trust_bundle,
+            force,
+        )
+        .map_err(le)
+    }
+
+    pub fn certificate_generate_self_signed_json(
+        &mut self,
+        name: String,
+        dns_names: Vec<String>,
+        ip_addresses: Vec<String>,
+        cn: Option<String>,
+        days: u32,
+        algorithm: String,
+        force: bool,
+    ) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::certificate_generate_self_signed_json(
+            &mut self.loom,
+            &name,
+            dns_names,
+            ip_addresses,
+            cn.as_deref(),
+            days,
+            &algorithm,
+            force,
+        )
+        .map_err(le)
+    }
+
+    pub fn certificate_remove_json(&mut self, name: String) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::certificate_remove_json(&mut self.loom, &name).map_err(le)
+    }
+
+    pub fn certificate_audit_json(&mut self, name: String) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::certificate_audit_json(&mut self.loom, &name).map_err(le)
+    }
+
+    pub fn network_access_list_json(&mut self) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::network_access_list_json(&mut self.loom).map_err(le)
+    }
+
+    pub fn network_access_set_json(
+        &mut self,
+        name: String,
+        description: Option<String>,
+        default_action: String,
+        rules_json: String,
+    ) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::network_access_set_json(
+            &mut self.loom,
+            &name,
+            description.as_deref(),
+            &default_action,
+            &rules_json,
+        )
+        .map_err(le)
+    }
+
+    pub fn network_access_remove_json(&mut self, name: String) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::network_access_remove_json(&mut self.loom, &name).map_err(le)
+    }
+
+    pub fn network_access_audit_json(&mut self, name: String) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::network_access_audit_json(&mut self.loom, &name).map_err(le)
     }
 
     pub fn acl_list_json(&mut self) -> Result<String, JsError> {
@@ -1637,11 +1796,11 @@ impl LoomSql {
         }
         let id = random_workspace_id()?;
         let name = name.as_deref().filter(|value| !value.is_empty());
-        let ns = match facet.as_deref().filter(|value| !value.is_empty()) {
-            Some(facet) => self
+        let ns = match domain.as_deref().filter(|value| !value.is_empty()) {
+            Some(domain) => self
                 .loom
                 .registry_mut()
-                .create(FacetKind::parse(facet).map_err(le)?, name, id)
+                .create(FacetKind::parse(domain).map_err(le)?, name, id)
                 .map_err(le)?,
             None => self
                 .loom
@@ -1712,6 +1871,21 @@ impl LoomSql {
         Ok((identity, acl))
     }
 
+    fn prepare_security_admin_context(&mut self) -> Result<(), JsError> {
+        let (identity, acl) = self.load_control_state()?;
+        let mut authorized_identity = identity;
+        if let (Some(principal), Some(passphrase)) = (&self.auth_principal, &self.auth_passphrase) {
+            let principal = WorkspaceId::parse(principal).map_err(le)?;
+            let session = authorized_identity
+                .authenticate_passphrase(principal, passphrase, random_workspace_id()?.to_string())
+                .map_err(le)?;
+            self.loom.set_session(session.id);
+        }
+        self.loom.set_identity_store(authorized_identity);
+        self.loom.set_acl_store(acl);
+        Ok(())
+    }
+
     pub fn authenticate_passphrase(
         &mut self,
         principal: String,
@@ -1737,6 +1911,11 @@ impl LoomSql {
     pub fn identity_list_json(&mut self) -> Result<String, JsError> {
         let (identity, _) = self.authorize_global_admin()?;
         Ok(identity_list_json_inner(&identity))
+    }
+
+    pub fn audit_list_json(&mut self) -> Result<String, JsError> {
+        self.prepare_security_admin_context()?;
+        SecurityAdminService::audit_list_json(&mut self.loom).map_err(le)
     }
 
     pub fn identity_add_principal(
@@ -1959,6 +2138,92 @@ impl LoomSql {
             .map_err(le)?;
         self.loom.set_identity_store(identity);
         Ok(())
+    }
+
+    pub fn identity_force_detach_authority_json(
+        &mut self,
+        principal: String,
+        generation: f64,
+        reason: String,
+    ) -> Result<String, JsError> {
+        if self.readonly {
+            return Err(JsError::new("this session is a read-only snapshot"));
+        }
+        self.prepare_security_admin_context()?;
+        let principal = WorkspaceId::parse(&principal).map_err(le)?;
+        IdentityAuthorityPolicyService::force_detach_authority_json(
+            &mut self.loom,
+            principal,
+            generation as u64,
+            &reason,
+        )
+        .map_err(le)
+    }
+
+    pub fn identity_authority_source_snapshot(&mut self) -> Result<Vec<u8>, JsError> {
+        self.prepare_security_admin_context()?;
+        IdentityAuthorityPolicyService::source_identity_snapshot(&mut self.loom).map_err(le)
+    }
+
+    pub fn identity_replicate_authority_json(
+        &mut self,
+        source: String,
+        source_identity_snapshot: Vec<u8>,
+        become_authority: bool,
+    ) -> Result<String, JsError> {
+        if self.readonly {
+            return Err(JsError::new("this session is a read-only snapshot"));
+        }
+        self.prepare_security_admin_context()?;
+        IdentityAuthorityPolicyService::replicate_authority_snapshot_json(
+            &mut self.loom,
+            &source_identity_snapshot,
+            &source,
+            become_authority,
+        )
+        .map_err(le)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn identity_configure_authority_replication_json(
+        &mut self,
+        id: String,
+        source: String,
+        disabled: bool,
+        pull_on_start: bool,
+        interval_ms: Option<f64>,
+        jitter_ms: f64,
+        backoff_ms: f64,
+        publish_witness: bool,
+    ) -> Result<String, JsError> {
+        if self.readonly {
+            return Err(JsError::new("this session is a read-only snapshot"));
+        }
+        self.prepare_security_admin_context()?;
+        IdentityAuthorityPolicyService::configure_authority_replication_json(
+            &mut self.loom,
+            &id,
+            &source,
+            disabled,
+            pull_on_start,
+            interval_ms.map(|value| value as u64),
+            jitter_ms as u64,
+            backoff_ms as u64,
+            publish_witness,
+        )
+        .map_err(le)
+    }
+
+    pub fn identity_remove_authority_replication_json(
+        &mut self,
+        id: String,
+    ) -> Result<String, JsError> {
+        if self.readonly {
+            return Err(JsError::new("this session is a read-only snapshot"));
+        }
+        self.prepare_security_admin_context()?;
+        IdentityAuthorityPolicyService::remove_authority_replication_json(&mut self.loom, &id)
+            .map_err(le)
     }
 
     pub fn acl_list_json(&mut self) -> Result<String, JsError> {
@@ -2483,8 +2748,8 @@ mod document;
 mod drive;
 mod graph;
 mod kv;
-mod ledger;
 mod lanes;
+mod ledger;
 mod mail_fns;
 mod meetings;
 mod pages;

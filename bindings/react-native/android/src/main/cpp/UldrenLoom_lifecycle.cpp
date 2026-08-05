@@ -135,9 +135,8 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeStudioSurfaceCatalogJson(
   }
   return result;
 }
-
 extern "C" JNIEXPORT jbyteArray JNICALL
-Java_ai_uldren_loom_rn_UldrenLoomNative_nativeExecCbor(
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeApplyCbor(
     JNIEnv *env, jobject thiz, jstring loomPath, jbyteArray request,
     jbyteArray passphrase, jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
   (void)thiz;
@@ -153,7 +152,7 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeExecCbor(
   jbyte *req = env->GetByteArrayElements(request, nullptr);
   unsigned char *ptr = nullptr;
   uintptr_t len = 0;
-  st = loom_exec_cbor(
+  st = loom_apply_cbor(
       h, reinterpret_cast<const unsigned char *>(req), static_cast<uintptr_t>(reqLen), &ptr, &len);
   env->ReleaseByteArrayElements(request, req, JNI_ABORT);
   loom_close(h);
@@ -162,4 +161,196 @@ Java_ai_uldren_loom_rn_UldrenLoomNative_nativeExecCbor(
     return nullptr;
   }
   return ownedBytes(env, ptr, len);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeLifecycleDefineStandardJson(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring workspace, jstring kind, jstring version,
+    jstring completionPredicateDigest, jbyteArray passphrase, jbyteArray kek, jstring authPrincipal,
+    jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openAuthenticatedStoreKeyed(env, p, passphrase, kek, authPrincipal, authPassphrase, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *workspaceChars = env->GetStringUTFChars(workspace, nullptr);
+  const char *kindChars = env->GetStringUTFChars(kind, nullptr);
+  const char *versionChars = env->GetStringUTFChars(version, nullptr);
+  const char *digestChars = env->GetStringUTFChars(completionPredicateDigest, nullptr);
+  char *out = nullptr;
+  st = loom_lifecycle_define_standard_json(
+      h, workspaceChars, kindChars, versionChars, digestChars, &out);
+  env->ReleaseStringUTFChars(workspace, workspaceChars);
+  env->ReleaseStringUTFChars(kind, kindChars);
+  env->ReleaseStringUTFChars(version, versionChars);
+  env->ReleaseStringUTFChars(completionPredicateDigest, digestChars);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jstring result = env->NewStringUTF(out ? out : "");
+  if (out) {
+    loom_string_free(out);
+  }
+  return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeLifecycleDefineJson(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring workspace, jbyteArray definition,
+    jbyteArray passphrase, jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openAuthenticatedStoreKeyed(env, p, passphrase, kek, authPrincipal, authPassphrase, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *workspaceChars = env->GetStringUTFChars(workspace, nullptr);
+  jsize definitionLen = env->GetArrayLength(definition);
+  jbyte *definitionBytes = env->GetByteArrayElements(definition, nullptr);
+  char *out = nullptr;
+  st = loom_lifecycle_define_json(
+      h, workspaceChars, reinterpret_cast<const unsigned char *>(definitionBytes),
+      static_cast<uintptr_t>(definitionLen), &out);
+  env->ReleaseStringUTFChars(workspace, workspaceChars);
+  env->ReleaseByteArrayElements(definition, definitionBytes, JNI_ABORT);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jstring result = env->NewStringUTF(out ? out : "");
+  if (out) {
+    loom_string_free(out);
+  }
+  return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeLifecycleInstantiateJson(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring workspace, jstring instanceId,
+    jstring definitionId, jstring subjectRefsJson, jbyteArray passphrase, jbyteArray kek,
+    jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openAuthenticatedStoreKeyed(env, p, passphrase, kek, authPrincipal, authPassphrase, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *workspaceChars = env->GetStringUTFChars(workspace, nullptr);
+  const char *instanceChars = env->GetStringUTFChars(instanceId, nullptr);
+  const char *definitionChars = env->GetStringUTFChars(definitionId, nullptr);
+  const char *subjectsChars = env->GetStringUTFChars(subjectRefsJson, nullptr);
+  char *out = nullptr;
+  st = loom_lifecycle_instantiate_json(
+      h, workspaceChars, instanceChars, definitionChars, subjectsChars, &out);
+  env->ReleaseStringUTFChars(workspace, workspaceChars);
+  env->ReleaseStringUTFChars(instanceId, instanceChars);
+  env->ReleaseStringUTFChars(definitionId, definitionChars);
+  env->ReleaseStringUTFChars(subjectRefsJson, subjectsChars);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jstring result = env->NewStringUTF(out ? out : "");
+  if (out) {
+    loom_string_free(out);
+  }
+  return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeLifecycleTransitionJson(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring workspace, jstring instanceId,
+    jstring transitionId, jstring toStageId, jstring actorPrincipalId, jstring gateEvaluationsJson,
+    jstring snapshotDigest, jbyteArray passphrase, jbyteArray kek, jstring authPrincipal,
+    jbyteArray authPassphrase) {
+  (void)thiz;
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openAuthenticatedStoreKeyed(env, p, passphrase, kek, authPrincipal, authPassphrase, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *workspaceChars = env->GetStringUTFChars(workspace, nullptr);
+  const char *instanceChars = env->GetStringUTFChars(instanceId, nullptr);
+  const char *transitionChars = env->GetStringUTFChars(transitionId, nullptr);
+  const char *stageChars = env->GetStringUTFChars(toStageId, nullptr);
+  const char *actorValue =
+      actorPrincipalId ? env->GetStringUTFChars(actorPrincipalId, nullptr) : nullptr;
+  const char *gateChars = env->GetStringUTFChars(gateEvaluationsJson, nullptr);
+  const char *snapshotValue =
+      snapshotDigest ? env->GetStringUTFChars(snapshotDigest, nullptr) : nullptr;
+  char *out = nullptr;
+  st = loom_lifecycle_transition_json(
+      h, workspaceChars, instanceChars, transitionChars, stageChars, actorValue, gateChars,
+      snapshotValue, &out);
+  env->ReleaseStringUTFChars(workspace, workspaceChars);
+  env->ReleaseStringUTFChars(instanceId, instanceChars);
+  env->ReleaseStringUTFChars(transitionId, transitionChars);
+  env->ReleaseStringUTFChars(toStageId, stageChars);
+  if (actorValue) {
+    env->ReleaseStringUTFChars(actorPrincipalId, actorValue);
+  }
+  env->ReleaseStringUTFChars(gateEvaluationsJson, gateChars);
+  if (snapshotValue) {
+    env->ReleaseStringUTFChars(snapshotDigest, snapshotValue);
+  }
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jstring result = env->NewStringUTF(out ? out : "");
+  if (out) {
+    loom_string_free(out);
+  }
+  return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ai_uldren_loom_rn_UldrenLoomNative_nativeRefsReconcileJson(
+    JNIEnv *env, jobject thiz, jstring loomPath, jstring workspace, jstring max, jbyteArray passphrase,
+    jbyteArray kek, jstring authPrincipal, jbyteArray authPassphrase) {
+  (void)thiz;
+  uint64_t maxValue = 0;
+  if (!parseU64String(env, max, &maxValue)) {
+    return nullptr;
+  }
+  const char *p = env->GetStringUTFChars(loomPath, nullptr);
+  LoomSession *h = nullptr;
+  int32_t st = openAuthenticatedStoreKeyed(env, p, passphrase, kek, authPrincipal, authPassphrase, &h);
+  env->ReleaseStringUTFChars(loomPath, p);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  const char *workspaceChars = env->GetStringUTFChars(workspace, nullptr);
+  char *out = nullptr;
+  st = loom_refs_reconcile_json(h, workspaceChars, maxValue, &out);
+  env->ReleaseStringUTFChars(workspace, workspaceChars);
+  loom_close(h);
+  if (st != 0) {
+    throwLoom(env);
+    return nullptr;
+  }
+  jstring result = env->NewStringUTF(out ? out : "");
+  if (out) {
+    loom_string_free(out);
+  }
+  return result;
 }

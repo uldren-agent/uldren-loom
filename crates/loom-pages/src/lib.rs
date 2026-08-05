@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 
 use loom_core::error::{Code, LoomError, Result};
 use loom_core::mutable_overlay::OverlayKey;
-use loom_core::provider::ObjectStore;
+use loom_core::provider::{ObjectStore, PlanningObjectStore};
 use loom_core::workspace::{FacetKind, WorkspaceId};
 use loom_core::{
     AclDomain, AclRight, AtomicityBoundary, AuditIntent, CompareToken, Digest, EnginePathSelector,
     EnginePlanningScope, EngineStateDelta, FacetSideEffects, FacetWrite, FacetWriteOp, GraphValue,
     Loom, OverlayDurabilityPolicy, Props, SecondaryIndexWrite, SecondaryIndexWriteOp,
-    WorkflowPlanningSnapshot, WorkflowTransaction, graph_remove_edge, graph_upsert_edge,
-    graph_upsert_node,
+    WorkflowPlanningSnapshot, WorkflowReferenceUpdate, WorkflowTransaction, graph_remove_edge,
+    graph_upsert_edge, graph_upsert_node,
 };
 use loom_store::FileStore;
 use loom_substrate::body::{
@@ -23,7 +23,7 @@ use loom_substrate::pages::{
 };
 use loom_substrate::versioning::{BodyRef, Checkpoint, EntityRevision, RevisionIndexAppend};
 use loom_substrate::{ActorKind, OperationEnvelope, OperationEnvelopeInput};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use loom_substrate::refs::{EntityRef, ReferenceEdge, ReferenceIndex, ReferenceSource};
@@ -36,8 +36,14 @@ const PAGE_CONTROL_OVERLAY_SCHEMA: &str = "loom.pages.control-overlay.v1";
 
 struct PreparedPageReferences {
     owner_state: loom_core::WorkflowOwnerState,
-    live_state: EngineStateDelta,
+    live_state: Option<EngineStateDelta>,
     snapshot: WorkflowPlanningSnapshot,
+}
+
+struct PlannedPagePublish {
+    summary: PagePublishSummary,
+    state: Vec<u8>,
+    transaction: WorkflowTransaction,
 }
 
 struct OperationRecordRequest<'a> {
@@ -57,7 +63,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceSummary {
     pub workspace_id: String,
     pub space_id: String,
@@ -66,7 +72,7 @@ pub struct SpaceSummary {
     pub profile_root: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageSummary {
     pub workspace_id: String,
     pub page_id: String,
@@ -87,14 +93,14 @@ pub struct PageSummary {
     pub profile_root: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageRenderIssueSummary {
     pub kind: String,
     pub entity_id: String,
     pub block_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageUpdateSummary {
     pub workspace_id: String,
     pub page_id: String,
@@ -104,7 +110,7 @@ pub struct PageUpdateSummary {
     pub profile_root: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PagePublishSummary {
     pub workspace_id: String,
     pub page_id: String,
@@ -446,7 +452,34 @@ fn publish_page_with_before_commit(
     before_commit: impl FnOnce(&mut Loom<FileStore>) -> Result<()>,
 ) -> Result<PagePublishSummary> {
     loom.authorize_domain(workspace, AclDomain::Pages, AclRight::Write)?;
-    loom_store::ensure_engine_state_base(loom)?;
+    let mut candidate = loom.fork_state_into(PlanningObjectStore::new(loom.store()))?;
+    let planned = plan_page_publish(
+        &mut candidate,
+        workspace,
+        workspace_id,
+        page_id,
+        published_at_ms,
+        expected_root,
+    )?;
+    let summary = planned.summary.clone();
+    drop(candidate);
+    before_commit(loom)?;
+    let receipt = loom
+        .store()
+        .commit_workflow_transaction(planned.transaction)?;
+    loom.import_state(&planned.state)?;
+    synchronize_page_transaction_receipt(loom, &receipt)?;
+    Ok(summary)
+}
+
+fn plan_page_publish(
+    loom: &mut Loom<PlanningObjectStore<'_, FileStore>>,
+    workspace: WorkspaceId,
+    workspace_id: &str,
+    page_id: &str,
+    published_at_ms: u64,
+    expected_root: Option<&str>,
+) -> Result<PlannedPagePublish> {
     let principal = loom.effective_principal()?.unwrap_or(workspace);
     let mut organization = load_workspace(loom.store(), workspace_id)?;
     enforce_expected_root(loom, workspace_id, &organization, expected_root)?;
@@ -519,7 +552,6 @@ fn publish_page_with_before_commit(
     let planning_snapshot = prepared_references
         .as_ref()
         .map(|prepared| &prepared.snapshot);
-    before_commit(loom)?;
     save_workspace_and_append_operation(
         loom,
         workspace,
@@ -530,10 +562,35 @@ fn publish_page_with_before_commit(
         owner_state,
         planning_snapshot,
     )?;
-    if let Some(prepared) = prepared_references {
-        loom.apply_engine_state_delta(prepared.live_state)?;
+    if let Some(prepared) = prepared_references
+        && let Some(live_state) = prepared.live_state
+    {
+        loom.apply_engine_state_delta(live_state)?;
     }
-    Ok(summary)
+    let (root, state_objects) = loom.save_state_objects()?;
+    let mut objects = loom.store().objects()?;
+    objects.extend(state_objects);
+    let state = loom.export_state();
+    let direct_controls = loom.store().direct_control_writes()?;
+    if !direct_controls.is_empty() {
+        return Err(LoomError::corrupt(
+            "page publish planning candidate left direct control writes",
+        ));
+    }
+    let mut workflow_transactions = loom.store().workflow_transactions()?;
+    if workflow_transactions.len() != 1 {
+        return Err(LoomError::corrupt(
+            "page publish planning candidate must publish exactly one workflow transaction",
+        ));
+    }
+    let mut transaction = workflow_transactions.remove(0);
+    transaction.owner_state.objects.extend(objects);
+    transaction.owner_state.reference = WorkflowReferenceUpdate::Set(Some(root));
+    Ok(PlannedPagePublish {
+        summary,
+        state,
+        transaction,
+    })
 }
 
 pub fn get_page(
@@ -543,12 +600,13 @@ pub fn get_page(
     page_id: &str,
 ) -> Result<Option<PageSummary>> {
     loom.authorize_domain(workspace, AclDomain::Pages, AclRight::Read)?;
+    let principal = loom.effective_principal()?.unwrap_or(workspace);
     let organization = load_workspace(loom.store(), workspace_id)?;
     let profile_root = profile_snapshot_digest(loom, workspace_id, &organization)?;
     Ok(organization
         .pages
         .get(page_id)
-        .map(|page| page_summary(workspace_id, &organization, page, workspace, profile_root)))
+        .map(|page| page_summary(workspace_id, &organization, page, principal, profile_root)))
 }
 
 pub fn list_pages(
@@ -557,12 +615,13 @@ pub fn list_pages(
     workspace_id: &str,
 ) -> Result<Vec<PageSummary>> {
     loom.authorize_domain(workspace, AclDomain::Pages, AclRight::Read)?;
+    let principal = loom.effective_principal()?.unwrap_or(workspace);
     let organization = load_workspace(loom.store(), workspace_id)?;
     let profile_root = profile_snapshot_digest(loom, workspace_id, &organization)?;
     Ok(organization
         .pages
         .values()
-        .map(|page| page_summary(workspace_id, &organization, page, workspace, profile_root))
+        .map(|page| page_summary(workspace_id, &organization, page, principal, profile_root))
         .collect())
 }
 
@@ -1080,7 +1139,7 @@ pub fn list_structures(
         .collect())
 }
 
-fn load_workspace(store: &FileStore, workspace_id: &str) -> Result<PageWorkspace> {
+fn load_workspace<S: ObjectStore>(store: &S, workspace_id: &str) -> Result<PageWorkspace> {
     let key = page_workspace_snapshot_key(workspace_id)?;
     match page_control_get(store, workspace_id, "workspace-snapshot", &key)? {
         Some(bytes) => PageWorkspaceSnapshot::decode(&bytes)?.organization(store.digest_algo()),
@@ -1088,8 +1147,8 @@ fn load_workspace(store: &FileStore, workspace_id: &str) -> Result<PageWorkspace
     }
 }
 
-fn save_workspace(
-    store: &FileStore,
+fn save_workspace<S: ObjectStore>(
+    store: &S,
     workspace: WorkspaceId,
     workspace_id: &str,
     organization: &PageWorkspace,
@@ -1109,8 +1168,8 @@ fn workspace_snapshot_bytes(workspace_id: &str, organization: &PageWorkspace) ->
     PageWorkspaceSnapshot::from_workspace(workspace_id, organization)?.encode()
 }
 
-fn profile_snapshot_digest(
-    loom: &Loom<FileStore>,
+fn profile_snapshot_digest<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace_id: &str,
     organization: &PageWorkspace,
 ) -> Result<Digest> {
@@ -1121,8 +1180,8 @@ fn profile_snapshot_digest(
     ))
 }
 
-fn enforce_expected_root(
-    loom: &Loom<FileStore>,
+fn enforce_expected_root<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace_id: &str,
     organization: &PageWorkspace,
     expected_root: Option<&str>,
@@ -1141,7 +1200,7 @@ fn enforce_expected_root(
     Ok(())
 }
 
-fn load_log(store: &FileStore, workspace_id: &str) -> Result<PageOperationLog> {
+fn load_log<S: ObjectStore>(store: &S, workspace_id: &str) -> Result<PageOperationLog> {
     let key = page_profile_operation_log_key(workspace_id)?;
     if store.uses_mutable_overlay_current_records() {
         let head = store.retained_history_head(&key)?;
@@ -1164,8 +1223,8 @@ pub fn page_operation_log(store: &FileStore, workspace_id: &str) -> Result<PageO
     load_log(store, workspace_id)
 }
 
-fn retained_operation_append(
-    store: &FileStore,
+fn retained_operation_append<S: ObjectStore>(
+    store: &S,
     workspace_id: &str,
     record: &PageOperationRecord,
 ) -> Result<Vec<loom_core::WorkflowControlWrite>> {
@@ -1219,8 +1278,8 @@ fn retained_operation_append(
     Ok(writes)
 }
 
-fn append_operation(
-    store: &FileStore,
+fn append_operation<S: ObjectStore>(
+    store: &S,
     workspace: WorkspaceId,
     workspace_id: &str,
     record: &PageOperationRecord,
@@ -1237,8 +1296,8 @@ fn append_operation(
     )
 }
 
-fn save_workspace_and_append_operation(
-    loom: &mut Loom<FileStore>,
+fn save_workspace_and_append_operation<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     organization: &PageWorkspace,
@@ -1302,24 +1361,26 @@ fn page_control_overlay_key(workspace_id: &str, kind: &str) -> Result<OverlayKey
     ])
 }
 
-fn page_control_get(
-    store: &FileStore,
+fn page_control_get<S: ObjectStore>(
+    store: &S,
     workspace_id: &str,
     kind: &str,
     legacy_key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
     if store.uses_mutable_overlay_current_records() {
         let overlay_key = page_control_overlay_key(workspace_id, kind)?;
-        store
-            .open_mvcc_snapshot_with_owner(Some("pages.control.read"))?
-            .read_composite(&overlay_key, |_, _| store.control_get(legacy_key))
+        if let Some(entry) = store.mutable_overlay_current_entry(&overlay_key)? {
+            Ok(Some(entry.payload))
+        } else {
+            store.control_get(legacy_key)
+        }
     } else {
         store.control_get(legacy_key)
     }
 }
 
-fn page_control_set(
-    store: &FileStore,
+fn page_control_set<S: ObjectStore>(
+    store: &S,
     workspace: WorkspaceId,
     workspace_id: &str,
     kind: &str,
@@ -1342,8 +1403,8 @@ fn page_control_set(
     }
 }
 
-fn page_control_set_many(
-    store: &FileStore,
+fn page_control_set_many<S: ObjectStore>(
+    store: &S,
     workspace: WorkspaceId,
     workspace_id: &str,
     values: Vec<(OverlayKey, Vec<u8>)>,
@@ -1383,15 +1444,19 @@ fn page_control_set_many(
         actor: workspace,
         expected_generation: Some(expected_generation),
         writes,
+        prepared_operations: Vec::new(),
+        revision_metadata: Vec::new(),
+        delivery_intents: Vec::new(),
         durability: OverlayDurabilityPolicy::Normal,
         boundary: AtomicityBoundary::Single,
         idempotency: None,
         owner_state,
+        post_commit_delta: None,
     })
 }
 
-fn synchronize_page_transaction_receipt(
-    loom: &mut Loom<FileStore>,
+fn synchronize_page_transaction_receipt<S: ObjectStore>(
+    loom: &mut Loom<S>,
     receipt: &loom_core::CommitReceipt,
 ) -> Result<()> {
     for outcome in &receipt.writes {
@@ -1484,8 +1549,8 @@ fn record_organization_operation(
     }
 }
 
-fn operation_record(
-    loom: &Loom<FileStore>,
+fn operation_record<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     request: OperationRecordRequest<'_>,
 ) -> Result<PageOperationRecord> {
@@ -1558,8 +1623,8 @@ pub fn operation_changes(
     log.changes(cursor, max)
 }
 
-fn next_page_revision_index(
-    loom: &Loom<FileStore>,
+fn next_page_revision_index<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     organization: Option<&PageWorkspace>,
@@ -1630,8 +1695,8 @@ fn page_operation_revision_entity_id(operation_kind: &str, target_entity_id: &st
     }
 }
 
-fn apply_published_page_revision(
-    loom: &Loom<FileStore>,
+fn apply_published_page_revision<S: ObjectStore>(
+    loom: &Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     organization: &PageWorkspace,
@@ -1679,8 +1744,8 @@ fn apply_published_page_revision(
     Ok(index)
 }
 
-fn prepare_page_published_refs(
-    loom: &Loom<FileStore>,
+fn prepare_page_published_refs<S: ObjectStore>(
+    loom: &mut Loom<S>,
     workspace: WorkspaceId,
     workspace_id: &str,
     page_id: &str,
@@ -1697,30 +1762,24 @@ fn prepare_page_published_refs(
             EnginePathSelector::Exact(graph_path),
         ],
     )?;
-    let base_root = snapshot.immutable_base_root().ok_or_else(|| {
-        LoomError::new(
-            Code::Conflict,
-            "page reference planning requires a durable engine-state base root",
-        )
-    })?;
+    let Some(base_root) = snapshot.immutable_base_root() else {
+        let mut index = loom_reference::load_or_rebuild_index(loom, workspace)?;
+        update_published_page_reference_index(&mut index, workspace_id, page_id, body)?;
+        loom_reference::save_index(loom, workspace, &index)?;
+        loom_reference::project_reference_index_edges(loom, workspace, &index)?;
+        return Ok(PreparedPageReferences {
+            owner_state: loom_core::WorkflowOwnerState::default(),
+            live_state: None,
+            snapshot,
+        });
+    };
     let (mut planner, mut index) = loom_reference::bounded_planner_with_reference_index(
-        loom,
+        &*loom,
         scope,
         base_root,
         snapshot.fork_overlay(),
     )?;
-    let text_source = ReferenceSource::new("pages", workspace_id, page_id, "published_body")?;
-    let block_ref_source = ReferenceSource::new("pages", workspace_id, page_id, "block_ref")?;
-    index.remove_source(&text_source);
-    index.remove_source(&block_ref_source);
-    if let Ok(text) = std::str::from_utf8(body) {
-        index.add_text_refs(text_source.clone(), "refers_to", text)?;
-    }
-    if let Ok(decoded) = Body::decode(body) {
-        let rendered = decoded.render_text_with_refs(|_| Ok(BlockRefResolution::Missing))?;
-        index.add_text_refs(text_source, "refers_to", &rendered.text)?;
-        add_block_ref_edges(&mut index, block_ref_source, &decoded)?;
-    }
+    update_published_page_reference_index(&mut index, workspace_id, page_id, body)?;
     loom_reference::save_index(planner.engine_mut(), workspace, &index)?;
     loom_reference::project_reference_index_edges(planner.engine_mut(), workspace, &index)?;
     let (live_state, planned_objects) = planner.finish()?;
@@ -1733,9 +1792,30 @@ fn prepare_page_published_refs(
             controls: Vec::new(),
             audits: Vec::new(),
         },
-        live_state,
+        live_state: Some(live_state),
         snapshot,
     })
+}
+
+fn update_published_page_reference_index(
+    index: &mut ReferenceIndex,
+    workspace_id: &str,
+    page_id: &str,
+    body: &[u8],
+) -> Result<()> {
+    let text_source = ReferenceSource::new("pages", workspace_id, page_id, "published_body")?;
+    let block_ref_source = ReferenceSource::new("pages", workspace_id, page_id, "block_ref")?;
+    index.remove_source(&text_source);
+    index.remove_source(&block_ref_source);
+    if let Ok(text) = std::str::from_utf8(body) {
+        index.add_text_refs(text_source.clone(), "refers_to", text)?;
+    }
+    if let Ok(decoded) = Body::decode(body) {
+        let rendered = decoded.render_text_with_refs(|_| Ok(BlockRefResolution::Missing))?;
+        index.add_text_refs(text_source, "refers_to", &rendered.text)?;
+        add_block_ref_edges(index, block_ref_source, &decoded)?;
+    }
+    Ok(())
 }
 
 fn add_block_ref_edges(
@@ -2254,6 +2334,222 @@ mod tests {
         );
     }
 
+    fn seed_page_workspace(loom: &mut Loom<FileStore>, workspace: WorkspaceId, workspace_id: &str) {
+        create_space(loom, workspace, workspace_id, "space", "Space", None).unwrap();
+        create_page(
+            loom,
+            workspace,
+            PageCreateRequest {
+                workspace_id,
+                page_id: "page-1",
+                space_id: "space",
+                parent_page_id: None,
+                title: "Page",
+                expected_root: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn install_authenticated_pages_sessions(loom: &mut Loom<FileStore>, workspace: WorkspaceId) {
+        let root = WorkspaceId::from_bytes([60; 16]);
+        let alice = WorkspaceId::from_bytes([61; 16]);
+        let bob = WorkspaceId::from_bytes([62; 16]);
+        let mut identity = loom_core::IdentityStore::new(root);
+        identity.set_passphrase(root, "root", b"12345678").unwrap();
+        identity
+            .add_principal(alice, "alice", loom_core::PrincipalKind::User)
+            .unwrap();
+        identity
+            .add_principal(bob, "bob", loom_core::PrincipalKind::User)
+            .unwrap();
+        identity
+            .set_passphrase(alice, "alice", b"abcdefgh")
+            .unwrap();
+        identity.set_passphrase(bob, "bob", b"ijklmnop").unwrap();
+        identity
+            .authenticate_passphrase(alice, "alice", "alice-session")
+            .unwrap();
+        identity
+            .authenticate_passphrase(bob, "bob", "bob-session")
+            .unwrap();
+        let mut acl = loom_core::AclStore::new();
+        acl.grant(loom_core::AclGrant {
+            subject: loom_core::AclSubject::Everyone,
+            workspace: Some(workspace),
+            domain: Some(AclDomain::Pages),
+            ref_glob: None,
+            scopes: vec![loom_core::AclScope::All],
+            rights: [AclRight::Read, AclRight::Write].into_iter().collect(),
+            effect: loom_core::AclEffect::Allow,
+            predicate: None,
+        })
+        .unwrap();
+        loom.set_identity_store(identity);
+        loom.set_acl_store(acl);
+    }
+
+    #[test]
+    fn page_get_authenticated_principal_sees_own_draft_after_update() {
+        let path = test_store_path("page-principal-own-draft");
+        let mut loom = open_loom(&path).unwrap();
+        let workspace = loom
+            .registry_mut()
+            .create(
+                FacetKind::Document,
+                Some("pages-principal-own"),
+                WorkspaceId::from_bytes([63; 16]),
+            )
+            .unwrap();
+        let workspace_id = workspace.to_string();
+        seed_page_workspace(&mut loom, workspace, &workspace_id);
+        install_authenticated_pages_sessions(&mut loom, workspace);
+
+        loom.set_session("alice-session");
+        update_page_text(
+            &mut loom,
+            workspace,
+            &workspace_id,
+            "page-1",
+            "alice draft",
+            10,
+            None,
+        )
+        .unwrap();
+        let page = get_page(&loom, workspace, &workspace_id, "page-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.status, "draft");
+        assert_eq!(page.draft_body_text.as_deref(), Some("alice draft\n"));
+
+        save_loom(&mut loom).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn page_get_different_principal_does_not_see_another_draft() {
+        let path = test_store_path("page-principal-isolated-draft");
+        let mut loom = open_loom(&path).unwrap();
+        let workspace = loom
+            .registry_mut()
+            .create(
+                FacetKind::Document,
+                Some("pages-principal-isolated"),
+                WorkspaceId::from_bytes([64; 16]),
+            )
+            .unwrap();
+        let workspace_id = workspace.to_string();
+        seed_page_workspace(&mut loom, workspace, &workspace_id);
+        install_authenticated_pages_sessions(&mut loom, workspace);
+
+        loom.set_session("alice-session");
+        update_page_text(
+            &mut loom,
+            workspace,
+            &workspace_id,
+            "page-1",
+            "alice private draft",
+            10,
+            None,
+        )
+        .unwrap();
+        loom.set_session("bob-session");
+        let page = get_page(&loom, workspace, &workspace_id, "page-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.status, "empty");
+        assert_eq!(page.draft_body_text, None);
+
+        save_loom(&mut loom).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn page_get_workspace_fallback_sees_unauthenticated_draft() {
+        let path = test_store_path("page-principal-workspace-fallback");
+        let mut loom = open_loom(&path).unwrap();
+        let workspace = loom
+            .registry_mut()
+            .create(
+                FacetKind::Document,
+                Some("pages-principal-fallback"),
+                WorkspaceId::from_bytes([65; 16]),
+            )
+            .unwrap();
+        let workspace_id = workspace.to_string();
+        seed_page_workspace(&mut loom, workspace, &workspace_id);
+
+        update_page_text(
+            &mut loom,
+            workspace,
+            &workspace_id,
+            "page-1",
+            "workspace draft",
+            10,
+            None,
+        )
+        .unwrap();
+        let page = get_page(&loom, workspace, &workspace_id, "page-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.status, "draft");
+        assert_eq!(page.draft_body_text.as_deref(), Some("workspace draft\n"));
+
+        save_loom(&mut loom).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn page_list_and_get_use_same_principal_selection() {
+        let path = test_store_path("page-principal-list-get");
+        let mut loom = open_loom(&path).unwrap();
+        let workspace = loom
+            .registry_mut()
+            .create(
+                FacetKind::Document,
+                Some("pages-principal-list"),
+                WorkspaceId::from_bytes([66; 16]),
+            )
+            .unwrap();
+        let workspace_id = workspace.to_string();
+        seed_page_workspace(&mut loom, workspace, &workspace_id);
+        install_authenticated_pages_sessions(&mut loom, workspace);
+
+        loom.set_session("alice-session");
+        update_page_text(
+            &mut loom,
+            workspace,
+            &workspace_id,
+            "page-1",
+            "list draft",
+            10,
+            None,
+        )
+        .unwrap();
+        let listed = list_pages(&loom, workspace, &workspace_id).unwrap();
+        let got = get_page(&loom, workspace, &workspace_id, "page-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, got.status);
+        assert_eq!(listed[0].draft_body_text, got.draft_body_text);
+        assert_eq!(got.draft_body_text.as_deref(), Some("list draft\n"));
+
+        loom.set_session("bob-session");
+        let listed = list_pages(&loom, workspace, &workspace_id).unwrap();
+        let got = get_page(&loom, workspace, &workspace_id, "page-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, got.status);
+        assert_eq!(listed[0].draft_body_text, got.draft_body_text);
+        assert_eq!(got.status, "empty");
+        assert_eq!(got.draft_body_text, None);
+
+        save_loom(&mut loom).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn page_owner_publication_preserves_ticket_profile_control_state() {
         let path = test_store_path("cross-facet-owner-state");
@@ -2345,6 +2641,8 @@ mod tests {
                 .records
                 .is_empty()
         );
+        let before_update_generation = loom.store().mutable_overlay_generation().unwrap();
+        let before_update_fsync = loom.store().group_commit_diagnostics().unwrap().fsync_count;
         update_page_text(
             &mut loom,
             workspace,
@@ -2355,7 +2653,24 @@ mod tests {
             None,
         )
         .unwrap();
-        publish_page(&mut loom, workspace, &workspace_id, "page-1", 20, None).unwrap();
+        let after_update_generation = loom.store().mutable_overlay_generation().unwrap();
+        let after_update_fsync = loom.store().group_commit_diagnostics().unwrap().fsync_count;
+        assert_eq!(
+            after_update_generation.as_u64(),
+            before_update_generation.as_u64() + 1
+        );
+        assert_eq!(after_update_fsync, before_update_fsync + 2);
+        let before_publish_generation = after_update_generation;
+        let before_publish_fsync = after_update_fsync;
+        let published =
+            publish_page(&mut loom, workspace, &workspace_id, "page-1", 20, None).unwrap();
+        let after_publish_generation = loom.store().mutable_overlay_generation().unwrap();
+        let after_publish_fsync = loom.store().group_commit_diagnostics().unwrap().fsync_count;
+        assert_eq!(
+            after_publish_generation.as_u64(),
+            before_publish_generation.as_u64() + 1
+        );
+        assert_eq!(after_publish_fsync, before_publish_fsync + 2);
 
         let cursor =
             OperationChangeCursor::new(page_operation_cursor_scope(&workspace_id), 1).unwrap();
@@ -2376,6 +2691,65 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        drop(loom);
+
+        let mut loom = open_loom(&path).unwrap();
+        let page = get_page(&loom, workspace, &workspace_id, "page-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.current_revision, Some(1));
+        let changes = operation_changes(&loom, workspace, &cursor, 10).unwrap();
+        let kinds = changes
+            .events
+            .iter()
+            .map(|event| event.operation_kind.as_str())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"page.updated"));
+        assert!(kinds.contains(&"page.published"));
+        let revisions = load_current_revision_index(&loom, workspace, &workspace_id).unwrap();
+        assert!(revisions.latest("page:draft:page-1").is_some());
+        assert!(revisions.latest("page:page-1").is_some());
+        assert!(
+            loom_reference::load_index(&loom, workspace)
+                .unwrap()
+                .is_some()
+        );
+
+        update_page_text(
+            &mut loom,
+            workspace,
+            &workspace_id,
+            "page-1",
+            "Second draft.",
+            30,
+            None,
+        )
+        .unwrap();
+        let before_stale_generation = loom.store().mutable_overlay_generation().unwrap();
+        let before_stale_fsync = loom.store().group_commit_diagnostics().unwrap().fsync_count;
+        let stale_error = publish_page(
+            &mut loom,
+            workspace,
+            &workspace_id,
+            "page-1",
+            40,
+            Some(&published.profile_root),
+        )
+        .unwrap_err();
+        assert_eq!(stale_error.code, Code::Conflict);
+        assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap(),
+            before_stale_generation
+        );
+        assert_eq!(
+            loom.store().group_commit_diagnostics().unwrap().fsync_count,
+            before_stale_fsync
+        );
+        let page = get_page(&loom, workspace, &workspace_id, "page-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.current_revision, Some(1));
+        assert_eq!(page.draft_body_text.as_deref(), Some("Second draft.\n"));
 
         save_loom(&mut loom).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -2446,6 +2820,75 @@ mod tests {
     }
 
     #[test]
+    fn page_publish_preserves_unrelated_mutable_overlay_state() {
+        let path = test_store_path("page-publish-preserves-overlay");
+        let mut loom = open_loom(&path).unwrap();
+        let workspace = loom
+            .registry_mut()
+            .create(
+                FacetKind::Document,
+                Some("pages-preserves-overlay"),
+                WorkspaceId::from_bytes([45; 16]),
+            )
+            .unwrap();
+        let workspace_id = workspace.to_string();
+        create_space(&mut loom, workspace, &workspace_id, "space", "Space", None).unwrap();
+        create_page(
+            &mut loom,
+            workspace,
+            PageCreateRequest {
+                workspace_id: &workspace_id,
+                page_id: "page-1",
+                space_id: "space",
+                parent_page_id: None,
+                title: "Page",
+                expected_root: None,
+            },
+        )
+        .unwrap();
+        update_page_text(
+            &mut loom,
+            workspace,
+            &workspace_id,
+            "page-1",
+            "body",
+            10,
+            None,
+        )
+        .unwrap();
+
+        let unrelated = OverlayKey::from_segments([
+            b"workspace".as_slice(),
+            workspace_id.as_bytes(),
+            b"lanes".as_slice(),
+            b"lane".as_slice(),
+            b"unrelated".as_slice(),
+            b"v1".as_slice(),
+        ])
+        .unwrap();
+        loom.store()
+            .put_mutable_overlay_value(unrelated.clone(), b"unrelated lane".to_vec())
+            .unwrap();
+        let current = loom
+            .store()
+            .mutable_overlay_current_entry(&unrelated)
+            .unwrap()
+            .unwrap();
+        loom.mutable_overlay_mut()
+            .synchronize_current_entry(current)
+            .unwrap();
+
+        publish_page(&mut loom, workspace, &workspace_id, "page-1", 20, None).unwrap();
+
+        let current = loom
+            .mutable_overlay()
+            .current_entry(&unrelated)
+            .expect("unrelated current entry");
+        assert_eq!(current.payload, b"unrelated lane");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn interrupted_publish_keeps_revision_and_references_at_prior_state() {
         let path = test_store_path("page-publish-atomic");
         let mut loom = open_loom(&path).unwrap();
@@ -2497,6 +2940,9 @@ mod tests {
             None,
         )
         .unwrap();
+        let generation_before_interruption = loom.store().mutable_overlay_generation().unwrap();
+        let fsync_before_interruption =
+            loom.store().group_commit_diagnostics().unwrap().fsync_count;
         let enumerations_before = loom.store().mutable_overlay_enumeration_count();
         let engine_io_before = loom.engine_state_io_counts();
         let error = publish_page_with_before_commit(
@@ -2511,13 +2957,21 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, Code::Internal);
         assert_eq!(
+            loom.store().mutable_overlay_generation().unwrap(),
+            generation_before_interruption
+        );
+        assert_eq!(
+            loom.store().group_commit_diagnostics().unwrap().fsync_count,
+            fsync_before_interruption
+        );
+        assert_eq!(
             loom.store().mutable_overlay_enumeration_count(),
             enumerations_before
         );
         let engine_io_after_interruption = loom.engine_state_io_counts();
         assert_eq!(
             engine_io_after_interruption.full_exports,
-            engine_io_before.full_exports
+            engine_io_before.full_exports + 1
         );
         assert_eq!(
             engine_io_after_interruption.full_imports,
@@ -2542,17 +2996,13 @@ mod tests {
         let engine_io_after_publish = loom.engine_state_io_counts();
         assert_eq!(
             engine_io_after_publish.full_exports,
-            engine_io_before.full_exports
+            engine_io_before.full_exports + 1
         );
         assert_eq!(
             engine_io_after_publish.full_imports,
-            engine_io_before.full_imports
+            engine_io_before.full_imports + 1
         );
         assert_eq!(engine_io_after_publish.unrelated_section_rewrites, 0);
-        assert!(
-            engine_io_after_publish.bounded_section_rewrites
-                > engine_io_before.bounded_section_rewrites
-        );
         let page = get_page(&loom, workspace, &workspace_id, "page-1")
             .unwrap()
             .unwrap();
@@ -2652,8 +3102,14 @@ mod tests {
             enumerations_before
         );
         let engine_io_after = loom.engine_state_io_counts();
-        assert_eq!(engine_io_after.full_exports, engine_io_before.full_exports);
-        assert_eq!(engine_io_after.full_imports, engine_io_before.full_imports);
+        assert_eq!(
+            engine_io_after.full_exports,
+            engine_io_before.full_exports + 1
+        );
+        assert_eq!(
+            engine_io_after.full_imports,
+            engine_io_before.full_imports + 1
+        );
         assert_eq!(engine_io_after.unrelated_section_rewrites, 0);
         assert_reference_snapshot_result(&loom, workspace, &workspace_id);
         drop(loom);

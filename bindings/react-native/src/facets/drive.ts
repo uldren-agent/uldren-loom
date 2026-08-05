@@ -72,7 +72,7 @@ export function driveResolveConflictJson(loomPath: string, workspace: string, dr
 }
 
 export function driveGrantShareJson(loomPath: string, workspace: string, driveWorkspaceId: string, grantId: string, targetKind: string, targetId: string, principal: string, role: string, grantedAtMs: U64, expiresAtMs?: U64 | null, key?: LoomKey, auth?: LoomAuth): Promise<string> {
-  return UldrenLoom.driveGrantShareJson(loomPath, workspace, driveWorkspaceId, grantId, targetKind, targetId, principal, role, grantedAtMs, expiresAtMs ?? '', ...args(key, auth));
+  return UldrenLoom.driveGrantShareJson(loomPath, workspace, driveWorkspaceId, grantId, targetKind, targetId, principal, role, grantedAtMs, expiresAtMs ?? null, ...args(key, auth));
 }
 
 export function driveRevokeShareJson(loomPath: string, workspace: string, driveWorkspaceId: string, grantId: string, key?: LoomKey, auth?: LoomAuth): Promise<string> {
@@ -84,7 +84,7 @@ export function driveApplyShareExpiryJson(loomPath: string, workspace: string, d
 }
 
 export function drivePinRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, pinId: string, kind: string, root: string, targetEntityId: string | null | undefined, addedAtMs: U64, expiresAtMs?: U64 | null, key?: LoomKey, auth?: LoomAuth): Promise<string> {
-  return UldrenLoom.drivePinRetentionJson(loomPath, workspace, driveWorkspaceId, pinId, kind, root, targetEntityId ?? '', addedAtMs, expiresAtMs ?? '', ...args(key, auth));
+  return UldrenLoom.drivePinRetentionJson(loomPath, workspace, driveWorkspaceId, pinId, kind, root, targetEntityId ?? null, addedAtMs, expiresAtMs ?? null, ...args(key, auth));
 }
 
 export function driveUnpinRetentionJson(loomPath: string, workspace: string, driveWorkspaceId: string, pinId: string, key?: LoomKey, auth?: LoomAuth): Promise<string> {

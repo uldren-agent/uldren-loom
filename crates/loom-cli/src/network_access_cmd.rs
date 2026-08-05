@@ -12,119 +12,53 @@ pub(crate) fn run_network_access(action: NetworkAccessCmd, keys: &KeyOpts) -> Re
 }
 
 fn run_network_access_list(store: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let policies = loom
-        .store()
-        .network_access_policies()
-        .map_err(|e| e.to_string())?;
-    let references = network_access_served_listener_reference_map(loom.store())?;
-    let seq = loom
-        .store()
-        .audit_append(
-            Some(actor),
-            "network-access.policy.list",
-            Some("network-access"),
-        )
-        .map_err(|e| e.to_string())?;
-    let mut out = format!("{{\"seq\":{seq},\"policies\":[");
-    for (idx, policy) in policies.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&network_access_policy_record_json(
-            loom.store(),
-            policy,
-            network_access_references_for(&references, &policy.name),
-        )?);
-    }
-    out.push_str("]}");
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let out =
+        execute_generated_string(&client, "NetworkAccess", "network_access_list_json", vec![])?;
     println!("{out}");
     Ok(())
 }
 
 fn run_network_access_set(args: NetworkAccessSetArgs, keys: &KeyOpts) -> Result<(), String> {
-    let default_action =
-        loom_store::NetworkAccessAction::parse(&args.default_action).map_err(|e| e.to_string())?;
     let rules = network_access_rules_from_args(&args)?;
-    let loom = cli_open_loom(&args.store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let mut policy = FileStore::network_access_policy_record(
-        &args.name,
-        args.description,
-        default_action,
-        rules,
-    )
-    .map_err(|e| e.to_string())?;
-    let target = network_access_policy_target(&args.name);
-    let seq = loom
-        .store()
-        .save_network_access_policy_audited(
-            &policy,
-            Some(actor),
-            "network-access.policy.set",
-            Some(&target),
-        )
-        .map_err(|e| e.to_string())?;
-    policy.created_audit_seq = policy.created_audit_seq.or(Some(seq));
-    policy.updated_audit_seq = Some(seq);
-    println!(
-        "{}",
-        network_access_policy_json(loom.store(), &policy, seq, &[])?
+    let rules_json = network_access_rules_json(&rules);
+    let client = remote::open_cli_generated_client(&args.store, keys)?;
+    let out = execute_generated_string(
+        &client,
+        "NetworkAccess",
+        "network_access_set_json",
+        vec![
+            args.name.to_value(),
+            args.description.to_value(),
+            args.default_action.to_value(),
+            rules_json.to_value(),
+        ],
     );
+    println!("{}", out?);
     Ok(())
 }
 
 fn run_network_access_remove(store: &str, name: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let references = network_access_served_listener_references(loom.store(), name)?;
-    let target = network_access_policy_target(name);
-    if !references.is_empty() {
-        let denied_target = network_access_denied_remove_target(name, &references);
-        loom.store()
-            .audit_append(
-                Some(actor),
-                "network-access.policy.remove.denied",
-                Some(&denied_target),
-            )
-            .map_err(|e| e.to_string())?;
-        return Err(format!(
-            "network access policy {name:?} is referenced by served listeners: {}",
-            references.join(", ")
-        ));
-    }
-    let seq = loom
-        .store()
-        .remove_network_access_policy_audited(
-            name,
-            Some(actor),
-            "network-access.policy.remove",
-            Some(&target),
-        )
-        .map_err(|e| e.to_string())?;
-    println!("{{\"seq\":{seq},\"name\":{}}}", json_string(name));
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let out = execute_generated_string(
+        &client,
+        "NetworkAccess",
+        "network_access_remove_json",
+        vec![name.to_value()],
+    )?;
+    println!("{out}");
     Ok(())
 }
 
 fn run_network_access_audit(store: &str, name: &str, keys: &KeyOpts) -> Result<(), String> {
-    let loom = cli_open_loom(store, keys)?;
-    let actor = require_global_admin_actor(&loom)?;
-    let policy = loom
-        .store()
-        .network_access_policy(name)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("network access policy {name:?} not found"))?;
-    let references = network_access_served_listener_references(loom.store(), name)?;
-    let target = network_access_policy_target(name);
-    let seq = loom
-        .store()
-        .audit_append(Some(actor), "network-access.policy.audit", Some(&target))
-        .map_err(|e| e.to_string())?;
-    println!(
-        "{}",
-        network_access_policy_json(loom.store(), &policy, seq, &references)?
-    );
+    let client = remote::open_cli_generated_client(store, keys)?;
+    let out = execute_generated_string(
+        &client,
+        "NetworkAccess",
+        "network_access_audit_json",
+        vec![name.to_value()],
+    )?;
+    println!("{out}");
     Ok(())
 }
 
@@ -364,6 +298,7 @@ fn push_network_access_mtls_rule(
     });
 }
 
+#[cfg(test)]
 fn network_access_served_listener_references(
     store: &FileStore,
     name: &str,
@@ -395,10 +330,12 @@ fn network_access_references_for<'a>(
     references.get(name).map(Vec::as_slice).unwrap_or(&[])
 }
 
+#[cfg(test)]
 fn network_access_policy_target(name: &str) -> String {
     format!("name={name}")
 }
 
+#[cfg(test)]
 fn network_access_denied_remove_target(name: &str, references: &[String]) -> String {
     let mut target = network_access_policy_target(name);
     target.push_str(";served_listener_count=");
@@ -420,6 +357,7 @@ fn network_access_denied_remove_target(name: &str, references: &[String]) -> Str
     target
 }
 
+#[cfg(test)]
 fn network_access_policy_json(
     store: &FileStore,
     policy: &loom_store::NetworkAccessPolicyRecord,
@@ -435,6 +373,7 @@ fn network_access_policy_json(
     Ok(out)
 }
 
+#[cfg(test)]
 fn network_access_policy_record_json(
     store: &FileStore,
     policy: &loom_store::NetworkAccessPolicyRecord,
@@ -511,6 +450,18 @@ fn network_access_rule_json(rule: &loom_store::NetworkAccessRule) -> String {
     out.push_str(",\"description\":");
     push_json_option(&mut out, rule.description.as_deref());
     out.push('}');
+    out
+}
+
+fn network_access_rules_json(rules: &[loom_store::NetworkAccessRule]) -> String {
+    let mut out = String::from("[");
+    for (idx, rule) in rules.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&network_access_rule_json(rule));
+    }
+    out.push(']');
     out
 }
 
@@ -641,6 +592,7 @@ fn served_listener_bind_is_public(bind: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn push_network_access_json_u64_option(out: &mut String, value: Option<u64>) {
     match value {
         Some(value) => out.push_str(&value.to_string()),
@@ -692,7 +644,6 @@ mod tests {
                 mode: None,
                 disabled: true,
                 tls_certificate_bundle: None,
-                tls_mode: None,
                 auth_mode: None,
                 exposure: None,
                 audit_mode: None,
@@ -739,7 +690,6 @@ mod tests {
                 mode: None,
                 disabled: false,
                 tls_certificate_bundle: None,
-                tls_mode: None,
                 auth_mode: None,
                 exposure: None,
                 audit_mode: None,

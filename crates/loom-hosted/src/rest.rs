@@ -274,13 +274,17 @@ impl RestAdapter<'_> {
         auth: &HostedAuth,
         workspace: WorkspaceId,
         src_path: &str,
+        author: Option<&str>,
+        message: Option<&str>,
         commit: bool,
         dry_run: bool,
     ) -> RestResult<Vec<u8>> {
         rest_result(
             200,
             self.kernel.write(auth, |loom| {
-                crate::archive::fs_import(loom, workspace, src_path, commit, dry_run)
+                crate::archive::fs_import(
+                    loom, workspace, src_path, author, message, commit, dry_run,
+                )
             }),
         )
     }
@@ -301,18 +305,36 @@ impl RestAdapter<'_> {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the generated Archive IDL signature"
+    )]
     pub fn archive_import(
         &self,
         auth: &HostedAuth,
         workspace: WorkspaceId,
         src_path: &str,
         kind: &str,
+        gzip_output_path: Option<&str>,
+        commit: bool,
+        author: Option<&str>,
+        message: Option<&str>,
         dry_run: bool,
     ) -> RestResult<Vec<u8>> {
         rest_result(
             200,
             self.kernel.write(auth, |loom| {
-                crate::archive::archive_import(loom, workspace, src_path, kind, dry_run)
+                crate::archive::archive_import(
+                    loom,
+                    workspace,
+                    src_path,
+                    kind,
+                    gzip_output_path,
+                    commit,
+                    author,
+                    message,
+                    dry_run,
+                )
             }),
         )
     }
@@ -397,11 +419,18 @@ impl RestAdapter<'_> {
         workspace: WorkspaceId,
         workspace_id: &str,
         project_id: &str,
+        include_contracts: bool,
     ) -> RestResult<Option<TicketProjectSummary>> {
         rest_result(
             200,
             self.kernel.read(auth, |loom| {
-                crate::tickets::project_settings_get(loom, workspace, workspace_id, project_id)
+                crate::tickets::project_settings_get(
+                    loom,
+                    workspace,
+                    workspace_id,
+                    project_id,
+                    include_contracts,
+                )
             }),
         )
     }
@@ -1957,6 +1986,7 @@ impl RestAdapter<'_> {
                     message_id,
                     thread_id,
                     body,
+                    None,
                 )
             }),
         )
@@ -1981,6 +2011,7 @@ impl RestAdapter<'_> {
                     channel_id,
                     message_id,
                     body,
+                    None,
                 )
             }),
         )
@@ -2005,6 +2036,7 @@ impl RestAdapter<'_> {
                     channel_id,
                     message_id,
                     reason,
+                    None,
                 )
             }),
         )
@@ -2029,6 +2061,7 @@ impl RestAdapter<'_> {
                     channel_id,
                     thread_id,
                     parent_message_id,
+                    None,
                 )
             }),
         )
@@ -2055,6 +2088,7 @@ impl RestAdapter<'_> {
                     task_id,
                     message_id,
                     title,
+                    None,
                 )
             }),
         )
@@ -2081,6 +2115,7 @@ impl RestAdapter<'_> {
                     task_id,
                     claim_id,
                     lease_token,
+                    None,
                 )
             }),
         )
@@ -2107,6 +2142,7 @@ impl RestAdapter<'_> {
                     task_id,
                     claim_id,
                     result_message_id,
+                    None,
                 )
             }),
         )
@@ -2135,6 +2171,7 @@ impl RestAdapter<'_> {
                     agent_principal,
                     source_message_ids,
                     prompt,
+                    None,
                 )
             }),
         )
@@ -2159,6 +2196,7 @@ impl RestAdapter<'_> {
                     channel_id,
                     invocation_id,
                     message_id,
+                    None,
                 )
             }),
         )
@@ -2187,6 +2225,7 @@ impl RestAdapter<'_> {
                     from_agent_principal,
                     to_principal,
                     reason,
+                    None,
                 )
             }),
         )
@@ -2211,6 +2250,7 @@ impl RestAdapter<'_> {
                     channel_id,
                     message_id,
                     kind,
+                    None,
                 )
             }),
         )
@@ -2235,6 +2275,7 @@ impl RestAdapter<'_> {
                     channel_id,
                     message_id,
                     kind,
+                    None,
                 )
             }),
         )
@@ -2264,7 +2305,7 @@ impl RestAdapter<'_> {
         rest_result(
             200,
             self.kernel.write(auth, |loom| {
-                crate::chat::register_emoji(loom, workspace, workspace_id, kind)
+                crate::chat::register_emoji(loom, workspace, workspace_id, kind, None)
             }),
         )
     }
@@ -2279,7 +2320,7 @@ impl RestAdapter<'_> {
         rest_result(
             200,
             self.kernel.write(auth, |loom| {
-                crate::chat::unregister_emoji(loom, workspace, workspace_id, kind)
+                crate::chat::unregister_emoji(loom, workspace, workspace_id, kind, None)
             }),
         )
     }
@@ -2325,7 +2366,14 @@ impl RestAdapter<'_> {
         rest_result(
             200,
             self.kernel.write(auth, |loom| {
-                crate::chat::update_cursor(loom, workspace, workspace_id, channel_id, next_sequence)
+                crate::chat::update_cursor(
+                    loom,
+                    workspace,
+                    workspace_id,
+                    channel_id,
+                    next_sequence,
+                    None,
+                )
             }),
         )
     }
@@ -2406,13 +2454,10 @@ impl RestAdapter<'_> {
                     from_sequence,
                     max,
                 )?;
+                let batch = loom_substrate::changes::hosted_operation_changes_batch(batch);
                 Ok(HostedSubstrateChangesBatch {
-                    events: batch
-                        .events
-                        .into_iter()
-                        .map(crate::substrate_changes::operation_event)
-                        .collect(),
-                    next: batch.next.encode(),
+                    events: batch.events.into_iter().map(Into::into).collect(),
+                    next: batch.next,
                 })
             }),
         )
@@ -2956,7 +3001,15 @@ mod tests {
         fs::create_dir_all(fs_import_dir.join("docs")).unwrap();
         fs::write(fs_import_dir.join("docs").join("fs.txt"), b"fs alpha").unwrap();
         let fs_import = rest
-            .fs_import(&auth, ns, fs_import_dir.to_str().unwrap(), false, false)
+            .fs_import(
+                &auth,
+                ns,
+                fs_import_dir.to_str().unwrap(),
+                None,
+                None,
+                false,
+                false,
+            )
             .unwrap();
         let fs_import_report = ImportReport::decode(&fs_import.body).unwrap();
         assert_eq!(fs_import.status, 200);
@@ -3003,10 +3056,18 @@ mod tests {
                 imported_ns,
                 archive_path.to_str().unwrap(),
                 "tar",
+                None,
+                false,
+                None,
+                None,
                 false,
             )
             .unwrap();
-        let import_report = ImportReport::decode(&imported.body).unwrap();
+        let import_values = match loom_codec::decode(&imported.body).unwrap() {
+            loom_codec::Value::Array(values) => values,
+            other => panic!("archive import result not an array: {other:?}"),
+        };
+        let import_report = ImportReport::from_value(import_values[1].clone()).unwrap();
         assert_eq!(import_report.profile, "archive");
         assert!(import_report.bytes_in > 0);
         assert!(import_report.bytes_stored >= 5);

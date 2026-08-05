@@ -1,6 +1,13 @@
 import CUldrenLoom
 import Foundation
 
+public enum LaneTicketPlacement: Int32 {
+    case first = 1
+    case last = 2
+    case before = 3
+    case after = 4
+}
+
 public extension Loom {
     func lanesCreate(workspace: String, lane: [UInt8]) throws -> [UInt8] {
         var ptr: UnsafeMutablePointer<UInt8>?
@@ -44,12 +51,12 @@ public extension Loom {
     }
 
     func lanesTicketAdd(workspace: String, laneId: String, ticketId: String,
-                        updatedBy: String, placement: String = "append",
+                        updatedBy: String, placement: LaneTicketPlacement = .last,
                         anchor: String? = nil) throws -> [UInt8] {
         var ptr: UnsafeMutablePointer<UInt8>?
         var len: UInt = 0
         let status = loom_lanes_ticket_add_cbor(session, workspace, laneId, ticketId, updatedBy,
-                                                placement, anchor, &ptr, &len)
+                                                placement.rawValue, anchor, &ptr, &len)
         guard status == 0 else { throw LoomSql.lastError() }
         return Loom.takeBytes(ptr, len)
     }

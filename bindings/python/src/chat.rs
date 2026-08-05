@@ -2,91 +2,8 @@
 
 use super::*;
 
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct OperationEventJson {
-    workspace_id: String,
-    app_id: String,
-    scope_id: String,
-    operation_id: String,
-    operation_kind: String,
-    sequence: u64,
-    actor_principal: String,
-    timestamp_ms: u64,
-    root_after: String,
-    payload_digest: String,
-    policy_labels: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct OperationBatchJson {
-    events: Vec<OperationEventJson>,
-    next: String,
-}
-
-fn to_json<T: Serialize>(value: loom_core::error::Result<T>) -> PyResult<String> {
-    let value = value.map_err(py_err)?;
-    serde_json::to_string(&value).map_err(|error| PyRuntimeError::new_err(error.to_string()))
-}
-
-fn operation_batch_json(
-    value: loom_core::error::Result<loom_substrate::changes::OperationChangeBatch>,
-) -> PyResult<String> {
-    let batch = value.map_err(py_err)?;
-    to_json(Ok(OperationBatchJson {
-        events: batch
-            .events
-            .into_iter()
-            .map(|event| OperationEventJson {
-                workspace_id: event.workspace_id,
-                app_id: event.app_id,
-                scope_id: event.scope_id,
-                operation_id: event.operation_id,
-                operation_kind: event.operation_kind,
-                sequence: event.sequence,
-                actor_principal: event.actor_principal,
-                timestamp_ms: event.timestamp_ms,
-                root_after: event.root_after.to_string(),
-                payload_digest: event.payload_digest.to_string(),
-                policy_labels: event.policy_labels,
-            })
-            .collect(),
-        next: batch.next.encode(),
-    }))
-}
-
-fn parse_workspace_id(value: &str) -> PyResult<WorkspaceId> {
-    WorkspaceId::parse(value).map_err(py_err)
-}
-
-fn parse_string_list(value: &str) -> PyResult<Vec<String>> {
-    serde_json::from_str(value).map_err(|error| PyRuntimeError::new_err(error.to_string()))
-}
-
-fn chat_read<T>(
-    path: &str,
-    workspace: &str,
-    passphrase: Option<&str>,
-    f: impl FnOnce(&Loom<FileStore>, WorkspaceId) -> PyResult<T>,
-) -> PyResult<T> {
-    let loom = open_loom_read_unlocked(path, key_spec(passphrase).as_ref()).map_err(py_err)?;
-    let workspace_id = resolve_workspace_arg(&loom, workspace)?;
-    f(&loom, workspace_id)
-}
-
-fn chat_write<T>(
-    path: &str,
-    workspace: &str,
-    passphrase: Option<&str>,
-    f: impl FnOnce(&mut Loom<FileStore>, WorkspaceId) -> PyResult<T>,
-) -> PyResult<T> {
-    let mut loom = open_loom_unlocked(path, key_spec(passphrase).as_ref()).map_err(py_err)?;
-    let workspace_id = resolve_workspace_arg(&loom, workspace)?;
-    let out = f(&mut loom, workspace_id)?;
-    save_loom(&mut loom).map_err(py_err)?;
-    Ok(out)
-}
+use futures::executor::block_on;
+use loom_client::generated_api::Chat as GeneratedChat;
 
 #[pyfunction]
 #[pyo3(signature = (path, workspace, chat_workspace_id, channel_id, channel_handle, name, passphrase=None))]
@@ -99,17 +16,20 @@ pub(crate) fn chat_create_channel_json(
     name: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    let channel_id = parse_workspace_id(channel_id)?;
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::ensure_channel(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            channel_handle,
-            name,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_create_channel_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            channel_handle.to_string(),
+            name.to_string(),
+            None,
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -122,15 +42,19 @@ pub(crate) fn chat_rename_channel_json(
     channel_handle: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::rename_channel(
-            loom,
-            ns,
-            chat_workspace_id,
-            selector,
-            channel_handle,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_rename_channel_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            selector.to_string(),
+            channel_handle.to_string(),
+            None,
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -141,9 +65,16 @@ pub(crate) fn chat_list_channels_json(
     chat_workspace_id: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_read(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::list_channels(loom, ns, chat_workspace_id))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_list_channels_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -158,17 +89,51 @@ pub(crate) fn chat_post_message_json(
     body_text: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::post_message(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            message_id,
-            thread_id,
-            body_text.as_bytes().to_vec(),
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_post_message_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            message_id.to_string(),
+            thread_id.map(str::to_string),
+            body_text.to_string(),
+            None,
+        ),
+    )
+    .map_err(py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, workspace, chat_workspace_id, channel_id, message_id, thread_id, body, expected_entity_tag=None, passphrase=None))]
+pub(crate) fn chat_post_message_bytes_json(
+    path: &str,
+    workspace: &str,
+    chat_workspace_id: &str,
+    channel_id: &str,
+    message_id: &str,
+    thread_id: Option<&str>,
+    body: &[u8],
+    expected_entity_tag: Option<&str>,
+    passphrase: Option<&str>,
+) -> PyResult<String> {
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_post_message_bytes_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            message_id.to_string(),
+            thread_id.map(str::to_string),
+            body.to_vec(),
+            expected_entity_tag.map(str::to_string),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -182,16 +147,48 @@ pub(crate) fn chat_edit_message_json(
     body_text: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::edit_message(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            message_id,
-            body_text.as_bytes().to_vec(),
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_edit_message_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            message_id.to_string(),
+            body_text.to_string(),
+            None,
+        ),
+    )
+    .map_err(py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, workspace, chat_workspace_id, channel_id, message_id, body, expected_entity_tag=None, passphrase=None))]
+pub(crate) fn chat_edit_message_bytes_json(
+    path: &str,
+    workspace: &str,
+    chat_workspace_id: &str,
+    channel_id: &str,
+    message_id: &str,
+    body: &[u8],
+    expected_entity_tag: Option<&str>,
+    passphrase: Option<&str>,
+) -> PyResult<String> {
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_edit_message_bytes_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            message_id.to_string(),
+            body.to_vec(),
+            expected_entity_tag.map(str::to_string),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -205,16 +202,20 @@ pub(crate) fn chat_redact_message_json(
     reason: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::redact_message(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            message_id,
-            reason,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_redact_message_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            message_id.to_string(),
+            reason.map(str::to_string),
+            None,
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -228,16 +229,20 @@ pub(crate) fn chat_create_thread_json(
     parent_message_id: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::create_thread(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            thread_id,
-            parent_message_id,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_create_thread_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            thread_id.to_string(),
+            parent_message_id.to_string(),
+            None,
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -252,17 +257,21 @@ pub(crate) fn chat_create_task_json(
     title: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::create_task(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            task_id,
-            message_id,
-            title,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_create_task_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            task_id.to_string(),
+            message_id.map(str::to_string),
+            title.to_string(),
+            None,
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -277,17 +286,21 @@ pub(crate) fn chat_claim_task_json(
     lease_token: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::claim_task(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            task_id,
-            claim_id,
-            lease_token,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_claim_task_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            task_id.to_string(),
+            claim_id.to_string(),
+            lease_token.map(str::to_string),
+            None,
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -302,17 +315,21 @@ pub(crate) fn chat_complete_task_json(
     result_message_id: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::complete_task(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            task_id,
-            claim_id,
-            result_message_id,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_complete_task_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            task_id.to_string(),
+            claim_id.to_string(),
+            result_message_id.map(str::to_string),
+            None,
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -328,20 +345,54 @@ pub(crate) fn chat_invoke_agent_json(
     prompt_text: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    let agent_principal = parse_workspace_id(agent_principal)?;
-    let source_message_ids = parse_string_list(source_message_ids_json)?;
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::invoke_agent(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            invocation_id,
-            agent_principal,
-            source_message_ids,
-            prompt_text.as_bytes().to_vec(),
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_invoke_agent_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            invocation_id.to_string(),
+            agent_principal.to_string(),
+            source_message_ids_json.to_string(),
+            prompt_text.to_string(),
+            None,
+        ),
+    )
+    .map_err(py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, workspace, chat_workspace_id, channel_id, invocation_id, agent_principal, source_message_ids_json, prompt, expected_entity_tag=None, passphrase=None))]
+pub(crate) fn chat_invoke_agent_bytes_json(
+    path: &str,
+    workspace: &str,
+    chat_workspace_id: &str,
+    channel_id: &str,
+    invocation_id: &str,
+    agent_principal: &str,
+    source_message_ids_json: &str,
+    prompt: &[u8],
+    expected_entity_tag: Option<&str>,
+    passphrase: Option<&str>,
+) -> PyResult<String> {
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_invoke_agent_bytes_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            invocation_id.to_string(),
+            agent_principal.to_string(),
+            source_message_ids_json.to_string(),
+            prompt.to_vec(),
+            expected_entity_tag.map(str::to_string),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -355,16 +406,20 @@ pub(crate) fn chat_agent_reply_json(
     message_id: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::agent_reply(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            invocation_id,
-            message_id,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_agent_reply_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            invocation_id.to_string(),
+            message_id.to_string(),
+            None,
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -380,24 +435,26 @@ pub(crate) fn chat_request_handoff_json(
     reason: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    let from_agent_principal = parse_workspace_id(from_agent_principal)?;
-    let to_principal = to_principal.map(parse_workspace_id).transpose()?;
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::request_handoff(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            handoff_id,
-            from_agent_principal,
-            to_principal,
-            reason,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_request_handoff_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            handoff_id.to_string(),
+            from_agent_principal.to_string(),
+            to_principal.map(str::to_string),
+            reason.map(str::to_string),
+            None,
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, chat_workspace_id, channel_id, message_id, kind, passphrase=None))]
+#[pyo3(signature = (path, workspace, chat_workspace_id, channel_id, message_id, kind, expected_entity_tag=None, passphrase=None))]
 pub(crate) fn chat_add_reaction_json(
     path: &str,
     workspace: &str,
@@ -405,22 +462,27 @@ pub(crate) fn chat_add_reaction_json(
     channel_id: &str,
     message_id: &str,
     kind: &str,
+    expected_entity_tag: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::add_reaction(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            message_id,
-            kind,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_add_reaction_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            message_id.to_string(),
+            kind.to_string(),
+            expected_entity_tag.map(str::to_string),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, chat_workspace_id, channel_id, message_id, kind, passphrase=None))]
+#[pyo3(signature = (path, workspace, chat_workspace_id, channel_id, message_id, kind, expected_entity_tag=None, passphrase=None))]
 pub(crate) fn chat_remove_reaction_json(
     path: &str,
     workspace: &str,
@@ -428,18 +490,23 @@ pub(crate) fn chat_remove_reaction_json(
     channel_id: &str,
     message_id: &str,
     kind: &str,
+    expected_entity_tag: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::remove_reaction(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-            message_id,
-            kind,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_remove_reaction_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+            message_id.to_string(),
+            kind.to_string(),
+            expected_entity_tag.map(str::to_string),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -450,42 +517,64 @@ pub(crate) fn chat_emoji_list_json(
     chat_workspace_id: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_read(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::emoji_registry(loom, ns, chat_workspace_id))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_emoji_list_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, chat_workspace_id, kind, passphrase=None))]
+#[pyo3(signature = (path, workspace, chat_workspace_id, kind, expected_entity_tag=None, passphrase=None))]
 pub(crate) fn chat_emoji_register_json(
     path: &str,
     workspace: &str,
     chat_workspace_id: &str,
     kind: &str,
+    expected_entity_tag: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::register_emoji(loom, ns, chat_workspace_id, kind))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_emoji_register_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            kind.to_string(),
+            expected_entity_tag.map(str::to_string),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, chat_workspace_id, kind, passphrase=None))]
+#[pyo3(signature = (path, workspace, chat_workspace_id, kind, expected_entity_tag=None, passphrase=None))]
 pub(crate) fn chat_emoji_unregister_json(
     path: &str,
     workspace: &str,
     chat_workspace_id: &str,
     kind: &str,
+    expected_entity_tag: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::unregister_emoji(
-            loom,
-            ns,
-            chat_workspace_id,
-            kind,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_emoji_unregister_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            kind.to_string(),
+            expected_entity_tag.map(str::to_string),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -497,14 +586,17 @@ pub(crate) fn chat_messages_json(
     channel_id: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_read(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::channel_projection(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_messages_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -516,35 +608,43 @@ pub(crate) fn chat_cursor_json(
     channel_id: &str,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_read(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::read_cursor(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
-        ))
-    })
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_cursor_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, chat_workspace_id, channel_id, next_sequence, passphrase=None))]
+#[pyo3(signature = (path, workspace, chat_workspace_id, channel_id, next_sequence, expected_entity_tag=None, passphrase=None))]
 pub(crate) fn chat_update_cursor_json(
     path: &str,
     workspace: &str,
     chat_workspace_id: &str,
     channel_id: &str,
     next_sequence: u64,
+    expected_entity_tag: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_write(path, workspace, passphrase, |loom, ns| {
-        to_json(loom_chat::update_cursor(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_update_cursor_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
             next_sequence,
-        ))
-    })
+            expected_entity_tag.map(str::to_string),
+        ),
+    )
+    .map_err(py_err)
 }
 
 #[pyfunction]
@@ -558,14 +658,18 @@ pub(crate) fn chat_fetch_events_json(
     max: usize,
     passphrase: Option<&str>,
 ) -> PyResult<String> {
-    chat_read(path, workspace, passphrase, |loom, ns| {
-        operation_batch_json(loom_chat::operation_changes(
-            loom,
-            ns,
-            chat_workspace_id,
-            channel_id,
+    let max = u64::try_from(max).map_err(|_| PyRuntimeError::new_err("max exceeds u64"))?;
+    let generated = generated_session::open_generated_session(path, passphrase, None, None)?;
+    block_on(
+        <loom_client::LocalLoomClient as GeneratedChat>::chat_fetch_events_json(
+            &generated.client,
+            generated.session.clone(),
+            workspace.to_string(),
+            chat_workspace_id.to_string(),
+            channel_id.to_string(),
             from_sequence,
             max,
-        ))
-    })
+        ),
+    )
+    .map_err(py_err)
 }

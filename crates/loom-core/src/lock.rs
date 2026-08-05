@@ -30,19 +30,19 @@ pub struct LockToken {
 }
 
 /// Runtime lock register plus durable-local fence high-waters for one embedded coordinator.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LockCoordinator {
     locks: BTreeMap<Vec<u8>, LockState>,
     next_fence_by_key: BTreeMap<Vec<u8>, u64>,
     applied_fence_by_key: BTreeMap<Vec<u8>, u64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LockState {
     holders: Vec<Holder>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Holder {
     owner: LockOwner,
     mode: LockMode,
@@ -149,6 +149,28 @@ impl LockCoordinator {
             .unwrap_or(0)
     }
 
+    /// Remove every live holder owned by one authenticated logical session.
+    pub fn release_owner(&mut self, owner: &LockOwner, now_ms: u64) -> usize {
+        let keys: Vec<Vec<u8>> = self.locks.keys().cloned().collect();
+        let mut removed = 0usize;
+        for key in keys {
+            self.expire_key(&key, now_ms);
+            if let Some(state) = self.locks.get_mut(&key) {
+                let before = state.holders.len();
+                state.holders.retain(|holder| &holder.owner != owner);
+                removed = removed.saturating_add(before.saturating_sub(state.holders.len()));
+            }
+            if self
+                .locks
+                .get(&key)
+                .is_some_and(|state| state.holders.is_empty())
+            {
+                self.locks.remove(&key);
+            }
+        }
+        removed
+    }
+
     /// Record that a fenced write was applied to `key`.
     pub fn apply_fence(&mut self, key: &[u8], fence: Fence) -> Result<()> {
         let Some(sequence) = fence.embedded_sequence() else {
@@ -184,6 +206,18 @@ impl LockCoordinator {
             .get(key)
             .copied()
             .map(Fence::embedded)
+    }
+
+    /// Earliest unexpired holder lease for `key`, without exposing holder state.
+    pub fn earliest_live_lease_deadline(&self, key: &[u8], now_ms: u64) -> Option<u64> {
+        self.locks.get(key).and_then(|state| {
+            state
+                .holders
+                .iter()
+                .map(|holder| holder.lease_deadline_ms)
+                .filter(|deadline| *deadline > now_ms)
+                .min()
+        })
     }
 
     /// Persistable fence counter snapshot.
@@ -438,6 +472,21 @@ mod tests {
     }
 
     #[test]
+    fn earliest_live_lease_deadline_is_key_scoped_and_ignores_expired_holders() {
+        let mut c = LockCoordinator::default();
+        c.try_acquire(b"k", owner("a"), LockMode::Shared, 30, 10)
+            .unwrap();
+        c.try_acquire(b"k", owner("b"), LockMode::Shared, 50, 10)
+            .unwrap();
+        c.try_acquire(b"other", owner("c"), LockMode::Exclusive, 5, 10)
+            .unwrap();
+        assert_eq!(c.earliest_live_lease_deadline(b"k", 10), Some(40));
+        assert_eq!(c.earliest_live_lease_deadline(b"k", 40), Some(60));
+        assert_eq!(c.earliest_live_lease_deadline(b"k", 60), None);
+        assert_eq!(c.earliest_live_lease_deadline(b"missing", 10), None);
+    }
+
+    #[test]
     fn break_key_removes_holders_without_reusing_fences() {
         let mut c = LockCoordinator::default();
         let token = c
@@ -452,6 +501,30 @@ mod tests {
             .try_acquire(b"k", owner("b"), LockMode::Exclusive, 100, 12)
             .unwrap();
         assert_eq!(next.fence, Fence::embedded(2));
+    }
+
+    #[test]
+    fn release_owner_removes_only_one_logical_session() {
+        let mut coordinator = LockCoordinator::default();
+        let first = LockOwner {
+            principal: "principal".to_string(),
+            session: "first".to_string(),
+        };
+        let second = LockOwner {
+            principal: "principal".to_string(),
+            session: "second".to_string(),
+        };
+        coordinator
+            .try_acquire(b"a".to_vec(), first.clone(), LockMode::Exclusive, 100, 1)
+            .unwrap();
+        coordinator
+            .try_acquire(b"b".to_vec(), first.clone(), LockMode::Exclusive, 100, 1)
+            .unwrap();
+        let retained = coordinator
+            .try_acquire(b"c".to_vec(), second.clone(), LockMode::Exclusive, 100, 1)
+            .unwrap();
+        assert_eq!(coordinator.release_owner(&first, 2), 2);
+        assert!(coordinator.release(&retained, 2).is_ok());
     }
 
     #[test]

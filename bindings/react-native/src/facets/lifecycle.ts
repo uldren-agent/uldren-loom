@@ -1,4 +1,6 @@
 import UldrenLoom from '../NativeUldrenLoom';
+import { authArgs, keyArgs } from '../internal';
+import type { LoomAuth, LoomKey } from '../internal';
 
 /** The engine version. */
 export function version(): string {
@@ -54,4 +56,122 @@ export async function runtimeProfile(): Promise<Uint8Array> {
 
 export async function studioSurfaceCatalogJson(workspace: string, set = 'all'): Promise<string> {
   return UldrenLoom.studioSurfaceCatalogJson(workspace, set);
+}
+
+export function lifecycleDefineStandardJson(
+  loomPath: string,
+  workspace: string,
+  kind: string,
+  version: string,
+  completionPredicateDigest: string,
+  key?: LoomKey,
+  auth?: LoomAuth
+): Promise<string> {
+  const [passphrase, kek] = keyArgs(key);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.lifecycleDefineStandardJson(
+    loomPath,
+    workspace,
+    kind,
+    version,
+    completionPredicateDigest,
+    passphrase,
+    kek,
+    authPrincipal,
+    authPassphrase
+  );
+}
+
+export function lifecycleDefineJson(
+  loomPath: string,
+  workspace: string,
+  definition: Uint8Array | number[],
+  key?: LoomKey,
+  auth?: LoomAuth
+): Promise<string> {
+  const [passphrase, kek] = keyArgs(key);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.lifecycleDefineJson(
+    loomPath,
+    workspace,
+    Array.from(definition),
+    passphrase,
+    kek,
+    authPrincipal,
+    authPassphrase
+  );
+}
+
+export function lifecycleInstantiateJson(
+  loomPath: string,
+  workspace: string,
+  instanceId: string,
+  definitionId: string,
+  subjectRefsJson: string,
+  key?: LoomKey,
+  auth?: LoomAuth
+): Promise<string> {
+  const [passphrase, kek] = keyArgs(key);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.lifecycleInstantiateJson(
+    loomPath,
+    workspace,
+    instanceId,
+    definitionId,
+    subjectRefsJson,
+    passphrase,
+    kek,
+    authPrincipal,
+    authPassphrase
+  );
+}
+
+export function lifecycleTransitionJson(
+  loomPath: string,
+  workspace: string,
+  instanceId: string,
+  transitionId: string,
+  toStageId: string,
+  actorPrincipalId: string | null | undefined,
+  gateEvaluationsJson: string,
+  snapshotDigest?: string | null,
+  key?: LoomKey,
+  auth?: LoomAuth
+): Promise<string> {
+  const [passphrase, kek] = keyArgs(key);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.lifecycleTransitionJson(
+    loomPath,
+    workspace,
+    instanceId,
+    transitionId,
+    toStageId,
+    actorPrincipalId ?? null,
+    gateEvaluationsJson,
+    snapshotDigest ?? null,
+    passphrase,
+    kek,
+    authPrincipal,
+    authPassphrase
+  );
+}
+
+export function refsReconcileJson(
+  loomPath: string,
+  workspace: string,
+  max: string,
+  key?: LoomKey,
+  auth?: LoomAuth
+): Promise<string> {
+  const [passphrase, kek] = keyArgs(key);
+  const [authPrincipal, authPassphrase] = authArgs(auth);
+  return UldrenLoom.refsReconcileJson(
+    loomPath,
+    workspace,
+    max,
+    passphrase,
+    kek,
+    authPrincipal,
+    authPassphrase
+  );
 }

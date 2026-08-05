@@ -34,6 +34,54 @@ fn update_metadata(lane: &mut Lane, updated_by: &str) {
         .unwrap_or(u64::MAX);
 }
 
+pub const LANE_TICKET_PLACEMENT_FIRST: i32 = 1;
+pub const LANE_TICKET_PLACEMENT_LAST: i32 = 2;
+pub const LANE_TICKET_PLACEMENT_BEFORE: i32 = 3;
+pub const LANE_TICKET_PLACEMENT_AFTER: i32 = 4;
+
+fn lane_ticket_placement<'a>(
+    placement: i32,
+    anchor: Option<&'a str>,
+) -> loom_core::error::Result<loom_lanes::LaneTicketPlacement<'a>> {
+    match placement {
+        0 | LANE_TICKET_PLACEMENT_LAST => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(loom_core::error::LoomError::invalid(
+                    "placement 'LAST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::Last)
+        }
+        LANE_TICKET_PLACEMENT_FIRST => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(loom_core::error::LoomError::invalid(
+                    "placement 'FIRST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::First)
+        }
+        LANE_TICKET_PLACEMENT_BEFORE => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::Before)
+            .ok_or_else(|| {
+                loom_core::error::LoomError::invalid(
+                    "placement 'BEFORE' requires an anchor ticket id",
+                )
+            }),
+        LANE_TICKET_PLACEMENT_AFTER => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::After)
+            .ok_or_else(|| {
+                loom_core::error::LoomError::invalid(
+                    "placement 'AFTER' requires an anchor ticket id",
+                )
+            }),
+        _ => Err(loom_core::error::LoomError::invalid(
+            "unknown lane ticket placement",
+        )),
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (path, workspace, lane, passphrase=None))]
 pub(crate) fn lanes_create<'py>(
@@ -143,7 +191,7 @@ pub(crate) fn lanes_update<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, workspace, lane_id, ticket_id, updated_by, placement="append", anchor=None, passphrase=None))]
+#[pyo3(signature = (path, workspace, lane_id, ticket_id, updated_by, placement=LANE_TICKET_PLACEMENT_LAST, anchor=None, passphrase=None))]
 pub(crate) fn lanes_ticket_add<'py>(
     py: Python<'py>,
     path: &str,
@@ -151,12 +199,12 @@ pub(crate) fn lanes_ticket_add<'py>(
     lane_id: &str,
     ticket_id: &str,
     updated_by: &str,
-    placement: &str,
+    placement: i32,
     anchor: Option<&str>,
     passphrase: Option<&str>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let bytes = mutate_lane(path, workspace, lane_id, passphrase, |lane| {
-        let placement = loom_lanes::LaneTicketPlacement::parse(placement, anchor).map_err(py_err)?;
+        let placement = lane_ticket_placement(placement, anchor).map_err(py_err)?;
         loom_lanes::place_lane_ticket(lane, ticket_id, placement).map_err(py_err)?;
         update_metadata(lane, updated_by);
         Ok(())

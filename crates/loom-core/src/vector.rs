@@ -16,11 +16,38 @@ use crate::provider::ObjectStore;
 use crate::tabular::Value;
 use crate::vcs::Loom;
 use crate::workspace::{FacetKind, WorkspaceId, facet_path, facet_root};
+use loom_types::ContentTag;
 pub use loom_vector::{
     AcceleratorPolicy, Hit, MetaFilter, Metric, PqIndex, VectorAccelerator, VectorEntry, VectorSet,
     search_auto, search_with_policy, sort_hits,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Owner-scoped condition for a single vector source-aware mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VectorCondition {
+    Any,
+    Absent,
+    Exact(VectorExactToken),
+}
+
+/// Opaque token for an exact vector entry comparison.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VectorExactToken(Vec<u8>);
+
+impl VectorExactToken {
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    fn from_content_tag(tag: ContentTag) -> Self {
+        Self(tag.to_entity_tag().as_bytes().to_vec())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 // ---- versioned-set facade over the engine -------------------------------------------------------
 
@@ -714,6 +741,94 @@ pub fn vector_upsert_with_source<S: ObjectStore>(
     loom.write_file_reserved(ns, &source_path(name, id), source_text.as_bytes(), 0o100644)
 }
 
+/// Return an owner-issued exact-comparison token for the current vector entry.
+pub fn vector_exact_token<S: ObjectStore>(
+    loom: &Loom<S>,
+    ns: WorkspaceId,
+    name: &str,
+    id: &str,
+) -> Result<Option<VectorExactToken>> {
+    loom.authorize_collection(ns, FacetKind::Vector, name, AclRight::Read)?;
+    require_manifest(loom, ns, name)?;
+    let entry = match loom.read_file_reserved(ns, &entry_path(name, id)) {
+        Ok(bytes) => bytes,
+        Err(err) if err.code == Code::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    Ok(Some(vector_exact_token_for(loom, ns, name, id, &entry)?))
+}
+
+/// Conditionally insert or replace a source-aware vector entry using an owner-issued token.
+pub fn vector_upsert_with_source_conditioned<S: ObjectStore>(
+    loom: &mut Loom<S>,
+    ns: WorkspaceId,
+    name: &str,
+    id: &str,
+    vector: Vec<f32>,
+    metadata: BTreeMap<String, Value>,
+    source_text: &str,
+    model: Option<TextEmbeddingModel>,
+    condition: VectorCondition,
+) -> Result<VectorExactToken> {
+    loom.authorize_collection(ns, FacetKind::Vector, name, AclRight::Write)?;
+    let current_entry = match loom.read_file_reserved(ns, &entry_path(name, id)) {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.code == Code::NotFound => None,
+        Err(err) => return Err(err),
+    };
+    match condition {
+        VectorCondition::Any => {}
+        VectorCondition::Absent if current_entry.is_none() => {}
+        VectorCondition::Absent => {
+            return Err(LoomError::new(
+                Code::AlreadyExists,
+                "vector entry already exists",
+            ));
+        }
+        VectorCondition::Exact(token) => match current_entry.as_deref() {
+            Some(entry) if token == vector_exact_token_for(loom, ns, name, id, entry)? => {}
+            _ => {
+                return Err(LoomError::new(
+                    Code::Conflict,
+                    "vector exact condition did not match",
+                ));
+            }
+        },
+    }
+    vector_upsert_with_source(loom, ns, name, id, vector, metadata, source_text, model)?;
+    vector_exact_token(loom, ns, name, id)?
+        .ok_or_else(|| LoomError::new(Code::Internal, "vector token missing after upsert"))
+}
+
+fn vector_exact_token_for<S: ObjectStore>(
+    loom: &Loom<S>,
+    ns: WorkspaceId,
+    name: &str,
+    id: &str,
+    entry: &[u8],
+) -> Result<VectorExactToken> {
+    let source = match loom.read_file_reserved(ns, &source_path(name, id)) {
+        Ok(bytes) => cbor::Value::Bytes(bytes),
+        Err(err) if err.code == Code::NotFound => cbor::Value::Null,
+        Err(err) => return Err(err),
+    };
+    let model = match loom.read_file_reserved(ns, &embedding_model_path(name)) {
+        Ok(bytes) => cbor::Value::Bytes(bytes),
+        Err(err) if err.code == Code::NotFound => cbor::Value::Null,
+        Err(err) => return Err(err),
+    };
+    let logical_record = cbor::encode(&cbor::Value::Array(vec![
+        cbor::Value::Bytes(ns.as_bytes().to_vec()),
+        cbor::Value::Text(name.to_owned()),
+        cbor::Value::Text(id.to_owned()),
+        cbor::Value::Bytes(entry.to_vec()),
+        source,
+        model,
+    ]));
+    let digest = crate::Digest::hash(loom.store().digest_algo(), &logical_record);
+    Ok(VectorExactToken::from_content_tag(ContentTag::new(digest)))
+}
+
 /// Embed `source_text` through the installed provider and store both the resulting vector and source
 /// text. `UNSUPPORTED` is returned when no embedding provider is configured.
 pub fn vector_upsert_text<S: ObjectStore>(
@@ -1184,6 +1299,86 @@ mod tests {
         );
         assert!(vector_delete(&mut loom, ns, "emb", "a").unwrap());
         assert_eq!(vector_source_text(&loom, ns, "emb", "a").unwrap(), None);
+    }
+
+    #[test]
+    fn exact_tokens_are_fixed_entity_tags_and_do_not_disclose_record_bytes() {
+        use crate::provider::memory::MemoryStore;
+        use crate::workspace::{FacetKind, WorkspaceId};
+
+        let mut loom = Loom::new(MemoryStore::new());
+        let ns = loom
+            .registry_mut()
+            .create(FacetKind::Vector, None, WorkspaceId::from_bytes([7; 16]))
+            .unwrap();
+        vector_create(&mut loom, ns, "emb", 2, Metric::Cosine).unwrap();
+        let mut metadata = BTreeMap::new();
+        metadata.insert("label".to_string(), Value::Text("blue".to_string()));
+        vector_upsert_with_source(
+            &mut loom,
+            ns,
+            "emb",
+            "doc-1",
+            vec![1.0, 0.0],
+            metadata,
+            "secret source",
+            Some(TextEmbeddingModel {
+                model_id: "model-a".to_string(),
+                dimension: 2,
+                weights_digest: Some("sha256:aaa".to_string()),
+            }),
+        )
+        .unwrap();
+
+        let token = vector_exact_token(&loom, ns, "emb", "doc-1")
+            .unwrap()
+            .unwrap();
+        let expected_len = ContentTag::new(crate::Digest::hash(
+            loom.store().digest_algo(),
+            b"same-length-reference",
+        ))
+        .to_entity_tag()
+        .as_bytes()
+        .len();
+        assert_eq!(token.as_bytes().len(), expected_len);
+        for needle in [
+            b"secret source".as_slice(),
+            b"model-a".as_slice(),
+            b"sha256:aaa".as_slice(),
+            b"blue".as_slice(),
+            b"doc-1".as_slice(),
+            b"emb".as_slice(),
+            &1.0f32.to_le_bytes(),
+        ] {
+            assert!(
+                !token
+                    .as_bytes()
+                    .windows(needle.len())
+                    .any(|window| window == needle),
+                "token disclosed {:?}",
+                String::from_utf8_lossy(needle)
+            );
+        }
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("label".to_string(), Value::Text("red".to_string()));
+        let next = vector_upsert_with_source_conditioned(
+            &mut loom,
+            ns,
+            "emb",
+            "doc-1",
+            vec![0.0, 1.0],
+            metadata,
+            "changed source",
+            Some(TextEmbeddingModel {
+                model_id: "model-a".to_string(),
+                dimension: 2,
+                weights_digest: Some("sha256:aaa".to_string()),
+            }),
+            VectorCondition::Exact(token.clone()),
+        )
+        .unwrap();
+        assert_ne!(token, next);
     }
 
     #[test]

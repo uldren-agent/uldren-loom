@@ -57,6 +57,7 @@ pub fn default_compression_for_facets(facets: &[FacetKind]) -> CompressionHint {
                 | FacetKind::Mail
                 | FacetKind::Search
                 | FacetKind::Dataframe
+                | FacetKind::Inference
         )
     }) {
         CompressionHint::Small
@@ -669,6 +670,8 @@ mod tests {
         assert_eq!(FacetKind::parse("vcs").unwrap(), FacetKind::Vcs);
         assert_eq!(FacetKind::Search.as_str(), "search");
         assert_eq!(FacetKind::parse("search").unwrap(), FacetKind::Search);
+        assert_eq!(FacetKind::Inference.as_str(), "inference");
+        assert_eq!(FacetKind::parse("inference").unwrap(), FacetKind::Inference);
     }
 
     #[test]
@@ -690,6 +693,27 @@ mod tests {
             "stable tags must be a gap-free 0..N range"
         );
         assert_eq!(FacetKind::from_stable_tag(count), None);
+        assert_eq!(FacetKind::Inference.stable_tag(), 21);
+        assert_eq!(FacetKind::from_stable_tag(21), Some(FacetKind::Inference));
+    }
+
+    #[test]
+    fn acl_domain_stable_tags_round_trip() {
+        let mut tags = std::collections::BTreeSet::new();
+        for domain in AclDomain::ALL {
+            let tag = domain.stable_tag();
+            assert_eq!(AclDomain::from_stable_tag(tag), Some(domain));
+            assert!(
+                tags.insert(tag),
+                "duplicate stable tag {tag} for {domain:?}"
+            );
+        }
+        assert_eq!(AclDomain::Tickets.stable_tag(), 21);
+        assert_eq!(AclDomain::Meetings.stable_tag(), 25);
+        assert_eq!(AclDomain::Inference.stable_tag(), 26);
+        assert_eq!(AclDomain::parse("inference").unwrap(), AclDomain::Inference);
+        assert_eq!(AclDomain::from(FacetKind::Inference), AclDomain::Inference);
+        assert_eq!(AclDomain::from_stable_tag(27), None);
     }
 
     #[test]

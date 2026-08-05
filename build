@@ -1,0 +1,12 @@
+#!/bin/bash
+
+cargo build
+
+cp target/debug/loom .
+
+./loom
+
+mv loom matrix
+
+cp matrix/loom scripts/loop
+cp matrix/loom /Users/nxkavian/Drive/Source/Uldren/loom/loom

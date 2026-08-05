@@ -209,3 +209,28 @@ actual fun Loom.vectorSearchPolicyCbor(
         path, workspace, name, query, k, filter, policy, threshold, ef, pqM, pqK, pqIters,
         passphrase?.encodeToByteArray(), kek, authPrincipal, authPassphrase?.encodeToByteArray(),
     )
+
+actual fun Loom.vectorTextUpsert(
+        path: String,
+        request: ByteArray,
+        passphrase: String?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: String?,
+    ): ByteArray = LoomNative.nativeVectorTextUpsert(
+        path, request, passphrase?.encodeToByteArray(), kek,
+        authPrincipal, authPassphrase?.encodeToByteArray(),
+    )
+
+actual fun Loom.vectorWorkspaceConfigureJson(
+        path: String,
+        workspace: String,
+        requestJson: String,
+        passphrase: String?,
+        kek: ByteArray?,
+        authPrincipal: String?,
+        authPassphrase: String?,
+    ): String = LoomNative.nativeVectorWorkspaceConfigureJson(
+        path, workspace, requestJson, passphrase?.encodeToByteArray(), kek,
+        authPrincipal, authPassphrase?.encodeToByteArray(),
+    )

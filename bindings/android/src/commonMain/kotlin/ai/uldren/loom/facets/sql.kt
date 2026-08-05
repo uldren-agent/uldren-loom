@@ -81,3 +81,14 @@ expect fun Loom.sqlTableDiffCbor(
         authPrincipal: String? = null,
         authPassphrase: String? = null,
     ): ByteArray
+
+expect fun Loom.sqlExecResult(
+        path: String,
+        workspace: String,
+        db: String,
+        sql: String,
+        passphrase: String? = null,
+        kek: ByteArray? = null,
+        authPrincipal: String? = null,
+        authPassphrase: String? = null,
+    ): ByteArray

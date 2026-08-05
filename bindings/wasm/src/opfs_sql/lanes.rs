@@ -2,7 +2,7 @@ use loom_codec::{Value as CborValue, encode as cbor_encode};
 use loom_lanes::{Lane, LaneStatus};
 use wasm_bindgen::prelude::*;
 
-use super::{LoomStore, le, resolve_workspace_arg, save_loom};
+use super::{LoomSql, LoomStore, ensure_doc_ns, le, resolve_workspace_arg, save_loom};
 
 fn update_metadata(lane: &mut Lane, updated_by: &str) {
     lane.updated_by = updated_by.to_string();
@@ -10,10 +10,58 @@ fn update_metadata(lane: &mut Lane, updated_by: &str) {
 }
 
 #[wasm_bindgen]
+pub enum LaneTicketPlacement {
+    First = 1,
+    Last = 2,
+    Before = 3,
+    After = 4,
+}
+
+fn lane_ticket_placement<'a>(
+    placement: LaneTicketPlacement,
+    anchor: Option<&'a str>,
+) -> loom_core::error::Result<loom_lanes::LaneTicketPlacement<'a>> {
+    match placement {
+        LaneTicketPlacement::Last => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(loom_core::error::LoomError::invalid(
+                    "placement 'LAST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::Last)
+        }
+        LaneTicketPlacement::First => {
+            if anchor.is_some_and(|anchor| !anchor.is_empty()) {
+                return Err(loom_core::error::LoomError::invalid(
+                    "placement 'FIRST' rejects an anchor ticket id",
+                ));
+            }
+            Ok(loom_lanes::LaneTicketPlacement::First)
+        }
+        LaneTicketPlacement::Before => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::Before)
+            .ok_or_else(|| {
+                loom_core::error::LoomError::invalid(
+                    "placement 'BEFORE' requires an anchor ticket id",
+                )
+            }),
+        LaneTicketPlacement::After => anchor
+            .filter(|anchor| !anchor.is_empty())
+            .map(loom_lanes::LaneTicketPlacement::After)
+            .ok_or_else(|| {
+                loom_core::error::LoomError::invalid(
+                    "placement 'AFTER' requires an anchor ticket id",
+                )
+            }),
+    }
+}
+
+#[wasm_bindgen]
 impl LoomStore {
     pub fn lanes_create(&mut self, workspace: String, lane: Vec<u8>) -> Result<Vec<u8>, JsError> {
         let lane = Lane::decode(&lane).map_err(le)?;
-        let ns = resolve_workspace_arg(&self.loom, &workspace)?;
+        let ns = ensure_doc_ns(&mut self.loom, &workspace)?;
         let lane = loom_lanes::create_lane(&mut self.loom, ns, lane).map_err(le)?;
         save_loom(&mut self.loom).map_err(le)?;
         lane.encode().map_err(le)
@@ -68,7 +116,10 @@ impl LoomStore {
                 lane.description = description;
             }
             if let Some(lane_status) = lane_status {
-                lane.lane_status = LaneStatus::parse(&lane_status).map_err(le)?.as_str().to_string();
+                lane.lane_status = LaneStatus::parse(&lane_status)
+                    .map_err(le)?
+                    .as_str()
+                    .to_string();
             }
             if let Some(status_report) = status_report {
                 lane.status_report = status_report;
@@ -87,12 +138,11 @@ impl LoomStore {
         lane_id: String,
         ticket_id: String,
         updated_by: String,
-        placement: String,
+        placement: LaneTicketPlacement,
         anchor: Option<String>,
     ) -> Result<Vec<u8>, JsError> {
         self.mutate_lane(workspace, lane_id, |lane| {
-            let placement = loom_lanes::LaneTicketPlacement::parse(&placement, anchor.as_deref())
-                .map_err(le)?;
+            let placement = lane_ticket_placement(placement, anchor.as_deref()).map_err(le)?;
             loom_lanes::place_lane_ticket(lane, &ticket_id, placement).map_err(le)?;
             update_metadata(lane, &updated_by);
             Ok(())
@@ -116,7 +166,6 @@ impl LoomStore {
             Ok(())
         })
     }
-
 }
 
 impl LoomStore {
@@ -129,7 +178,74 @@ impl LoomStore {
     where
         F: FnOnce(&mut Lane) -> Result<(), JsError>,
     {
+        let ns = ensure_doc_ns(&mut self.loom, &workspace)?;
+        let mut lane = loom_lanes::get_lane(&self.loom, ns, &lane_id)
+            .map_err(le)?
+            .ok_or_else(|| JsError::new("NOT_FOUND: lane not found"))?;
+        mutate(&mut lane)?;
+        let lane = loom_lanes::put_lane(&mut self.loom, ns, lane).map_err(le)?;
+        save_loom(&mut self.loom).map_err(le)?;
+        lane.encode().map_err(le)
+    }
+}
+
+#[wasm_bindgen]
+impl LoomSql {
+    pub fn lanes_create(&mut self, workspace: String, lane: Vec<u8>) -> Result<Vec<u8>, JsError> {
+        if self.readonly {
+            return Err(JsError::new("this session is a read-only snapshot"));
+        }
+        let lane = Lane::decode(&lane).map_err(le)?;
+        let ns = ensure_doc_ns(&mut self.loom, &workspace)?;
+        let lane = loom_lanes::create_lane(&mut self.loom, ns, lane).map_err(le)?;
+        save_loom(&mut self.loom).map_err(le)?;
+        lane.encode().map_err(le)
+    }
+
+    pub fn lanes_get(
+        &self,
+        workspace: String,
+        lane_id: String,
+    ) -> Result<Option<Vec<u8>>, JsError> {
         let ns = resolve_workspace_arg(&self.loom, &workspace)?;
+        loom_lanes::get_lane(&self.loom, ns, &lane_id)
+            .map_err(le)?
+            .map(|lane| lane.encode().map_err(le))
+            .transpose()
+    }
+
+    pub fn lanes_ticket_add(
+        &mut self,
+        workspace: String,
+        lane_id: String,
+        ticket_id: String,
+        updated_by: String,
+        placement: LaneTicketPlacement,
+        anchor: Option<String>,
+    ) -> Result<Vec<u8>, JsError> {
+        if self.readonly {
+            return Err(JsError::new("this session is a read-only snapshot"));
+        }
+        self.mutate_lane(workspace, lane_id, |lane| {
+            let placement = lane_ticket_placement(placement, anchor.as_deref()).map_err(le)?;
+            loom_lanes::place_lane_ticket(lane, &ticket_id, placement).map_err(le)?;
+            update_metadata(lane, &updated_by);
+            Ok(())
+        })
+    }
+}
+
+impl LoomSql {
+    fn mutate_lane<F>(
+        &mut self,
+        workspace: String,
+        lane_id: String,
+        mutate: F,
+    ) -> Result<Vec<u8>, JsError>
+    where
+        F: FnOnce(&mut Lane) -> Result<(), JsError>,
+    {
+        let ns = ensure_doc_ns(&mut self.loom, &workspace)?;
         let mut lane = loom_lanes::get_lane(&self.loom, ns, &lane_id)
             .map_err(le)?
             .ok_or_else(|| JsError::new("NOT_FOUND: lane not found"))?;
